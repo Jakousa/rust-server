@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::BytesMut;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -265,6 +265,20 @@ impl GatewayServer {
             }
 
             let routed_packets = self.dispatcher.process_frames(session_id, &mut buf)?;
+            for pkt in &routed_packets {
+                if let ClientPacket::Ping(ping) = &pkt.packet {
+                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                        client_timestamp: ping.timestamp,
+                        server_timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                    });
+                    let out = pong.encode();
+                    let _ = socket.write_all(&out).await;
+                }
+            }
+
             if let Some(ref tx) = self.packet_tx {
                 for pkt in routed_packets {
                     let _ = tx.send(pkt).await;

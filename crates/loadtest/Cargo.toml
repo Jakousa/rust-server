@@ -1,0 +1,17 @@
+[package]
+name = "mmo-loadtest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mmo-core = { path = "../core" }
+mmo-schema = { path = "../schema" }
+tokio = { version = "1.38", features = ["full"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+bytes = "1.6"
+hdrhistogram = "7.5"
+rand = "0.8"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"

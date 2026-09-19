@@ -1,0 +1,77 @@
+services:
+  director:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mmo-server:latest
+    container_name: mmo-director
+    command: ["mmo-director"]
+    networks:
+      - mmo-net
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+
+  node-1:
+    image: mmo-server:latest
+    container_name: mmo-node-1
+    command: ["mmo-node"]
+    environment:
+      NODE_ID: "1"
+      LISTEN_ADDR: "0.0.0.0:50052"
+      DIRECTOR_ADDR: "http://director:50051"
+    networks:
+      - mmo-net
+    depends_on:
+      - director
+    restart: unless-stopped
+
+  node-2:
+    image: mmo-server:latest
+    container_name: mmo-node-2
+    command: ["mmo-node"]
+    environment:
+      NODE_ID: "2"
+      LISTEN_ADDR: "0.0.0.0:50053"
+      DIRECTOR_ADDR: "http://director:50051"
+    networks:
+      - mmo-net
+    depends_on:
+      - director
+    restart: unless-stopped
+
+  gateway:
+    image: mmo-server:latest
+    container_name: mmo-gateway
+    command: ["mmo-gateway"]
+    environment:
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DIRECTOR_ADDR: "http://director:50051"
+      DEFAULT_NODE_ADDR: "node-1:50052"
+    networks:
+      - mmo-net
+    ports:
+      - "8080:8080"
+    depends_on:
+      - node-1
+      - node-2
+    restart: unless-stopped
+
+  loadtest:
+    image: mmo-server:latest
+    container_name: mmo-loadtest
+    command: ["mmo-loadtest", "--gateway-addr", "gateway:8080", "--bots", "100", "--duration-secs", "5"]
+    environment:
+      GATEWAY_ADDR: "gateway:8080"
+      BOT_COUNT: "100"
+      DURATION_SECS: "5"
+    networks:
+      - mmo-net
+    depends_on:
+      - gateway
+    profiles:
+      - loadtest
+
+networks:
+  mmo-net:
+    driver: bridge

@@ -48,6 +48,11 @@ impl SessionRouter {
         self.session_to_node.insert(session_id, node_address);
     }
 
+    /// Registers a fallback route for a session before a player GUID is identified.
+    pub fn register_session_fallback(&mut self, session_id: u64, node_address: String) {
+        self.session_to_node.insert(session_id, node_address);
+    }
+
     /// Updates the authoritative node address for a player GUID during seamless handovers.
     ///
     /// Updates both GUID and session-based lookups. Returns `true` if the route

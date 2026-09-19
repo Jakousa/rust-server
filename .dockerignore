@@ -1,0 +1,5 @@
+target
+.git
+.agents
+*.md
+openspec/changes/archive
