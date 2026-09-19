@@ -1,0 +1,18 @@
+[package]
+name = "mmo-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mmo-core = { path = "../core" }
+mmo-schema = { path = "../schema" }
+tokio = { version = "1.42", features = ["full"] }
+tonic = "0.12.3"
+bytes = "1.9"
+thiserror = "2.0"
+
+[dev-dependencies]
+mmo-node = { path = "../node" }
+mmo-director = { path = "../director" }
+
+

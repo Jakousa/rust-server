@@ -1,27 +1,9 @@
-[package]
-name = "first_rust_project"
-version = "0.1.0"
-edition = "2021"
-build = "build.rs"
-
-[lib]
-name = "first_rust_project"
-path = "src/lib.rs"
-
-[dependencies]
-async-std = "1.13.0"
-prost = "0.13.4"
-tokio = { version = "1.42.0", features = ["full"] }
-tonic = "0.12.3"
-tonic-reflection = "0.12.3"
-uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "my_benchmark"
-harness = false
-
-[build-dependencies]
-tonic-build = "0.12.3"
+[workspace]
+members = [
+    "crates/core",
+    "crates/schema",
+    "crates/director",
+    "crates/node",
+    "crates/gateway",
+]
+resolver = "2"

@@ -1,0 +1,18 @@
+[package]
+name = "mmo-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mmo-core = { path = "../core" }
+mmo-schema = { path = "../schema" }
+tokio = { version = "1.42", features = ["full"] }
+tonic = "0.12.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "engine_benchmarks"
+path = "../../benches/engine_benchmarks.rs"
+harness = false

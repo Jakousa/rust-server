@@ -1,0 +1,83 @@
+// FlatBuffers schema for client-facing game protocol
+
+namespace Mmo.ClientFbs;
+
+struct Vec3 {
+  x: float;
+  y: float;
+  z: float;
+}
+
+enum InteractionType : ubyte {
+  Talk = 0,
+  Attack = 1,
+  UseItem = 2,
+  Loot = 3,
+  Trade = 4,
+}
+
+table MovementPacket {
+  entity_id: ulong;
+  position: Vec3;
+  velocity: Vec3;
+  yaw: float;
+  pitch: float;
+  timestamp: ulong;
+  sequence: uint;
+}
+
+table MovementCorrectionPacket {
+  entity_id: ulong;
+  corrected_position: Vec3;
+  corrected_velocity: Vec3;
+  sequence: uint;
+  reason: ubyte;
+}
+
+table InteractionPacket {
+  source_guid: ulong;
+  target_guid: ulong;
+  interaction_type: InteractionType;
+  action_id: uint;
+  payload: [ubyte];
+}
+
+table InteractionResultPacket {
+  action_id: uint;
+  success: bool;
+  error_code: uint;
+  payload: [ubyte];
+}
+
+table EntityStatePacket {
+  entity_id: ulong;
+  position: Vec3;
+  velocity: Vec3;
+  yaw: float;
+  pitch: float;
+  health: uint;
+  max_health: uint;
+  state_flags: uint;
+  timestamp: ulong;
+}
+
+table EntityDespawnPacket {
+  entity_id: ulong;
+}
+
+union PacketPayload {
+  Movement: MovementPacket,
+  MovementCorrection: MovementCorrectionPacket,
+  Interaction: InteractionPacket,
+  InteractionResult: InteractionResultPacket,
+  EntityState: EntityStatePacket,
+  EntityDespawn: EntityDespawnPacket,
+}
+
+table GamePacket {
+  magic: ushort = 0x4D4D;
+  sequence: uint;
+  payload: PacketPayload;
+}
+
+root_type GamePacket;

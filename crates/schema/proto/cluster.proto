@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package mmo.cluster;
+
+message Vector3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+message BoundingBox {
+  Vector3 min = 1;
+  Vector3 max = 2;
+}
+
+// DirectorService messages
+message RegisterNodeRequest {
+  uint32 node_id = 1;
+  string listen_addr = 2;
+  BoundingBox bounds = 3;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 assigned_node_id = 3;
+}
+
+message HeartbeatRequest {
+  uint32 node_id = 1;
+  float tick_rate = 2;
+  uint32 entity_count = 3;
+  float cpu_percent = 4;
+  uint64 memory_bytes = 5;
+  uint64 timestamp = 6;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  bool should_split = 2;
+}
+
+message SplitReportRequest {
+  uint32 node_id = 1;
+  BoundingBox original_bounds = 2;
+  repeated BoundingBox child_bounds = 3;
+  uint32 total_entities = 4;
+}
+
+message SplitReportResponse {
+  bool acknowledged = 1;
+  repeated uint32 assigned_node_ids = 2;
+}
+
+// NodeService messages
+message RemoteCommandRequest {
+  uint64 guid = 1;
+  uint32 action_id = 2;
+  bytes payload = 3;
+  uint32 source_node_id = 4;
+  uint32 target_node_id = 5;
+}
+
+message RemoteCommandResponse {
+  bool success = 1;
+  uint32 error_code = 2;
+  string error_message = 3;
+  bytes result = 4;
+}
+
+message GhostEntity {
+  uint64 guid = 1;
+  Vector3 position = 2;
+  Vector3 velocity = 3;
+  float yaw = 4;
+  float pitch = 5;
+  bytes component_data = 6;
+  uint64 last_tick = 7;
+}
+
+message GhostSyncRequest {
+  uint32 source_node_id = 1;
+  repeated GhostEntity ghosts = 2;
+  uint64 tick = 3;
+}
+
+message GhostSyncResponse {
+  bool acknowledged = 1;
+  uint32 synced_count = 2;
+}
+
+// Services
+service DirectorService {
+  rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportSplit (SplitReportRequest) returns (SplitReportResponse);
+}
+
+service NodeService {
+  rpc RemoteCommand (RemoteCommandRequest) returns (RemoteCommandResponse);
+  rpc SyncGhosts (GhostSyncRequest) returns (GhostSyncResponse);
+}
