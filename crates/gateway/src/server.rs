@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 
 use mmo_core::guid::Guid;
 use mmo_schema::client::{ClientCodecError, ClientPacket};
+use mmo_storage::cache::{SessionCacheBackend, SessionData};
+use mmo_storage::db::StorageError;
 
 use crate::router::SessionRouter;
 
@@ -32,6 +34,9 @@ pub enum GatewayError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
 
     #[error("Session {0} not found")]
     SessionNotFound(u64),
@@ -157,12 +162,13 @@ impl PacketDispatcher {
 }
 
 /// Gateway server managing connection lifecycles, streaming packet framing,
-/// and dynamic routing to authoritative simulation nodes.
+/// dynamic routing to authoritative simulation nodes, and optional distributed session caching.
 pub struct GatewayServer {
     router: Arc<RwLock<SessionRouter>>,
     dispatcher: PacketDispatcher,
     session_counter: Arc<AtomicU64>,
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
+    cache: Option<Arc<dyn SessionCacheBackend>>,
 }
 
 impl GatewayServer {
@@ -174,6 +180,7 @@ impl GatewayServer {
             dispatcher,
             session_counter: Arc::new(AtomicU64::new(1)),
             packet_tx: None,
+            cache: None,
         }
     }
 
@@ -188,7 +195,14 @@ impl GatewayServer {
             dispatcher,
             session_counter: Arc::new(AtomicU64::new(1)),
             packet_tx: Some(packet_tx),
+            cache: None,
         }
+    }
+
+    /// Sets an optional distributed session cache backend.
+    pub fn with_cache(mut self, cache: Arc<dyn SessionCacheBackend>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Accesses the underlying `SessionRouter`.
@@ -199,6 +213,11 @@ impl GatewayServer {
     /// Accesses the packet dispatcher.
     pub fn dispatcher(&self) -> &PacketDispatcher {
         &self.dispatcher
+    }
+
+    /// Accesses the session cache backend, if configured.
+    pub fn cache(&self) -> Option<&Arc<dyn SessionCacheBackend>> {
+        self.cache.as_ref()
     }
 
     /// Generates the next monotonic unique session ID.
@@ -215,6 +234,31 @@ impl GatewayServer {
     ) -> Result<(), GatewayError> {
         let mut router = self.router.write().map_err(|_| GatewayError::LockPoisoned)?;
         router.register_session(session_id, guid, node_address);
+        Ok(())
+    }
+
+    /// Registers a session in the gateway routing table, and updates the distributed session cache if configured.
+    pub async fn register_session_with_cache(
+        &self,
+        session_id: u64,
+        guid: Guid,
+        node_address: String,
+        ttl_secs: u64,
+    ) -> Result<(), GatewayError> {
+        self.register_session(session_id, guid, node_address.clone())?;
+        if let Some(ref cache) = self.cache {
+            let session_data = SessionData {
+                session_id,
+                guid: guid.raw(),
+                node_address,
+                expires_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + ttl_secs,
+            };
+            cache.set_session(&session_data, ttl_secs).await?;
+        }
         Ok(())
     }
 
@@ -236,10 +280,44 @@ impl GatewayServer {
         Ok(router.get_route_by_session(session_id).map(|s| s.to_string()))
     }
 
+    /// Resolves the authoritative route for a session ID. Checks local router first,
+    /// falling back to querying the distributed session cache (and synchronizing into the local router if found).
+    pub async fn resolve_route_or_cache(
+        &self,
+        session_id: u64,
+    ) -> Result<Option<String>, GatewayError> {
+        if let Some(addr) = self.get_route_by_session(session_id)? {
+            return Ok(Some(addr));
+        }
+
+        if let Some(ref cache) = self.cache {
+            if let Some(data) = cache.get_session(session_id).await? {
+                let guid = Guid::from_raw(data.guid);
+                let addr = data.node_address.clone();
+                self.register_session(session_id, guid, addr.clone())?;
+                return Ok(Some(addr));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Removes a session from the routing table.
     pub fn remove_session(&self, session_id: u64) -> Result<Option<Guid>, GatewayError> {
         let mut router = self.router.write().map_err(|_| GatewayError::LockPoisoned)?;
         Ok(router.remove_session(session_id))
+    }
+
+    /// Removes a session from the local routing table and distributed cache.
+    pub async fn remove_session_with_cache(
+        &self,
+        session_id: u64,
+    ) -> Result<Option<Guid>, GatewayError> {
+        let guid = self.remove_session(session_id)?;
+        if let Some(ref cache) = self.cache {
+            let _ = cache.remove_session(session_id).await?;
+        }
+        Ok(guid)
     }
 
     /// Binds a TCP connection listener to the specified address.
@@ -286,8 +364,8 @@ impl GatewayServer {
             }
         }
 
-        // Clean up session route on disconnect
-        let _ = self.remove_session(session_id);
+        // Clean up session route and cache entry on disconnect
+        let _ = self.remove_session_with_cache(session_id).await;
         Ok(())
     }
 }
@@ -544,4 +622,57 @@ mod tests {
         // Session removed on disconnect
         assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn test_gateway_server_with_cache_backend() {
+        use mmo_storage::cache::MemoryCache;
+
+        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let cache = Arc::new(MemoryCache::new());
+        let server = GatewayServer::new(router).with_cache(cache.clone());
+
+        let player_guid = Guid::new(EntityType::Player, 1, 888);
+        let session_id = 42;
+        let node_addr = "127.0.0.1:50053".to_string();
+
+        // 1. Register with cache
+        server
+            .register_session_with_cache(session_id, player_guid, node_addr.clone(), 60)
+            .await
+            .unwrap();
+
+        // Verify route in local router
+        assert_eq!(
+            server.get_route_by_session(session_id).unwrap(),
+            Some(node_addr.clone())
+        );
+
+        // Verify route in cache backend
+        let cached = cache
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("Session in cache");
+        assert_eq!(cached.guid, player_guid.raw());
+        assert_eq!(cached.node_address, node_addr);
+
+        // 2. Clear local router to simulate separate gateway replica resolving route from cache
+        server.router().write().unwrap().clear();
+        assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
+
+        // Resolving route via resolve_route_or_cache should query cache and populate local router
+        let resolved = server.resolve_route_or_cache(session_id).await.unwrap();
+        assert_eq!(resolved, Some(node_addr.clone()));
+        assert_eq!(
+            server.get_route_by_session(session_id).unwrap(),
+            Some(node_addr)
+        );
+
+        // 3. Remove with cache
+        let removed = server.remove_session_with_cache(session_id).await.unwrap();
+        assert_eq!(removed, Some(player_guid));
+        assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
+        assert!(cache.get_session(session_id).await.unwrap().is_none());
+    }
 }
+

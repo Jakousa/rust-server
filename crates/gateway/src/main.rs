@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use mmo_gateway::{GatewayServer, SessionRouter};
+use mmo_storage::cache::{MemoryCache, RedisCache, SessionCacheBackend};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,17 +14,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_addr = std::env::var("DIRECTOR_ADDR")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
+    let redis_url = std::env::var("REDIS_URL").ok();
+
     println!("============================================================");
     println!("          MMO Edge Gateway Daemon Initialized               ");
     println!("============================================================");
     println!("Listen Address      : {}", listen_addr);
     println!("Default Node Route  : {}", default_node_addr);
     println!("Director Address    : {}", director_addr);
+    println!(
+        "Session Cache       : {}",
+        redis_url
+            .as_deref()
+            .unwrap_or("In-Memory (REDIS_URL not set)")
+    );
     println!("------------------------------------------------------------");
+
+    let cache: Arc<dyn SessionCacheBackend> = match redis_url {
+        Some(ref url) => match RedisCache::new(url) {
+            Ok(rc) => {
+                println!("[Gateway] Connected to Redis session cache at {}", url);
+                Arc::new(rc)
+            }
+            Err(e) => {
+                eprintln!("[Gateway] Failed to connect to Redis ({}), falling back to MemoryCache", e);
+                Arc::new(MemoryCache::new())
+            }
+        },
+        None => Arc::new(MemoryCache::new()),
+    };
 
     let router = Arc::new(RwLock::new(SessionRouter::new()));
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
-    let server = Arc::new(GatewayServer::with_packet_channel(router, packet_tx));
+    let server = Arc::new(
+        GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache),
+    );
 
     // Background worker to consume/log routed packets
     tokio::spawn(async move {

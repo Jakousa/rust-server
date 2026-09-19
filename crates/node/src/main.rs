@@ -5,10 +5,12 @@ use tokio::sync::RwLock;
 use tonic::transport::Server;
 
 use mmo_core::BoundingBox3D;
-use mmo_node::{NodeServiceImpl, TickSimulation};
+use mmo_node::{NodeServiceImpl, TickSimulation, WriteBehindSnapshotter};
 use mmo_schema::cluster::director_service_client::DirectorServiceClient;
 use mmo_schema::cluster::node_service_server::NodeServiceServer;
 use mmo_schema::cluster::{BoundingBox, HeartbeatRequest, RegisterNodeRequest, Vector3};
+use mmo_storage::db::Database;
+use mmo_storage::repository::CharacterRepository;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,13 +25,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_addr = std::env::var("DIRECTOR_ADDR")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
+    let db_url = std::env::var("DATABASE_URL").ok();
+
     println!("============================================================");
     println!("        MMO Simulation Node Daemon Initialized             ");
     println!("============================================================");
     println!("Node ID          : {}", node_id);
     println!("Listen Address   : {}", listen_addr);
     println!("Director Address : {}", director_addr);
+    println!(
+        "Database URL     : {}",
+        db_url.as_deref().unwrap_or("Disabled (DATABASE_URL not set)")
+    );
     println!("------------------------------------------------------------");
+
+    let _snapshotter = if let Some(ref url) = db_url {
+        match Database::connect(url).await {
+            Ok(db) => {
+                println!("[Node {}] Connected to database at {}", node_id, url);
+                let repo = CharacterRepository::new(db);
+                Some(WriteBehindSnapshotter::new(repo))
+            }
+            Err(e) => {
+                eprintln!("[Node {}] Database connection failed: {}", node_id, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Default world bounds (-100.0 to 100.0)
     let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));

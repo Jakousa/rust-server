@@ -6,6 +6,7 @@
 pub mod kinematics;
 pub mod network;
 pub mod sim;
+pub mod snapshotter;
 
 pub use kinematics::{KinematicValidator, KinematicViolation, KinematicViolationReason};
 pub use network::{
@@ -13,3 +14,4 @@ pub use network::{
     GhostRecord, GhostStore, NodeServiceImpl, RemoteCommandErrorCode,
 };
 pub use sim::TickSimulation;
+pub use snapshotter::WriteBehindSnapshotter;

@@ -20,6 +20,8 @@ services:
       NODE_ID: "1"
       LISTEN_ADDR: "0.0.0.0:50052"
       DIRECTOR_ADDR: "http://director:50051"
+      DATABASE_URL: ${DATABASE_URL:-sqlite://mmo.db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
       - mmo-net
     depends_on:
@@ -34,6 +36,8 @@ services:
       NODE_ID: "2"
       LISTEN_ADDR: "0.0.0.0:50053"
       DIRECTOR_ADDR: "http://director:50051"
+      DATABASE_URL: ${DATABASE_URL:-sqlite://mmo.db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
       - mmo-net
     depends_on:
@@ -48,6 +52,7 @@ services:
       LISTEN_ADDR: "0.0.0.0:8080"
       DIRECTOR_ADDR: "http://director:50051"
       DEFAULT_NODE_ADDR: "node-1:50052"
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
       - mmo-net
     ports:
@@ -72,6 +77,51 @@ services:
     profiles:
       - loadtest
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: mmo-postgres
+    environment:
+      POSTGRES_USER: mmo
+      POSTGRES_PASSWORD: mmo_password
+      POSTGRES_DB: mmo_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - mmo-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmo -d mmo_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - storage
+      - full
+
+  redis:
+    image: redis:7-alpine
+    container_name: mmo-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mmo-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - storage
+      - full
+
 networks:
   mmo-net:
     driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+

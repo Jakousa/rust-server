@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 mmo-core = { path = "../core" }
 mmo-schema = { path = "../schema" }
+mmo-storage = { path = "../storage" }
 tokio = { version = "1.42", features = ["full"] }
 tonic = "0.12.3"
 bytes = "1.9"
