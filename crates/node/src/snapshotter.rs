@@ -95,6 +95,48 @@ impl WriteBehindSnapshotter {
         }
         count
     }
+
+    /// Captures a snapshot of an `Entity` using the `ComponentCodecRegistry` to dynamically serialize attached components.
+    pub fn capture_entity_snapshot(
+        entity: &mmo_core::Entity,
+        codecs: &mmo_core::ComponentCodecRegistry,
+        version: u64,
+    ) -> EntitySnapshot {
+        let attributes = codecs.serialize_all(&entity.components);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        EntitySnapshot {
+            guid: entity.guid.0,
+            position: entity.position,
+            rotation: entity.rotation,
+            attributes,
+            version,
+            timestamp: now,
+        }
+    }
+
+    /// Marks an entity as dirty by dynamically extracting its components using the `ComponentCodecRegistry`.
+    pub fn mark_entity_dirty(
+        &self,
+        entity: &mmo_core::Entity,
+        codecs: &mmo_core::ComponentCodecRegistry,
+        version: u64,
+    ) {
+        let snapshot = Self::capture_entity_snapshot(entity, codecs, version);
+        self.mark_dirty(entity.guid, snapshot);
+    }
+
+    /// Restores dynamic components from an `EntitySnapshot` into an `Entity`.
+    pub fn restore_entity_components(
+        entity: &mut mmo_core::Entity,
+        snapshot: &EntitySnapshot,
+        codecs: &mmo_core::ComponentCodecRegistry,
+    ) -> Result<usize, String> {
+        codecs.deserialize_into(&snapshot.attributes, &mut entity.components)
+    }
 }
 
 #[cfg(test)]

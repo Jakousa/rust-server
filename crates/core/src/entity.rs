@@ -68,6 +68,16 @@ impl ComponentStore {
         self.components.is_empty()
     }
 
+    /// Returns an iterator over all attached components as `(&TypeId, &Box<dyn Any + Send + Sync>)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&TypeId, &Box<dyn Any + Send + Sync>)> {
+        self.components.iter()
+    }
+
+    /// Inserts a type-erased component box with the specified `TypeId`.
+    pub fn insert_raw(&mut self, type_id: TypeId, component: Box<dyn Any + Send + Sync>) {
+        self.components.insert(type_id, component);
+    }
+
     /// Clears all attached components.
     pub fn clear(&mut self) {
         self.components.clear();
@@ -209,6 +219,19 @@ impl EntityStore {
     pub fn get_mut_by_guid(&mut self, guid: Guid) -> Option<&mut Entity> {
         let key = self.guid_to_key.get(&guid)?;
         self.entities.get_mut(*key)
+    }
+
+    /// Safely retrieves mutable references to two distinct entities by their GUIDs.
+    ///
+    /// Returns `None` if the GUIDs are identical or if either entity does not exist in the store.
+    pub fn get_two_mut(&mut self, g1: Guid, g2: Guid) -> Option<(&mut Entity, &mut Entity)> {
+        if g1 == g2 {
+            return None;
+        }
+        let k1 = *self.guid_to_key.get(&g1)?;
+        let k2 = *self.guid_to_key.get(&g2)?;
+        let [e1, e2] = self.entities.get_disjoint_mut([k1, k2])?;
+        Some((e1, e2))
     }
 
     /// Looks up the `EntityKey` corresponding to a `Guid`.
@@ -485,5 +508,46 @@ mod tests {
         assert!(store.get(key2).is_some());
         assert_eq!(store.get_by_guid(guid).unwrap().position, (2.0, 2.0, 2.0));
         assert_eq!(store.get_key_by_guid(guid), Some(key2));
+    }
+
+    #[test]
+    fn test_component_store_iter_and_insert_raw() {
+        let mut store = ComponentStore::new();
+        store.add_component(Health { current: 80, max: 100 });
+        assert_eq!(store.iter().count(), 1);
+
+        let vel = Velocity { x: 3.5, y: 7.0, z: 0.0 };
+        store.insert_raw(TypeId::of::<Velocity>(), Box::new(vel));
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.iter().count(), 2);
+
+        let retrieved_vel = store.get_component::<Velocity>();
+        assert!(retrieved_vel.is_some());
+        assert_eq!(retrieved_vel.unwrap().x, 3.5);
+    }
+
+    #[test]
+    fn test_entity_store_get_two_mut() {
+        let mut store = EntityStore::new();
+        let g1 = Guid::new(EntityType::Player, 1, 101);
+        let g2 = Guid::new(EntityType::Player, 1, 102);
+
+        store.spawn(g1, (0.0, 0.0, 0.0));
+        store.spawn(g2, (10.0, 0.0, 0.0));
+
+        // Simultaneous disjoint mutable borrow
+        let (e1, e2) = store.get_two_mut(g1, g2).expect("Both entities exist");
+        e1.position.0 = 5.0;
+        e2.position.0 = 15.0;
+
+        assert_eq!(store.get_by_guid(g1).unwrap().position.0, 5.0);
+        assert_eq!(store.get_by_guid(g2).unwrap().position.0, 15.0);
+
+        // Same GUID should return None
+        assert!(store.get_two_mut(g1, g1).is_none());
+
+        // Non-existent GUID should return None
+        let g_missing = Guid::new(EntityType::Player, 1, 999);
+        assert!(store.get_two_mut(g1, g_missing).is_none());
     }
 }

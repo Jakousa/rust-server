@@ -9,8 +9,7 @@ use std::sync::Arc;
 use crate::guid::Guid;
 
 /// Gameplay lifecycle events that can be dispatched through the hook pipeline.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     /// Dispatched before an entity moves; handlers can inspect or veto the movement.
     BeforeMove {
@@ -72,8 +71,7 @@ impl Event {
 /// Mutable context passed to hook handlers during event dispatch.
 ///
 /// Handlers can inspect or veto an action by calling [`EventContext::cancel`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventContext {
     canceled: bool,
     cancel_reason: Option<String>,

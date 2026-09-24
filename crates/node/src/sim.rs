@@ -8,7 +8,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
 
-use mmo_core::{BoundingBox3D, EntityStore, Event, Guid, HookDispatcher, Octree};
+use mmo_core::{
+    BoundingBox3D, ComponentCodecRegistry, EntityStore, Event, EventQueue, GameplayPlugin, Guid,
+    HookDispatcher, ModularPacketRouter, Octree, PluginManager, TickContext, TickSystem,
+};
 
 use crate::kinematics::KinematicValidator;
 use crate::network::{GhostBroadcaster, GhostStore, NodeServiceImpl};
@@ -23,6 +26,11 @@ pub struct TickSimulation {
     pub kinematics: KinematicValidator,
     pub tick_counter: u64,
     pub ghost_store: GhostStore,
+    pub codecs: ComponentCodecRegistry,
+    pub event_queue: EventQueue,
+    pub packets: ModularPacketRouter,
+    pub tick_systems: Vec<Box<dyn TickSystem>>,
+    pub plugin_manager: PluginManager,
 }
 
 impl TickSimulation {
@@ -52,6 +60,11 @@ impl TickSimulation {
             kinematics,
             tick_counter: 0,
             ghost_store: GhostStore::new(),
+            codecs: ComponentCodecRegistry::new(),
+            event_queue: EventQueue::new(),
+            packets: ModularPacketRouter::new(),
+            tick_systems: Vec::new(),
+            plugin_manager: PluginManager::new(),
         }
     }
 
@@ -114,12 +127,40 @@ impl TickSimulation {
 
     /// Executes a single simulation step.
     ///
-    /// Increments the `tick_counter`, iterates through active entities in `EntityStore`,
-    /// executes tick updates, and triggers synchronous hook dispatches (`Event::OnTick`).
+    /// Registers a gameplay plugin to be initialized in this simulation node.
+    pub fn add_plugin(&mut self, plugin: Box<dyn GameplayPlugin>) {
+        self.plugin_manager.add_plugin(plugin);
+    }
+
+    /// Initializes and builds all registered plugins.
+    pub fn init_plugins(&mut self) {
+        self.plugin_manager.build_all(
+            &mut self.hooks,
+            &mut self.codecs,
+            &mut self.event_queue,
+            &mut self.packets,
+            &mut self.tick_systems,
+        );
+    }
+
+    /// Increments the `tick_counter`, runs batch tick systems, iterates through active entities
+    /// in `EntityStore`, executes tick updates, and triggers synchronous hook dispatches (`Event::OnTick`).
     pub fn step(&mut self, dt_sec: f32) {
         self.tick_counter += 1;
 
-        // Snapshot entity GUIDs to avoid borrowing conflicts during hook dispatch
+        // 1. Run batch tick systems registered by plugins
+        let mut tick_ctx = TickContext {
+            entities: &mut self.entity_store,
+            octree: &mut self.octree,
+            events: &mut self.event_queue,
+            dt_sec,
+            tick: self.tick_counter,
+        };
+        for system in &mut self.tick_systems {
+            system.update(&mut tick_ctx);
+        }
+
+        // 2. Snapshot entity GUIDs to avoid borrowing conflicts during hook dispatch
         let guids: Vec<Guid> = self.entity_store.iter().map(|(_, ent)| ent.guid).collect();
 
         for guid in guids {
@@ -179,6 +220,18 @@ impl TickSimulation {
         // 3. Spatial world boundary check
         if !self.octree.bounds.contains(new_pos) {
             return Err(current_pos);
+        }
+
+        // 3.5. Component movement checks (encumbrance and death status)
+        if let Some(entity) = self.entity_store.get_by_guid(guid) {
+            if mmo_gameplay::check_encumbrance(&entity.components) {
+                return Err(current_pos);
+            }
+            if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
+                if health.is_dead {
+                    return Err(current_pos);
+                }
+            }
         }
 
         // 4. Synchronous BeforeMove hook dispatch (veto / cancel support)

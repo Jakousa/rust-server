@@ -1195,6 +1195,7 @@ name = "mmo-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "slotmap",
  "thiserror 2.0.20",
  "tokio",
@@ -1208,6 +1209,17 @@ dependencies = [
  "mmo-schema",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "mmo-gameplay"
+version = "0.1.0"
+dependencies = [
+ "mmo-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1248,6 +1260,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "mmo-core",
+ "mmo-gameplay",
  "mmo-schema",
  "mmo-storage",
  "serde_json",

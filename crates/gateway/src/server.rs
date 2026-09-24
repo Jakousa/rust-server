@@ -169,6 +169,7 @@ pub struct GatewayServer {
     session_counter: Arc<AtomicU64>,
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     cache: Option<Arc<dyn SessionCacheBackend>>,
+    social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
 }
 
 impl GatewayServer {
@@ -181,6 +182,7 @@ impl GatewayServer {
             session_counter: Arc::new(AtomicU64::new(1)),
             packet_tx: None,
             cache: None,
+            social_bus: None,
         }
     }
 
@@ -196,6 +198,7 @@ impl GatewayServer {
             session_counter: Arc::new(AtomicU64::new(1)),
             packet_tx: Some(packet_tx),
             cache: None,
+            social_bus: None,
         }
     }
 
@@ -203,6 +206,42 @@ impl GatewayServer {
     pub fn with_cache(mut self, cache: Arc<dyn SessionCacheBackend>) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    /// Sets an optional social pub/sub message bus backend.
+    pub fn with_social_bus(mut self, social_bus: Arc<dyn mmo_storage::SocialBus>) -> Self {
+        self.social_bus = Some(social_bus);
+        self
+    }
+
+    /// Accesses the social bus, if configured.
+    pub fn social_bus(&self) -> Option<&Arc<dyn mmo_storage::SocialBus>> {
+        self.social_bus.as_ref()
+    }
+
+    /// Publishes a chat message to the social bus.
+    pub async fn dispatch_chat(
+        &self,
+        message: mmo_storage::ChatMessage,
+    ) -> Result<(), mmo_storage::SocialBusError> {
+        if let Some(bus) = &self.social_bus {
+            let topic = match message.channel {
+                mmo_storage::ChatChannel::Global => "chat:global".to_string(),
+                mmo_storage::ChatChannel::Area => "chat:area".to_string(),
+                mmo_storage::ChatChannel::Guild => {
+                    format!("chat:guild:{}", message.target_guid.unwrap_or(0))
+                }
+                mmo_storage::ChatChannel::Party => {
+                    format!("chat:party:{}", message.target_guid.unwrap_or(0))
+                }
+                mmo_storage::ChatChannel::Whisper => {
+                    format!("whisper:{}", message.target_guid.unwrap_or(0))
+                }
+            };
+            bus.publish(&topic, &mmo_storage::SocialEnvelope::Chat(message))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Accesses the underlying `SessionRouter`.

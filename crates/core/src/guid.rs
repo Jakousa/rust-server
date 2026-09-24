@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u16)]
 pub enum EntityType {
     Unknown = 0,
@@ -29,7 +29,7 @@ impl From<u16> for EntityType {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Guid(pub u64);
 
 impl Guid {
