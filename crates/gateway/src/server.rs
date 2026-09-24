@@ -5,10 +5,12 @@
 //! and dynamically dispatching packets to authoritative simulation nodes via `SessionRouter`.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use bytes::{Bytes, BytesMut};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,6 +21,7 @@ use mmo_schema::client::{ClientCodecError, ClientPacket};
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
+use crate::quic::{create_quic_server, generate_self_signed_cert, QuicTransportError};
 use crate::router::SessionRouter;
 
 /// Errors that can occur within the Edge Gateway server or packet dispatcher.
@@ -38,6 +41,12 @@ pub enum GatewayError {
 
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
+
+    #[error("QUIC transport error: {0}")]
+    Quic(#[from] QuicTransportError),
+
+    #[error("Certificate error: {0}")]
+    Certificate(#[from] rcgen::Error),
 
     #[error("Session {0} not found")]
     SessionNotFound(u64),
@@ -504,6 +513,172 @@ impl GatewayServer {
         let _ = self.remove_session_with_cache(session_id).await;
         Ok(())
     }
+
+    /// Binds a QUIC UDP connection listener to the specified address with given TLS certificates.
+    pub fn bind_quic(
+        &self,
+        addr: SocketAddr,
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<quinn::Endpoint, GatewayError> {
+        create_quic_server(addr, certs, key).map_err(GatewayError::from)
+    }
+
+    /// Convenience method to bind a QUIC listener with automatically generated self-signed certificates.
+    pub fn bind_quic_self_signed(
+        &self,
+        addr: SocketAddr,
+        subject_alt_names: &[&str],
+    ) -> Result<quinn::Endpoint, GatewayError> {
+        let (certs, key) = generate_self_signed_cert(subject_alt_names)?;
+        self.bind_quic(addr, certs, key)
+    }
+
+    /// Handles an active client QUIC connection:
+    /// Multiplexes unreliable datagrams (movement, entity state sync) and reliable streams (interactions, chat),
+    /// decodes client packets, forwards routed packets to simulation nodes, and handles downstream broadcasts.
+    pub async fn handle_quic_connection(
+        &self,
+        connection: quinn::Connection,
+        session_id: u64,
+    ) -> Result<(), GatewayError> {
+        let active_send_stream: Arc<tokio::sync::Mutex<Option<quinn::SendStream>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (downstream_tx, mut downstream_rx) = mpsc::channel::<Bytes>(1024);
+
+        self.register_session_sink(session_id, downstream_tx)?;
+
+        let active_stream_writer = active_send_stream.clone();
+        let conn_writer = connection.clone();
+        let downstream_handle = tokio::spawn(async move {
+            while let Some(bytes) = downstream_rx.recv().await {
+                let is_ephemeral = is_ephemeral_packet(&bytes);
+                let mut sent_datagram = false;
+                if is_ephemeral {
+                    if conn_writer.send_datagram(bytes.clone()).is_ok() {
+                        sent_datagram = true;
+                    }
+                }
+                if !sent_datagram {
+                    let mut lock = active_stream_writer.lock().await;
+                    if let Some(ref mut send) = *lock {
+                        if send.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    } else if let Ok((mut send, _recv)) = conn_writer.open_bi().await {
+                        if send.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        *lock = Some(send);
+                    }
+                }
+            }
+        });
+
+        loop {
+            tokio::select! {
+                dgram_res = connection.read_datagram() => {
+                    match dgram_res {
+                        Ok(dg) => {
+                            let mut dgram_buf = BytesMut::from(dg.as_ref());
+                            while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut dgram_buf) {
+                                if let ClientPacket::Ping(ref ping) = packet {
+                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                                        client_timestamp: ping.timestamp,
+                                        server_timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64,
+                                    });
+                                    let _ = connection.send_datagram(Bytes::from(pong.encode()));
+                                }
+                                if let Ok(routed) = self.dispatcher.dispatch_packet(session_id, packet) {
+                                    if let Some(ref tx) = self.packet_tx {
+                                        let _ = tx.send(routed).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                bi_res = connection.accept_bi() => {
+                    match bi_res {
+                        Ok((send, mut recv)) => {
+                            *active_send_stream.lock().await = Some(send);
+                            let active_stream = active_send_stream.clone();
+                            let dispatcher = self.dispatcher.clone();
+                            let packet_tx = self.packet_tx.clone();
+                            tokio::spawn(async move {
+                                let mut buf = BytesMut::with_capacity(8192);
+                                let mut chunk = [0u8; 4096];
+                                loop {
+                                    match recv.read(&mut chunk).await {
+                                        Ok(Some(n)) if n > 0 => {
+                                            buf.extend_from_slice(&chunk[..n]);
+                                            while let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
+                                                if let ClientPacket::Ping(ref ping) = pkt {
+                                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                                                        client_timestamp: ping.timestamp,
+                                                        server_timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap()
+                                                            .as_millis() as u64,
+                                                    });
+                                                    let mut lock = active_stream.lock().await;
+                                                    if let Some(ref mut send) = *lock {
+                                                        let _ = send.write_all(&pong.encode()).await;
+                                                    }
+                                                }
+                                                if let Ok(routed) = dispatcher.dispatch_packet(session_id, pkt) {
+                                                    if let Some(ref tx) = packet_tx {
+                                                        let _ = tx.send(routed).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = connection.closed() => {
+                    break;
+                }
+            }
+        }
+
+        // Clean up downstream session sink and task on disconnect
+        let _ = self.remove_session_sink(session_id);
+        downstream_handle.abort();
+
+        // Clean up session route and cache entry on disconnect
+        let _ = self.remove_session_with_cache(session_id).await;
+        Ok(())
+    }
+}
+
+/// Helper to determine if a packet frame is ephemeral (high-frequency movement or sync)
+/// suited for unreliable QUIC Datagrams.
+pub fn is_ephemeral_packet(bytes: &[u8]) -> bool {
+    if bytes.len() >= 4 && bytes[0] == 0x4D && bytes[1] == 0x4D {
+        let opcode_raw = u16::from_le_bytes([bytes[2], bytes[3]]);
+        if let Ok(opcode) = mmo_schema::client::Opcode::from_u16(opcode_raw) {
+            return matches!(
+                opcode,
+                mmo_schema::client::Opcode::Movement
+                    | mmo_schema::client::Opcode::MovementCorrection
+                    | mmo_schema::client::Opcode::EntityState
+                    | mmo_schema::client::Opcode::EntityDespawn
+                    | mmo_schema::client::Opcode::Ping
+                    | mmo_schema::client::Opcode::Pong
+            );
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -912,5 +1087,153 @@ mod tests {
         // Verify sink was unregistered
         assert!(!server_clone.has_session_sink(session_id).unwrap());
     }
+
+    #[test]
+    fn test_is_ephemeral_packet() {
+        let move_pkt = ClientPacket::Movement(MovementPacket {
+            entity_id: 1,
+            position: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            timestamp: 0,
+            sequence: 0,
+        });
+        assert!(is_ephemeral_packet(&move_pkt.encode()));
+
+        let entity_state_pkt = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: 1,
+            position: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        assert!(is_ephemeral_packet(&entity_state_pkt.encode()));
+
+        let interact_pkt = ClientPacket::Interaction(InteractionPacket {
+            source_guid: 1,
+            target_guid: 2,
+            interaction_type: InteractionType::Attack,
+            action_id: 10,
+            payload: vec![],
+        });
+        assert!(!is_ephemeral_packet(&interact_pkt.encode()));
+    }
+
+    #[tokio::test]
+    async fn test_gateway_quic_server_datagram_and_stream_handling() {
+        use crate::quic::QuicClientSession;
+
+        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let (packet_tx, mut packet_rx) = mpsc::channel(100);
+        let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
+
+        let session_id = 99;
+        let player_guid = Guid::new(EntityType::Player, 1, 999);
+        let node_addr = "127.0.0.1:50051".to_string();
+        server.register_session(session_id, player_guid, node_addr.clone()).unwrap();
+
+        let quic_endpoint = server
+            .bind_quic_self_signed("127.0.0.1:0".parse().unwrap(), &["localhost", "127.0.0.1"])
+            .expect("bind quic");
+        let local_addr = quic_endpoint.local_addr().unwrap();
+
+        let srv = server.clone();
+        let srv_endpoint = quic_endpoint.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = srv_endpoint.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let _ = srv.handle_quic_connection(conn, session_id).await;
+        });
+
+        let mut client = QuicClientSession::connect(local_addr, "localhost")
+            .await
+            .expect("client connect");
+
+        // 1. Inbound Datagram (Movement)
+        let move_pkt = ClientPacket::Movement(MovementPacket {
+            entity_id: player_guid.raw(),
+            position: Vec3::new(10.0, 20.0, 30.0),
+            velocity: Vec3::ZERO,
+            yaw: 1.0,
+            pitch: 0.0,
+            timestamp: 1234,
+            sequence: 1,
+        });
+        client.send_datagram(&move_pkt).expect("send datagram");
+
+        let routed_move = tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
+            .await
+            .expect("timeout waiting for routed movement")
+            .expect("routed move pkt");
+        assert_eq!(routed_move.session_id, session_id);
+        assert_eq!(routed_move.packet, move_pkt);
+
+        // 2. Inbound Stream (Interaction)
+        let interact_pkt = ClientPacket::Interaction(InteractionPacket {
+            source_guid: player_guid.raw(),
+            target_guid: 555,
+            interaction_type: InteractionType::Loot,
+            action_id: 1,
+            payload: vec![1, 2, 3],
+        });
+        client.send_packet_stream(&interact_pkt).await.expect("send stream");
+
+        let routed_interact = tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
+            .await
+            .expect("timeout waiting for routed interaction")
+            .expect("routed interact pkt");
+        assert_eq!(routed_interact.session_id, session_id);
+        assert_eq!(routed_interact.packet, interact_pkt);
+
+        // 3. Bidirectional Stream Ping -> Pong
+        let ping_pkt = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 7777 });
+        client.send_packet_stream(&ping_pkt).await.expect("send ping");
+        let pong_pkt = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.recv_packet_stream(),
+        )
+        .await
+        .expect("timeout waiting for pong")
+        .expect("pong pkt");
+        if let ClientPacket::Pong(pong) = pong_pkt {
+            assert_eq!(pong.client_timestamp, 7777);
+        } else {
+            panic!("Expected Pong packet, got {pong_pkt:?}");
+        }
+
+        // 4. Downstream ephemeral broadcast from server via datagram
+        let entity_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: 12345,
+            position: Vec3::new(5.0, 6.0, 7.0),
+            velocity: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 80,
+            max_health: 100,
+            state_flags: 1,
+            timestamp: 9000,
+        });
+        server.send_packet_to_session(session_id, &entity_state).await.unwrap();
+
+        let received_state = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.read_datagram(),
+        )
+        .await
+        .expect("timeout waiting for downstream entity state")
+        .expect("read datagram");
+        assert_eq!(received_state, entity_state);
+
+        // Disconnect
+        client.close(0, "normal test close");
+        let _ = server_task.await;
+        assert!(!server.has_session_sink(session_id).unwrap());
+    }
 }
+
 

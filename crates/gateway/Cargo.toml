@@ -11,6 +11,9 @@ tokio = { version = "1.42", features = ["full"] }
 tonic = "0.12.3"
 bytes = "1.9"
 thiserror = "2.0"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [dev-dependencies]
 mmo-node = { path = "../node" }

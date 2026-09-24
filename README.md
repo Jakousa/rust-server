@@ -38,7 +38,7 @@ A high-performance, distributed, server-authoritative MMO game engine written in
 - [x] **Cross-Node Gameplay & Social Bus**: Cluster message broker (`SocialBus` with Memory and Redis backends) bridging whispers, global chat channels, party state sync, and guild vault updates across simulation nodes and edge gateways.
 - [x] **Autonomous NPC & Monster AI**: Completely decoupled ECS-native systems for kinematic navigation, entity-driven spawners, sensory perception scanning, threat/hate tables, and modular FSM behaviors.
 - [x] **Client AoI Packet Broadcasting**: Real-time position and state replication (`EntityState` and `EntityDespawn` packets) pushed from simulation nodes through the Edge Gateway to connected clients within the 3D Octree visibility radius with dynamic density throttling.
+- [x] **Native QUIC UDP Transport**: Edge Gateway hybrid UDP transport using `quinn` with TLS 1.3, combining unreliable datagrams (ephemeral movement and AoI entity state sync) with multiplexed reliable streams (transactional interactions and chat).
 
 ### Current Focus & Upcoming Milestones
-- [ ] **Native QUIC UDP Transport**: Upgrade Edge Gateway from framed TCP to native multiplexed QUIC (`quinn`) streams with 0-RTT reconnection and packet loss resilience.
 - [ ] **Playable Visual Client Frontend**: Interactive client built in Bevy or WebAssembly/WebGL to explore the world, interact with entities, equip gear, and fight monsters.

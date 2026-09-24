@@ -7,11 +7,11 @@ Manages client transport termination over QUIC and FlatBuffers, session tracking
 ## Requirements
 
 ### Requirement: Client Transport Termination
-The Edge Gateway SHALL accept client connections over QUIC and deserialize game packets using FlatBuffers.
+The Edge Gateway SHALL accept client connections over native QUIC UDP transport and deserialize binary game packets from multiplexed bidirectional or unidirectional streams.
 
 #### Scenario: Client connects to gateway
-- **WHEN** a client establishes a QUIC connection with the Edge Gateway
-- **THEN** the gateway SHALL authenticate the session and maintain the active client connection stream
+- **WHEN** a client establishes a native QUIC connection over UDP with the Edge Gateway
+- **THEN** the gateway SHALL negotiate the TLS 1.3 session and maintain the active client connection streams
 
 ### Requirement: Dynamic Packet Forwarding
 The Edge Gateway SHALL route incoming movement and interaction packets to the specific simulation node owning the player's current octant.
