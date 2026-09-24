@@ -698,7 +698,7 @@ mod tests {
             entity_id: 555,
             position: Vec3::new(1.0, 2.0, 3.0),
             velocity: Vec3::new(0.1, 0.2, 0.3),
-            yaw: 3.14,
+            yaw: std::f32::consts::PI,
             pitch: -0.5,
             health: 100,
             max_health: 100,

@@ -500,7 +500,7 @@ mod tests {
 
         // Insert new entity with same GUID
         let mut entity2 = Entity::new(guid, (2.0, 2.0, 2.0));
-        entity2.rotation = 3.14;
+        entity2.rotation = std::f32::consts::PI;
         let key2 = store.insert_entity(entity2);
 
         assert_eq!(store.count(), 1);

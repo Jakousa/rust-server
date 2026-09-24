@@ -344,7 +344,7 @@ mod tests {
         let snap2 = EntitySnapshot {
             guid: 5002,
             position: (4.0, 5.0, 6.0),
-            rotation: 3.14,
+            rotation: std::f32::consts::PI,
             attributes: serde_json::json!({"mana": 50}),
             version: 1,
             timestamp: 1000,

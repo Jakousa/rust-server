@@ -235,13 +235,10 @@ impl Octree {
                 let idx = bounds.child_index(pos);
                 let mut res = children[idx].remove(guid, pos);
                 if !res {
-                    // Pos may lie on a shared boundary face
                     for (i, child) in children.iter_mut().enumerate() {
-                        if i != idx && child.bounds.contains(pos) {
-                            if child.remove(guid, pos) {
-                                res = true;
-                                break;
-                            }
+                        if i != idx && child.bounds.contains(pos) && child.remove(guid, pos) {
+                            res = true;
+                            break;
                         }
                     }
                 }
