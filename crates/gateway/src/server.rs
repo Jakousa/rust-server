@@ -4,10 +4,11 @@
 //! `mmo_schema::client::ClientPacket::decode_frame`, extracting acting GUIDs / session IDs,
 //! and dynamically dispatching packets to authoritative simulation nodes via `SessionRouter`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -170,6 +171,7 @@ pub struct GatewayServer {
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     cache: Option<Arc<dyn SessionCacheBackend>>,
     social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
+    session_sinks: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
 }
 
 impl GatewayServer {
@@ -183,6 +185,7 @@ impl GatewayServer {
             packet_tx: None,
             cache: None,
             social_bus: None,
+            session_sinks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -199,6 +202,7 @@ impl GatewayServer {
             packet_tx: Some(packet_tx),
             cache: None,
             social_bus: None,
+            session_sinks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -359,23 +363,113 @@ impl GatewayServer {
         Ok(guid)
     }
 
+    /// Registers a downstream packet sender for a client session.
+    pub fn register_session_sink(
+        &self,
+        session_id: u64,
+        sender: mpsc::Sender<Bytes>,
+    ) -> Result<(), GatewayError> {
+        let mut sinks = self.session_sinks.write().map_err(|_| GatewayError::LockPoisoned)?;
+        sinks.insert(session_id, sender);
+        Ok(())
+    }
+
+    /// Removes a downstream packet sender for a client session.
+    pub fn remove_session_sink(
+        &self,
+        session_id: u64,
+    ) -> Result<Option<mpsc::Sender<Bytes>>, GatewayError> {
+        let mut sinks = self.session_sinks.write().map_err(|_| GatewayError::LockPoisoned)?;
+        Ok(sinks.remove(&session_id))
+    }
+
+    /// Returns the number of active downstream session sinks.
+    pub fn active_sink_count(&self) -> Result<usize, GatewayError> {
+        let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
+        Ok(sinks.len())
+    }
+
+    /// Checks if a downstream session sink is registered for the given session ID.
+    pub fn has_session_sink(&self, session_id: u64) -> Result<bool, GatewayError> {
+        let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
+        Ok(sinks.contains_key(&session_id))
+    }
+
+    /// Sends raw framed bytes downstream to a specific client session.
+    pub async fn send_bytes_to_session(
+        &self,
+        session_id: u64,
+        bytes: Bytes,
+    ) -> Result<bool, GatewayError> {
+        let sender = {
+            let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
+            sinks.get(&session_id).cloned()
+        };
+
+        if let Some(tx) = sender {
+            Ok(tx.send(bytes).await.is_ok())
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Encodes and sends a `ClientPacket` downstream to a specific client session.
+    pub async fn send_packet_to_session(
+        &self,
+        session_id: u64,
+        packet: &ClientPacket,
+    ) -> Result<bool, GatewayError> {
+        let encoded = Bytes::from(packet.encode());
+        self.send_bytes_to_session(session_id, encoded).await
+    }
+
+    /// Broadcasts a `ClientPacket` to all connected client sessions.
+    pub async fn broadcast_packet(&self, packet: &ClientPacket) -> Result<usize, GatewayError> {
+        let encoded = Bytes::from(packet.encode());
+        let senders: Vec<mpsc::Sender<Bytes>> = {
+            let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
+            sinks.values().cloned().collect()
+        };
+
+        let mut sent_count = 0;
+        for tx in senders {
+            if tx.send(encoded.clone()).await.is_ok() {
+                sent_count += 1;
+            }
+        }
+        Ok(sent_count)
+    }
+
     /// Binds a TCP connection listener to the specified address.
     pub async fn bind(&self, addr: &str) -> Result<TcpListener, GatewayError> {
         TcpListener::bind(addr).await.map_err(GatewayError::Io)
     }
 
     /// Handles an active client connection socket:
-    /// Streams incoming bytes into a framing buffer, decodes client packets,
-    /// resolves routing destination, and dispatches to the internal channel / node.
+    /// Splits the stream into concurrent read and write tasks, streams incoming bytes
+    /// into a framing buffer, decodes client packets, and forwards downstream broadcasts.
     pub async fn handle_connection(
         &self,
-        mut socket: TcpStream,
+        socket: TcpStream,
         session_id: u64,
     ) -> Result<(), GatewayError> {
+        let (mut read_half, mut write_half) = socket.into_split();
+        let (downstream_tx, mut downstream_rx) = mpsc::channel::<Bytes>(1024);
+
+        self.register_session_sink(session_id, downstream_tx)?;
+
+        let writer_handle = tokio::spawn(async move {
+            while let Some(bytes) = downstream_rx.recv().await {
+                if write_half.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut buf = BytesMut::with_capacity(8192);
 
         loop {
-            let bytes_read = socket.read_buf(&mut buf).await.map_err(GatewayError::Io)?;
+            let bytes_read = read_half.read_buf(&mut buf).await.map_err(GatewayError::Io)?;
             if bytes_read == 0 {
                 // Client cleanly closed connection
                 break;
@@ -391,8 +485,7 @@ impl GatewayServer {
                             .unwrap()
                             .as_millis() as u64,
                     });
-                    let out = pong.encode();
-                    let _ = socket.write_all(&out).await;
+                    let _ = self.send_packet_to_session(session_id, &pong).await;
                 }
             }
 
@@ -402,6 +495,10 @@ impl GatewayServer {
                 }
             }
         }
+
+        // Clean up downstream session sink and writer task on disconnect
+        let _ = self.remove_session_sink(session_id);
+        writer_handle.abort();
 
         // Clean up session route and cache entry on disconnect
         let _ = self.remove_session_with_cache(session_id).await;
@@ -712,6 +809,108 @@ mod tests {
         assert_eq!(removed, Some(player_guid));
         assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
         assert!(cache.get_session(session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_session_sink_registry() {
+        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let server = GatewayServer::new(router);
+
+        let (tx1, mut rx1) = mpsc::channel(16);
+        let (tx2, mut _rx2) = mpsc::channel(16);
+
+        server.register_session_sink(1, tx1).unwrap();
+        server.register_session_sink(2, tx2).unwrap();
+
+        assert_eq!(server.active_sink_count().unwrap(), 2);
+        assert!(server.has_session_sink(1).unwrap());
+        assert!(server.has_session_sink(2).unwrap());
+        assert!(!server.has_session_sink(3).unwrap());
+
+        // Send to session 1
+        let pkt = ClientPacket::EntityDespawn(mmo_schema::client::EntityDespawnPacket {
+            entity_id: 12345,
+        });
+        assert!(server.send_packet_to_session(1, &pkt).await.unwrap());
+        assert!(!server.send_packet_to_session(999, &pkt).await.unwrap());
+
+        let received1 = rx1.recv().await.expect("received packet bytes");
+        let decoded = ClientPacket::decode_frame(&mut bytes::BytesMut::from(received1.as_ref())).unwrap();
+        assert_eq!(decoded, Some(pkt.clone()));
+
+        // Broadcast
+        let count = server.broadcast_packet(&pkt).await.unwrap();
+        assert_eq!(count, 2);
+
+        // Remove sink 1
+        server.remove_session_sink(1).unwrap();
+        assert_eq!(server.active_sink_count().unwrap(), 1);
+        assert!(!server.has_session_sink(1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_downstream_packet_streaming() {
+        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let (packet_tx, _packet_rx) = mpsc::channel(100);
+        let server = GatewayServer::with_packet_channel(router.clone(), packet_tx);
+
+        let listener = server.bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let session_id = server.next_session_id();
+        let player_guid = Guid::new(EntityType::Player, 1, 999);
+        server
+            .register_session(session_id, player_guid, "127.0.0.1:50051".to_string())
+            .unwrap();
+
+        let server_clone = Arc::new(server);
+        let srv = server_clone.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = srv.handle_connection(socket, session_id).await;
+        });
+
+        let mut client_stream = TcpStream::connect(local_addr).await.unwrap();
+
+        // Wait brief moment for handle_connection to register the sink
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(server_clone.has_session_sink(session_id).unwrap());
+
+        // Send an EntityState packet downstream from server to client
+        let entity_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: 8888,
+            position: Vec3::new(10.0, 20.0, 30.0),
+            velocity: Vec3::new(1.0, 0.0, 0.0),
+            yaw: 1.5,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 5000,
+        });
+
+        assert!(
+            server_clone
+                .send_packet_to_session(session_id, &entity_state)
+                .await
+                .unwrap()
+        );
+
+        // Client reads the framed packet
+        let mut read_buf = BytesMut::with_capacity(1024);
+        let n = client_stream.read_buf(&mut read_buf).await.unwrap();
+        assert!(n > 0);
+
+        let client_packet = ClientPacket::decode_frame(&mut read_buf).unwrap();
+        assert_eq!(client_packet, Some(entity_state));
+
+        // Clean disconnect
+        drop(client_stream);
+        let _ = server_task.await;
+
+        // Verify sink was unregistered
+        assert!(!server_clone.has_session_sink(session_id).unwrap());
     }
 }
 

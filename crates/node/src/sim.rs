@@ -13,6 +13,7 @@ use mmo_core::{
     HookDispatcher, ModularPacketRouter, Octree, PluginManager, TickContext, TickSystem,
 };
 
+use crate::aoi::{AoiBroadcastJob, AoiManager, ObserverConfig, ObserverState};
 use crate::kinematics::KinematicValidator;
 use crate::network::{GhostBroadcaster, GhostStore, NodeServiceImpl};
 
@@ -31,6 +32,8 @@ pub struct TickSimulation {
     pub packets: ModularPacketRouter,
     pub tick_systems: Vec<Box<dyn TickSystem>>,
     pub plugin_manager: PluginManager,
+    pub aoi: AoiManager,
+    pub pending_broadcast_jobs: Vec<AoiBroadcastJob>,
 }
 
 impl TickSimulation {
@@ -65,6 +68,8 @@ impl TickSimulation {
             packets: ModularPacketRouter::new(),
             tick_systems: Vec::new(),
             plugin_manager: PluginManager::new(),
+            aoi: AoiManager::new(),
+            pending_broadcast_jobs: Vec::new(),
         }
     }
 
@@ -170,6 +175,40 @@ impl TickSimulation {
                 dt_sec,
             });
         }
+
+        // 3. Update AoI observers and queue broadcast jobs
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut aoi_jobs = self.aoi.update_observers(
+            &self.entity_store,
+            &self.octree,
+            self.tick_counter,
+            now_ms,
+        );
+        self.pending_broadcast_jobs.append(&mut aoi_jobs);
+    }
+
+    /// Drains and returns all queued AoI broadcast jobs accumulated during ticks.
+    pub fn drain_broadcast_jobs(&mut self) -> Vec<AoiBroadcastJob> {
+        std::mem::take(&mut self.pending_broadcast_jobs)
+    }
+
+    /// Registers a player session as an AoI observer.
+    pub fn register_aoi_observer(
+        &mut self,
+        session_id: u64,
+        player_guid: Guid,
+        config: ObserverConfig,
+    ) {
+        self.aoi.register_observer(session_id, player_guid, config);
+    }
+
+    /// Unregisters an AoI observer by session ID.
+    pub fn unregister_aoi_observer(&mut self, session_id: u64) -> Option<ObserverState> {
+        self.aoi.unregister_observer(session_id)
     }
 
     /// Convenience helper executing a standard 20 Hz (50ms) simulation tick step.
@@ -473,5 +512,46 @@ mod tests {
             "Expected elapsed >= 150ms for 4 ticks, got {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn test_tick_simulation_aoi_broadcast_integration() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let player = Guid::new(EntityType::Player, 1, 100);
+        let npc = Guid::new(EntityType::Npc, 1, 200);
+
+        sim.spawn_entity(player, (10.0, 10.0, 10.0));
+        sim.register_aoi_observer(1, player, ObserverConfig::default());
+
+        // Step 1: Only player present, no other entities -> no broadcast jobs
+        sim.step_tick();
+        assert!(sim.drain_broadcast_jobs().is_empty());
+
+        // Spawn NPC within AoI radius
+        sim.spawn_entity(npc, (15.0, 10.0, 10.0));
+
+        // Step 2: NPC enters AoI -> broadcast job generated
+        sim.step_tick();
+        let jobs = sim.drain_broadcast_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].session_id, 1);
+        assert_eq!(jobs[0].player_guid, player);
+        assert_eq!(jobs[0].packets.len(), 1);
+
+        // Queue drained
+        assert!(sim.drain_broadcast_jobs().is_empty());
+
+        // Step 3: Despawn NPC
+        sim.despawn_entity(npc);
+        sim.step_tick();
+        let jobs = sim.drain_broadcast_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].packets.len(), 1);
+        match &jobs[0].packets[0] {
+            mmo_schema::client::ClientPacket::EntityDespawn(d) => {
+                assert_eq!(d.entity_id, npc.raw());
+            }
+            other => panic!("Expected EntityDespawn, got {:?}", other),
+        }
     }
 }

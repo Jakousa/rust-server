@@ -310,11 +310,47 @@ impl Octree {
         results
     }
 
+    /// Queries all entity GUIDs within radial distance from `center`, appending into `results`.
+    pub fn query_radius_into(&self, center: (f32, f32, f32), radius: f32, results: &mut Vec<Guid>) {
+        if radius >= 0.0 {
+            self.query_radius_internal(center, radius, radius * radius, results);
+        }
+    }
+
+    /// Queries all entity GUIDs with their positions within radial distance from `center`, appending into `results`.
+    pub fn query_radius_with_pos_into(
+        &self,
+        center: (f32, f32, f32),
+        radius: f32,
+        results: &mut Vec<(Guid, (f32, f32, f32))>,
+    ) {
+        if radius >= 0.0 {
+            self.query_radius_with_pos_internal(center, radius, radius * radius, results);
+        }
+    }
+
+    /// Queries all entity GUIDs with their positions and squared distance within radial distance from `center`, appending into `results`.
+    pub fn query_radius_with_dist_sq_into(
+        &self,
+        center: (f32, f32, f32),
+        radius: f32,
+        results: &mut Vec<(Guid, (f32, f32, f32), f32)>,
+    ) {
+        if radius >= 0.0 {
+            self.query_radius_with_dist_sq_internal(center, radius, radius * radius, results);
+        }
+    }
+
     /// Queries and returns all entity GUIDs located within the given axis-aligned bounding box.
     pub fn query_range(&self, aabb: &BoundingBox3D) -> Vec<Guid> {
         let mut results = Vec::new();
         self.query_range_internal(aabb, &mut results);
         results
+    }
+
+    /// Queries all entity GUIDs located within the given axis-aligned bounding box, appending into `results`.
+    pub fn query_range_into(&self, aabb: &BoundingBox3D, results: &mut Vec<Guid>) {
+        self.query_range_internal(aabb, results);
     }
 
     /// Returns the total number of entities stored across this octree node and its descendants.
@@ -500,6 +536,37 @@ impl Octree {
             OctreeNode::Branch { children } => {
                 for child in children.iter() {
                     child.query_radius_with_pos_internal(center, radius, radius_sq, results);
+                }
+            }
+        }
+    }
+
+    fn query_radius_with_dist_sq_internal(
+        &self,
+        center: (f32, f32, f32),
+        radius: f32,
+        radius_sq: f32,
+        results: &mut Vec<(Guid, (f32, f32, f32), f32)>,
+    ) {
+        if !self.bounds.intersects_sphere(center, radius) {
+            return;
+        }
+
+        match &self.node {
+            OctreeNode::Leaf { entities } => {
+                for &(guid, pos) in entities {
+                    let dx = pos.0 - center.0;
+                    let dy = pos.1 - center.1;
+                    let dz = pos.2 - center.2;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq <= radius_sq {
+                        results.push((guid, pos, dist_sq));
+                    }
+                }
+            }
+            OctreeNode::Branch { children } => {
+                for child in children.iter() {
+                    child.query_radius_with_dist_sq_internal(center, radius, radius_sq, results);
                 }
             }
         }
@@ -917,5 +984,43 @@ mod tests {
         // Range query finds all 20
         let found = octree.query_radius((50.0, 50.0, 50.0), 1.0);
         assert_eq!(found.len(), 20);
+    }
+
+    #[test]
+    fn test_zero_allocation_query_into() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::with_config(bounds, 2, 1);
+
+        octree.insert(make_guid(1), (10.0, 10.0, 10.0));
+        octree.insert(make_guid(2), (12.0, 10.0, 10.0));
+        octree.insert(make_guid(3), (50.0, 50.0, 50.0));
+
+        let mut guids_buf = Vec::new();
+        octree.query_radius_into((10.0, 10.0, 10.0), 5.0, &mut guids_buf);
+        assert_eq!(guids_buf.len(), 2);
+        assert!(guids_buf.contains(&make_guid(1)));
+        assert!(guids_buf.contains(&make_guid(2)));
+
+        let mut pos_buf = Vec::new();
+        octree.query_radius_with_pos_into((10.0, 10.0, 10.0), 5.0, &mut pos_buf);
+        assert_eq!(pos_buf.len(), 2);
+
+        let mut dist_buf = Vec::new();
+        octree.query_radius_with_dist_sq_into((10.0, 10.0, 10.0), 5.0, &mut dist_buf);
+        assert_eq!(dist_buf.len(), 2);
+        for &(g, pos, dist_sq) in &dist_buf {
+            if g == make_guid(1) {
+                assert_eq!(pos, (10.0, 10.0, 10.0));
+                assert_eq!(dist_sq, 0.0);
+            } else if g == make_guid(2) {
+                assert_eq!(pos, (12.0, 10.0, 10.0));
+                assert_eq!(dist_sq, 4.0);
+            }
+        }
+
+        let mut aabb_buf = Vec::new();
+        let aabb = BoundingBox3D::new((0.0, 0.0, 0.0), (20.0, 20.0, 20.0));
+        octree.query_range_into(&aabb, &mut aabb_buf);
+        assert_eq!(aabb_buf.len(), 2);
     }
 }

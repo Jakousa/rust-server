@@ -1258,9 +1258,11 @@ dependencies = [
 name = "mmo-node"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "mmo-core",
  "mmo-gameplay",
+ "mmo-gateway",
  "mmo-schema",
  "mmo-storage",
  "serde_json",
