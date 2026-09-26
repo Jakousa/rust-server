@@ -62,7 +62,10 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     // 3. Start Donor Node (Node 1: [0.0..50.0, 0.0..100.0, 0.0..100.0])
     // -------------------------------------------------------------------------
     let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
-    let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, donor_bounds)));
+    let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+        1,
+        donor_bounds,
+    )));
     let donor_service = NodeServiceImpl::new(Arc::clone(&donor_sim));
 
     let donor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -128,7 +131,10 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
         // Position is outside Node 1 bounds [0..50] by 5.0 units >= margin (1.0)
         assert!(d.check_boundary_migration(player_guid, target_pos, 1.0, 20));
         // Staging target position
-        d.entity_store.get_mut_by_guid(player_guid).unwrap().position = target_pos;
+        d.entity_store
+            .get_mut_by_guid(player_guid)
+            .unwrap()
+            .position = target_pos;
     }
 
     // Execute Two-Phase Live Entity Migration with Gateway Route Commit

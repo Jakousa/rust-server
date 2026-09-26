@@ -2,7 +2,9 @@ use crate::metrics::{MetricsAggregator, MetricsSnapshot};
 use crate::trajectory::{BehaviorProfile, TrajectoryController, WorldBounds};
 use bytes::BytesMut;
 use mmo_core::guid::{EntityType, Guid};
-use mmo_schema::client::{ClientPacket, InteractionPacket, InteractionType, MovementPacket, PingPacket, Vec3};
+use mmo_schema::client::{
+    ClientPacket, InteractionPacket, InteractionType, MovementPacket, PingPacket, Vec3,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

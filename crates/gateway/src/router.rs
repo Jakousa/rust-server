@@ -135,8 +135,7 @@ impl SessionRouter {
         } else if let Some(session_ref) = self.guid_to_session.get(&guid) {
             let sid = *session_ref.value();
             drop(session_ref);
-            self.session_to_node
-                .insert(sid, new_node_address.clone());
+            self.session_to_node.insert(sid, new_node_address.clone());
         }
         self.guid_to_node.insert(guid, new_node_address);
         existed
@@ -420,10 +419,8 @@ mod tests {
         );
 
         // When node 0 dies, reassign all its routes to node 1
-        let reassigned = router.reassign_node_routes(
-            "mmo-node-0.mmo-node:50052",
-            "mmo-node-1.mmo-node:50052",
-        );
+        let reassigned =
+            router.reassign_node_routes("mmo-node-0.mmo-node:50052", "mmo-node-1.mmo-node:50052");
         assert_eq!(reassigned, 4); // 2 guids + 2 sessions
 
         assert_eq!(

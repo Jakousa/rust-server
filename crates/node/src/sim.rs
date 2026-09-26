@@ -951,7 +951,10 @@ mod tests {
         let move_pos = (5.2, 5.0, 5.0);
         let move_res = sim.process_client_move(guid, move_pos, 0.05);
         assert_eq!(move_res, Err(start_pos));
-        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, start_pos);
+        assert_eq!(
+            sim.entity_store.get_by_guid(guid).unwrap().position,
+            start_pos
+        );
 
         // Step tick does not crash or dispatch mutations to migrating entity
         sim.step_tick();

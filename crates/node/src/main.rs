@@ -131,8 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let success = resp.into_inner().success;
                 println!(
                     "[Node {}] Registered with Director: success={}",
-                    node_id,
-                    success
+                    node_id, success
                 );
                 if success {
                     telemetry_clone.mark_ready();
