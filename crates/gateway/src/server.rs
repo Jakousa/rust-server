@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 
 use mmo_core::guid::Guid;
 use mmo_schema::client::{ClientCodecError, ClientPacket};
+use mmo_schema::cluster::gateway_service_server::{GatewayService, GatewayServiceServer};
+use mmo_schema::cluster::{RouteUpdateRequest, RouteUpdateResponse};
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
@@ -194,6 +196,42 @@ impl Drop for SessionDropGuard {
     }
 }
 
+/// gRPC service implementation for dynamic Edge Gateway route updates.
+#[derive(Clone)]
+pub struct GatewayServiceImpl {
+    router: Arc<SessionRouter>,
+}
+
+impl GatewayServiceImpl {
+    /// Creates a new `GatewayServiceImpl` backed by the given `SessionRouter`.
+    pub fn new(router: Arc<SessionRouter>) -> Self {
+        Self { router }
+    }
+
+    /// Wraps this implementation in a Tonic gRPC `GatewayServiceServer`.
+    pub fn into_server(self) -> GatewayServiceServer<Self> {
+        GatewayServiceServer::new(self)
+    }
+}
+
+#[tonic::async_trait]
+impl GatewayService for GatewayServiceImpl {
+    async fn update_route(
+        &self,
+        request: tonic::Request<RouteUpdateRequest>,
+    ) -> Result<tonic::Response<RouteUpdateResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let guid = Guid::from_raw(req.guid);
+        self.router
+            .update_route_with_session(guid, req.session_id, req.node_address);
+        metrics::counter!("mmo_gateway_route_updates_total").increment(1);
+        Ok(tonic::Response::new(RouteUpdateResponse {
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+}
+
 /// Gateway server managing connection lifecycles, streaming packet framing,
 /// dynamic routing to authoritative simulation nodes, and optional distributed session caching.
 pub struct GatewayServer {
@@ -285,6 +323,11 @@ impl GatewayServer {
     /// Accesses the underlying `SessionRouter`.
     pub fn router(&self) -> &Arc<SessionRouter> {
         &self.router
+    }
+
+    /// Creates a [`GatewayServiceImpl`] backed by this server's routing table.
+    pub fn create_service(&self) -> GatewayServiceImpl {
+        GatewayServiceImpl::new(Arc::clone(&self.router))
     }
 
     /// Accesses the packet dispatcher.
@@ -1392,5 +1435,39 @@ mod tests {
 
         server.remove_session_sink(session_id).unwrap();
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_service_update_route() {
+        let router = Arc::new(SessionRouter::new());
+        let service = GatewayServiceImpl::new(Arc::clone(&router));
+
+        let guid = Guid::new(mmo_core::guid::EntityType::Player, 1, 100);
+        let session_id = 77;
+        let initial_node = "127.0.0.1:50051".to_string();
+        router.register_session(session_id, guid, initial_node);
+
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+
+        let update_req = tonic::Request::new(RouteUpdateRequest {
+            guid: guid.raw(),
+            session_id,
+            node_address: "127.0.0.1:50052".to_string(),
+        });
+
+        let resp = service.update_route(update_req).await.unwrap().into_inner();
+        assert!(resp.success);
+
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(session_id).as_deref(),
+            Some("127.0.0.1:50052")
+        );
     }
 }

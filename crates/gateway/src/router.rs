@@ -119,6 +119,29 @@ impl SessionRouter {
         existed
     }
 
+    /// Updates the authoritative node address for a player GUID and explicit session ID.
+    pub fn update_route_with_session(
+        &self,
+        guid: Guid,
+        session_id: u64,
+        new_node_address: String,
+    ) -> bool {
+        let existed = self.guid_to_node.contains_key(&guid);
+        if session_id != 0 {
+            self.session_to_guid.insert(session_id, guid);
+            self.guid_to_session.insert(guid, session_id);
+            self.session_to_node
+                .insert(session_id, new_node_address.clone());
+        } else if let Some(session_ref) = self.guid_to_session.get(&guid) {
+            let sid = *session_ref.value();
+            drop(session_ref);
+            self.session_to_node
+                .insert(sid, new_node_address.clone());
+        }
+        self.guid_to_node.insert(guid, new_node_address);
+        existed
+    }
+
     /// Resolves the authoritative node address for a given player GUID.
     pub fn get_route_by_guid(&self, guid: Guid) -> Option<String> {
         self.guid_to_node.get(&guid).map(|s| s.value().clone())

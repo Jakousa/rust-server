@@ -92,6 +92,47 @@ message GhostSyncResponse {
   uint32 synced_count = 2;
 }
 
+// Entity Component Serialization
+message SerializedComponent {
+  uint32 component_id = 1;
+  bytes data = 2;
+}
+
+// Migration messages
+message MigrateEntityRequest {
+  uint64 guid = 1;
+  uint32 source_node_id = 2;
+  uint32 target_node_id = 3;
+  Vector3 position = 4;
+  Vector3 velocity = 5;
+  float yaw = 6;
+  float pitch = 7;
+  uint32 last_sequence = 8;
+  uint64 session_id = 9;
+  repeated SerializedComponent components = 10;
+  uint64 topology_epoch = 11;
+  uint64 last_migration_tick = 12;
+}
+
+message MigrateEntityResponse {
+  bool success = 1;
+  uint32 error_code = 2;
+  string error_message = 3;
+  uint64 acknowledged_guid = 4;
+}
+
+// Gateway Ingress Route Update messages
+message RouteUpdateRequest {
+  uint64 guid = 1;
+  uint64 session_id = 2;
+  string node_address = 3;
+}
+
+message RouteUpdateResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -102,4 +143,9 @@ service DirectorService {
 service NodeService {
   rpc RemoteCommand (RemoteCommandRequest) returns (RemoteCommandResponse);
   rpc SyncGhosts (GhostSyncRequest) returns (GhostSyncResponse);
+  rpc MigrateEntity (MigrateEntityRequest) returns (MigrateEntityResponse);
+}
+
+service GatewayService {
+  rpc UpdateRoute (RouteUpdateRequest) returns (RouteUpdateResponse);
 }

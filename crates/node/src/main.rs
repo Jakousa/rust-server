@@ -166,8 +166,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timestamp: now,
             };
 
-            if let Err(e) = client.heartbeat(hb).await {
-                eprintln!("[Node {}] Heartbeat send failed: {}", node_id, e);
+            match client.heartbeat(hb).await {
+                Ok(resp) => {
+                    let inner = resp.into_inner();
+                    if inner.should_split {
+                        let proto_bounds = Some(BoundingBox {
+                            min: Some(Vector3 {
+                                x: bounds.min.0,
+                                y: bounds.min.1,
+                                z: bounds.min.2,
+                            }),
+                            max: Some(Vector3 {
+                                x: bounds.max.0,
+                                y: bounds.max.1,
+                                z: bounds.max.2,
+                            }),
+                        });
+                        let split_req = mmo_schema::cluster::SplitReportRequest {
+                            node_id: node_id as u32,
+                            original_bounds: proto_bounds,
+                            child_bounds: vec![],
+                            total_entities: entity_count,
+                        };
+                        if let Ok(split_resp) = client.report_split(split_req).await {
+                            println!(
+                                "[Node {}] Split reported, assigned nodes: {:?}",
+                                node_id,
+                                split_resp.into_inner().assigned_node_ids
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Node {}] Heartbeat send failed: {}", node_id, e);
+                }
             }
         }
     });

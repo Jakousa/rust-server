@@ -37,6 +37,12 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Unified `TelemetryServer` in `crates/core` with `/metrics`, `/healthz`, and `/ready`.
   - Prometheus metrics instrumentation across Node, Gateway, and Director.
   - Local `k3d` cluster deployment with Kubernetes probes and Prometheus pod discovery.
+- [x] **Track 2: Dynamic Spatial Partitioning & Live Entity Migration**
+  - Authoritative Two-Phase Entity Migration Protocol with strict state freeze leases.
+  - Zero-duplication guarantee with donor-driven Gateway route commit and connection failure rollback.
+  - Live Edge Gateway `GatewayService` gRPC server and lock-free `SessionRouter` updates.
+  - Boundary crossing detection, hysteresis buffer margin ($\delta_{\text{hysteresis}} = 1.0$), and cooldown propagation.
+  - Comprehensive unit, proptest, and multi-node live migration end-to-end integration tests.
 
 ---
 
@@ -44,8 +50,7 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ```mermaid
 flowchart LR
-    T2["Track 2: Dynamic Partitioning\n& Live Entity Migration"] --> T3["Track 3: Production Storage\n(PostgreSQL & Inventory)"]
-    T3 --> T4["Track 4: Scale & Chaos Testing\n(10k Bot Ingestion on K8s)"]
+    T3["Track 3: Production Storage\n(PostgreSQL & Inventory)"] --> T4["Track 4: Scale & Chaos Testing\n(10k Bot Ingestion on K8s)"]
 ```
 
 ---

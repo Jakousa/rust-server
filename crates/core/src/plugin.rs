@@ -69,7 +69,7 @@ impl<T: 'static + Send + Sync + Serialize + DeserializeOwned> ComponentCodec
 }
 
 /// Registry managing dynamic component codecs for serialization and persistence.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ComponentCodecRegistry {
     by_type_id: HashMap<TypeId, Arc<dyn ComponentCodec>>,
     by_name: HashMap<String, Arc<dyn ComponentCodec>>,

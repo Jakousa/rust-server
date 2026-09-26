@@ -78,6 +78,26 @@ impl BoundingBox3D {
         )
     }
 
+    /// Clamps an arbitrary point to lie on or within the bounding box volume.
+    #[inline]
+    pub fn clamp_point(&self, point: (f32, f32, f32)) -> (f32, f32, f32) {
+        (
+            point.0.clamp(self.min.0, self.max.0),
+            point.1.clamp(self.min.1, self.max.1),
+            point.2.clamp(self.min.2, self.max.2),
+        )
+    }
+
+    /// Computes the Euclidean distance from an arbitrary point to the nearest surface of this bounding box.
+    /// Returns 0.0 if the point is inside or on the boundary.
+    pub fn distance_to_point(&self, point: (f32, f32, f32)) -> f32 {
+        let clamped = self.clamp_point(point);
+        let dx = point.0 - clamped.0;
+        let dy = point.1 - clamped.1;
+        let dz = point.2 - clamped.2;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
     /// Returns the dimensional extent (width, height, depth) along the X, Y, and Z axes.
     #[inline]
     pub fn dimensions(&self) -> (f32, f32, f32) {
@@ -1035,5 +1055,26 @@ mod tests {
         let aabb = BoundingBox3D::new((0.0, 0.0, 0.0), (20.0, 20.0, 20.0));
         octree.query_range_into(&aabb, &mut aabb_buf);
         assert_eq!(aabb_buf.len(), 2);
+    }
+
+    #[test]
+    fn test_bounding_box_clamp_and_distance() {
+        let bbox = BoundingBox3D::new((0.0, 0.0, 0.0), (10.0, 10.0, 10.0));
+
+        // Inside point
+        assert_eq!(bbox.clamp_point((5.0, 5.0, 5.0)), (5.0, 5.0, 5.0));
+        assert_eq!(bbox.distance_to_point((5.0, 5.0, 5.0)), 0.0);
+
+        // Point on surface
+        assert_eq!(bbox.clamp_point((10.0, 5.0, 5.0)), (10.0, 5.0, 5.0));
+        assert_eq!(bbox.distance_to_point((10.0, 5.0, 5.0)), 0.0);
+
+        // Outside point along X
+        assert_eq!(bbox.clamp_point((13.0, 5.0, 5.0)), (10.0, 5.0, 5.0));
+        assert_eq!(bbox.distance_to_point((13.0, 5.0, 5.0)), 3.0);
+
+        // Outside point in corner
+        assert_eq!(bbox.clamp_point((13.0, 14.0, 10.0)), (10.0, 10.0, 10.0));
+        assert_eq!(bbox.distance_to_point((13.0, 14.0, 10.0)), 5.0); // 3-4-5 triangle
     }
 }

@@ -118,4 +118,58 @@ mod tests {
         };
         assert_eq!(ghost_sync.ghosts.len(), 1);
     }
+
+    #[test]
+    fn test_cluster_migration_and_gateway_messages() {
+        let req = MigrateEntityRequest {
+            guid: 12345,
+            source_node_id: 1,
+            target_node_id: 2,
+            position: Some(Vector3 {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0,
+            }),
+            velocity: Some(Vector3 {
+                x: 0.5,
+                y: 0.0,
+                z: 0.0,
+            }),
+            yaw: 1.57,
+            pitch: 0.0,
+            last_sequence: 42,
+            session_id: 999,
+            components: vec![SerializedComponent {
+                component_id: 1,
+                data: vec![1, 2, 3, 4],
+            }],
+            topology_epoch: 2,
+            last_migration_tick: 100,
+        };
+        assert_eq!(req.guid, 12345);
+        assert_eq!(req.components.len(), 1);
+        assert_eq!(req.last_migration_tick, 100);
+
+        let resp = MigrateEntityResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            acknowledged_guid: 12345,
+        };
+        assert!(resp.success);
+        assert_eq!(resp.acknowledged_guid, 12345);
+
+        let route_req = RouteUpdateRequest {
+            guid: 12345,
+            session_id: 999,
+            node_address: "127.0.0.1:50052".to_string(),
+        };
+        assert_eq!(route_req.node_address, "127.0.0.1:50052");
+
+        let route_resp = RouteUpdateResponse {
+            success: true,
+            error_message: String::new(),
+        };
+        assert!(route_resp.success);
+    }
 }

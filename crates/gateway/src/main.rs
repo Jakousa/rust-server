@@ -11,6 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
         .parse()?;
 
+    let grpc_addr: std::net::SocketAddr = std::env::var("GRPC_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50050".to_string())
+        .parse()?;
+
     let default_node_addr =
         std::env::var("DEFAULT_NODE_ADDR").unwrap_or_else(|_| "127.0.0.1:50052".to_string());
 
@@ -24,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("Listen Address      : {}", listen_addr);
     println!("Admin Address       : {}", admin_addr);
+    println!("gRPC Address        : {}", grpc_addr);
     println!("Default Node Route  : {}", default_node_addr);
     println!("Director Address    : {}", director_addr);
     println!(
@@ -65,6 +70,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if pkt.is_movement() {
                 // In production, forward to destination node via internal channel
             }
+        }
+    });
+
+    let grpc_service = server.create_service();
+    tokio::spawn(async move {
+        println!("[Gateway] gRPC Service listening on {}", grpc_addr);
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(grpc_service.into_server())
+            .serve(grpc_addr)
+            .await
+        {
+            eprintln!("[Gateway] gRPC Server failed: {}", e);
         }
     });
 

@@ -13,5 +13,6 @@ pub use quic::{
 };
 pub use router::SessionRouter;
 pub use server::{
-    extract_acting_guid, GatewayError, GatewayServer, PacketDispatcher, RoutedPacket,
+    extract_acting_guid, GatewayError, GatewayServer, GatewayServiceImpl, PacketDispatcher,
+    RoutedPacket,
 };

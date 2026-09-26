@@ -156,6 +156,11 @@ impl AoiManager {
         self.observers.get(session_id)
     }
 
+    /// Retrieves the session ID mapped to a player GUID.
+    pub fn get_session_by_guid(&self, player_guid: Guid) -> Option<u64> {
+        self.guid_to_session.get(&player_guid).copied()
+    }
+
     /// Returns the number of registered observers.
     pub fn observer_count(&self) -> usize {
         self.observers.len()

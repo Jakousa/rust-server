@@ -1614,6 +1614,7 @@ dependencies = [
  "mmo-gateway",
  "mmo-schema",
  "mmo-storage",
+ "proptest",
  "serde_json",
  "tokio",
  "tonic",

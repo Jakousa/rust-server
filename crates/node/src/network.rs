@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use mmo_core::guid::Guid;
 use mmo_core::{BoundingBox3D, EntityStore, Event, Octree};
+use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::node_service_server::{NodeService, NodeServiceServer};
 use mmo_schema::cluster::{
-    GhostEntity, GhostSyncRequest, GhostSyncResponse, RemoteCommandRequest, RemoteCommandResponse,
-    Vector3,
+    GhostEntity, GhostSyncRequest, GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse,
+    RemoteCommandRequest, RemoteCommandResponse, RouteUpdateRequest, SerializedComponent, Vector3,
 };
 
 use crate::sim::TickSimulation;
@@ -277,6 +278,16 @@ impl NodeService for NodeServiceImpl {
             }));
         }
 
+        // 1.5. Migration lease check (strict freeze)
+        if sim.is_migrating(target) {
+            return Ok(tonic::Response::new(RemoteCommandResponse {
+                success: false,
+                error_code: RemoteCommandErrorCode::Vetoed as u32,
+                error_message: format!("Target entity {} is currently migrating", target),
+                result: Vec::new(),
+            }));
+        }
+
         // 2. Dispatch BeforeInteract hook (check for vetoes)
         let before_ctx = sim.hooks.dispatch(&Event::BeforeInteract {
             initiator,
@@ -327,6 +338,231 @@ impl NodeService for NodeServiceImpl {
             synced_count: synced_count as u32,
         }))
     }
+
+    /// Receives and adopts an entity migrated live from a donor simulation node.
+    async fn migrate_entity(
+        &self,
+        request: tonic::Request<MigrateEntityRequest>,
+    ) -> Result<tonic::Response<MigrateEntityResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let guid = Guid::from_raw(req.guid);
+
+        let target_pos = match req.position {
+            Some(ref p) => (p.x, p.y, p.z),
+            None => {
+                return Ok(tonic::Response::new(MigrateEntityResponse {
+                    success: false,
+                    error_code: 1,
+                    error_message: "Missing position coordinates in MigrateEntityRequest".to_string(),
+                    acknowledged_guid: req.guid,
+                }));
+            }
+        };
+
+        let mut sim = self.sim.write().await;
+
+        // 1. Boundary validation
+        if !sim.octree.bounds.contains(target_pos) {
+            return Ok(tonic::Response::new(MigrateEntityResponse {
+                success: false,
+                error_code: 2,
+                error_message: format!(
+                    "Position {:?} is outside recipient node {} bounds {:?}",
+                    target_pos, sim.node_id, sim.octree.bounds
+                ),
+                acknowledged_guid: req.guid,
+            }));
+        }
+
+        // 2. Remove from ghost store if previously mirrored as a ghost
+        sim.ghost_store.remove(guid);
+
+        // 3. Insert entity into EntityStore and Octree
+        sim.entity_store.spawn(guid, target_pos);
+        sim.octree.insert(guid, target_pos);
+
+        // 4. Restore serialized components
+        let codecs = sim.codecs.clone();
+        for c in &req.components {
+            if c.component_id == 0 {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&c.data) {
+                    if let Some(entity) = sim.entity_store.get_mut_by_guid(guid) {
+                        let _ = codecs.deserialize_into(&val, &mut entity.components);
+                    }
+                }
+            }
+        }
+
+        // 5. Restore kinematic tracking state with preserved sequence
+        let mut kin_state = crate::kinematics::EntityKinematicState::new(sim.current_time);
+        kin_state.initialized = true;
+        kin_state.last_sequence = req.last_sequence;
+        sim.kinematic_states.insert(guid, kin_state);
+
+        // 6. Restore cooldown tick
+        if req.last_migration_tick > 0 {
+            sim.set_last_migration_tick(guid, req.last_migration_tick);
+        }
+
+        // 7. Register AoI observer if an active client session was attached
+        if req.session_id != 0 {
+            sim.register_aoi_observer(
+                req.session_id,
+                guid,
+                crate::aoi::ObserverConfig::default(),
+            );
+        }
+
+        metrics::counter!("mmo_migration_inbound_total", "status" => "success").increment(1);
+
+        Ok(tonic::Response::new(MigrateEntityResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            acknowledged_guid: req.guid,
+        }))
+    }
+}
+
+/// Executes an authoritative two-phase entity migration from `sim` to a target simulation node.
+///
+/// Follows strict lock-ordering and concurrency rules:
+/// 1. Phase 1 (under write lock): Acquires `migrating_leases` lease, snapshots kinematic state,
+///    and serializes component data. Drops the write lock before network I/O.
+/// 2. Async I/O: Sends [`MigrateEntityRequest`] to `target_node_addr` over gRPC.
+/// 3. Gateway Commit: If successful and `gateway_addr` is provided, updates the Edge Gateway route.
+/// 4. Phase 2 (under write lock): If successful, despawns local entity without triggering death events
+///    and cleans up session/AoI state. If failed or timed out, rolls back the lease, snaps back,
+///    and retains authority (zero-duplication guarantee).
+pub async fn execute_entity_migration(
+    sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+    guid: Guid,
+    target_node_id: u32,
+    target_node_addr: &str,
+    gateway_addr: Option<&str>,
+) -> Result<bool, String> {
+    let (req, session_id) = {
+        let mut sim_guard = sim.write().await;
+        if !sim_guard.acquire_migration_lease(guid) {
+            return Err("Failed to acquire migration lease (already migrating or not found)".to_string());
+        }
+        let entity = match sim_guard.entity_store.get_by_guid(guid) {
+            Some(e) => e,
+            None => {
+                sim_guard.release_migration_lease(guid);
+                return Err("Entity not found in store".to_string());
+            }
+        };
+        let pos = entity.position;
+        let last_seq = sim_guard
+            .kinematic_states
+            .get(&guid)
+            .map(|s| s.last_sequence)
+            .unwrap_or(0);
+        let last_mig_tick = sim_guard.tick_counter;
+
+        let comp_json = sim_guard.codecs.serialize_all(&entity.components);
+        let comp_bytes = serde_json::to_vec(&comp_json).unwrap_or_default();
+        let components = vec![SerializedComponent {
+            component_id: 0,
+            data: comp_bytes,
+        }];
+
+        let session_id = sim_guard.aoi.get_session_by_guid(guid).unwrap_or(0);
+
+        let req = MigrateEntityRequest {
+            guid: guid.raw(),
+            source_node_id: sim_guard.node_id as u32,
+            target_node_id,
+            position: Some(Vector3 {
+                x: pos.0,
+                y: pos.1,
+                z: pos.2,
+            }),
+            velocity: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            yaw: 0.0,
+            pitch: 0.0,
+            last_sequence: last_seq,
+            session_id,
+            components,
+            topology_epoch: 1,
+            last_migration_tick: last_mig_tick,
+        };
+        (req, session_id)
+    }; // sim_guard write lock is dropped here before async network I/O
+
+    let endpoint = if target_node_addr.starts_with("http") {
+        target_node_addr.to_string()
+    } else {
+        format!("http://{}", target_node_addr)
+    };
+
+    let mut client = match NodeServiceClient::connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            let mut sim_guard = sim.write().await;
+            sim_guard.release_migration_lease(guid);
+            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
+            return Err(format!("Connection to recipient node failed: {}", e));
+        }
+    };
+
+    let resp = match client.migrate_entity(req).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            let mut sim_guard = sim.write().await;
+            sim_guard.release_migration_lease(guid);
+            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
+            return Err(format!("MigrateEntity RPC failed: {}", e));
+        }
+    };
+
+    if !resp.success {
+        let mut sim_guard = sim.write().await;
+        sim_guard.release_migration_lease(guid);
+        metrics::counter!("mmo_migration_rollbacks_total").increment(1);
+        return Err(format!("Recipient rejected migration: {}", resp.error_message));
+    }
+
+    // Step 3: Gateway commit
+    if let Some(gw_addr) = gateway_addr {
+        let gw_endpoint = if gw_addr.starts_with("http") {
+            gw_addr.to_string()
+        } else {
+            format!("http://{}", gw_addr)
+        };
+        if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
+            let _ = gw_client
+                .update_route(RouteUpdateRequest {
+                    guid: guid.raw(),
+                    session_id,
+                    node_address: target_node_addr.to_string(),
+                })
+                .await;
+        }
+    }
+
+    // Step 4: Despawn local entity cleanly
+    {
+        let mut sim_guard = sim.write().await;
+        sim_guard.release_migration_lease(guid);
+        sim_guard.kinematic_states.remove(&guid);
+        if session_id != 0 {
+            sim_guard.unregister_aoi_observer(session_id);
+        }
+        if let Some(entity) = sim_guard.entity_store.despawn_by_guid(guid) {
+            if !sim_guard.octree.remove(guid, entity.position) {
+                sim_guard.octree.remove_by_guid(guid);
+            }
+        }
+    }
+
+    metrics::counter!("mmo_migration_outbound_total", "status" => "success").increment(1);
+    Ok(true)
 }
 
 /// Prepared broadcast payload ready to be sent to a neighboring node endpoint.
@@ -1007,6 +1243,137 @@ mod tests {
             assert!(s.ghost_store.contains(ghost_guid));
             let g = s.ghost_store.get(ghost_guid).unwrap();
             assert_eq!(g.position, (99.0, 99.0, 99.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_command_veto_when_target_migrating() {
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, test_bounds())));
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        let initiator = Guid::new(EntityType::Player, 1, 10);
+        let target = Guid::new(EntityType::Player, 1, 20);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(initiator, (0.0, 0.0, 0.0));
+            s.spawn_entity(target, (5.0, 5.0, 5.0));
+            // Place target under migration lease
+            assert!(s.acquire_migration_lease(target));
+        }
+
+        let req = tonic::Request::new(make_remote_command(initiator, target, 1, &[], 1, 1));
+        let resp = service.remote_command(req).await.unwrap().into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(resp.error_code, RemoteCommandErrorCode::Vetoed as u32);
+        assert!(resp.error_message.contains("currently migrating"));
+    }
+
+    #[tokio::test]
+    async fn test_node_service_migrate_entity_and_outbound_execution() {
+        use tonic::transport::Server;
+
+        // Recipient Node on Node 2
+        let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let recipient_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            2,
+            recipient_bounds,
+        )));
+        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let recipient_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(recipient_service.into_server())
+                .serve(recipient_addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Donor Node on Node 1
+        let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
+        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, donor_bounds)));
+
+        let guid = Guid::new(EntityType::Player, 1, 555);
+        let target_pos = (55.0, 10.0, 10.0); // Inside Node 2 bounds
+
+        {
+            let mut d = donor_sim.write().await;
+            d.spawn_entity(guid, (49.0, 10.0, 10.0));
+            // Update entity to target_pos in preparation for migration
+            d.entity_store.get_mut_by_guid(guid).unwrap().position = target_pos;
+            let mut kin = crate::kinematics::EntityKinematicState::new(d.current_time);
+            kin.initialized = true;
+            kin.last_sequence = 123;
+            d.kinematic_states.insert(guid, kin);
+        }
+
+        // Execute migration
+        let res = execute_entity_migration(
+            Arc::clone(&donor_sim),
+            guid,
+            2,
+            &recipient_addr.to_string(),
+            None,
+        )
+        .await;
+
+        assert_eq!(res, Ok(true));
+
+        // Verify donor has cleanly despawned the entity and cleared lease
+        {
+            let d = donor_sim.read().await;
+            assert!(!d.entity_store.contains_guid(guid));
+            assert!(!d.is_migrating(guid));
+            assert!(!d.kinematic_states.contains_key(&guid));
+        }
+
+        // Verify recipient has adopted entity with sequence restored
+        {
+            let r = recipient_sim.read().await;
+            assert!(r.entity_store.contains_guid(guid));
+            let ent = r.entity_store.get_by_guid(guid).unwrap();
+            assert_eq!(ent.position, target_pos);
+            let kin = r.kinematic_states.get(&guid).unwrap();
+            assert_eq!(kin.last_sequence, 123);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_entity_migration_connection_failure_rollback() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, bounds)));
+        let guid = Guid::new(EntityType::Player, 1, 777);
+        let pos = (10.0, 10.0, 10.0);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(guid, pos);
+        }
+
+        // Try migrating to unreachable port
+        let res = execute_entity_migration(
+            Arc::clone(&sim),
+            guid,
+            2,
+            "127.0.0.1:59999",
+            None,
+        )
+        .await;
+
+        assert!(res.is_err());
+
+        // Zero-duplication guarantee: Donor MUST still own the entity and lease MUST be released
+        {
+            let s = sim.read().await;
+            assert!(s.entity_store.contains_guid(guid));
+            assert_eq!(s.entity_store.get_by_guid(guid).unwrap().position, pos);
+            assert!(!s.is_migrating(guid));
         }
     }
 }

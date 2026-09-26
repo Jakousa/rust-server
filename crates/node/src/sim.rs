@@ -36,6 +36,8 @@ pub struct TickSimulation {
     pub aoi: AoiManager,
     pub pending_broadcast_jobs: Vec<AoiBroadcastJob>,
     pub kinematic_states: HashMap<Guid, EntityKinematicState>,
+    pub migrating_leases: HashMap<Guid, Instant>,
+    pub last_migration_ticks: HashMap<Guid, u64>,
     pub current_time: Instant,
 }
 
@@ -74,6 +76,8 @@ impl TickSimulation {
             aoi: AoiManager::new(),
             pending_broadcast_jobs: Vec::new(),
             kinematic_states: HashMap::new(),
+            migrating_leases: HashMap::new(),
+            last_migration_ticks: HashMap::new(),
             current_time: Instant::now(),
         }
     }
@@ -118,6 +122,68 @@ impl TickSimulation {
         GhostBroadcaster::new(self.node_id as u32, boundary_margin)
     }
 
+    /// Checks whether an entity currently holds an active migration lease.
+    pub fn is_migrating(&self, guid: Guid) -> bool {
+        self.migrating_leases.contains_key(&guid)
+    }
+
+    /// Acquires a migration lease for an entity, freezing its movement and mutations.
+    ///
+    /// Returns `true` if the lease was acquired, or `false` if already migrating or entity not found.
+    pub fn acquire_migration_lease(&mut self, guid: Guid) -> bool {
+        if !self.entity_store.contains_guid(guid) || self.is_migrating(guid) {
+            return false;
+        }
+        self.migrating_leases.insert(guid, self.current_time);
+        true
+    }
+
+    /// Releases a migration lease for an entity.
+    pub fn release_migration_lease(&mut self, guid: Guid) -> bool {
+        self.migrating_leases.remove(&guid).is_some()
+    }
+
+    /// Sets the last migration tick for an entity to enforce cooldowns.
+    pub fn set_last_migration_tick(&mut self, guid: Guid, tick: u64) {
+        self.last_migration_ticks.insert(guid, tick);
+    }
+
+    /// Returns the last migration tick for an entity, if recorded.
+    pub fn get_last_migration_tick(&self, guid: Guid) -> Option<u64> {
+        self.last_migration_ticks.get(&guid).copied()
+    }
+
+    /// Checks whether an entity is currently in migration cooldown.
+    pub fn is_in_migration_cooldown(&self, guid: Guid, cooldown_ticks: u64) -> bool {
+        if let Some(&last_tick) = self.last_migration_ticks.get(&guid) {
+            self.tick_counter < last_tick + cooldown_ticks
+        } else {
+            false
+        }
+    }
+
+    /// Evaluates whether a proposed movement qualifies for boundary migration across partitions.
+    ///
+    /// Returns `true` if `new_pos` is outside local bounds by at least `margin` world units,
+    /// the entity is not currently migrating, and migration cooldown has elapsed.
+    pub fn check_boundary_migration(
+        &self,
+        guid: Guid,
+        new_pos: (f32, f32, f32),
+        margin: f32,
+        cooldown_ticks: u64,
+    ) -> bool {
+        if self.is_migrating(guid) || self.is_in_migration_cooldown(guid, cooldown_ticks) {
+            return false;
+        }
+        self.octree.bounds.distance_to_point(new_pos) >= margin
+    }
+
+    /// Collects all entity GUIDs currently residing inside the specified bounding box volume.
+    pub fn find_entities_in_bounds(&self, bounds: &BoundingBox3D) -> Vec<Guid> {
+        self.octree.query_range(bounds)
+    }
+
     /// Spawns an entity into both `EntityStore` and `Octree`, dispatching `OnSpawn`.
     ///
     /// Returns `true` if the entity was successfully spawned within octree boundaries.
@@ -140,6 +206,8 @@ impl TickSimulation {
     /// Returns `true` if the entity existed and was removed.
     pub fn despawn_entity(&mut self, guid: Guid) -> bool {
         self.kinematic_states.remove(&guid);
+        self.migrating_leases.remove(&guid);
+        self.last_migration_ticks.remove(&guid);
         if let Some(entity) = self.entity_store.despawn_by_guid(guid) {
             if !self.octree.remove(guid, entity.position) {
                 self.octree.remove_by_guid(guid);
@@ -190,7 +258,12 @@ impl TickSimulation {
         }
 
         // 2. Snapshot entity GUIDs to avoid borrowing conflicts during hook dispatch
-        let guids: Vec<Guid> = self.entity_store.iter().map(|(_, ent)| ent.guid).collect();
+        let guids: Vec<Guid> = self
+            .entity_store
+            .iter()
+            .map(|(_, ent)| ent.guid)
+            .filter(|g| !self.migrating_leases.contains_key(g))
+            .collect();
 
         for guid in guids {
             self.hooks.dispatch(&Event::OnTick {
@@ -335,6 +408,14 @@ impl TickSimulation {
         new_pos: (f32, f32, f32),
         sequence: u32,
     ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
+        // 0. Migration lease check: movement is strictly frozen while migrating
+        if self.is_migrating(guid) {
+            return match self.entity_store.get_by_guid(guid) {
+                Some(e) => Err(e.position),
+                None => Err(new_pos),
+            };
+        }
+
         // 1. Fetch current entity coordinates
         let current_pos = match self.entity_store.get_by_guid(guid) {
             Some(entity) => entity.position,
@@ -834,5 +915,71 @@ mod tests {
         let render = server.render_metrics();
         assert!(render.contains("mmo_node_active_entities"));
         assert!(render.contains("mmo_node_tick_duration_seconds"));
+    }
+
+    #[test]
+    fn test_migration_lease_lifecycle_and_freeze() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 101);
+        let start_pos = (5.0, 5.0, 5.0);
+        assert!(sim.spawn_entity(guid, start_pos));
+
+        assert!(!sim.is_migrating(guid));
+
+        // Acquire lease
+        assert!(sim.acquire_migration_lease(guid));
+        assert!(sim.is_migrating(guid));
+        // Double acquisition fails
+        assert!(!sim.acquire_migration_lease(guid));
+
+        // Movement is strictly frozen while under lease
+        let move_pos = (5.2, 5.0, 5.0);
+        let move_res = sim.process_client_move(guid, move_pos, 0.05);
+        assert_eq!(move_res, Err(start_pos));
+        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, start_pos);
+
+        // Step tick does not crash or dispatch mutations to migrating entity
+        sim.step_tick();
+
+        // Release lease
+        assert!(sim.release_migration_lease(guid));
+        assert!(!sim.is_migrating(guid));
+
+        // Movement passes after lease release
+        let valid_res = sim.process_client_move(guid, move_pos, 0.05);
+        assert_eq!(valid_res, Ok(move_pos));
+    }
+
+    #[test]
+    fn test_boundary_migration_hysteresis_and_cooldown() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (10.0, 10.0, 10.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let guid = Guid::new(EntityType::Player, 1, 102);
+        assert!(sim.spawn_entity(guid, (9.5, 5.0, 5.0)));
+
+        const MARGIN: f32 = 1.0;
+        const COOLDOWN: u64 = 20;
+
+        // Position slightly outside boundary (10.3) < margin (1.0) -> false
+        let shallow_outside = (10.3, 5.0, 5.0);
+        assert!(!sim.check_boundary_migration(guid, shallow_outside, MARGIN, COOLDOWN));
+
+        // Position deep outside boundary (11.5) >= margin (1.0) -> true
+        let deep_outside = (11.5, 5.0, 5.0);
+        assert!(sim.check_boundary_migration(guid, deep_outside, MARGIN, COOLDOWN));
+
+        // Set cooldown tick
+        sim.set_last_migration_tick(guid, sim.tick_counter);
+        assert!(sim.is_in_migration_cooldown(guid, COOLDOWN));
+
+        // During cooldown, boundary migration is suppressed
+        assert!(!sim.check_boundary_migration(guid, deep_outside, MARGIN, COOLDOWN));
+
+        // Advance simulation ticks past cooldown
+        for _ in 0..COOLDOWN + 1 {
+            sim.step_tick();
+        }
+        assert!(!sim.is_in_migration_cooldown(guid, COOLDOWN));
+        assert!(sim.check_boundary_migration(guid, deep_outside, MARGIN, COOLDOWN));
     }
 }

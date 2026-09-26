@@ -18,6 +18,7 @@ metrics = "0.24"
 criterion = { version = "0.5", default-features = false }
 mmo-gateway = { path = "../gateway" }
 bytes = "1.9"
+proptest = "1.6"
 
 [[bench]]
 name = "engine_benchmarks"
