@@ -64,77 +64,50 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ```mermaid
 flowchart LR
-    T5["Track 5: Distributed Combat & Ability System\n(Spellbook, GCD, Targeted Spells)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
+    T5["Track 5: Interaction Primitives & Pluggable Abilities\n(Timed Actions, Dynamic Attributes, Spatial Queries)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
 ```
 
 ---
 
-### Track 2: Dynamic Spatial Partitioning & Live Entity Migration
+### Track 5: Generalized Interaction Engine & Pluggable Ability System
 
-**Goal**: Transform the spatial grid into a fully elastic, self-balancing cluster where simulation nodes autonomously split, merge, and migrate entities live without client disconnection or simulation stutter.
+**Goal**: Establish the engine's core interaction and temporal action primitives in `crates/core`, decoupling all game-specific mechanics (spells, combat, gathering, crafting) into modular plugins in `crates/gameplay`.
 
 #### Key Deliverables:
-1. **Automated Split & Merge Triggers**:
-   - Simulation nodes monitor local entity density and tick duration metrics.
-   - Director evaluates load reports against spatial thresholds and issues split/merge commands during the 20 Hz tick.
-2. **Two-Phase Entity Migration Protocol**:
-   - Inter-node gRPC streaming channel between donor and recipient nodes.
-   - Phase 1: Donor serializes entity state, components, and kinematics history into a migration payload; marks entity in `Migrating` lease state (frozen movement).
-   - Phase 2: Recipient inserts entity into its authoritative `EntityStore` and octree, acknowledges transfer; donor despawns local entity.
-   - Zero-duplication guarantee: If network fails during transfer, donor retains authority.
-3. **Dynamic Gateway Route Invalidation**:
-   - Recipient node or Director notifies Edge Gateway of new entity ownership (`update_route`).
-   - Edge Gateway updates internal `SessionRouter` lock-free routing table; subsequent client inputs route to the new node seamlessly.
-4. **Verification Gates**:
-   - Multi-node migration unit and integration tests under active movement.
-   - Boundary oscillation (hysteresis) property testing to prevent thrashing when entities cross borders repeatedly.
+
+1. **Engine Core: Cancellable Timed Actions (`crates/core`)**:
+   - Generic `TimedAction` / `ActionQueue` component attached to entities.
+   - Configurable action durations and interrupt flags: `CancelOnMovement`, `CancelOnDamage`, `CancelOnStun`, `CancelOnTargetLost`.
+   - Tick-based execution emitting `ActionStartedEvent`, `ActionProgressEvent`, `ActionCompletedEvent`, and `ActionInterruptedEvent`.
+   - Used by plugins for spell casts, weapon reload/windup, item crafting, gathering channels, or warp drive spooling.
+
+2. **Engine Core: Dynamic Attribute & Modifier System (`crates/core`)**:
+   - `AttributeSet` component supporting data-driven numeric properties (scalars, base values, flat/percent modifiers, min/max bounds).
+   - Dynamic regeneration / decay rates evaluated during the 20 Hz simulation tick.
+   - Periodic timed modifiers (Auras / Buffs / Debuffs / DoTs / HoTs) with expiration timers and tick intervals.
+
+3. **Engine Core: Spatial Targeting & Interaction Queries (`crates/core`)**:
+   - Authoritative geometric queries against the 3D Octree: Point-to-Point, Raycast / Line-of-Sight, Cone / Frontal Cleave, and Sphere / Radial AoE.
+   - Validation pipeline: range checks, orientation/facing angle checks, and line-of-sight obstruction guards.
+   - Cross-boundary interaction dispatch: when an action targets an entity on a neighbor simulation node, routing interaction events across nodes via gRPC.
+
+4. **Gameplay Plugin Layer: Pluggable Ability & Combat Systems (`crates/gameplay`)**:
+   - Refactor `CombatPlugin` to consume `AttributeSet` (e.g. `health`, `armor`) and `TimedAction` primitives.
+   - Implement reference `AbilityPlugin`: cooldown tracking, resource costs, instant vs. casted abilities, and damage/heal event emission.
+   - Integrate with existing `ThreatPlugin` and `MonsterAiPlugin`.
+
+5. **Verification Gates**:
+   - Unit and property tests for action interruption under kinematic movement and damage.
+   - Attribute modifier stacking, clamping, and decay determinism tests.
+   - Cross-partition spatial interaction tests between adjacent simulation nodes.
 
 ---
 
-### Track 3: Production Distributed Storage (PostgreSQL & Account/Inventory)
+### Track 6: Network Delta Compression & Bandwidth Bit-Packing
 
-**Goal**: Upgrade persistence from local node-level SQLite to an enterprise-grade distributed relational database capable of multi-region replication, strict ACID item transactions, and scalable account/inventory management.
-
-#### Key Deliverables:
-1. **PostgreSQL / CockroachDB Engine**:
-   - Add async PostgreSQL backend to `crates/storage` using `sqlx` connection pools.
-   - Automated schema migrations via `sqlx-migrate` or versioned SQL scripts.
-   - Connection pool health telemetry and query latency histograms.
-2. **Relational MMO Data Model**:
-   - `accounts`: Authentication credentials, account status, character slots.
-   - `characters`: Level, experience, attributes, coordinates, rotation, bound nodes.
-   - `inventories`: Item instances, bag slots, durability, enchantments, and stack counts.
-   - `spellbook_cooldowns`: Active cooldown timers and ability ranks.
-3. **Transactional Item Trade & Transfer Protocol**:
-   - Multi-row atomic database transactions for player-to-player trading and bank deposits.
-   - Rollback and audit logging preventing duplication exploits even during abrupt server termination.
-4. **Distributed Cache Synchronization**:
-   - Redis-backed cache layer for fast character lookup with write-through or write-behind semantics.
-5. **Verification Gates**:
-   - Concurrent item trade race condition tests.
-   - Database connection failure and reconnection recovery tests.
-
----
-
-### Track 4: Kubernetes Scale & Chaos Testing (10k Bot Ingestion & Failover)
-
-**Goal**: Stress-test the entire distributed cluster under realistic MMO load (1,000 to 10,000 concurrent bot connections) within the local `k3d` environment, validating cluster stability, tick budgets, and chaos resilience.
+**Goal**: Minimize egress bandwidth consumption by implementing bit-packed delta state compression for high-frequency AoI entity replication.
 
 #### Key Deliverables:
-1. **Containerized Headless Bot Load Generator**:
-   - Package `crates/loadtest` into a scalable Kubernetes Deployment / Job.
-   - Configurable bot behaviors: random walk, clustering hotspots, chat spam, rapid movement input, and combat interaction.
-2. **Scale Benchmark Scenarios (1k to 10k CCU)**:
-   - High-throughput QUIC datagram ingestion stress.
-   - AoI interest management benchmark measuring bandwidth and throttling efficiency under extreme hotspot density.
-3. **Chaos Resiliency Verification**:
-   - Automated chaos scripts simulating hard node crashes (`kill -9`, pod eviction, network partition).
-   - Verify Director detects node death within 5 seconds, triggers partition reassignment, and surviving nodes adopt orphaned entities without client session termination.
-4. **Comprehensive Grafana Dashboards**:
-   - Pre-configured Grafana dashboards in `k8s/overlays/local/grafana.yaml` visualizing:
-     - Cluster-wide 20 Hz tick duration percentiles (p50, p95, p99).
-     - Gateway packet rates, bandwidth in/out, and buffer drop counters.
-     - Active player CCU and entity counts per simulation node.
-5. **Verification Gates**:
-   - Sustained 10,000 bot simulation with p99 tick times $< 45\text{ ms}$.
-   - Zero lost player sessions during node eviction and failover recovery.
+1. **Bit-Packed Field Masks**: Variable-length encoding and bitmask flags transmitting only modified entity fields (position $\Delta$, velocity, active animation/action) per tick.
+2. **Quantized Kinematics**: Fixed-point quantization for 3D coordinates and quaternion rotations reducing byte footprint per replicated entity.
+3. **Bandwidth Profiling & Verification**: Benchmark bandwidth savings under 1,000+ bot density before and after delta compression.
