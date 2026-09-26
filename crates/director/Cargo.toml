@@ -8,3 +8,4 @@ mmo-core = { path = "../core" }
 mmo-schema = { path = "../schema" }
 tokio = { version = "1.42", features = ["full"] }
 tonic = "0.12.3"
+metrics = "0.24"

@@ -60,6 +60,19 @@ impl Opcode {
             other => Err(ClientCodecError::UnknownOpcode(other)),
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Opcode::Movement => "Movement",
+            Opcode::MovementCorrection => "MovementCorrection",
+            Opcode::Interaction => "Interaction",
+            Opcode::InteractionResult => "InteractionResult",
+            Opcode::EntityState => "EntityState",
+            Opcode::EntityDespawn => "EntityDespawn",
+            Opcode::Ping => "Ping",
+            Opcode::Pong => "Pong",
+        }
+    }
 }
 
 /// 3D Vector for coordinates and velocities.

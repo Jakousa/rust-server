@@ -3,6 +3,7 @@ pub mod guid;
 pub mod hook;
 pub mod octree;
 pub mod plugin;
+pub mod telemetry;
 
 pub use entity::{ComponentStore, Entity, EntityKey, EntityStore};
 pub use guid::{EntityType, Guid};
@@ -13,3 +14,5 @@ pub use plugin::{
     GameplayPlugin, ModularPacketHandler, ModularPacketRouter, PluginContext, PluginManager,
     TickContext, TickSystem, TypedComponentCodec,
 };
+pub use telemetry::{TelemetryError, TelemetryServer};
+

@@ -16,7 +16,8 @@ spec:
         app: mmo-gateway
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: gateway
@@ -26,6 +27,8 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:8080"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
             - name: DIRECTOR_ADDR
               value: "http://mmo-director:50051"
             - name: DEFAULT_NODE_ADDR
@@ -37,6 +40,21 @@ spec:
             - name: http-tcp
               containerPort: 8080
               protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
           resources:
             requests:
               cpu: "100m"
@@ -64,4 +82,8 @@ spec:
     - name: http-tcp
       port: 8080
       targetPort: 8080
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
       protocol: TCP

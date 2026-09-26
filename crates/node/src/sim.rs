@@ -173,6 +173,7 @@ impl TickSimulation {
     /// Increments the `tick_counter`, runs batch tick systems, iterates through active entities
     /// in `EntityStore`, executes tick updates, and triggers synchronous hook dispatches (`Event::OnTick`).
     pub fn step(&mut self, dt_sec: f32) {
+        let start = std::time::Instant::now();
         self.tick_counter += 1;
         self.advance_time(Duration::from_secs_f32(dt_sec));
 
@@ -209,6 +210,22 @@ impl TickSimulation {
             self.aoi
                 .update_observers(&self.entity_store, &self.octree, self.tick_counter, now_ms);
         self.pending_broadcast_jobs.append(&mut aoi_jobs);
+
+        // 4. Record simulation loop metrics
+        let duration = start.elapsed();
+        let duration_sec = duration.as_secs_f64();
+        let node_id_str = self.node_id.to_string();
+
+        metrics::histogram!("mmo_node_tick_duration_seconds", "node_id" => node_id_str.clone())
+            .record(duration_sec);
+        if duration > Self::TICK_INTERVAL {
+            metrics::counter!("mmo_node_tick_overruns_total", "node_id" => node_id_str.clone())
+                .increment(1);
+        }
+        metrics::gauge!("mmo_node_active_entities", "node_id" => node_id_str.clone())
+            .set(self.entity_store.count() as f64);
+        metrics::gauge!("mmo_node_aoi_observers", "node_id" => node_id_str)
+            .set(self.aoi.observer_count() as f64);
     }
 
     /// Drains and returns all queued AoI broadcast jobs accumulated during ticks.
@@ -804,5 +821,18 @@ mod tests {
         sim.advance_time(Duration::from_millis(50));
         let pos3 = (0.8, 0.0, 0.0);
         assert_eq!(sim.process_client_move_with_seq(guid, pos3, 2), Err(pos2));
+    }
+
+    #[test]
+    fn test_step_tick_telemetry_metrics() {
+        let server = mmo_core::TelemetryServer::init().unwrap();
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 999);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+        sim.step_tick();
+
+        let render = server.render_metrics();
+        assert!(render.contains("mmo_node_active_entities"));
+        assert!(render.contains("mmo_node_tick_duration_seconds"));
     }
 }

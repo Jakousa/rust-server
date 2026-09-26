@@ -72,6 +72,7 @@ impl WriteBehindSnapshotter {
             return false;
         }
         map.insert(guid, snapshot);
+        metrics::gauge!("mmo_node_snapshot_dirty_queue").set(map.len() as f64);
         self.notify.notify_one();
         true
     }
@@ -121,13 +122,16 @@ impl WriteBehindSnapshotter {
     pub async fn flush_batch(&self) -> usize {
         let batch: Vec<EntitySnapshot> = {
             let mut map = self.dirty_map.lock().unwrap();
-            map.drain().map(|(_, v)| v).collect()
+            let drained: Vec<EntitySnapshot> = map.drain().map(|(_, v)| v).collect();
+            metrics::gauge!("mmo_node_snapshot_dirty_queue").set(0.0);
+            drained
         };
 
         if batch.is_empty() {
             return 0;
         }
 
+        let start = std::time::Instant::now();
         let mut saved_total = 0;
         for chunk in batch.chunks(self.chunk_size) {
             match self.repository.save_snapshot_batch(chunk).await {
@@ -143,6 +147,8 @@ impl WriteBehindSnapshotter {
                 }
             }
         }
+        let elapsed_sec = start.elapsed().as_secs_f64();
+        metrics::histogram!("mmo_node_snapshot_flush_duration_seconds").record(elapsed_sec);
         saved_total
     }
 
@@ -310,5 +316,33 @@ mod tests {
             let snap = repo.get_snapshot(guid.raw()).await.unwrap();
             assert!(snap.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_snapshotter_telemetry_metrics() {
+        let server = mmo_core::TelemetryServer::init().unwrap();
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+        let snapshotter = WriteBehindSnapshotter::with_limits(repo, 10, 5);
+
+        let guid = Guid::new(EntityType::Player, 1, 42);
+        snapshotter.mark_dirty(
+            guid,
+            EntitySnapshot {
+                guid: guid.raw(),
+                position: (1.0, 2.0, 3.0),
+                rotation: 0.0,
+                attributes: serde_json::json!({}),
+                version: 1,
+                timestamp: 1000,
+            },
+        );
+
+        let render_before = server.render_metrics();
+        assert!(render_before.contains("mmo_node_snapshot_dirty_queue"));
+
+        snapshotter.flush_batch().await;
+        let render_after = server.render_metrics();
+        assert!(render_after.contains("mmo_node_snapshot_flush_duration_seconds"));
     }
 }

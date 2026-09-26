@@ -16,17 +16,38 @@ spec:
         app: mmo-director
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "50051"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: director
           image: mmo-server:local
           imagePullPolicy: IfNotPresent
           command: ["mmo-director"]
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:50051"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
           ports:
             - name: grpc
               containerPort: 50051
               protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
           resources:
             requests:
               cpu: "100m"
@@ -50,4 +71,8 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
       protocol: TCP

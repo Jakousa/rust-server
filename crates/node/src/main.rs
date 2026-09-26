@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.0.0.0:50052".to_string())
         .parse()?;
 
+    let admin_addr: SocketAddr = std::env::var("ADMIN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
+        .parse()?;
+
     let director_addr =
         std::env::var("DIRECTOR_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
@@ -32,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("Node ID          : {}", node_id);
     println!("Listen Address   : {}", listen_addr);
+    println!("Admin Address    : {}", admin_addr);
     println!("Director Address : {}", director_addr);
     println!(
         "Database URL     : {}",
@@ -40,6 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("Disabled (DATABASE_URL not set)")
     );
     println!("------------------------------------------------------------");
+
+    let telemetry = mmo_core::TelemetryServer::init()?;
+    telemetry.spawn(admin_addr);
 
     let _snapshotter = if let Some(ref url) = db_url {
         match Database::connect(url).await {
@@ -80,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect and register with Director (with retry backoff)
     let director_endpoint = director_addr.clone();
     let sim_clone = Arc::clone(&sim);
+    let telemetry_clone = telemetry.clone();
     tokio::spawn(async move {
         println!(
             "[Node {}] Attempting connection to Director at {}...",
@@ -119,11 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match client.register_node(reg_req).await {
             Ok(resp) => {
+                let success = resp.into_inner().success;
                 println!(
                     "[Node {}] Registered with Director: success={}",
                     node_id,
-                    resp.into_inner().success
+                    success
                 );
+                if success {
+                    telemetry_clone.mark_ready();
+                }
             }
             Err(e) => {
                 eprintln!("[Node {}] Failed to register with Director: {}", node_id, e);

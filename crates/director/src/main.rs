@@ -36,9 +36,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let addr: SocketAddr = "0.0.0.0:50051".parse()?;
+    let addr: SocketAddr = std::env::var("LISTEN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50051".to_string())
+        .parse()?;
+
+    let admin_addr: SocketAddr = std::env::var("ADMIN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
+        .parse()?;
+
+    let telemetry = mmo_core::TelemetryServer::init()?;
+    telemetry.spawn(admin_addr);
+    telemetry.mark_ready();
 
     println!("Director gRPC service listening on {}", addr);
+    println!("Director Admin service listening on {}", admin_addr);
     Server::builder()
         .add_service(DirectorServiceServer::new(service))
         .serve(addr)

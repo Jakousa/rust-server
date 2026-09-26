@@ -17,7 +17,8 @@ spec:
         app: mmo-node
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "50052"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: node
@@ -34,6 +35,8 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:50052"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
             - name: DIRECTOR_ADDR
               value: "http://mmo-director:50051"
             - name: DATABASE_URL
@@ -42,6 +45,21 @@ spec:
             - name: grpc
               containerPort: 50052
               protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
           resources:
             requests:
               cpu: "250m"
@@ -65,4 +83,8 @@ spec:
     - name: grpc
       port: 50052
       targetPort: 50052
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
       protocol: TCP

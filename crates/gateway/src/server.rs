@@ -180,6 +180,7 @@ impl Drop for SessionDropGuard {
     fn drop(&mut self) {
         let _ = self.router.remove_session(self.session_id);
         self.session_sinks.remove(&self.session_id);
+        metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
         if let Some(ref handle) = self.writer_handle {
             handle.abort();
         }
@@ -208,6 +209,7 @@ pub struct GatewayServer {
 impl GatewayServer {
     /// Creates a new `GatewayServer` with the given routing table.
     pub fn new(router: Arc<SessionRouter>) -> Self {
+        metrics::gauge!("mmo_gateway_active_sessions").set(0.0);
         let dispatcher = PacketDispatcher::new(router.clone());
         Self {
             router,
@@ -225,6 +227,7 @@ impl GatewayServer {
         router: Arc<SessionRouter>,
         packet_tx: mpsc::Sender<RoutedPacket>,
     ) -> Self {
+        metrics::gauge!("mmo_gateway_active_sessions").set(0.0);
         let dispatcher = PacketDispatcher::new(router.clone());
         Self {
             router,
@@ -412,6 +415,7 @@ impl GatewayServer {
         sender: mpsc::Sender<Bytes>,
     ) -> Result<(), GatewayError> {
         self.session_sinks.insert(session_id, sender);
+        metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
         Ok(())
     }
 
@@ -420,7 +424,9 @@ impl GatewayServer {
         &self,
         session_id: u64,
     ) -> Result<Option<mpsc::Sender<Bytes>>, GatewayError> {
-        Ok(self.session_sinks.remove(&session_id).map(|(_, s)| s))
+        let res = self.session_sinks.remove(&session_id).map(|(_, s)| s);
+        metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
+        Ok(res)
     }
 
     /// Returns the number of active downstream session sinks.
@@ -440,13 +446,21 @@ impl GatewayServer {
         bytes: Bytes,
     ) -> Result<bool, GatewayError> {
         if let Some(entry) = self.session_sinks.get(&session_id) {
+            let byte_len = bytes.len() as u64;
             match entry.value().try_send(bytes) {
-                Ok(_) => Ok(true),
+                Ok(_) => {
+                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(byte_len);
+                    Ok(true)
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Buffer saturated - slow consumer drop
+                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                     Ok(false)
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                    Ok(false)
+                }
             }
         } else {
             Ok(false)
@@ -459,6 +473,8 @@ impl GatewayServer {
         session_id: u64,
         packet: &ClientPacket,
     ) -> Result<bool, GatewayError> {
+        metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => packet.opcode().as_str())
+            .increment(1);
         let encoded = Bytes::from(packet.encode());
         self.send_bytes_to_session(session_id, encoded).await
     }
@@ -466,11 +482,20 @@ impl GatewayServer {
     /// Broadcasts a `ClientPacket` non-blockingly to all connected client sessions.
     pub async fn broadcast_packet(&self, packet: &ClientPacket) -> Result<usize, GatewayError> {
         let encoded = Bytes::from(packet.encode());
+        let byte_len = encoded.len() as u64;
         let mut sent_count = 0;
         for entry in self.session_sinks.iter() {
             if entry.value().try_send(encoded.clone()).is_ok() {
                 sent_count += 1;
+            } else {
+                metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
             }
+        }
+        if sent_count > 0 {
+            metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => packet.opcode().as_str())
+                .increment(sent_count as u64);
+            metrics::counter!("mmo_gateway_bytes_sent_total")
+                .increment(byte_len * sent_count as u64);
         }
         Ok(sent_count)
     }
@@ -520,9 +545,12 @@ impl GatewayServer {
                 // Client cleanly closed connection
                 break;
             }
+            metrics::counter!("mmo_gateway_bytes_received_total").increment(bytes_read as u64);
 
             let routed_packets = self.dispatcher.process_frames(session_id, &mut buf)?;
             for pkt in &routed_packets {
+                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.packet.opcode().as_str())
+                    .increment(1);
                 if let ClientPacket::Ping(ping) = &pkt.packet {
                     let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
                         client_timestamp: ping.timestamp,
@@ -617,8 +645,11 @@ impl GatewayServer {
                 dgram_res = connection.read_datagram() => {
                     match dgram_res {
                         Ok(dg) => {
+                            metrics::counter!("mmo_gateway_bytes_received_total").increment(dg.len() as u64);
                             let mut dgram_buf = BytesMut::from(dg.as_ref());
                             while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut dgram_buf) {
+                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
+                                    .increment(1);
                                 if let ClientPacket::Ping(ref ping) = packet {
                                     let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
                                         client_timestamp: ping.timestamp,
@@ -627,11 +658,19 @@ impl GatewayServer {
                                             .unwrap()
                                             .as_millis() as u64,
                                     });
-                                    let _ = connection.send_datagram(Bytes::from(pong.encode()));
+                                    let pong_bytes = Bytes::from(pong.encode());
+                                    metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
+                                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
+                                    let _ = connection.send_datagram(pong_bytes);
                                 }
-                                if let Ok(routed) = self.dispatcher.dispatch_packet(session_id, packet) {
-                                    if let Some(ref tx) = self.packet_tx {
-                                        let _ = tx.send(routed).await;
+                                match self.dispatcher.dispatch_packet(session_id, packet) {
+                                    Ok(routed) => {
+                                        if let Some(ref tx) = self.packet_tx {
+                                            let _ = tx.send(routed).await;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                                     }
                                 }
                             }
@@ -652,8 +691,11 @@ impl GatewayServer {
                                 loop {
                                     match recv.read(&mut chunk).await {
                                         Ok(Some(n)) if n > 0 => {
+                                            metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
                                             buf.extend_from_slice(&chunk[..n]);
                                             while let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
+                                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                                                    .increment(1);
                                                 if let ClientPacket::Ping(ref ping) = pkt {
                                                     let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
                                                         client_timestamp: ping.timestamp,
@@ -662,14 +704,22 @@ impl GatewayServer {
                                                             .unwrap()
                                                             .as_millis() as u64,
                                                     });
+                                                    let pong_bytes = pong.encode();
+                                                    metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
+                                                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
                                                     let mut lock = active_stream.lock().await;
                                                     if let Some(ref mut send) = *lock {
-                                                        let _ = send.write_all(&pong.encode()).await;
+                                                        let _ = send.write_all(&pong_bytes).await;
                                                     }
                                                 }
-                                                if let Ok(routed) = dispatcher.dispatch_packet(session_id, pkt) {
-                                                    if let Some(ref tx) = packet_tx {
-                                                        let _ = tx.send(routed).await;
+                                                match dispatcher.dispatch_packet(session_id, pkt) {
+                                                    Ok(routed) => {
+                                                        if let Some(ref tx) = packet_tx {
+                                                            let _ = tx.send(routed).await;
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                                                     }
                                                 }
                                             }
@@ -1313,5 +1363,34 @@ mod tests {
         assert!(!server.has_session_sink(session_id).unwrap());
         assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_telemetry_metrics() {
+        let telemetry = mmo_core::TelemetryServer::init().unwrap();
+        let router = Arc::new(SessionRouter::new());
+        let server = GatewayServer::new(router);
+
+        let session_id = 999;
+        let (tx, rx) = mpsc::channel(1);
+        server.register_session_sink(session_id, tx).unwrap();
+
+        let render_active = telemetry.render_metrics();
+        assert!(render_active.contains("mmo_gateway_active_sessions"));
+
+        let ping = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 12345 });
+        server.send_packet_to_session(session_id, &ping).await.unwrap();
+
+        // Saturate buffer and send again to trigger packet drop
+        let dropped = server.send_packet_to_session(session_id, &ping).await.unwrap();
+        assert!(!dropped);
+
+        let render_metrics = telemetry.render_metrics();
+        assert!(render_metrics.contains("mmo_gateway_packets_sent_total"));
+        assert!(render_metrics.contains("mmo_gateway_bytes_sent_total"));
+        assert!(render_metrics.contains("mmo_gateway_packets_dropped_total"));
+
+        server.remove_session_sink(session_id).unwrap();
+        drop(rx);
     }
 }

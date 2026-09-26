@@ -72,6 +72,7 @@ pub fn make_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, QuicTransportError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
@@ -142,6 +143,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 
 /// Creates a `quinn::ClientConfig` configured with datagrams and a skip-verification verifier for tests.
 pub fn make_insecure_client_config() -> quinn::ClientConfig {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))

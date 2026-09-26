@@ -7,6 +7,10 @@ use tokio::sync::mpsc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
+    let admin_addr: std::net::SocketAddr = std::env::var("ADMIN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
+        .parse()?;
+
     let default_node_addr =
         std::env::var("DEFAULT_NODE_ADDR").unwrap_or_else(|_| "127.0.0.1:50052".to_string());
 
@@ -19,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("          MMO Edge Gateway Daemon Initialized               ");
     println!("============================================================");
     println!("Listen Address      : {}", listen_addr);
+    println!("Admin Address       : {}", admin_addr);
     println!("Default Node Route  : {}", default_node_addr);
     println!("Director Address    : {}", director_addr);
     println!(
@@ -28,6 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("In-Memory (REDIS_URL not set)")
     );
     println!("------------------------------------------------------------");
+
+    let telemetry = mmo_core::TelemetryServer::init()?;
+    telemetry.spawn(admin_addr);
 
     let cache: Arc<dyn SessionCacheBackend> = match redis_url {
         Some(ref url) => match RedisCache::new(url) {
@@ -61,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let listener = server.bind(&listen_addr).await?;
+    telemetry.mark_ready();
     println!(
         "Edge Gateway actively listening for client connections on {}",
         listen_addr

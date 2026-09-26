@@ -82,11 +82,19 @@ impl DirectorServiceImpl {
         let dead_nodes = reg.check_dead_nodes(timeout);
 
         if dead_nodes.is_empty() {
+            metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
             return Vec::new();
         }
 
         let mut coord = self.coordinator.write().await;
-        coord.recover_orphaned_partitions(&dead_nodes, &mut reg)
+        let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
+        if !events.is_empty() {
+            metrics::counter!("mmo_director_partition_recoveries_total")
+                .increment(events.len() as u64);
+            metrics::gauge!("mmo_director_topology_epoch").set(coord.topology_epoch() as f64);
+        }
+        metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+        events
     }
 }
 
@@ -113,6 +121,9 @@ impl DirectorService for DirectorServiceImpl {
         coord.assign_initial_node(assigned_node_id);
         let topology_epoch = coord.topology_epoch();
 
+        metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+        metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
+
         Ok(Response::new(RegisterNodeResponse {
             success: true,
             message: "Simulation node registered successfully".to_string(),
@@ -132,6 +143,9 @@ impl DirectorService for DirectorServiceImpl {
 
         let coord = self.coordinator.read().await;
         let topology_epoch = coord.topology_epoch();
+
+        metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+        metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
 
         if acknowledged {
             let should_split = coord.evaluate_heartbeat(req.node_id, req.entity_count);
@@ -174,6 +188,8 @@ impl DirectorService for DirectorServiceImpl {
         let assigned_node_ids =
             coord.handle_split(req.node_id, original_bounds, child_bounds, &mut reg);
         let topology_epoch = coord.topology_epoch();
+
+        metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
 
         Ok(Response::new(SplitReportResponse {
             acknowledged: true,
@@ -423,5 +439,58 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(hb_node2.topology_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn test_director_telemetry_metrics() {
+        let telemetry = mmo_core::TelemetryServer::init().unwrap();
+        let service = DirectorServiceImpl::default_service();
+
+        let bounds = BoundingBox3D::new((-50.0, -50.0, -50.0), (50.0, 50.0, 50.0));
+        let reg_req = Request::new(RegisterNodeRequest {
+            node_id: 1,
+            listen_addr: "127.0.0.1:50052".to_string(),
+            bounds: Some(bounding_box_3d_to_proto(&bounds)),
+        });
+
+        service.register_node(reg_req).await.unwrap();
+
+        let render_reg = telemetry.render_metrics();
+        assert!(render_reg.contains("mmo_director_active_nodes"));
+        assert!(render_reg.contains("mmo_director_topology_epoch"));
+
+        // Register node 2 and trigger split and recovery
+        let reg_req2 = Request::new(RegisterNodeRequest {
+            node_id: 2,
+            listen_addr: "127.0.0.1:50053".to_string(),
+            bounds: None,
+        });
+        service.register_node(reg_req2).await.unwrap();
+
+        service
+            .report_split(Request::new(SplitReportRequest {
+                node_id: 1,
+                original_bounds: Some(bounding_box_3d_to_proto(&bounds)),
+                child_bounds: vec![],
+                total_entities: 100,
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut reg = service.registry.write().await;
+            reg.set_last_heartbeat(
+                1,
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            );
+        }
+
+        let recovery = service
+            .check_and_recover_dead_nodes(std::time::Duration::from_secs(5))
+            .await;
+        assert!(!recovery.is_empty());
+
+        let render_recovery = telemetry.render_metrics();
+        assert!(render_recovery.contains("mmo_director_partition_recoveries_total"));
     }
 }

@@ -33,6 +33,6 @@ COPY --from=builder /app/target/release/mmo-node /usr/local/bin/mmo-node
 COPY --from=builder /app/target/release/mmo-gateway /usr/local/bin/mmo-gateway
 COPY --from=builder /app/target/release/mmo-loadtest /usr/local/bin/mmo-loadtest
 
-EXPOSE 50051 50052 8080
+EXPOSE 50051 50052 8080 9091
 
 CMD ["mmo-director"]
