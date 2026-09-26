@@ -43,6 +43,12 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Live Edge Gateway `GatewayService` gRPC server and lock-free `SessionRouter` updates.
   - Boundary crossing detection, hysteresis buffer margin ($\delta_{\text{hysteresis}} = 1.0$), and cooldown propagation.
   - Comprehensive unit, proptest, and multi-node live migration end-to-end integration tests.
+- [x] **Track 3: Production Distributed Storage (PostgreSQL & Account/Inventory)**
+  - Dual-backend SQL abstraction supporting distributed PostgreSQL (`postgres://`) and hermetic SQLite (`sqlite:`).
+  - Cross-dialect automated schema migrations (`accounts`, `characters`, `entity_snapshots`, `inventories`, `items`, `trades`).
+  - Deadlock-free ACID player-to-player item trade protocol with strict GUID lock ordering and full transaction rollback on capacity exhaustion.
+  - Batched statement execution in `save_snapshot_batch` eliminating network round-trip overhead.
+  - Live PostgreSQL deployment in Kubernetes (`k8s/base/postgres.yaml`) with connection health telemetry.
 
 ---
 
@@ -50,7 +56,7 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ```mermaid
 flowchart LR
-    T3["Track 3: Production Storage\n(PostgreSQL & Inventory)"] --> T4["Track 4: Scale & Chaos Testing\n(10k Bot Ingestion on K8s)"]
+    T4["Track 4: Scale & Chaos Testing\n(10k Bot Ingestion on K8s)"]
 ```
 
 ---

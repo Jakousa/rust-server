@@ -23,35 +23,107 @@ pub enum StorageError {
 
     #[error("Version conflict: record version {current} >= incoming {incoming}")]
     VersionConflict { current: u64, incoming: u64 },
+
+    #[error("Unsupported database backend: {0}")]
+    UnsupportedBackend(String),
+
+    #[error("Inventory is full for character {0} (capacity {1})")]
+    InventoryFull(u64, u32),
+
+    #[error("Item {0} not found in inventory of character {1}")]
+    ItemNotFound(String, u64),
+
+    #[error("Slot collision: slot {0} is already occupied on character {1}")]
+    SlotCollision(u32, u64),
+
+    #[error("Insufficient quantity: requested {requested}, available {available}")]
+    InsufficientQuantity { requested: u32, available: u32 },
+
+    #[error("Trade failed: {0}")]
+    TradeError(String),
 }
 
-/// Central database manager backed by SQLite connection pool.
+/// Database backend variant.
+#[derive(Clone)]
+pub enum DbBackend {
+    Sqlite(sqlx::Pool<Sqlite>),
+    Postgres(sqlx::Pool<sqlx::Postgres>),
+}
+
+/// Helper function to adapt standard ANSI SQL queries with `?` parameters
+/// to PostgreSQL's `$1, $2, ...` positional parameter requirements.
+pub fn sql_for_dialect(query: &str, is_postgres: bool) -> String {
+    if !is_postgres {
+        return query.to_string();
+    }
+    let mut result = String::with_capacity(query.len() + 16);
+    let mut param_idx = 1;
+    let mut in_single_quote = false;
+    for c in query.chars() {
+        if c == '\'' {
+            in_single_quote = !in_single_quote;
+            result.push(c);
+        } else if c == '?' && !in_single_quote {
+            result.push('$');
+            result.push_str(&param_idx.to_string());
+            param_idx += 1;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Central database manager backed by SQLite or PostgreSQL connection pool.
 #[derive(Clone)]
 pub struct Database {
-    pool: Pool<Sqlite>,
+    backend: DbBackend,
 }
 
 impl Database {
-    /// Connects to a SQLite database using the provided connection string.
+    /// Connects to a database using the provided connection string.
+    /// Auto-detects dialect:
+    /// - `postgres://` or `postgresql://` -> PostgreSQL pool
+    /// - `sqlite:` or local path -> SQLite pool
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        let mut opts = SqliteConnectOptions::from_str(url)?
-            .create_if_missing(true)
-            .busy_timeout(Duration::from_secs(5));
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .min_connections(2)
+                .max_connections(20)
+                .acquire_timeout(Duration::from_secs(5))
+                .idle_timeout(Duration::from_secs(600))
+                .connect(url)
+                .await?;
 
-        if !url.contains(":memory:") {
-            opts = opts
-                .pragma("journal_mode", "WAL")
-                .pragma("synchronous", "NORMAL");
+            let db = Self {
+                backend: DbBackend::Postgres(pool),
+            };
+            db.run_migrations().await?;
+            Ok(db)
+        } else if url.starts_with("sqlite:") || url.contains(".db") || url.contains(":memory:") {
+            let mut opts = SqliteConnectOptions::from_str(url)?
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_secs(5));
+
+            if !url.contains(":memory:") {
+                opts = opts
+                    .pragma("journal_mode", "WAL")
+                    .pragma("synchronous", "NORMAL");
+            }
+
+            let pool = SqlitePoolOptions::new()
+                .max_connections(10)
+                .connect_with(opts)
+                .await?;
+
+            let db = Self {
+                backend: DbBackend::Sqlite(pool),
+            };
+            db.run_migrations().await?;
+            Ok(db)
+        } else {
+            Err(StorageError::UnsupportedBackend(url.to_string()))
         }
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(10)
-            .connect_with(opts)
-            .await?;
-
-        let db = Self { pool };
-        db.run_migrations().await?;
-        Ok(db)
     }
 
     /// Creates an in-memory SQLite database for unit tests and local isolation.
@@ -64,34 +136,71 @@ impl Database {
             .connect_with(opts)
             .await?;
 
-        let db = Self { pool };
+        let db = Self {
+            backend: DbBackend::Sqlite(pool),
+        };
         db.run_migrations().await?;
         Ok(db)
     }
 
-    /// Returns a reference to the underlying SQLx pool.
+    /// Returns a reference to the active `DbBackend`.
+    pub fn backend(&self) -> &DbBackend {
+        &self.backend
+    }
+
+    /// Returns whether the database backend is PostgreSQL.
+    pub fn is_postgres(&self) -> bool {
+        matches!(self.backend, DbBackend::Postgres(_))
+    }
+
+    /// Returns a reference to the underlying SQLite pool if active.
+    pub fn sqlite_pool(&self) -> Option<&Pool<Sqlite>> {
+        match &self.backend {
+            DbBackend::Sqlite(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the underlying PostgreSQL pool if active.
+    pub fn pg_pool(&self) -> Option<&Pool<sqlx::Postgres>> {
+        match &self.backend {
+            DbBackend::Postgres(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Backward compatibility accessor for SQLite pool (used by legacy tests).
     pub fn pool(&self) -> &Pool<Sqlite> {
-        &self.pool
+        self.sqlite_pool()
+            .expect("Database backend is not SQLite; use db.backend() or pg_pool()")
+    }
+
+    /// Liveness / readiness health check probe executing `SELECT 1`.
+    pub async fn ping(&self) -> Result<(), StorageError> {
+        match &self.backend {
+            DbBackend::Sqlite(pool) => {
+                sqlx::query("SELECT 1").execute(pool).await?;
+            }
+            DbBackend::Postgres(pool) => {
+                sqlx::query("SELECT 1").execute(pool).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Executes idempotent database migrations setting up core tables and indexes.
     pub async fn run_migrations(&self) -> Result<(), StorageError> {
-        sqlx::query(
+        let statements = [
             r#"
             CREATE TABLE IF NOT EXISTS accounts (
                 account_id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
-                created_at INTEGER NOT NULL
+                created_at BIGINT NOT NULL
             );
             "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS characters (
-                guid INTEGER PRIMARY KEY,
+                guid BIGINT PRIMARY KEY,
                 account_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 level INTEGER NOT NULL DEFAULT 1,
@@ -100,31 +209,81 @@ impl Database {
                 pos_z REAL NOT NULL,
                 rotation REAL NOT NULL DEFAULT 0.0,
                 attributes_json TEXT NOT NULL DEFAULT '{}',
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+                updated_at BIGINT NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
             );
+            "#,
+            r#"
             CREATE INDEX IF NOT EXISTS idx_characters_account ON characters(account_id);
             "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS entity_snapshots (
-                guid INTEGER PRIMARY KEY,
+                guid BIGINT PRIMARY KEY,
                 pos_x REAL NOT NULL,
                 pos_y REAL NOT NULL,
                 pos_z REAL NOT NULL,
                 rotation REAL NOT NULL DEFAULT 0.0,
                 attributes_json TEXT NOT NULL DEFAULT '{}',
-                version INTEGER NOT NULL DEFAULT 1,
-                timestamp INTEGER NOT NULL
+                version BIGINT NOT NULL DEFAULT 1,
+                timestamp BIGINT NOT NULL
             );
             "#,
-        )
-        .execute(&self.pool)
-        .await?;
+            r#"
+            CREATE TABLE IF NOT EXISTS inventories (
+                character_guid BIGINT PRIMARY KEY,
+                capacity INTEGER NOT NULL DEFAULT 30,
+                updated_at BIGINT NOT NULL,
+                FOREIGN KEY (character_guid) REFERENCES characters(guid) ON DELETE CASCADE
+            );
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS items (
+                item_instance_id TEXT PRIMARY KEY,
+                character_guid BIGINT NOT NULL,
+                item_def_id INTEGER NOT NULL,
+                slot INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                durability INTEGER NOT NULL DEFAULT 100,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                FOREIGN KEY (character_guid) REFERENCES characters(guid) ON DELETE CASCADE,
+                CONSTRAINT uq_character_slot UNIQUE(character_guid, slot)
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_items_character_slot ON items(character_guid, slot);
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS trades (
+                trade_id TEXT PRIMARY KEY,
+                sender_guid BIGINT NOT NULL,
+                recipient_guid BIGINT NOT NULL,
+                items_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trades_sender ON trades(sender_guid);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trades_recipient ON trades(recipient_guid);
+            "#,
+        ];
+
+        match &self.backend {
+            DbBackend::Sqlite(pool) => {
+                for stmt in statements {
+                    sqlx::query(stmt).execute(pool).await?;
+                }
+            }
+            DbBackend::Postgres(pool) => {
+                for stmt in statements {
+                    sqlx::query(stmt).execute(pool).await?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -140,13 +299,29 @@ mod tests {
 
         // Verify tables exist by querying sqlite_master
         let count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'characters', 'entity_snapshots')"
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts', 'characters', 'entity_snapshots', 'inventories', 'items', 'trades')"
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
 
-        assert_eq!(count.0, 3);
+        assert_eq!(count.0, 6);
+    }
+
+    #[tokio::test]
+    async fn test_database_ping() {
+        let db = Database::connect_memory().await.unwrap();
+        assert!(db.ping().await.is_ok());
+    }
+
+    #[test]
+    fn test_sql_for_dialect_translation() {
+        let query = "INSERT INTO items (id, name, desc) VALUES (?, ?, 'what?');";
+        assert_eq!(sql_for_dialect(query, false), query);
+        assert_eq!(
+            sql_for_dialect(query, true),
+            "INSERT INTO items (id, name, desc) VALUES ($1, $2, 'what?');"
+        );
     }
 
     #[tokio::test]

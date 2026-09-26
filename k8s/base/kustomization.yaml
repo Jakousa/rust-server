@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - namespace.yaml
+  - postgres.yaml
   - director.yaml
   - node-statefulset.yaml
   - gateway.yaml

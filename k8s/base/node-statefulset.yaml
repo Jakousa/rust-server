@@ -40,7 +40,7 @@ spec:
             - name: DIRECTOR_ADDR
               value: "http://mmo-director:50051"
             - name: DATABASE_URL
-              value: "sqlite:///tmp/mmo.db"
+              value: "postgres://mmo:mmo_secret@postgres.mmo.svc.cluster.local:5432/mmo_db"
           ports:
             - name: grpc
               containerPort: 50052
