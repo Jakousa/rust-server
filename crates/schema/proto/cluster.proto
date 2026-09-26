@@ -133,6 +133,16 @@ message RouteUpdateResponse {
   string error_message = 2;
 }
 
+message ReassignNodeRoutesRequest {
+  string dead_node_address = 1;
+  string new_node_address = 2;
+}
+
+message ReassignNodeRoutesResponse {
+  bool success = 1;
+  uint32 reassigned_count = 2;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -148,4 +158,5 @@ service NodeService {
 
 service GatewayService {
   rpc UpdateRoute (RouteUpdateRequest) returns (RouteUpdateResponse);
+  rpc ReassignNodeRoutes (ReassignNodeRoutesRequest) returns (ReassignNodeRoutesResponse);
 }

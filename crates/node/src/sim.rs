@@ -372,6 +372,11 @@ impl TickSimulation {
     /// [`Self::TICK_DT_SEC`] to prevent time-banking speed exploits.
     /// For sub-microsecond intervals (such as synchronous test calls), floors to nominal [`Self::TICK_DT_SEC`].
     pub fn compute_server_dt(&mut self, guid: Guid) -> f32 {
+        self.compute_server_dt_with_seq(guid, 1)
+    }
+
+    /// Calculates server-authoritative delta time with jitter tolerance based on sequence delta.
+    pub fn compute_server_dt_with_seq(&mut self, guid: Guid, seq_delta: u32) -> f32 {
         let now = self.current_time;
         let state = self
             .kinematic_states
@@ -390,9 +395,10 @@ impl TickSimulation {
         if elapsed > 1.0 {
             // Idle gap clamping: prevent banking idle time
             Self::TICK_DT_SEC
-        } else if elapsed < 1e-4 {
-            // Microsecond floor for test calls running back-to-back
-            Self::TICK_DT_SEC
+        } else if elapsed < Self::TICK_DT_SEC {
+            // Jitter tolerance: packets arriving compressed by network buffer flushes
+            // floor to nominal tick duration per sequence increment, capped at 0.2s
+            (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2)
         } else {
             elapsed
         }
@@ -423,16 +429,25 @@ impl TickSimulation {
         };
 
         // 2. Monotonic sequence check (if sequence is specified and entity was already initialized)
-        if sequence > 0 {
+        let seq_delta = if sequence > 0 {
             if let Some(state) = self.kinematic_states.get(&guid) {
                 if state.initialized && sequence <= state.last_sequence {
                     return Err(current_pos);
                 }
+                if state.initialized && state.last_sequence > 0 {
+                    sequence - state.last_sequence
+                } else {
+                    1
+                }
+            } else {
+                1
             }
-        }
+        } else {
+            1
+        };
 
-        // 3. Compute server-authoritative delta time (ignoring any client claims)
-        let dt_sec = self.compute_server_dt(guid);
+        // 3. Compute server-authoritative delta time with sequence jitter tolerance
+        let dt_sec = self.compute_server_dt_with_seq(guid, seq_delta);
 
         // 4. Kinematic validation (speed caps, teleport threshold, NaN/Inf, dt bounds)
         if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
@@ -981,5 +996,23 @@ mod tests {
         }
         assert!(!sim.is_in_migration_cooldown(guid, COOLDOWN));
         assert!(sim.check_boundary_migration(guid, deep_outside, MARGIN, COOLDOWN));
+    }
+
+    #[test]
+    fn test_process_client_move_compressed_jitter_burst_accepted() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let guid = Guid::new(EntityType::Player, 1, 999);
+        assert!(sim.spawn_entity(guid, (50.0, 50.0, 0.0)));
+
+        // Initial move at seq=1
+        let res1 = sim.process_client_move_with_seq(guid, (50.5, 50.0, 0.0), 1);
+        assert_eq!(res1, Ok((50.5, 50.0, 0.0)));
+
+        // Second packet arrives in rapid jitter burst (e.g. 1ms elapsed) with seq=2
+        // advancing another 0.5 units (within normal 10.0 m/s speed over nominal 50ms)
+        sim.advance_time(std::time::Duration::from_millis(1));
+        let res2 = sim.process_client_move_with_seq(guid, (51.0, 50.0, 0.0), 2);
+        assert_eq!(res2, Ok((51.0, 50.0, 0.0)));
     }
 }

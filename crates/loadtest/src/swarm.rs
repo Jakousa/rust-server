@@ -1,10 +1,8 @@
-//! Swarm manager coordinating concurrent virtual bot clients.
-
 use crate::metrics::{MetricsAggregator, MetricsSnapshot};
-use crate::trajectory::{TrajectoryController, WorldBounds};
+use crate::trajectory::{BehaviorProfile, TrajectoryController, WorldBounds};
 use bytes::BytesMut;
 use mmo_core::guid::{EntityType, Guid};
-use mmo_schema::client::{ClientPacket, MovementPacket, PingPacket, Vec3};
+use mmo_schema::client::{ClientPacket, InteractionPacket, InteractionType, MovementPacket, PingPacket, Vec3};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +21,9 @@ pub struct SwarmConfig {
     pub stagger_delay: Duration,
     pub bounds: WorldBounds,
     pub max_bot_speed: f32,
+    pub profile: BehaviorProfile,
+    pub hotspot_center: Vec3,
+    pub hotspot_radius: f32,
 }
 
 impl Default for SwarmConfig {
@@ -36,6 +37,9 @@ impl Default for SwarmConfig {
             stagger_delay: Duration::from_millis(5),
             bounds: WorldBounds::default_arena(),
             max_bot_speed: 15.0,
+            profile: BehaviorProfile::RandomWalk,
+            hotspot_center: Vec3::ZERO,
+            hotspot_radius: 50.0,
         }
     }
 }
@@ -73,10 +77,14 @@ impl SwarmManager {
 
         for i in 0..self.config.bot_count {
             let guid = Guid::new(EntityType::Player, 1, (i + 1) as u32);
-            let mut traj = TrajectoryController::new(
+            let profile = self.config.profile;
+            let mut traj = TrajectoryController::with_profile(
                 Vec3::new(0.0, 0.0, 0.0),
                 self.config.max_bot_speed,
                 self.config.bounds,
+                self.config.profile,
+                self.config.hotspot_center,
+                self.config.hotspot_radius,
             );
             let target_addr = self.config.gateway_addr.clone();
             let metrics = Arc::clone(&self.metrics);
@@ -109,6 +117,7 @@ impl SwarmManager {
                 let mut next_ping = Instant::now();
                 let mut last_ping: Option<(u64, Instant)> = None;
                 let start_time = Instant::now();
+                let mut seq: u32 = 0;
 
                 loop {
                     tokio::select! {
@@ -151,6 +160,7 @@ impl SwarmManager {
                         _ = tick_timer.tick() => {
                             let (pos, vel) = traj.step(dt);
                             let now_ms = start_time.elapsed().as_millis() as u64;
+                            seq += 1;
 
                             // Send movement
                             let move_pkt = ClientPacket::Movement(MovementPacket {
@@ -160,7 +170,7 @@ impl SwarmManager {
                                 yaw: 0.0,
                                 pitch: 0.0,
                                 timestamp: now_ms,
-                                sequence: 1,
+                                sequence: seq,
                             });
                             let encoded = move_pkt.encode();
                             if writer.write_all(&encoded).await.is_ok() {
@@ -168,6 +178,21 @@ impl SwarmManager {
                             } else {
                                 metrics.record_connection_error();
                                 break;
+                            }
+
+                            // If profile is CombatInteraction, send an interaction packet periodically
+                            if profile == BehaviorProfile::CombatInteraction && seq.is_multiple_of(20) {
+                                let interact_pkt = ClientPacket::Interaction(InteractionPacket {
+                                    source_guid: guid.raw(),
+                                    target_guid: 0,
+                                    interaction_type: InteractionType::Attack,
+                                    action_id: 1,
+                                    payload: bytes::Bytes::new(),
+                                });
+                                let encoded_interact = interact_pkt.encode();
+                                if writer.write_all(&encoded_interact).await.is_ok() {
+                                    metrics.record_packet_sent();
+                                }
                             }
 
                             // Send ping periodically
@@ -253,6 +278,7 @@ mod tests {
             stagger_delay: Duration::from_millis(1),
             bounds: WorldBounds::default_arena(),
             max_bot_speed: 10.0,
+            ..Default::default()
         };
 
         let manager = SwarmManager::new(config);

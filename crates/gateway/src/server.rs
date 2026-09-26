@@ -19,7 +19,9 @@ use tokio::sync::mpsc;
 use mmo_core::guid::Guid;
 use mmo_schema::client::{ClientCodecError, ClientPacket};
 use mmo_schema::cluster::gateway_service_server::{GatewayService, GatewayServiceServer};
-use mmo_schema::cluster::{RouteUpdateRequest, RouteUpdateResponse};
+use mmo_schema::cluster::{
+    ReassignNodeRoutesRequest, ReassignNodeRoutesResponse, RouteUpdateRequest, RouteUpdateResponse,
+};
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
@@ -228,6 +230,21 @@ impl GatewayService for GatewayServiceImpl {
         Ok(tonic::Response::new(RouteUpdateResponse {
             success: true,
             error_message: String::new(),
+        }))
+    }
+
+    async fn reassign_node_routes(
+        &self,
+        request: tonic::Request<ReassignNodeRoutesRequest>,
+    ) -> Result<tonic::Response<ReassignNodeRoutesResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let count = self
+            .router
+            .reassign_node_routes(&req.dead_node_address, &req.new_node_address);
+        metrics::counter!("mmo_gateway_route_reassignments_total").increment(count as u64);
+        Ok(tonic::Response::new(ReassignNodeRoutesResponse {
+            success: true,
+            reassigned_count: count as u32,
         }))
     }
 }

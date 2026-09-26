@@ -18,12 +18,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Background dead node detection and orphaned partition recovery loop
     let svc_clone = service.clone();
+    let gateway_grpc_addr =
+        std::env::var("GATEWAY_GRPC_ADDR").unwrap_or_else(|_| "http://mmo-gateway:50050".to_string());
+
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let dead_timeout_ms: u64 = std::env::var("NODE_DEAD_TIMEOUT_MS")
+            .unwrap_or_else(|_| "5000".to_string())
+            .parse()
+            .unwrap_or(5000);
+        let dead_timeout = Duration::from_millis(dead_timeout_ms);
+        eprintln!("[Director] Starting dead node detector loop (timeout={}ms)", dead_timeout_ms);
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut tick_count = 0u64;
         loop {
             interval.tick().await;
+            tick_count += 1;
+            if tick_count.is_multiple_of(10) {
+                let reg_len = svc_clone.registry.read().await.len();
+                eprintln!("[Director] Dead node check tick #{}, registered nodes: {}", tick_count, reg_len);
+            }
             let recovery_events = svc_clone
-                .check_and_recover_dead_nodes(Duration::from_secs(5))
+                .check_and_recover_dead_nodes(dead_timeout)
                 .await;
             if !recovery_events.is_empty() {
                 eprintln!(
@@ -32,6 +47,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recovery_events[0].epoch,
                     recovery_events
                 );
+
+                if let Ok(mut client) =
+                    mmo_schema::cluster::gateway_service_client::GatewayServiceClient::connect(
+                        gateway_grpc_addr.clone(),
+                    )
+                    .await
+                {
+                    for ev in &recovery_events {
+                        let dead_addr =
+                            format!("mmo-node-{}.mmo-node:50052", ev.previous_node_id.saturating_sub(1));
+                        let new_addr =
+                            format!("mmo-node-{}.mmo-node:50052", ev.new_node_id.saturating_sub(1));
+                        let req = mmo_schema::cluster::ReassignNodeRoutesRequest {
+                            dead_node_address: dead_addr.clone(),
+                            new_node_address: new_addr.clone(),
+                        };
+                        if let Ok(resp) = client.reassign_node_routes(req).await {
+                            eprintln!(
+                                "[Director] Propagated route reassignment: {} -> {} ({} routes updated)",
+                                dead_addr,
+                                new_addr,
+                                resp.into_inner().reassigned_count
+                            );
+                        }
+                    }
+                }
             }
         }
     });

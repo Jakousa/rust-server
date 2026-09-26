@@ -29,6 +29,10 @@ spec:
               value: "0.0.0.0:50051"
             - name: ADMIN_ADDR
               value: "0.0.0.0:9091"
+            - name: GATEWAY_GRPC_ADDR
+              value: "http://mmo-gateway:50050"
+            - name: NODE_DEAD_TIMEOUT_MS
+              value: "3000"
           ports:
             - name: grpc
               containerPort: 50051

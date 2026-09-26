@@ -110,7 +110,9 @@ impl NodeRegistry {
         let mut dead_nodes = Vec::new();
 
         self.nodes.retain(|&id, node| {
-            if now.duration_since(node.last_heartbeat) > timeout_duration {
+            let elapsed = now.duration_since(node.last_heartbeat);
+            if elapsed > timeout_duration {
+                eprintln!("[Director] Node {} timed out! Elapsed: {:?} > {:?}", id, elapsed, timeout_duration);
                 dead_nodes.push(id);
                 false
             } else {

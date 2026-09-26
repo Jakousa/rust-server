@@ -86,6 +86,8 @@ impl DirectorServiceImpl {
             return Vec::new();
         }
 
+        eprintln!("[Director] Dead node(s) detected: {:?}", dead_nodes);
+
         let mut coord = self.coordinator.write().await;
         let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
         if !events.is_empty() {

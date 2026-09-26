@@ -31,8 +31,14 @@ spec:
               ORDINAL=${HOSTNAME##*-}
               export NODE_ID=$((ORDINAL + 1))
               echo "Starting simulation node with dynamic NODE_ID=${NODE_ID} (hostname: ${HOSTNAME})"
+              if [ -n "${STARTUP_DELAY_SECS:-}" ] && [ "${STARTUP_DELAY_SECS}" -gt 0 ] 2>/dev/null; then
+                echo "Applying startup delay of ${STARTUP_DELAY_SECS}s..."
+                sleep "${STARTUP_DELAY_SECS}"
+              fi
               exec mmo-node
           env:
+            - name: STARTUP_DELAY_SECS
+              value: "4"
             - name: LISTEN_ADDR
               value: "0.0.0.0:50052"
             - name: ADMIN_ADDR

@@ -841,111 +841,124 @@ impl CharacterRepository {
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                let mut tx = pool.begin().await?;
+                let mut conn = pool.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
-                // 1. Verify characters exist in sorted order
-                let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
-                    .bind(first_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
-                    .bind(second_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                if c1.is_none() || c2.is_none() {
-                    return Err(StorageError::NotFound(
-                        "One or both trade participant characters not found".to_string(),
-                    ));
-                }
-
-                // 2. Fetch recipient inventory capacity
-                let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = ?")
-                    .bind(recipient_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let capacity = inv_row.map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30)).unwrap_or(30) as u32;
-
-                // 3. Fetch recipient occupied slots
-                let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = ?")
-                    .bind(recipient_guid as i64)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                    .into_iter()
-                    .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                    .collect();
-
-                let mut free_slots = Vec::new();
-                for slot_idx in 0..capacity {
-                    if !occupied_slots.contains(&slot_idx) {
-                        free_slots.push(slot_idx);
-                    }
-                }
-
-                if free_slots.len() < item_instance_ids.len() {
-                    return Err(StorageError::InventoryFull(recipient_guid, capacity));
-                }
-
-                // 4. Verify sender owns each item
-                for item_id in item_instance_ids {
-                    let item_row = sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = ?")
-                        .bind(item_id)
-                        .fetch_optional(&mut *tx)
+                let res: Result<TradeRecord, StorageError> = async {
+                    // 1. Verify characters exist in sorted order
+                    let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
+                        .bind(first_guid as i64)
+                        .fetch_optional(&mut *conn)
                         .await?;
+                    let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
+                        .bind(second_guid as i64)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                    if c1.is_none() || c2.is_none() {
+                        return Err(StorageError::NotFound(
+                            "One or both trade participant characters not found".to_string(),
+                        ));
+                    }
 
-                    match item_row {
-                        Some(r) => {
-                            let owner: i64 = r.try_get("character_guid")?;
-                            if owner as u64 != sender_guid {
+                    // 2. Fetch recipient inventory capacity
+                    let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = ?")
+                        .bind(recipient_guid as i64)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                    let capacity = inv_row.map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30)).unwrap_or(30) as u32;
+
+                    // 3. Fetch recipient occupied slots
+                    let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = ?")
+                        .bind(recipient_guid as i64)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                        .into_iter()
+                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                        .collect();
+
+                    let mut free_slots = Vec::new();
+                    for slot_idx in 0..capacity {
+                        if !occupied_slots.contains(&slot_idx) {
+                            free_slots.push(slot_idx);
+                        }
+                    }
+
+                    if free_slots.len() < item_instance_ids.len() {
+                        return Err(StorageError::InventoryFull(recipient_guid, capacity));
+                    }
+
+                    // 4. Verify sender owns each item
+                    for item_id in item_instance_ids {
+                        let item_row = sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = ?")
+                            .bind(item_id)
+                            .fetch_optional(&mut *conn)
+                            .await?;
+
+                        match item_row {
+                            Some(r) => {
+                                let owner: i64 = r.try_get("character_guid")?;
+                                if owner as u64 != sender_guid {
+                                    return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
+                                }
+                            }
+                            None => {
                                 return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                             }
                         }
-                        None => {
-                            return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
-                        }
+                    }
+
+                    // 5. Transfer items to recipient free slots
+                    for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                        sqlx::query(
+                            "UPDATE items SET character_guid = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
+                        )
+                        .bind(recipient_guid as i64)
+                        .bind(*target_slot as i32)
+                        .bind(now)
+                        .bind(item_id)
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+
+                    // 6. Record audit trail
+                    let items_json = serde_json::to_string(item_instance_ids)?;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        "#,
+                    )
+                    .bind(trade_id)
+                    .bind(sender_guid as i64)
+                    .bind(recipient_guid as i64)
+                    .bind(&items_json)
+                    .bind(TradeStatus::Committed.to_string())
+                    .bind(now)
+                    .execute(&mut *conn)
+                    .await?;
+
+                    Ok(TradeRecord {
+                        trade_id: trade_id.to_string(),
+                        sender_guid,
+                        recipient_guid,
+                        items_json,
+                        status: TradeStatus::Committed,
+                        created_at: now,
+                    })
+                }
+                .await;
+
+                match res {
+                    Ok(record) => {
+                        sqlx::query("COMMIT").execute(&mut *conn).await?;
+                        Ok(record)
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        Err(e)
                     }
                 }
-
-                // 5. Transfer items to recipient free slots
-                for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                    sqlx::query(
-                        "UPDATE items SET character_guid = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                    )
-                    .bind(recipient_guid as i64)
-                    .bind(*target_slot as i32)
-                    .bind(now)
-                    .bind(item_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                // 6. Record audit trail
-                let items_json = serde_json::to_string(item_instance_ids)?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    "#,
-                )
-                .bind(trade_id)
-                .bind(sender_guid as i64)
-                .bind(recipient_guid as i64)
-                .bind(&items_json)
-                .bind(TradeStatus::Committed.to_string())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok(TradeRecord {
-                    trade_id: trade_id.to_string(),
-                    sender_guid,
-                    recipient_guid,
-                    items_json,
-                    status: TradeStatus::Committed,
-                    created_at: now,
-                })
             }
             DbBackend::Postgres(pool) => {
                 let mut tx = pool.begin().await?;

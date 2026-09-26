@@ -7,3 +7,4 @@ resources:
   - director.yaml
   - node-statefulset.yaml
   - gateway.yaml
+  - loadtest.yaml

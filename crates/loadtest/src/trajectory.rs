@@ -46,6 +46,32 @@ impl WorldBounds {
     }
 }
 
+/// Behavior profile dictating bot movement and interaction styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BehaviorProfile {
+    #[default]
+    RandomWalk,
+    HotspotClustering,
+    CombatInteraction,
+}
+
+impl std::str::FromStr for BehaviorProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "random" | "randomwalk" | "random_walk" => Ok(BehaviorProfile::RandomWalk),
+            "hotspot" | "hotspotclustering" | "hotspot_clustering" => {
+                Ok(BehaviorProfile::HotspotClustering)
+            }
+            "combat" | "combatinteraction" | "combat_interaction" => {
+                Ok(BehaviorProfile::CombatInteraction)
+            }
+            other => Err(format!("Unknown behavior profile: {}", other)),
+        }
+    }
+}
+
 /// Kinematic trajectory controller for a single simulated bot.
 pub struct TrajectoryController {
     pub position: Vec3,
@@ -53,42 +79,79 @@ pub struct TrajectoryController {
     pub target: Vec3,
     pub max_speed: f32,
     pub bounds: WorldBounds,
+    pub profile: BehaviorProfile,
+    pub hotspot_center: Vec3,
+    pub hotspot_radius: f32,
 }
 
 impl TrajectoryController {
     /// Creates a new trajectory controller at the given start position.
     pub fn new(start: Vec3, max_speed: f32, bounds: WorldBounds) -> Self {
+        Self::with_profile(
+            start,
+            max_speed,
+            bounds,
+            BehaviorProfile::RandomWalk,
+            Vec3::ZERO,
+            50.0,
+        )
+    }
+
+    /// Creates a new trajectory controller with a specific behavior profile and hotspot parameters.
+    pub fn with_profile(
+        start: Vec3,
+        max_speed: f32,
+        bounds: WorldBounds,
+        profile: BehaviorProfile,
+        hotspot_center: Vec3,
+        hotspot_radius: f32,
+    ) -> Self {
         let mut ctrl = Self {
             position: bounds.clamp(start),
             velocity: Vec3::ZERO,
             target: Vec3::ZERO,
             max_speed,
             bounds,
+            profile,
+            hotspot_center,
+            hotspot_radius,
         };
         ctrl.pick_new_target();
         ctrl
     }
 
-    /// Selects a new target waypoint, deliberately picking across boundary planes.
+    /// Selects a new target waypoint based on active behavior profile.
     pub fn pick_new_target(&mut self) {
         let mut rng = rand::thread_rng();
 
-        // Pick a coordinate across the origin or quadrant boundary
-        let target_x = if self.position.x > 0.0 {
-            rng.gen_range(self.bounds.min.x..0.0)
-        } else {
-            rng.gen_range(0.0..self.bounds.max.x)
-        };
+        match self.profile {
+            BehaviorProfile::HotspotClustering => {
+                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                let r = rng.gen_range(0.0..self.hotspot_radius);
+                let target_x = self.hotspot_center.x + r * angle.cos();
+                let target_z = self.hotspot_center.z + r * angle.sin();
+                let target_y = self.hotspot_center.y;
+                self.target = self.bounds.clamp(Vec3::new(target_x, target_y, target_z));
+            }
+            BehaviorProfile::RandomWalk | BehaviorProfile::CombatInteraction => {
+                // Pick a coordinate across the origin or quadrant boundary
+                let target_x = if self.position.x > 0.0 {
+                    rng.gen_range(self.bounds.min.x..0.0)
+                } else {
+                    rng.gen_range(0.0..self.bounds.max.x)
+                };
 
-        let target_y = rng.gen_range(self.bounds.min.y..self.bounds.max.y);
+                let target_y = rng.gen_range(self.bounds.min.y..self.bounds.max.y);
 
-        let target_z = if self.position.z > 0.0 {
-            rng.gen_range(self.bounds.min.z..0.0)
-        } else {
-            rng.gen_range(0.0..self.bounds.max.z)
-        };
+                let target_z = if self.position.z > 0.0 {
+                    rng.gen_range(self.bounds.min.z..0.0)
+                } else {
+                    rng.gen_range(0.0..self.bounds.max.z)
+                };
 
-        self.target = Vec3::new(target_x, target_y, target_z);
+                self.target = Vec3::new(target_x, target_y, target_z);
+            }
+        }
     }
 
     /// Advances the trajectory by `dt_seconds` towards the target waypoint.
@@ -164,5 +227,54 @@ mod tests {
         assert!(ctrl.crosses_boundary_plane(Vec3::new(-5.0, 0.0, 5.0)));
         assert!(ctrl.crosses_boundary_plane(Vec3::new(5.0, 0.0, -5.0)));
         assert!(!ctrl.crosses_boundary_plane(Vec3::new(2.0, 0.0, 2.0)));
+    }
+
+    #[test]
+    fn test_hotspot_clustering_behavior() {
+        let bounds = WorldBounds::default_arena();
+        let hotspot_center = Vec3::new(20.0, 0.0, 20.0);
+        let hotspot_radius = 15.0;
+
+        let mut ctrl = TrajectoryController::with_profile(
+            Vec3::new(-50.0, 0.0, -50.0),
+            15.0,
+            bounds,
+            BehaviorProfile::HotspotClustering,
+            hotspot_center,
+            hotspot_radius,
+        );
+
+        // Advance several steps towards hotspot
+        for _ in 0..100 {
+            ctrl.step(0.1);
+        }
+
+        // Target should always be bounded by hotspot radius
+        let dist_to_center = ((ctrl.target.x - hotspot_center.x).powi(2)
+            + (ctrl.target.z - hotspot_center.z).powi(2))
+        .sqrt();
+        assert!(
+            dist_to_center <= hotspot_radius + 0.1,
+            "Target {:?} exceeds hotspot radius {}",
+            ctrl.target,
+            hotspot_radius
+        );
+    }
+
+    #[test]
+    fn test_behavior_profile_parsing() {
+        assert_eq!(
+            "random".parse::<BehaviorProfile>().unwrap(),
+            BehaviorProfile::RandomWalk
+        );
+        assert_eq!(
+            "hotspot".parse::<BehaviorProfile>().unwrap(),
+            BehaviorProfile::HotspotClustering
+        );
+        assert_eq!(
+            "combat".parse::<BehaviorProfile>().unwrap(),
+            BehaviorProfile::CombatInteraction
+        );
+        assert!("invalid".parse::<BehaviorProfile>().is_err());
     }
 }

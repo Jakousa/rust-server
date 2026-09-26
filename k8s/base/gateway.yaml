@@ -29,6 +29,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: ADMIN_ADDR
               value: "0.0.0.0:9091"
+            - name: GRPC_ADDR
+              value: "0.0.0.0:50050"
             - name: DIRECTOR_ADDR
               value: "http://mmo-director:50051"
             - name: DEFAULT_NODE_ADDR
@@ -42,6 +44,9 @@ spec:
               protocol: TCP
             - name: admin
               containerPort: 9091
+              protocol: TCP
+            - name: cluster-grpc
+              containerPort: 50050
               protocol: TCP
           livenessProbe:
             httpGet:
@@ -86,4 +91,8 @@ spec:
     - name: admin
       port: 9091
       targetPort: 9091
+      protocol: TCP
+    - name: cluster-grpc
+      port: 50050
+      targetPort: 50050
       protocol: TCP

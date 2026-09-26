@@ -169,7 +169,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match client.heartbeat(hb).await {
                 Ok(resp) => {
                     let inner = resp.into_inner();
-                    if inner.should_split {
+                    if !inner.acknowledged {
+                        let reg_req = RegisterNodeRequest {
+                            node_id: node_id as u32,
+                            listen_addr: listen_addr.to_string(),
+                            bounds: proto_bounds,
+                        };
+                        if let Ok(reg_resp) = client.register_node(reg_req).await {
+                            println!(
+                                "[Node {}] Re-registered with Director after unacknowledged heartbeat: success={}",
+                                node_id,
+                                reg_resp.into_inner().success
+                            );
+                        }
+                    } else if inner.should_split {
                         let proto_bounds = Some(BoundingBox {
                             min: Some(Vector3 {
                                 x: bounds.min.0,

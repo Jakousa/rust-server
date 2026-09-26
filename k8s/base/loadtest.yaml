@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-loadtest
+  namespace: mmo
+  labels:
+    app: mmo-loadtest
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: mmo-loadtest
+  template:
+    metadata:
+      labels:
+        app: mmo-loadtest
+    spec:
+      containers:
+        - name: loadtest
+          image: mmo-server:local
+          imagePullPolicy: IfNotPresent
+          command: ["mmo-loadtest"]
+          env:
+            - name: GATEWAY_ADDR
+              value: "mmo-gateway:8080"
+            - name: BOT_COUNT
+              value: "200"
+            - name: DURATION_SECS
+              value: "3600"
+            - name: BOT_BEHAVIOR
+              value: "hotspot"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"

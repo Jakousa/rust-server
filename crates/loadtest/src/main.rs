@@ -2,7 +2,8 @@
 
 use clap::Parser;
 use mmo_loadtest::swarm::{SwarmConfig, SwarmManager};
-use mmo_loadtest::trajectory::WorldBounds;
+use mmo_loadtest::trajectory::{BehaviorProfile, WorldBounds};
+use mmo_schema::client::Vec3;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,26 @@ struct Cli {
     /// Maximum movement speed (m/s)
     #[arg(long, default_value = "15.0")]
     max_speed: f32,
+
+    /// Bot behavior profile: random, hotspot, or combat
+    #[arg(long, env = "BOT_BEHAVIOR", default_value = "random")]
+    behavior: String,
+
+    /// Hotspot epicenter X coordinate
+    #[arg(long, default_value = "0.0")]
+    hotspot_x: f32,
+
+    /// Hotspot epicenter Y coordinate
+    #[arg(long, default_value = "0.0")]
+    hotspot_y: f32,
+
+    /// Hotspot epicenter Z coordinate
+    #[arg(long, default_value = "0.0")]
+    hotspot_z: f32,
+
+    /// Hotspot radius in meters
+    #[arg(long, default_value = "50.0")]
+    hotspot_radius: f32,
 }
 
 #[tokio::main]
@@ -41,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    let profile: BehaviorProfile = cli.behavior.parse().unwrap_or(BehaviorProfile::RandomWalk);
 
     println!("============================================================");
     println!("        MMO Engine Swarm Load Tester Initialized           ");
@@ -50,6 +72,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Duration          : {} seconds", cli.duration_secs);
     println!("Tick Rate         : {} Hz", cli.tick_rate);
     println!("Max Bot Speed     : {} m/s", cli.max_speed);
+    println!("Behavior Profile  : {:?}", profile);
+    if profile == BehaviorProfile::HotspotClustering {
+        println!(
+            "Hotspot Epicenter : ({}, {}, {}) [radius: {}m]",
+            cli.hotspot_x, cli.hotspot_y, cli.hotspot_z, cli.hotspot_radius
+        );
+    }
     println!("------------------------------------------------------------");
 
     let config = SwarmConfig {
@@ -61,6 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stagger_delay: Duration::from_millis(cli.stagger_ms),
         bounds: WorldBounds::default_arena(),
         max_bot_speed: cli.max_speed,
+        profile,
+        hotspot_center: Vec3::new(cli.hotspot_x, cli.hotspot_y, cli.hotspot_z),
+        hotspot_radius: cli.hotspot_radius,
     };
 
     let manager = SwarmManager::new(config);

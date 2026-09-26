@@ -5,3 +5,12 @@ resources:
   - ../../base
   - prometheus.yaml
   - grafana.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: grafana-dashboard-mmo-overview
+    namespace: mmo
+    files:
+      - dashboards/mmo-overview.json

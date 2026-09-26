@@ -142,6 +142,27 @@ impl SessionRouter {
         existed
     }
 
+    /// Reassigns all routes pointing to a dead or evacuated node to a new surviving node.
+    ///
+    /// This prevents traffic blackholing when an entire node crashes or terminates.
+    /// Returns the number of routes reassigned.
+    pub fn reassign_node_routes(&self, dead_node_address: &str, new_node_address: &str) -> usize {
+        let mut count = 0;
+        for mut entry in self.guid_to_node.iter_mut() {
+            if entry.value() == dead_node_address {
+                *entry.value_mut() = new_node_address.to_string();
+                count += 1;
+            }
+        }
+        for mut entry in self.session_to_node.iter_mut() {
+            if entry.value() == dead_node_address {
+                *entry.value_mut() = new_node_address.to_string();
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Resolves the authoritative node address for a given player GUID.
     pub fn get_route_by_guid(&self, guid: Guid) -> Option<String> {
         self.guid_to_node.get(&guid).map(|s| s.value().clone())
@@ -379,6 +400,43 @@ mod tests {
         assert_eq!(
             router.get_route_by_guid(guid2).as_deref(),
             Some("node2:50052")
+        );
+    }
+
+    #[test]
+    fn test_reassign_node_routes_on_node_blackout() {
+        let router = SessionRouter::new();
+        let guid1 = Guid::new(EntityType::Player, 1, 101);
+        let guid2 = Guid::new(EntityType::Player, 1, 102);
+        let guid3 = Guid::new(EntityType::Player, 1, 103);
+
+        router.register_session(1, guid1, "mmo-node-0.mmo-node:50052".into());
+        router.register_session(2, guid2, "mmo-node-0.mmo-node:50052".into());
+        router.register_session(3, guid3, "mmo-node-1.mmo-node:50052".into());
+
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("mmo-node-0.mmo-node:50052")
+        );
+
+        // When node 0 dies, reassign all its routes to node 1
+        let reassigned = router.reassign_node_routes(
+            "mmo-node-0.mmo-node:50052",
+            "mmo-node-1.mmo-node:50052",
+        );
+        assert_eq!(reassigned, 4); // 2 guids + 2 sessions
+
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("mmo-node-1.mmo-node:50052")
+        );
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("mmo-node-1.mmo-node:50052")
+        );
+        assert_eq!(
+            router.get_route_by_guid(guid3).as_deref(),
+            Some("mmo-node-1.mmo-node:50052")
         );
     }
 }

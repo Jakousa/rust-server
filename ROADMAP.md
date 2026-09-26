@@ -50,13 +50,21 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Batched statement execution in `save_snapshot_batch` eliminating network round-trip overhead.
   - Live PostgreSQL deployment in Kubernetes (`k8s/base/postgres.yaml`) with connection health telemetry.
 
+- [x] **Track 4: Kubernetes Scale & Chaos Testing (10k Bot Ingestion & Failover)**
+  - Enhanced headless bot swarm generator in `crates/loadtest` with `RandomWalk`, `HotspotClustering`, and `CombatInteraction` profiles.
+  - Jitter-tolerant movement kinematics validator in `crates/node` eliminating false-positive speed-hack snapbacks during high load bursts.
+  - Multi-pod horizontal scale-out deployment in `k8s/base/loadtest.yaml` targeting `mmo-gateway:8080`.
+  - Production Grafana overview dashboard (`k8s/overlays/local/dashboards/mmo-overview.json`) with live panels for 20 Hz tick percentiles (p50/p95/p99), tick overruns, CCU, packet throughput, drops, and persistence latency.
+  - Automated chaos test suite (`scripts/chaos.sh`) verifying autonomous dead-node detection within 3.5s, orphaned spatial partition recovery, Edge Gateway route propagation (200 routes updated), and StatefulSet node resurrection.
+  - Scaled benchmark with 1,000 bots delivering 15,967 packets/s, 0 snapback rejections, and p99 RTT latency of 1.58 ms.
+
 ---
 
 ## Next Engineering Roadmap
 
 ```mermaid
 flowchart LR
-    T4["Track 4: Scale & Chaos Testing\n(10k Bot Ingestion on K8s)"]
+    T5["Track 5: Distributed Combat & Ability System\n(Spellbook, GCD, Targeted Spells)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
 ```
 
 ---

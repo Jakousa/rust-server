@@ -5,7 +5,7 @@ CLUSTER_NAME="mmo-cluster"
 IMAGE_TAG="mmo-server:local"
 
 usage() {
-    echo "Usage: $0 {up|down|build|import|deploy|all|status|logs <app>}"
+    echo "Usage: $0 {up|down|build|import|deploy|reload|all|status|logs <app>}"
     echo ""
     echo "Commands:"
     echo "  up       Create local k3d cluster with MMO port forwards"
@@ -13,6 +13,7 @@ usage() {
     echo "  build    Build local Docker image (${IMAGE_TAG})"
     echo "  import   Import local Docker image into k3d"
     echo "  deploy   Apply Kubernetes manifests (k8s/overlays/local)"
+    echo "  reload   Full fast-iteration cycle: build -> import -> deploy -> rolling restart"
     echo "  all      Full workflow: up -> build -> import -> deploy"
     echo "  status   Show status of pods, services, and statefulsets in mmo namespace"
     echo "  logs     Tail logs for a service (e.g. mmo-director, mmo-node, mmo-gateway)"
@@ -69,12 +70,26 @@ cmd_logs() {
     kubectl logs -n mmo -l "app=${target}" -f
 }
 
+cmd_reload() {
+    cmd_build
+    cmd_import
+    cmd_deploy
+    echo "[k8s] Triggering rolling restart to pick up new image..."
+    kubectl rollout restart deployment/mmo-director deployment/mmo-gateway statefulset/mmo-node -n mmo
+    echo "[k8s] Waiting for rollouts to settle..."
+    kubectl rollout status deployment/mmo-director -n mmo --timeout=60s
+    kubectl rollout status deployment/mmo-gateway -n mmo --timeout=60s
+    kubectl rollout status statefulset/mmo-node -n mmo --timeout=60s
+    echo "[k8s] Cluster reload complete and verified healthy."
+}
+
 case "${1:-}" in
     up) cmd_up ;;
     down) cmd_down ;;
     build) cmd_build ;;
     import) cmd_import ;;
     deploy) cmd_deploy ;;
+    reload) cmd_reload ;;
     all)
         cmd_up
         cmd_build
