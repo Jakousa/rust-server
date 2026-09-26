@@ -5,7 +5,7 @@ CLUSTER_NAME="mmo-cluster"
 IMAGE_TAG="mmo-server:local"
 
 usage() {
-    echo "Usage: $0 {up|down|build|import|deploy|reload|all|status|logs <app>}"
+    echo "Usage: $0 {up|down|build|import|deploy|reload|all|status|logs <app>|loadtest|chaos}"
     echo ""
     echo "Commands:"
     echo "  up       Create local k3d cluster with MMO port forwards"
@@ -17,6 +17,8 @@ usage() {
     echo "  all      Full workflow: up -> build -> import -> deploy"
     echo "  status   Show status of pods, services, and statefulsets in mmo namespace"
     echo "  logs     Tail logs for a service (e.g. mmo-director, mmo-node, mmo-gateway)"
+    echo "  loadtest [bots] [duration] [behavior] Run bot swarm load test (defaults: 1000 bots, 10s, hotspot)"
+    echo "  chaos    Run end-to-end chaos failover & recovery test"
     exit 1
 }
 
@@ -83,6 +85,23 @@ cmd_reload() {
     echo "[k8s] Cluster reload complete and verified healthy."
 }
 
+cmd_loadtest() {
+    local bots="${1:-1000}"
+    local duration="${2:-10}"
+    local behavior="${3:-hotspot}"
+    echo "[LoadTest] Executing bot swarm against Gateway (127.0.0.1:8080)..."
+    echo "[LoadTest] Configuration: bots=${bots}, duration=${duration}s, behavior=${behavior}"
+    cargo run --release -p mmo-loadtest -- \
+        --gateway-addr 127.0.0.1:8080 \
+        --bots "${bots}" \
+        --duration-secs "${duration}" \
+        --behavior "${behavior}"
+}
+
+cmd_chaos() {
+    bash "$(dirname "$0")/chaos.sh"
+}
+
 case "${1:-}" in
     up) cmd_up ;;
     down) cmd_down ;;
@@ -98,5 +117,7 @@ case "${1:-}" in
         ;;
     status) cmd_status ;;
     logs) shift; cmd_logs "$@" ;;
+    loadtest) shift; cmd_loadtest "$@" ;;
+    chaos) cmd_chaos ;;
     *) usage ;;
 esac
