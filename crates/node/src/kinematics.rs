@@ -17,6 +17,8 @@ pub enum KinematicViolationReason {
     InvalidDeltaTime { dt: f32 },
     /// Non-finite (NaN or infinite) coordinates in new position.
     NonFiniteCoordinates,
+    /// Non-monotonic or replayed movement sequence number.
+    NonMonotonicSequence { seq: u32, last_seq: u32 },
 }
 
 impl fmt::Display for KinematicViolationReason {
@@ -43,6 +45,31 @@ impl fmt::Display for KinematicViolationReason {
             Self::NonFiniteCoordinates => {
                 write!(f, "non-finite coordinates detected")
             }
+            Self::NonMonotonicSequence { seq, last_seq } => {
+                write!(
+                    f,
+                    "non-monotonic sequence: packet seq {seq} <= last {last_seq}"
+                )
+            }
+        }
+    }
+}
+
+/// Server-side monotonic kinematic tracking state for an active entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityKinematicState {
+    pub last_move_time: std::time::Instant,
+    pub last_sequence: u32,
+    pub initialized: bool,
+}
+
+impl EntityKinematicState {
+    /// Creates a new uninitialized `EntityKinematicState` anchored to `initial_time`.
+    pub fn new(initial_time: std::time::Instant) -> Self {
+        Self {
+            last_move_time: initial_time,
+            last_sequence: 0,
+            initialized: false,
         }
     }
 }

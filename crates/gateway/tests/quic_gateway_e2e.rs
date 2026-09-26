@@ -10,7 +10,7 @@
 //! 7. Multi-client concurrent connections and broadcast fan-out.
 //! 8. Clean session sink cleanup upon client disconnection.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -26,7 +26,7 @@ use mmo_schema::client::{
 
 #[tokio::test]
 async fn test_quic_gateway_e2e_full_lifecycle() {
-    let router = Arc::new(RwLock::new(SessionRouter::new()));
+    let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(100);
     let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
 
@@ -87,7 +87,7 @@ async fn test_quic_gateway_e2e_full_lifecycle() {
         entity_id: player1_guid.raw(),
         position: Vec3::new(100.5, 20.0, -45.2),
         velocity: Vec3::new(5.0, 0.0, 0.0),
-        yaw: 3.14,
+        yaw: std::f32::consts::PI,
         pitch: -0.1,
         timestamp: 1_700_000_001,
         sequence: 42,

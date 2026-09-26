@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use mmo_gateway::{GatewayServer, SessionRouter};
 use mmo_storage::cache::{MemoryCache, RedisCache, SessionCacheBackend};
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Arc::new(MemoryCache::new()),
     };
 
-    let router = Arc::new(RwLock::new(SessionRouter::new()));
+    let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
     let server = Arc::new(
         GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache),
@@ -71,10 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let target_node = default_node_addr.clone();
 
                 // Register initial session routing to default node
-                {
-                    let mut r = server_clone.router().write().unwrap();
-                    r.register_session_fallback(session_id, target_node);
-                }
+                let _ = server_clone.register_session_fallback(session_id, target_node);
 
                 tokio::spawn(async move {
                     if let Err(e) = server_clone.handle_connection(socket, session_id).await {

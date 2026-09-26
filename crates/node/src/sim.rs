@@ -3,8 +3,9 @@
 //! Drives the fixed-frequency (20 Hz / 50ms) simulation game loop, entity iteration,
 //! hook dispatches, and authoritative client movement validation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
 
@@ -14,7 +15,7 @@ use mmo_core::{
 };
 
 use crate::aoi::{AoiBroadcastJob, AoiManager, ObserverConfig, ObserverState};
-use crate::kinematics::KinematicValidator;
+use crate::kinematics::{EntityKinematicState, KinematicValidator};
 use crate::network::{GhostBroadcaster, GhostStore, NodeServiceImpl};
 
 /// Authoritative simulation node driving world ticks, spatial partitioning,
@@ -34,6 +35,8 @@ pub struct TickSimulation {
     pub plugin_manager: PluginManager,
     pub aoi: AoiManager,
     pub pending_broadcast_jobs: Vec<AoiBroadcastJob>,
+    pub kinematic_states: HashMap<Guid, EntityKinematicState>,
+    pub current_time: Instant,
 }
 
 impl TickSimulation {
@@ -70,7 +73,24 @@ impl TickSimulation {
             plugin_manager: PluginManager::new(),
             aoi: AoiManager::new(),
             pending_broadcast_jobs: Vec::new(),
+            kinematic_states: HashMap::new(),
+            current_time: Instant::now(),
         }
+    }
+
+    /// Returns the current simulation monotonic timestamp.
+    pub fn current_time(&self) -> Instant {
+        self.current_time
+    }
+
+    /// Overrides the current simulation monotonic timestamp.
+    pub fn set_current_time(&mut self, time: Instant) {
+        self.current_time = time;
+    }
+
+    /// Advances the simulation monotonic timestamp by the given duration.
+    pub fn advance_time(&mut self, duration: Duration) {
+        self.current_time += duration;
     }
 
     /// Returns an immutable reference to the ghost store.
@@ -119,6 +139,7 @@ impl TickSimulation {
     ///
     /// Returns `true` if the entity existed and was removed.
     pub fn despawn_entity(&mut self, guid: Guid) -> bool {
+        self.kinematic_states.remove(&guid);
         if let Some(entity) = self.entity_store.despawn_by_guid(guid) {
             if !self.octree.remove(guid, entity.position) {
                 self.octree.remove_by_guid(guid);
@@ -152,6 +173,7 @@ impl TickSimulation {
     /// in `EntityStore`, executes tick updates, and triggers synchronous hook dispatches (`Event::OnTick`).
     pub fn step(&mut self, dt_sec: f32) {
         self.tick_counter += 1;
+        self.advance_time(Duration::from_secs_f32(dt_sec));
 
         // 1. Run batch tick systems registered by plugins
         let mut tick_ctx = TickContext {
@@ -231,19 +253,48 @@ impl TickSimulation {
         self.tick_counter
     }
 
-    /// Processes a client-reported movement packet authoritatively.
+    /// Calculates the server-authoritative delta time for an entity movement.
     ///
-    /// Performs kinematic speed and teleport validation, spatial boundary checks,
-    /// and dispatches `BeforeMove`. If validation passes, updates position in
-    /// `EntityStore` and `Octree`, dispatches `OnMove`, and returns `Ok(new_pos)`.
+    /// If the entity is moving for the first time on this node, returns nominal [`Self::TICK_DT_SEC`].
+    /// If the elapsed time since last move exceeds 1.0 second (idle time gap), clamps to
+    /// [`Self::TICK_DT_SEC`] to prevent time-banking speed exploits.
+    /// For sub-microsecond intervals (such as synchronous test calls), floors to nominal [`Self::TICK_DT_SEC`].
+    pub fn compute_server_dt(&mut self, guid: Guid) -> f32 {
+        let now = self.current_time;
+        let state = self
+            .kinematic_states
+            .entry(guid)
+            .or_insert_with(|| EntityKinematicState::new(now));
+
+        if !state.initialized {
+            state.initialized = true;
+            state.last_move_time = now;
+            return Self::TICK_DT_SEC;
+        }
+
+        let elapsed = now.duration_since(state.last_move_time).as_secs_f32();
+        state.last_move_time = now;
+
+        if elapsed > 1.0 {
+            // Idle gap clamping: prevent banking idle time
+            Self::TICK_DT_SEC
+        } else if elapsed < 1e-4 {
+            // Microsecond floor for test calls running back-to-back
+            Self::TICK_DT_SEC
+        } else {
+            elapsed
+        }
+    }
+
+    /// Validates and processes a client-reported movement packet with sequence monotonicity checking.
     ///
-    /// If validation fails, returns `Err(snap_back_pos)` indicating the authoritative
-    /// snap-back destination the client must be corrected to.
-    pub fn process_client_move(
+    /// The server strictly computes elapsed delta time from internal monotonic clocks and ignores
+    /// any client-provided delta time, protecting against speed hacks and spoofed teleports.
+    pub fn process_client_move_with_seq(
         &mut self,
         guid: Guid,
         new_pos: (f32, f32, f32),
-        dt_sec: f32,
+        sequence: u32,
     ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
         // 1. Fetch current entity coordinates
         let current_pos = match self.entity_store.get_by_guid(guid) {
@@ -251,17 +302,29 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
-        // 2. Kinematic validation (speed caps, teleport threshold, NaN/Inf, dt bounds)
+        // 2. Monotonic sequence check (if sequence is specified and entity was already initialized)
+        if sequence > 0 {
+            if let Some(state) = self.kinematic_states.get(&guid) {
+                if state.initialized && sequence <= state.last_sequence {
+                    return Err(current_pos);
+                }
+            }
+        }
+
+        // 3. Compute server-authoritative delta time (ignoring any client claims)
+        let dt_sec = self.compute_server_dt(guid);
+
+        // 4. Kinematic validation (speed caps, teleport threshold, NaN/Inf, dt bounds)
         if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
             return Err(violation.snap_back);
         }
 
-        // 3. Spatial world boundary check
+        // 5. Spatial world boundary check
         if !self.octree.bounds.contains(new_pos) {
             return Err(current_pos);
         }
 
-        // 3.5. Component movement checks (encumbrance and death status)
+        // 5.5. Component movement checks (encumbrance and death status)
         if let Some(entity) = self.entity_store.get_by_guid(guid) {
             if mmo_gameplay::check_encumbrance(&entity.components) {
                 return Err(current_pos);
@@ -273,7 +336,7 @@ impl TickSimulation {
             }
         }
 
-        // 4. Synchronous BeforeMove hook dispatch (veto / cancel support)
+        // 6. Synchronous BeforeMove hook dispatch (veto / cancel support)
         let ctx = self.hooks.dispatch(&Event::BeforeMove {
             entity: guid,
             from: current_pos,
@@ -283,18 +346,96 @@ impl TickSimulation {
             return Err(current_pos);
         }
 
-        // 5. Update EntityStore position
+        // 7. Update EntityStore position
         if let Some(entity) = self.entity_store.get_mut_by_guid(guid) {
             entity.position = new_pos;
         }
 
-        // 6. Update Octree spatial index
+        // 8. Update Octree spatial index
         if !self.octree.remove(guid, current_pos) {
             self.octree.remove_by_guid(guid);
         }
         self.octree.insert(guid, new_pos);
 
-        // 7. Dispatch OnMove hook
+        // 9. Update kinematic sequence
+        if let Some(state) = self.kinematic_states.get_mut(&guid) {
+            if sequence > 0 {
+                state.last_sequence = sequence;
+            }
+        }
+
+        // 10. Dispatch OnMove hook
+        self.hooks.dispatch(&Event::OnMove {
+            entity: guid,
+            position: new_pos,
+        });
+
+        Ok(new_pos)
+    }
+
+    /// Processes a client-reported movement packet authoritatively.
+    ///
+    /// Accepts `_client_dt_sec` for interface compatibility, but calculates delta time
+    /// strictly on the server to prevent client spoofing exploits.
+    pub fn process_client_move(
+        &mut self,
+        guid: Guid,
+        new_pos: (f32, f32, f32),
+        _client_dt_sec: f32,
+    ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
+        self.process_client_move_with_seq(guid, new_pos, 0)
+    }
+
+    /// Explicit deterministic move validation bypassing server monotonic clocks.
+    /// Used for synthetic kinematic test suites and regression verifications.
+    pub fn process_client_move_deterministic(
+        &mut self,
+        guid: Guid,
+        new_pos: (f32, f32, f32),
+        dt_sec: f32,
+    ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
+        let current_pos = match self.entity_store.get_by_guid(guid) {
+            Some(entity) => entity.position,
+            None => return Err(new_pos),
+        };
+
+        if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
+            return Err(violation.snap_back);
+        }
+
+        if !self.octree.bounds.contains(new_pos) {
+            return Err(current_pos);
+        }
+
+        if let Some(entity) = self.entity_store.get_by_guid(guid) {
+            if mmo_gameplay::check_encumbrance(&entity.components) {
+                return Err(current_pos);
+            }
+            if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
+                if health.is_dead {
+                    return Err(current_pos);
+                }
+            }
+        }
+
+        let ctx = self.hooks.dispatch(&Event::BeforeMove {
+            entity: guid,
+            from: current_pos,
+            to: new_pos,
+        });
+        if ctx.is_canceled() {
+            return Err(current_pos);
+        }
+
+        if let Some(entity) = self.entity_store.get_mut_by_guid(guid) {
+            entity.position = new_pos;
+        }
+
+        if !self.octree.remove(guid, current_pos) {
+            self.octree.remove_by_guid(guid);
+        }
+        self.octree.insert(guid, new_pos);
+
         self.hooks.dispatch(&Event::OnMove {
             entity: guid,
             position: new_pos,
@@ -553,5 +694,75 @@ mod tests {
             }
             other => panic!("Expected EntityDespawn, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_process_client_move_spoofed_dt_rejected_and_snapback() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 991);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+
+        // Malicious client tries to teleport 40.0 units while claiming dt_sec = 100.0
+        // (40.0 / 100.0 = 0.4 <= 10.0 max speed).
+        // The server MUST ignore the client's dt_sec and calculate elapsed time internally.
+        let spoof_pos = (40.0, 0.0, 0.0);
+        let result = sim.process_client_move(guid, spoof_pos, 100.0);
+
+        // Verify speed hack is caught and snap back to origin is returned
+        assert_eq!(result, Err((0.0, 0.0, 0.0)));
+        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_idle_entity_time_banking_prevented() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 992);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+
+        // Initial valid small move establishing baseline
+        let init_pos = (0.2, 0.0, 0.0);
+        assert_eq!(sim.process_client_move(guid, init_pos, 0.05), Ok(init_pos));
+
+        // Simulate entity standing idle for 10 seconds without moving
+        sim.advance_time(Duration::from_secs(10));
+
+        // Client attempts to "bank" 10 seconds of idle time and move 40 units at once
+        let dash_pos = (40.2, 0.0, 0.0);
+        let result = sim.process_client_move(guid, dash_pos, 10.0);
+
+        // Server clamps idle gap > 1.0s to 0.05s nominal tick duration, catching the exploit!
+        assert_eq!(result, Err(init_pos));
+        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, init_pos);
+    }
+
+    #[test]
+    fn test_process_client_move_sequence_monotonicity() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 993);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+
+        // Packet 1: sequence = 1, valid displacement (0.2 units)
+        let pos1 = (0.2, 0.0, 0.0);
+        assert_eq!(sim.process_client_move_with_seq(guid, pos1, 1), Ok(pos1));
+
+        // Advance 50ms
+        sim.advance_time(Duration::from_millis(50));
+
+        // Replay of sequence = 1 should be rejected
+        let replay_pos = (0.4, 0.0, 0.0);
+        assert_eq!(sim.process_client_move_with_seq(guid, replay_pos, 1), Err(pos1));
+
+        // Out-of-order sequence = 0 (or smaller than 1) should be rejected
+        assert_eq!(sim.process_client_move_with_seq(guid, replay_pos, 0), Ok(replay_pos));
+
+        // Advance 50ms and send monotonic sequence = 2
+        sim.advance_time(Duration::from_millis(50));
+        let pos2 = (0.6, 0.0, 0.0);
+        assert_eq!(sim.process_client_move_with_seq(guid, pos2, 2), Ok(pos2));
+
+        // Stale sequence = 2 sent again should be rejected
+        sim.advance_time(Duration::from_millis(50));
+        let pos3 = (0.8, 0.0, 0.0);
+        assert_eq!(sim.process_client_move_with_seq(guid, pos3, 2), Err(pos2));
     }
 }

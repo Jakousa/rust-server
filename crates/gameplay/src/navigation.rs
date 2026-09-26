@@ -145,6 +145,7 @@ impl TickSystem for NavSteeringSystem {
         "NavSteeringSystem"
     }
 
+    #[allow(clippy::type_complexity)]
     fn update(&mut self, ctx: &mut TickContext) {
         // Collect entity moves to apply in octree
         let mut updates: Vec<(Guid, (f32, f32, f32), (f32, f32, f32))> = Vec::new();

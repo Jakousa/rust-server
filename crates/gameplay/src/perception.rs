@@ -59,6 +59,7 @@ impl TickSystem for PerceptionScanSystem {
         "PerceptionScanSystem"
     }
 
+    #[allow(clippy::type_complexity)]
     fn update(&mut self, ctx: &mut TickContext) {
         // Collect observers ready to scan: (observer_guid, observer_pos, sight_radius, hostile_factions)
         let mut scans: Vec<(Guid, (f32, f32, f32), f32, Vec<u32>)> = Vec::new();

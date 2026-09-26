@@ -9,7 +9,7 @@
 //! 6. Component changes (e.g. `HealthComponent` damage) within view trigger updated `EntityState`.
 //! 7. High-density entity clusters trigger dynamic radius throttling.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -29,7 +29,7 @@ use mmo_schema::client::ClientPacket;
 #[tokio::test]
 async fn test_end_to_end_aoi_broadcasting_lifecycle() {
     // 1. Initialize GatewayServer on ephemeral port
-    let router = Arc::new(RwLock::new(SessionRouter::new()));
+    let router = Arc::new(SessionRouter::new());
     let (packet_tx, _packet_rx) = mpsc::channel(100);
     let gateway = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
 
@@ -105,12 +105,12 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
     }
 
     // --- PHASE 2: Player B moves into range (from 55m to 46m) -> Enter: EntityState received ---
-    sim.process_client_move(player_b, (46.0, 0.0, 0.0), 1.0)
+    sim.process_client_move_deterministic(player_b, (46.0, 0.0, 0.0), 1.0)
         .expect("valid move into range");
     sim.entity_store
         .get_mut_by_guid(player_b)
         .unwrap()
-        .rotation = 3.14;
+        .rotation = std::f32::consts::PI;
 
     forward_aoi_broadcasts(&mut sim, &gateway).await;
 
@@ -130,13 +130,13 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
         ClientPacket::EntityState(state) => {
             assert_eq!(state.entity_id, player_b.raw());
             assert_eq!(state.position.x, 46.0);
-            assert_eq!(state.yaw, 3.14);
+            assert_eq!(state.yaw, std::f32::consts::PI);
         }
         other => panic!("Expected EntityState on enter, got {:?}", other),
     }
 
     // --- PHASE 3: Continuous Movement inside range (from 46m to 38m) -> Delta update ---
-    sim.process_client_move(player_b, (38.0, 0.0, 0.0), 1.0)
+    sim.process_client_move_deterministic(player_b, (38.0, 0.0, 0.0), 1.0)
         .expect("valid move closer");
 
     forward_aoi_broadcasts(&mut sim, &gateway).await;

@@ -173,6 +173,7 @@ impl TickSystem for SpawnerSystem {
         "SpawnerSystem"
     }
 
+    #[allow(clippy::type_complexity)]
     fn update(&mut self, ctx: &mut TickContext) {
         // Collect living GUIDs to prune dead/missing spawns without borrowing conflicts
         let living_guids: std::collections::HashSet<Guid> = ctx

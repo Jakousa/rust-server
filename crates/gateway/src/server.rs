@@ -4,12 +4,12 @@
 //! `mmo_schema::client::ClientPacket::decode_frame`, extracting acting GUIDs / session IDs,
 //! and dynamically dispatching packets to authoritative simulation nodes via `SessionRouter`.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,17 +94,17 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
 /// and dynamically routing packets based on `SessionRouter` tables.
 #[derive(Clone)]
 pub struct PacketDispatcher {
-    router: Arc<RwLock<SessionRouter>>,
+    router: Arc<SessionRouter>,
 }
 
 impl PacketDispatcher {
-    /// Creates a new `PacketDispatcher` backed by a shared `SessionRouter`.
-    pub fn new(router: Arc<RwLock<SessionRouter>>) -> Self {
+    /// Creates a new `PacketDispatcher` backed by a shared lock-free `SessionRouter`.
+    pub fn new(router: Arc<SessionRouter>) -> Self {
         Self { router }
     }
 
     /// Accesses the underlying shared router.
-    pub fn router(&self) -> &Arc<RwLock<SessionRouter>> {
+    pub fn router(&self) -> &Arc<SessionRouter> {
         &self.router
     }
 
@@ -116,8 +116,7 @@ impl PacketDispatcher {
         session_id: u64,
         packet: ClientPacket,
     ) -> Result<RoutedPacket, GatewayError> {
-        let router = self.router.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Self::dispatch_with_router(&router, session_id, packet)
+        Self::dispatch_with_router(&self.router, session_id, packet)
     }
 
     /// Dispatches a single client packet using a direct reference to a `SessionRouter`.
@@ -136,7 +135,7 @@ impl PacketDispatcher {
             Some(addr) => Ok(RoutedPacket {
                 session_id,
                 guid,
-                node_address: addr.to_string(),
+                node_address: addr,
                 packet,
             }),
             None => Err(GatewayError::NoRouteFound { session_id, guid }),
@@ -152,8 +151,7 @@ impl PacketDispatcher {
         session_id: u64,
         buffer: &mut BytesMut,
     ) -> Result<Vec<RoutedPacket>, GatewayError> {
-        let router = self.router.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Self::process_frames_with_router(&router, session_id, buffer)
+        Self::process_frames_with_router(&self.router, session_id, buffer)
     }
 
     /// Frames and decodes client packets directly against a given `SessionRouter`.
@@ -171,21 +169,48 @@ impl PacketDispatcher {
     }
 }
 
+/// RAII guard that ensures session routes, sinks, and writer tasks are cleanly
+/// deregistered when a client connection handler terminates or is cancelled.
+pub struct SessionDropGuard {
+    pub session_id: u64,
+    pub router: Arc<SessionRouter>,
+    pub session_sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
+    pub cache: Option<Arc<dyn SessionCacheBackend>>,
+    pub writer_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SessionDropGuard {
+    fn drop(&mut self) {
+        let _ = self.router.remove_session(self.session_id);
+        self.session_sinks.remove(&self.session_id);
+        if let Some(ref handle) = self.writer_handle {
+            handle.abort();
+        }
+        if let Some(ref cache) = self.cache {
+            let cache = cache.clone();
+            let session_id = self.session_id;
+            tokio::spawn(async move {
+                let _ = cache.remove_session(session_id).await;
+            });
+        }
+    }
+}
+
 /// Gateway server managing connection lifecycles, streaming packet framing,
 /// dynamic routing to authoritative simulation nodes, and optional distributed session caching.
 pub struct GatewayServer {
-    router: Arc<RwLock<SessionRouter>>,
+    router: Arc<SessionRouter>,
     dispatcher: PacketDispatcher,
     session_counter: Arc<AtomicU64>,
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     cache: Option<Arc<dyn SessionCacheBackend>>,
     social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
-    session_sinks: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
+    session_sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
 }
 
 impl GatewayServer {
     /// Creates a new `GatewayServer` with the given routing table.
-    pub fn new(router: Arc<RwLock<SessionRouter>>) -> Self {
+    pub fn new(router: Arc<SessionRouter>) -> Self {
         let dispatcher = PacketDispatcher::new(router.clone());
         Self {
             router,
@@ -194,13 +219,13 @@ impl GatewayServer {
             packet_tx: None,
             cache: None,
             social_bus: None,
-            session_sinks: Arc::new(RwLock::new(HashMap::new())),
+            session_sinks: Arc::new(DashMap::new()),
         }
     }
 
     /// Creates a new `GatewayServer` that emits all routed packets into an `mpsc::Sender`.
     pub fn with_packet_channel(
-        router: Arc<RwLock<SessionRouter>>,
+        router: Arc<SessionRouter>,
         packet_tx: mpsc::Sender<RoutedPacket>,
     ) -> Self {
         let dispatcher = PacketDispatcher::new(router.clone());
@@ -211,7 +236,7 @@ impl GatewayServer {
             packet_tx: Some(packet_tx),
             cache: None,
             social_bus: None,
-            session_sinks: Arc::new(RwLock::new(HashMap::new())),
+            session_sinks: Arc::new(DashMap::new()),
         }
     }
 
@@ -258,7 +283,7 @@ impl GatewayServer {
     }
 
     /// Accesses the underlying `SessionRouter`.
-    pub fn router(&self) -> &Arc<RwLock<SessionRouter>> {
+    pub fn router(&self) -> &Arc<SessionRouter> {
         &self.router
     }
 
@@ -284,8 +309,17 @@ impl GatewayServer {
         guid: Guid,
         node_address: String,
     ) -> Result<(), GatewayError> {
-        let mut router = self.router.write().map_err(|_| GatewayError::LockPoisoned)?;
-        router.register_session(session_id, guid, node_address);
+        self.router.register_session(session_id, guid, node_address);
+        Ok(())
+    }
+
+    /// Registers a fallback route for a session in the gateway routing table.
+    pub fn register_session_fallback(
+        &self,
+        session_id: u64,
+        node_address: String,
+    ) -> Result<(), GatewayError> {
+        self.router.register_session_fallback(session_id, node_address);
         Ok(())
     }
 
@@ -316,20 +350,17 @@ impl GatewayServer {
 
     /// Updates the destination route for a player during seamless node handovers.
     pub fn update_route(&self, guid: Guid, new_node_address: String) -> Result<bool, GatewayError> {
-        let mut router = self.router.write().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(router.update_route(guid, new_node_address))
+        Ok(self.router.update_route(guid, new_node_address))
     }
 
     /// Resolves the current authoritative route for a player GUID.
     pub fn get_route_by_guid(&self, guid: Guid) -> Result<Option<String>, GatewayError> {
-        let router = self.router.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(router.get_route_by_guid(guid).map(|s| s.to_string()))
+        Ok(self.router.get_route_by_guid(guid))
     }
 
     /// Resolves the current authoritative route for a session ID.
     pub fn get_route_by_session(&self, session_id: u64) -> Result<Option<String>, GatewayError> {
-        let router = self.router.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(router.get_route_by_session(session_id).map(|s| s.to_string()))
+        Ok(self.router.get_route_by_session(session_id))
     }
 
     /// Resolves the authoritative route for a session ID. Checks local router first,
@@ -356,8 +387,12 @@ impl GatewayServer {
 
     /// Removes a session from the routing table.
     pub fn remove_session(&self, session_id: u64) -> Result<Option<Guid>, GatewayError> {
-        let mut router = self.router.write().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(router.remove_session(session_id))
+        Ok(self.router.remove_session(session_id))
+    }
+
+    /// Removes a session synchronously without allocating or erroring.
+    pub fn remove_session_sync(&self, session_id: u64) -> Option<Guid> {
+        self.router.remove_session(session_id)
     }
 
     /// Removes a session from the local routing table and distributed cache.
@@ -378,8 +413,7 @@ impl GatewayServer {
         session_id: u64,
         sender: mpsc::Sender<Bytes>,
     ) -> Result<(), GatewayError> {
-        let mut sinks = self.session_sinks.write().map_err(|_| GatewayError::LockPoisoned)?;
-        sinks.insert(session_id, sender);
+        self.session_sinks.insert(session_id, sender);
         Ok(())
     }
 
@@ -388,35 +422,34 @@ impl GatewayServer {
         &self,
         session_id: u64,
     ) -> Result<Option<mpsc::Sender<Bytes>>, GatewayError> {
-        let mut sinks = self.session_sinks.write().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(sinks.remove(&session_id))
+        Ok(self.session_sinks.remove(&session_id).map(|(_, s)| s))
     }
 
     /// Returns the number of active downstream session sinks.
     pub fn active_sink_count(&self) -> Result<usize, GatewayError> {
-        let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(sinks.len())
+        Ok(self.session_sinks.len())
     }
 
     /// Checks if a downstream session sink is registered for the given session ID.
     pub fn has_session_sink(&self, session_id: u64) -> Result<bool, GatewayError> {
-        let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
-        Ok(sinks.contains_key(&session_id))
+        Ok(self.session_sinks.contains_key(&session_id))
     }
 
-    /// Sends raw framed bytes downstream to a specific client session.
+    /// Sends raw framed bytes downstream to a specific client session without blocking.
     pub async fn send_bytes_to_session(
         &self,
         session_id: u64,
         bytes: Bytes,
     ) -> Result<bool, GatewayError> {
-        let sender = {
-            let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
-            sinks.get(&session_id).cloned()
-        };
-
-        if let Some(tx) = sender {
-            Ok(tx.send(bytes).await.is_ok())
+        if let Some(entry) = self.session_sinks.get(&session_id) {
+            match entry.value().try_send(bytes) {
+                Ok(_) => Ok(true),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Buffer saturated - slow consumer drop
+                    Ok(false)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(false),
+            }
         } else {
             Ok(false)
         }
@@ -432,17 +465,12 @@ impl GatewayServer {
         self.send_bytes_to_session(session_id, encoded).await
     }
 
-    /// Broadcasts a `ClientPacket` to all connected client sessions.
+    /// Broadcasts a `ClientPacket` non-blockingly to all connected client sessions.
     pub async fn broadcast_packet(&self, packet: &ClientPacket) -> Result<usize, GatewayError> {
         let encoded = Bytes::from(packet.encode());
-        let senders: Vec<mpsc::Sender<Bytes>> = {
-            let sinks = self.session_sinks.read().map_err(|_| GatewayError::LockPoisoned)?;
-            sinks.values().cloned().collect()
-        };
-
         let mut sent_count = 0;
-        for tx in senders {
-            if tx.send(encoded.clone()).await.is_ok() {
+        for entry in self.session_sinks.iter() {
+            if entry.value().try_send(encoded.clone()).is_ok() {
                 sent_count += 1;
             }
         }
@@ -475,6 +503,14 @@ impl GatewayServer {
             }
         });
 
+        let _drop_guard = SessionDropGuard {
+            session_id,
+            router: self.router.clone(),
+            session_sinks: self.session_sinks.clone(),
+            cache: self.cache.clone(),
+            writer_handle: Some(writer_handle),
+        };
+
         let mut buf = BytesMut::with_capacity(8192);
 
         loop {
@@ -505,12 +541,6 @@ impl GatewayServer {
             }
         }
 
-        // Clean up downstream session sink and writer task on disconnect
-        let _ = self.remove_session_sink(session_id);
-        writer_handle.abort();
-
-        // Clean up session route and cache entry on disconnect
-        let _ = self.remove_session_with_cache(session_id).await;
         Ok(())
     }
 
@@ -554,10 +584,8 @@ impl GatewayServer {
             while let Some(bytes) = downstream_rx.recv().await {
                 let is_ephemeral = is_ephemeral_packet(&bytes);
                 let mut sent_datagram = false;
-                if is_ephemeral {
-                    if conn_writer.send_datagram(bytes.clone()).is_ok() {
-                        sent_datagram = true;
-                    }
+                if is_ephemeral && conn_writer.send_datagram(bytes.clone()).is_ok() {
+                    sent_datagram = true;
                 }
                 if !sent_datagram {
                     let mut lock = active_stream_writer.lock().await;
@@ -574,6 +602,14 @@ impl GatewayServer {
                 }
             }
         });
+
+        let _drop_guard = SessionDropGuard {
+            session_id,
+            router: self.router.clone(),
+            session_sinks: self.session_sinks.clone(),
+            cache: self.cache.clone(),
+            writer_handle: Some(downstream_handle),
+        };
 
         loop {
             tokio::select! {
@@ -651,12 +687,6 @@ impl GatewayServer {
             }
         }
 
-        // Clean up downstream session sink and task on disconnect
-        let _ = self.remove_session_sink(session_id);
-        downstream_handle.abort();
-
-        // Clean up session route and cache entry on disconnect
-        let _ = self.remove_session_with_cache(session_id).await;
         Ok(())
     }
 }
@@ -690,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_framing_and_dispatch_mock_client_packets() {
-        let mut router = SessionRouter::new();
+        let router = SessionRouter::new();
         let player_guid = Guid::new(EntityType::Player, 1, 100);
         let session_id = 1;
         let node_addr = "127.0.0.1:50051".to_string();
@@ -760,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_route_handoff_seamless_packet_routing() {
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let dispatcher = PacketDispatcher::new(router.clone());
 
         let player_guid = Guid::new(EntityType::Player, 1, 555);
@@ -769,10 +799,7 @@ mod tests {
         let node2 = "127.0.0.1:50052".to_string();
 
         // Step 1: Initial registration to Node 1
-        {
-            let mut r = router.write().unwrap();
-            r.register_session(session_id, player_guid, node1.clone());
-        }
+        router.register_session(session_id, player_guid, node1.clone());
 
         // Step 2: Client sends movement packet #1 while in Node 1's domain
         let pkt1 = ClientPacket::Movement(MovementPacket {
@@ -810,11 +837,8 @@ mod tests {
         assert_eq!(routed2[0].node_address, node1);
 
         // Step 4: Player crosses boundary! Simulation triggers seamless handover to Node 2.
-        {
-            let mut r = router.write().unwrap();
-            let updated = r.update_route(player_guid, node2.clone());
-            assert!(updated, "Route should exist and be updated");
-        }
+        let updated = router.update_route(player_guid, node2.clone());
+        assert!(updated, "Route should exist and be updated");
 
         // Step 5: Client sends movement packet #3 and #4 immediately without reconnecting
         let pkt3 = ClientPacket::Movement(MovementPacket {
@@ -853,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_unrouted_packet_returns_error() {
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let dispatcher = PacketDispatcher::new(router);
 
         let unk_guid = Guid::new(EntityType::Player, 9, 999);
@@ -881,7 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_server_tcp_listener_and_packet_stream() {
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let (packet_tx, mut packet_rx) = mpsc::channel(16);
 
         let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
@@ -938,7 +962,7 @@ mod tests {
     async fn test_gateway_server_with_cache_backend() {
         use mmo_storage::cache::MemoryCache;
 
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let cache = Arc::new(MemoryCache::new());
         let server = GatewayServer::new(router).with_cache(cache.clone());
 
@@ -968,7 +992,7 @@ mod tests {
         assert_eq!(cached.node_address, node_addr);
 
         // 2. Clear local router to simulate separate gateway replica resolving route from cache
-        server.router().write().unwrap().clear();
+        server.router().clear();
         assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
 
         // Resolving route via resolve_route_or_cache should query cache and populate local router
@@ -988,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_session_sink_registry() {
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let server = GatewayServer::new(router);
 
         let (tx1, mut rx1) = mpsc::channel(16);
@@ -1025,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_downstream_packet_streaming() {
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let (packet_tx, _packet_rx) = mpsc::channel(100);
         let server = GatewayServer::with_packet_channel(router.clone(), packet_tx);
 
@@ -1128,7 +1152,7 @@ mod tests {
     async fn test_gateway_quic_server_datagram_and_stream_handling() {
         use crate::quic::QuicClientSession;
 
-        let router = Arc::new(RwLock::new(SessionRouter::new()));
+        let router = Arc::new(SessionRouter::new());
         let (packet_tx, mut packet_rx) = mpsc::channel(100);
         let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
 
@@ -1233,6 +1257,42 @@ mod tests {
         client.close(0, "normal test close");
         let _ = server_task.await;
         assert!(!server.has_session_sink(session_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_session_drop_guard_on_task_abort() {
+        let router = Arc::new(SessionRouter::new());
+        let server = Arc::new(GatewayServer::new(router));
+
+        let listener = server.bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let session_id = 555;
+        let player_guid = Guid::new(EntityType::Player, 1, 555);
+        let node_addr = "127.0.0.1:50051".to_string();
+        server.register_session(session_id, player_guid, node_addr).unwrap();
+
+        let srv = server.clone();
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = srv.handle_connection(socket, session_id).await;
+        });
+
+        let client = TcpStream::connect(local_addr).await.unwrap();
+
+        // Wait brief moment for handle_connection to set up sink
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(server.has_session_sink(session_id).unwrap());
+        assert!(server.get_route_by_session(session_id).unwrap().is_some());
+
+        // Abort the server task violently
+        handle.abort();
+        let _ = handle.await;
+
+        // Verify RAII cleanup was triggered despite task abort
+        assert!(!server.has_session_sink(session_id).unwrap());
+        assert_eq!(server.get_route_by_session(session_id).unwrap(), None);
+        drop(client);
     }
 }
 

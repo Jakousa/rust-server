@@ -13,7 +13,7 @@
 //! - Post-handover authoritative movement and interaction on Node 2
 
 use bytes::BytesMut;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use mmo_core::guid::{EntityType, Guid};
 use mmo_core::BoundingBox3D;
@@ -56,17 +56,14 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     // ------------------------------------------------------------------------
     // Step 3: Initialize Edge Gateway
     // ------------------------------------------------------------------------
-    let router = Arc::new(RwLock::new(SessionRouter::new()));
+    let router = Arc::new(SessionRouter::new());
     let dispatcher = PacketDispatcher::new(router.clone());
 
     let session_id = 9001u64;
     let player_guid = Guid::new(EntityType::Player, 1, 42);
 
     // Register initial player session routed to Node 1
-    {
-        let mut r = router.write().unwrap();
-        r.register_session(session_id, player_guid, node1_addr.clone());
-    }
+    router.register_session(session_id, player_guid, node1_addr.clone());
 
     // Spawn player authoritatively on Node 1 at (-3.0, 0.0, 0.0)
     let spawned = node1_sim.spawn_entity(player_guid, (-3.0, 0.0, 0.0));
@@ -169,13 +166,10 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     assert!(node2_bounds.contains(target_pos));
 
     // Dynamic handoff: Edge Gateway updates routing table
-    {
-        let mut r = router.write().unwrap();
-        let updated = r.update_route(player_guid, node2_addr.clone());
-        assert!(updated, "Existing route should be updated");
-        assert_eq!(r.get_route_by_guid(player_guid), Some(node2_addr.as_str()));
-        assert_eq!(r.get_route_by_session(session_id), Some(node2_addr.as_str()));
-    }
+    let updated = router.update_route(player_guid, node2_addr.clone());
+    assert!(updated, "Existing route should be updated");
+    assert_eq!(router.get_route_by_guid(player_guid).as_deref(), Some(node2_addr.as_str()));
+    assert_eq!(router.get_route_by_session(session_id).as_deref(), Some(node2_addr.as_str()));
 
     // Authoritative entity handoff:
     // Node 1 despawns player from its simulation

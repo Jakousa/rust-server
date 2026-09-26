@@ -1,5 +1,6 @@
 //! Generated Protocol and Schema definitions
 
+#[allow(clippy::result_large_err)]
 pub mod cluster {
     tonic::include_proto!("mmo.cluster");
 }

@@ -6,8 +6,7 @@ use std::sync::Arc;
 use mmo_core::guid::EntityType;
 use mmo_core::{BoundingBox3D, Guid};
 use mmo_gameplay::{
-    CombatPlugin, GuildManager, GuildMemberComponent, GuildPlugin, GuildRank, InventoryComponent,
-    InventoryPlugin, ItemStack, PartyManager, PartyMemberComponent, PartyPlugin, TradePlugin,
+    CombatPlugin, GuildPlugin, InventoryPlugin, PartyManager, PartyMemberComponent, PartyPlugin,
 };
 use mmo_node::sim::TickSimulation;
 use mmo_storage::{
@@ -78,7 +77,6 @@ async fn test_cross_node_social_bus_and_party_sync() {
     let mut party_events_rx = social_bus.subscribe("party:events").await.unwrap();
 
     let mut party_mgr_node1 = PartyManager::new();
-    let mut party_mgr_node2 = PartyManager::new();
 
     // P1 (Node 1) creates party
     let party_id = party_mgr_node1.create_party(p1_guid).unwrap();

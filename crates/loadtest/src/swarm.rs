@@ -129,12 +129,10 @@ impl SwarmManager {
                                                     }
                                                 }
                                             }
-                                            ClientPacket::MovementCorrection(corr) => {
-                                                if corr.entity_id == guid.raw() {
-                                                    metrics.record_snapback();
-                                                    traj.position = corr.corrected_position;
-                                                    traj.velocity = Vec3::ZERO;
-                                                }
+                                            ClientPacket::MovementCorrection(corr) if corr.entity_id == guid.raw() => {
+                                                metrics.record_snapback();
+                                                traj.position = corr.corrected_position;
+                                                traj.velocity = Vec3::ZERO;
                                             }
                                             _ => {}
                                         }

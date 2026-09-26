@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mmo_core::guid::{EntityType, Guid};
+use mmo_core::guid::Guid;
 use mmo_core::{BoundingBox3D, EntityStore, Event, Octree};
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::node_service_server::{NodeService, NodeServiceServer};
@@ -32,7 +32,24 @@ pub enum RemoteCommandErrorCode {
     Success = 0,
     EntityNotFound = 1,
     Vetoed = 2,
+    MalformedPayload = 3,
 }
+
+/// Network errors encountered during inter-node communication and packet processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkError {
+    MalformedPayload(String),
+}
+
+impl std::fmt::Display for NetworkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedPayload(msg) => write!(f, "Malformed payload: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for NetworkError {}
 
 /// Record representing a replicated ghost entity on a boundary node.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,13 +180,24 @@ impl GhostStore {
 /// Helper function extracting the initiator GUID from a [`RemoteCommandRequest`].
 ///
 /// If payload contains at least 8 bytes, decodes the first 8 bytes as a little-endian GUID.
-/// Otherwise, constructs a fallback Player GUID tagged with `source_node_id`.
-pub fn extract_initiator(req: &RemoteCommandRequest) -> Guid {
-    if req.payload.len() >= 8 {
-        Guid::from_raw(u64::from_le_bytes(req.payload[0..8].try_into().unwrap()))
-    } else {
-        Guid::new(EntityType::Player, req.source_node_id as u16, 0)
+/// Returns an error if the payload is less than 8 bytes or decodes to an invalid (zero) GUID.
+pub fn extract_initiator(req: &RemoteCommandRequest) -> Result<Guid, NetworkError> {
+    if req.payload.len() < 8 {
+        return Err(NetworkError::MalformedPayload(
+            "Remote command payload missing initiator GUID (minimum 8 bytes required)".to_string(),
+        ));
     }
+    let raw = u64::from_le_bytes(
+        req.payload[0..8]
+            .try_into()
+            .map_err(|_| NetworkError::MalformedPayload("Invalid payload slice".to_string()))?,
+    );
+    if raw == 0 {
+        return Err(NetworkError::MalformedPayload(
+            "Remote command initiator GUID cannot be zero".to_string(),
+        ));
+    }
+    Ok(Guid::from_raw(raw))
 }
 
 /// Constructs a [`RemoteCommandRequest`] encoding the initiator GUID into the payload.
@@ -222,7 +250,17 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<tonic::Response<RemoteCommandResponse>, tonic::Status> {
         let req = request.into_inner();
         let target = Guid::from_raw(req.guid);
-        let initiator = extract_initiator(&req);
+        let initiator = match extract_initiator(&req) {
+            Ok(init) => init,
+            Err(e) => {
+                return Ok(tonic::Response::new(RemoteCommandResponse {
+                    success: false,
+                    error_code: RemoteCommandErrorCode::MalformedPayload as u32,
+                    error_message: e.to_string(),
+                    result: Vec::new(),
+                }));
+            }
+        };
 
         let sim = self.sim.read().await;
 
@@ -467,6 +505,7 @@ impl GhostBroadcaster {
     }
 
     /// Sends a [`GhostSyncRequest`] using an established Tonic client channel.
+    #[allow(clippy::result_large_err)]
     pub async fn send_sync_to_channel(
         client: &mut NodeServiceClient<tonic::transport::Channel>,
         request: GhostSyncRequest,
@@ -476,6 +515,7 @@ impl GhostBroadcaster {
     }
 
     /// Sends a [`GhostSyncRequest`] to a gRPC endpoint URL.
+    #[allow(clippy::result_large_err)]
     pub async fn send_sync_to_endpoint(
         endpoint: &str,
         request: GhostSyncRequest,
@@ -625,6 +665,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_command_malformed_initiator_rejected() {
+        let sim = TickSimulation::new(1, test_bounds()).into_shared();
+        let target_guid = Guid::new(EntityType::Npc, 1, 60);
+
+        {
+            let mut s = sim.write().await;
+            assert!(s.spawn_entity(target_guid, (0.0, 0.0, 0.0)));
+        }
+
+        let service = NodeServiceImpl::new(sim);
+
+        // Case 1: Undersized payload (< 8 bytes)
+        let req_short = RemoteCommandRequest {
+            guid: target_guid.raw(),
+            action_id: 1,
+            payload: vec![1, 2, 3],
+            source_node_id: 2,
+            target_node_id: 1,
+        };
+        assert!(extract_initiator(&req_short).is_err());
+
+        let resp_short = service
+            .remote_command(tonic::Request::new(req_short))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_short.success);
+        assert_eq!(
+            resp_short.error_code,
+            RemoteCommandErrorCode::MalformedPayload as u32
+        );
+        assert!(resp_short.error_message.contains("missing initiator GUID"));
+
+        // Case 2: Zero initiator GUID (8 zero bytes)
+        let req_zero = RemoteCommandRequest {
+            guid: target_guid.raw(),
+            action_id: 1,
+            payload: vec![0u8; 8],
+            source_node_id: 2,
+            target_node_id: 1,
+        };
+        assert!(extract_initiator(&req_zero).is_err());
+
+        let resp_zero = service
+            .remote_command(tonic::Request::new(req_zero))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_zero.success);
+        assert_eq!(
+            resp_zero.error_code,
+            RemoteCommandErrorCode::MalformedPayload as u32
+        );
+        assert!(resp_zero.error_message.contains("cannot be zero"));
+    }
+
+    #[tokio::test]
     async fn test_ghost_entity_sync_insert_update_and_query() {
         let sim = TickSimulation::new(1, test_bounds()).into_shared();
         let service = NodeServiceImpl::new(sim.clone());
@@ -689,7 +786,7 @@ mod tests {
                     y: 0.2,
                     z: 0.0,
                 }),
-                yaw: 3.14,
+                yaw: std::f32::consts::PI,
                 pitch: 0.1,
                 component_data: vec![1, 2, 3, 4],
                 last_tick: 60,
@@ -712,7 +809,7 @@ mod tests {
             let ghost = s.ghost_store.get(ghost_guid).expect("ghost must exist");
             assert_eq!(ghost.position, (97.5, 1.0, 0.0));
             assert_eq!(ghost.velocity, (0.5, 0.2, 0.0));
-            assert_eq!(ghost.yaw, 3.14);
+            assert_eq!(ghost.yaw, std::f32::consts::PI);
             assert_eq!(ghost.last_tick, 60);
 
             // Radius query finds it

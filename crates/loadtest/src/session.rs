@@ -122,12 +122,10 @@ impl BotSession {
                         }
                     }
                 }
-                ClientPacket::MovementCorrection(corr) => {
-                    if corr.entity_id == self.guid.raw() {
-                        self.snapback_count += 1;
-                        self.current_position = corr.corrected_position;
-                        self.current_velocity = Vec3::ZERO;
-                    }
+                ClientPacket::MovementCorrection(corr) if corr.entity_id == self.guid.raw() => {
+                    self.snapback_count += 1;
+                    self.current_position = corr.corrected_position;
+                    self.current_velocity = Vec3::ZERO;
                 }
                 _ => {}
             }
