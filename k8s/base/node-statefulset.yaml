@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmo-node
+  namespace: mmo
+  labels:
+    app: mmo-node
+spec:
+  serviceName: mmo-node
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mmo-node
+  template:
+    metadata:
+      labels:
+        app: mmo-node
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "50052"
+    spec:
+      containers:
+        - name: node
+          image: mmo-server:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              export NODE_ID=$((ORDINAL + 1))
+              echo "Starting simulation node with dynamic NODE_ID=${NODE_ID} (hostname: ${HOSTNAME})"
+              exec mmo-node
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:50052"
+            - name: DIRECTOR_ADDR
+              value: "http://mmo-director:50051"
+            - name: DATABASE_URL
+              value: "sqlite:///tmp/mmo.db"
+          ports:
+            - name: grpc
+              containerPort: 50052
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-node
+  namespace: mmo
+  labels:
+    app: mmo-node
+spec:
+  clusterIP: None
+  selector:
+    app: mmo-node
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: 50052
+      protocol: TCP

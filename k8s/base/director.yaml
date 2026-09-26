@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-director
+  namespace: mmo
+  labels:
+    app: mmo-director
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mmo-director
+  template:
+    metadata:
+      labels:
+        app: mmo-director
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "50051"
+    spec:
+      containers:
+        - name: director
+          image: mmo-server:local
+          imagePullPolicy: IfNotPresent
+          command: ["mmo-director"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-director
+  namespace: mmo
+  labels:
+    app: mmo-director
+spec:
+  type: ClusterIP
+  selector:
+    app: mmo-director
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP

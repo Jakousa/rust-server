@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-gateway
+  namespace: mmo
+  labels:
+    app: mmo-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mmo-gateway
+  template:
+    metadata:
+      labels:
+        app: mmo-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+        - name: gateway
+          image: mmo-server:local
+          imagePullPolicy: IfNotPresent
+          command: ["mmo-gateway"]
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: DIRECTOR_ADDR
+              value: "http://mmo-director:50051"
+            - name: DEFAULT_NODE_ADDR
+              value: "mmo-node-0.mmo-node:50052"
+          ports:
+            - name: quic-udp
+              containerPort: 8080
+              protocol: UDP
+            - name: http-tcp
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-gateway
+  namespace: mmo
+  labels:
+    app: mmo-gateway
+spec:
+  type: LoadBalancer
+  selector:
+    app: mmo-gateway
+  ports:
+    - name: quic-udp
+      port: 8080
+      targetPort: 8080
+      protocol: UDP
+    - name: http-tcp
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
