@@ -5,6 +5,7 @@
 //! - [`combat`]: Health status, armor mitigation, batch tick regeneration, and damage event processing.
 //! - [`trade`]: Atomic two-player trade transactions with mutual confirmation and distance guards.
 
+pub mod ability;
 pub mod ai_brain;
 pub mod combat;
 pub mod guild;
@@ -18,6 +19,10 @@ pub mod spawner;
 pub mod threat;
 pub mod trade;
 
+pub use ability::{
+    execute_or_start_ability, AbilityDefinition, AbilityExecutedEvent, AbilityPlugin,
+    AbilityTickSystem, CooldownTracker,
+};
 pub use ai_brain::{FsmBrainComponent, FsmBrainSystem, FsmState, MonsterAiPlugin};
 pub use combat::{
     process_damage_events, CombatPlugin, DamageEvent, EntityDiedEvent, HealthComponent,
