@@ -152,7 +152,8 @@ pub fn process_damage_events(
             None => continue,
         };
 
-        let effective_damage = if let Some(stats) = target_entity.get_component::<StatsComponent>() {
+        let effective_damage = if let Some(stats) = target_entity.get_component::<StatsComponent>()
+        {
             stats.mitigate_damage(dmg.raw_damage)
         } else {
             dmg.raw_damage

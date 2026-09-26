@@ -388,9 +388,15 @@ impl GhostBroadcaster {
 
     /// Calculates the minimum perpendicular distance from a position to any of the 6 bounding box faces.
     pub fn distance_to_bounds(bounds: &BoundingBox3D, pos: (f32, f32, f32)) -> f32 {
-        let dx = (pos.0 - bounds.min.0).abs().min((bounds.max.0 - pos.0).abs());
-        let dy = (pos.1 - bounds.min.1).abs().min((bounds.max.1 - pos.1).abs());
-        let dz = (pos.2 - bounds.min.2).abs().min((bounds.max.2 - pos.2).abs());
+        let dx = (pos.0 - bounds.min.0)
+            .abs()
+            .min((bounds.max.0 - pos.0).abs());
+        let dy = (pos.1 - bounds.min.1)
+            .abs()
+            .min((bounds.max.1 - pos.1).abs());
+        let dz = (pos.2 - bounds.min.2)
+            .abs()
+            .min((bounds.max.2 - pos.2).abs());
         dx.min(dy).min(dz)
     }
 

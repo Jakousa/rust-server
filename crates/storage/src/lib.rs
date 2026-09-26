@@ -14,4 +14,3 @@ pub use social::{
     ChatChannel, ChatMessage, GuildSyncAction, MemorySocialBus, PartyAction, RedisSocialBus,
     SocialBus, SocialBusError, SocialEnvelope,
 };
-

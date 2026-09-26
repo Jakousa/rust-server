@@ -56,8 +56,8 @@ impl Database {
 
     /// Creates an in-memory SQLite database for unit tests and local isolation.
     pub async fn connect_memory() -> Result<Self, StorageError> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
-            .busy_timeout(Duration::from_secs(5));
+        let opts =
+            SqliteConnectOptions::from_str("sqlite::memory:")?.busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)

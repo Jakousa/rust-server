@@ -50,7 +50,10 @@ impl ThreatTableComponent {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.target == target) {
             entry.threat += amount;
         } else if self.entries.len() < self.max_entries {
-            self.entries.push(ThreatEntry { target, threat: amount });
+            self.entries.push(ThreatEntry {
+                target,
+                threat: amount,
+            });
         } else {
             // Table full: replace the entry with the lowest threat if new threat is higher
             if let Some((idx, lowest)) = self
@@ -60,7 +63,10 @@ impl ThreatTableComponent {
                 .min_by(|a, b| a.1.threat.partial_cmp(&b.1.threat).unwrap())
             {
                 if amount > lowest.threat {
-                    self.entries[idx] = ThreatEntry { target, threat: amount };
+                    self.entries[idx] = ThreatEntry {
+                        target,
+                        threat: amount,
+                    };
                 } else {
                     return;
                 }
@@ -279,7 +285,10 @@ mod tests {
         let mut leash = LeashComponent::new((0.0, 0.0, 0.0), 10.0);
         leash.is_leashed_out = false;
 
-        store.get_mut(monster_key).unwrap().add_component(ThreatTableComponent::default_combat());
+        store
+            .get_mut(monster_key)
+            .unwrap()
+            .add_component(ThreatTableComponent::default_combat());
         store.get_mut(monster_key).unwrap().add_component(leash);
 
         let player_guid = Guid::new(EntityType::Player, 1, 20);

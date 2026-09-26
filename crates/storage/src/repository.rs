@@ -187,7 +187,7 @@ impl CharacterRepository {
             UPDATE characters
             SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
             WHERE guid = ?
-            "#
+            "#,
         )
         .bind(snapshot.position.0)
         .bind(snapshot.position.1)
@@ -202,7 +202,10 @@ impl CharacterRepository {
     }
 
     /// Batch saves a slice of entity snapshots inside a single transaction.
-    pub async fn save_snapshot_batch(&self, snapshots: &[EntitySnapshot]) -> Result<usize, StorageError> {
+    pub async fn save_snapshot_batch(
+        &self,
+        snapshots: &[EntitySnapshot],
+    ) -> Result<usize, StorageError> {
         if snapshots.is_empty() {
             return Ok(0);
         }
@@ -243,7 +246,7 @@ impl CharacterRepository {
                 UPDATE characters
                 SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
                 WHERE guid = ?
-                "#
+                "#,
             )
             .bind(snap.position.0)
             .bind(snap.position.1)
@@ -319,7 +322,10 @@ mod tests {
         assert_eq!(fetched.position, (10.0, 0.0, 20.0));
 
         // 4. Update coordinates
-        let updated = repo.update_character_position(1001, (15.0, 1.0, 25.0), 1.57).await.unwrap();
+        let updated = repo
+            .update_character_position(1001, (15.0, 1.0, 25.0), 1.57)
+            .await
+            .unwrap();
         assert!(updated);
 
         let refetched = repo.get_character(1001).await.unwrap().unwrap();
@@ -350,7 +356,10 @@ mod tests {
             timestamp: 1000,
         };
 
-        let count = repo.save_snapshot_batch(&[snap1.clone(), snap2]).await.unwrap();
+        let count = repo
+            .save_snapshot_batch(&[snap1.clone(), snap2])
+            .await
+            .unwrap();
         assert_eq!(count, 2);
 
         let loaded = repo.get_snapshot(5001).await.unwrap().unwrap();

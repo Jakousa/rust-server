@@ -59,7 +59,8 @@ fn bench_octree_queries(c: &mut Criterion) {
 
     group.bench_function("find_boundary_neighbors", |b| {
         b.iter(|| {
-            let neighbors = octree.find_boundary_neighbors(black_box((10.0, 10.0, 10.0)), black_box(5.0));
+            let neighbors =
+                octree.find_boundary_neighbors(black_box((10.0, 10.0, 10.0)), black_box(5.0));
             black_box(neighbors);
         });
     });

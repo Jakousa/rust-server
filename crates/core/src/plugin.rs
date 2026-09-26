@@ -44,7 +44,9 @@ impl<T> TypedComponentCodec<T> {
     }
 }
 
-impl<T: 'static + Send + Sync + Serialize + DeserializeOwned> ComponentCodec for TypedComponentCodec<T> {
+impl<T: 'static + Send + Sync + Serialize + DeserializeOwned> ComponentCodec
+    for TypedComponentCodec<T>
+{
     fn type_name(&self) -> &'static str {
         self.name
     }
@@ -406,10 +408,7 @@ mod tests {
         );
 
         let mut store = ComponentStore::new();
-        store.add_component(MockHealth {
-            hp: 50,
-            max_hp: 50,
-        });
+        store.add_component(MockHealth { hp: 50, max_hp: 50 });
         let json = codecs.serialize_all(&store);
         assert!(json.get("health").is_some());
     }

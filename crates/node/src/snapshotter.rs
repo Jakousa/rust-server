@@ -30,7 +30,11 @@ pub struct WriteBehindSnapshotter {
 impl WriteBehindSnapshotter {
     /// Creates a new `WriteBehindSnapshotter` connected to a `CharacterRepository` with default limits.
     pub fn new(repository: CharacterRepository) -> Self {
-        Self::with_limits(repository, DEFAULT_MAX_DIRTY_CAPACITY, DEFAULT_FLUSH_CHUNK_SIZE)
+        Self::with_limits(
+            repository,
+            DEFAULT_MAX_DIRTY_CAPACITY,
+            DEFAULT_FLUSH_CHUNK_SIZE,
+        )
     }
 
     /// Creates a new `WriteBehindSnapshotter` with explicit dirty queue capacity and chunk size.

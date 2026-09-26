@@ -170,7 +170,11 @@ impl NodeRegistry {
             .min_by(|a, b| {
                 a.entity_count
                     .cmp(&b.entity_count)
-                    .then_with(|| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| {
+                        a.cpu_percent
+                            .partial_cmp(&b.cpu_percent)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| a.node_id.cmp(&b.node_id))
             })
             .map(|n| n.node_id);
@@ -181,7 +185,11 @@ impl NodeRegistry {
                 .min_by(|a, b| {
                     a.entity_count
                         .cmp(&b.entity_count)
-                        .then_with(|| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| {
+                            a.cpu_percent
+                                .partial_cmp(&b.cpu_percent)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .then_with(|| a.node_id.cmp(&b.node_id))
                 })
                 .map(|n| n.node_id)

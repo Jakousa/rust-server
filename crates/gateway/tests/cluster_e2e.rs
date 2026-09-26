@@ -85,7 +85,9 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     let mut frame_buf = BytesMut::new();
     frame_buf.extend_from_slice(&ClientPacket::Movement(move_pkt1.clone()).encode());
 
-    let routed_packets = dispatcher.process_frames(session_id, &mut frame_buf).unwrap();
+    let routed_packets = dispatcher
+        .process_frames(session_id, &mut frame_buf)
+        .unwrap();
     assert_eq!(routed_packets.len(), 1);
     assert_eq!(routed_packets[0].node_address, node1_addr);
     assert_eq!(routed_packets[0].session_id, session_id);
@@ -110,7 +112,9 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     frame_buf.clear();
     frame_buf.extend_from_slice(&ClientPacket::Movement(move_pkt2.clone()).encode());
 
-    let routed_packets = dispatcher.process_frames(session_id, &mut frame_buf).unwrap();
+    let routed_packets = dispatcher
+        .process_frames(session_id, &mut frame_buf)
+        .unwrap();
     assert_eq!(routed_packets[0].node_address, node1_addr);
 
     // Node 1 processes move
@@ -168,8 +172,14 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     // Dynamic handoff: Edge Gateway updates routing table
     let updated = router.update_route(player_guid, node2_addr.clone());
     assert!(updated, "Existing route should be updated");
-    assert_eq!(router.get_route_by_guid(player_guid).as_deref(), Some(node2_addr.as_str()));
-    assert_eq!(router.get_route_by_session(session_id).as_deref(), Some(node2_addr.as_str()));
+    assert_eq!(
+        router.get_route_by_guid(player_guid).as_deref(),
+        Some(node2_addr.as_str())
+    );
+    assert_eq!(
+        router.get_route_by_session(session_id).as_deref(),
+        Some(node2_addr.as_str())
+    );
 
     // Authoritative entity handoff:
     // Node 1 despawns player from its simulation
@@ -201,7 +211,9 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     frame_buf.clear();
     frame_buf.extend_from_slice(&ClientPacket::Movement(move_pkt3.clone()).encode());
 
-    let routed_packets = dispatcher.process_frames(session_id, &mut frame_buf).unwrap();
+    let routed_packets = dispatcher
+        .process_frames(session_id, &mut frame_buf)
+        .unwrap();
     assert_eq!(routed_packets.len(), 1);
     assert_eq!(
         routed_packets[0].node_address, node2_addr,
@@ -225,7 +237,9 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     frame_buf.clear();
     frame_buf.extend_from_slice(&ClientPacket::Interaction(interact_pkt).encode());
 
-    let routed_packets = dispatcher.process_frames(session_id, &mut frame_buf).unwrap();
+    let routed_packets = dispatcher
+        .process_frames(session_id, &mut frame_buf)
+        .unwrap();
     assert_eq!(routed_packets.len(), 1);
     assert_eq!(routed_packets[0].node_address, node2_addr);
     assert_eq!(routed_packets[0].guid, Some(player_guid));

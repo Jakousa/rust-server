@@ -6,7 +6,10 @@ use mmo_loadtest::trajectory::WorldBounds;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "mmo-loadtest", about = "Headless Bot Swarm Load Tester for Distributed MMO Engine")]
+#[command(
+    name = "mmo-loadtest",
+    about = "Headless Bot Swarm Load Tester for Distributed MMO Engine"
+)]
 struct Cli {
     /// Gateway network address to target
     #[arg(long, env = "GATEWAY_ADDR", default_value = "127.0.0.1:8080")]
@@ -67,8 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("                   LOAD TEST SUMMARY                        ");
     println!("============================================================");
     println!("Duration           : {:.2} s", snapshot.duration_secs);
-    println!("Packets Sent       : {} ({:.1} pkts/s)", snapshot.total_packets_sent, snapshot.send_rate_pps);
-    println!("Packets Received   : {} ({:.1} pkts/s)", snapshot.total_packets_received, snapshot.recv_rate_pps);
+    println!(
+        "Packets Sent       : {} ({:.1} pkts/s)",
+        snapshot.total_packets_sent, snapshot.send_rate_pps
+    );
+    println!(
+        "Packets Received   : {} ({:.1} pkts/s)",
+        snapshot.total_packets_received, snapshot.recv_rate_pps
+    );
     println!("Snapback Rejections: {}", snapshot.snapbacks);
     println!("Connection Errors  : {}", snapshot.connection_errors);
     println!("------------------------------------------------------------");

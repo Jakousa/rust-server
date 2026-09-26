@@ -5,9 +5,9 @@ use mmo_core::guid::EntityType;
 use mmo_core::{BoundingBox3D, Entity, Guid};
 use mmo_gameplay::{
     process_damage_events, CombatPlugin, DamageEvent, GuildManager, GuildMemberComponent,
-    GuildPlugin, GuildRank, HealthComponent, InventoryComponent, InventoryPlugin, LootContainerComponent,
-    LootEntry, LootPlugin, LootTable, QuestLogComponent, QuestObjective, QuestPlugin, QuestRecord,
-    QuestStatus, StatsComponent, TradePlugin,
+    GuildPlugin, GuildRank, HealthComponent, InventoryComponent, InventoryPlugin,
+    LootContainerComponent, LootEntry, LootPlugin, LootTable, QuestLogComponent, QuestObjective,
+    QuestPlugin, QuestRecord, QuestStatus, StatsComponent, TradePlugin,
 };
 use mmo_node::sim::TickSimulation;
 use mmo_node::snapshotter::WriteBehindSnapshotter;
@@ -37,7 +37,9 @@ async fn test_full_mmo_content_loop_integration() {
 
     let mut guild_mgr = GuildManager::new();
     let guild_id = guild_mgr.create_guild("Dragon Slayers", leader_guid, 10);
-    guild_mgr.add_member(guild_id, player_guid, GuildRank::Officer).unwrap();
+    guild_mgr
+        .add_member(guild_id, player_guid, GuildRank::Officer)
+        .unwrap();
 
     // 3. Spawn Player entity with components
     assert!(sim.spawn_entity(player_guid, (0.0, 0.0, 0.0)));
@@ -113,7 +115,9 @@ async fn test_full_mmo_content_loop_integration() {
     {
         let mut monster_loot = {
             let monster = sim.entity_store.get_mut_by_guid(monster_guid).unwrap();
-            monster.remove_component::<LootContainerComponent>().unwrap()
+            monster
+                .remove_component::<LootContainerComponent>()
+                .unwrap()
         };
 
         let player = sim.entity_store.get_mut_by_guid(player_guid).unwrap();
@@ -143,7 +147,10 @@ async fn test_full_mmo_content_loop_integration() {
     }
 
     let guild = guild_mgr.get_guild(guild_id).unwrap();
-    assert_eq!(guild.vault.slots[0].as_ref().unwrap().name, "Wolf Fang Trophy");
+    assert_eq!(
+        guild.vault.slots[0].as_ref().unwrap().name,
+        "Wolf Fang Trophy"
+    );
 
     // 11. Persistence: Verify full component snapshot serialization and recovery
     let db = Database::connect_memory().await.unwrap();
@@ -171,9 +178,13 @@ async fn test_full_mmo_content_loop_integration() {
     .unwrap();
     assert_eq!(restored, 5); // inventory, health, stats, quest_log, guild_member
 
-    let restored_quest_log = restored_player.get_component::<QuestLogComponent>().unwrap();
+    let restored_quest_log = restored_player
+        .get_component::<QuestLogComponent>()
+        .unwrap();
     assert!(restored_quest_log.completed_quests.contains(&1));
-    let restored_guild = restored_player.get_component::<GuildMemberComponent>().unwrap();
+    let restored_guild = restored_player
+        .get_component::<GuildMemberComponent>()
+        .unwrap();
     assert_eq!(restored_guild.guild_id, guild_id);
     assert_eq!(restored_guild.rank, GuildRank::Officer);
 }

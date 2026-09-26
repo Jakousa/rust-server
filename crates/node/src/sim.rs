@@ -205,12 +205,9 @@ impl TickSimulation {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut aoi_jobs = self.aoi.update_observers(
-            &self.entity_store,
-            &self.octree,
-            self.tick_counter,
-            now_ms,
-        );
+        let mut aoi_jobs =
+            self.aoi
+                .update_observers(&self.entity_store, &self.octree, self.tick_counter, now_ms);
         self.pending_broadcast_jobs.append(&mut aoi_jobs);
     }
 
@@ -508,7 +505,10 @@ mod tests {
         assert_eq!(result, Ok(target_pos));
 
         // EntityStore updated
-        let entity = sim.entity_store.get_by_guid(guid).expect("entity must exist");
+        let entity = sim
+            .entity_store
+            .get_by_guid(guid)
+            .expect("entity must exist");
         assert_eq!(entity.position, target_pos);
 
         // Octree updated
@@ -531,7 +531,10 @@ mod tests {
         assert_eq!(result, Err(start_pos));
 
         // Authoritative entity store remains unchanged
-        let entity = sim.entity_store.get_by_guid(guid).expect("entity must exist");
+        let entity = sim
+            .entity_store
+            .get_by_guid(guid)
+            .expect("entity must exist");
         assert_eq!(entity.position, start_pos);
 
         // Octree index still reflects original position
@@ -735,7 +738,10 @@ mod tests {
 
         // Verify speed hack is caught and snap back to origin is returned
         assert_eq!(result, Err((0.0, 0.0, 0.0)));
-        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, (0.0, 0.0, 0.0));
+        assert_eq!(
+            sim.entity_store.get_by_guid(guid).unwrap().position,
+            (0.0, 0.0, 0.0)
+        );
     }
 
     #[test]
@@ -757,7 +763,10 @@ mod tests {
 
         // Server clamps idle gap > 1.0s to 0.05s nominal tick duration, catching the exploit!
         assert_eq!(result, Err(init_pos));
-        assert_eq!(sim.entity_store.get_by_guid(guid).unwrap().position, init_pos);
+        assert_eq!(
+            sim.entity_store.get_by_guid(guid).unwrap().position,
+            init_pos
+        );
     }
 
     #[test]
@@ -775,10 +784,16 @@ mod tests {
 
         // Replay of sequence = 1 should be rejected
         let replay_pos = (0.4, 0.0, 0.0);
-        assert_eq!(sim.process_client_move_with_seq(guid, replay_pos, 1), Err(pos1));
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, replay_pos, 1),
+            Err(pos1)
+        );
 
         // Out-of-order sequence = 0 (or smaller than 1) should be rejected
-        assert_eq!(sim.process_client_move_with_seq(guid, replay_pos, 0), Ok(replay_pos));
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, replay_pos, 0),
+            Ok(replay_pos)
+        );
 
         // Advance 50ms and send monotonic sequence = 2
         sim.advance_time(Duration::from_millis(50));

@@ -182,7 +182,10 @@ mod tests {
         octree.insert(monster_guid, (0.0, 0.0, 0.0));
 
         let perception = PerceptionComponent::new(15.0, 2, vec![1]); // Monster faction 2, hostile to 1
-        store.get_mut(monster_key).unwrap().add_component(perception);
+        store
+            .get_mut(monster_key)
+            .unwrap()
+            .add_component(perception);
         store
             .get_mut(monster_key)
             .unwrap()

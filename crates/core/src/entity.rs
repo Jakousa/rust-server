@@ -29,7 +29,8 @@ impl ComponentStore {
 
     /// Attaches a component to the store. Replaces any existing component of the same type.
     pub fn add_component<T: 'static + Send + Sync>(&mut self, component: T) {
-        self.components.insert(TypeId::of::<T>(), Box::new(component));
+        self.components
+            .insert(TypeId::of::<T>(), Box::new(component));
     }
 
     /// Retrieves an immutable reference to the component of type `T`, if present.
@@ -360,7 +361,9 @@ mod tests {
         assert!(entity.has_component::<PlayerName>());
         assert!(!entity.has_component::<Velocity>());
 
-        let health = entity.get_component::<Health>().expect("health component must exist");
+        let health = entity
+            .get_component::<Health>()
+            .expect("health component must exist");
         assert_eq!(
             health,
             &Health {
@@ -369,7 +372,9 @@ mod tests {
             }
         );
 
-        let name = entity.get_component::<PlayerName>().expect("name component must exist");
+        let name = entity
+            .get_component::<PlayerName>()
+            .expect("name component must exist");
         assert_eq!(name.0, "Hero");
     }
 
@@ -394,7 +399,9 @@ mod tests {
             assert_eq!(ent_by_guid.position, (100.0, 200.0, 300.0));
             assert_eq!(ent_by_guid.rotation, 1.57);
 
-            let health = ent_by_guid.get_component_mut::<Health>().expect("health must exist");
+            let health = ent_by_guid
+                .get_component_mut::<Health>()
+                .expect("health must exist");
             health.current -= 30;
         }
 
@@ -513,10 +520,17 @@ mod tests {
     #[test]
     fn test_component_store_iter_and_insert_raw() {
         let mut store = ComponentStore::new();
-        store.add_component(Health { current: 80, max: 100 });
+        store.add_component(Health {
+            current: 80,
+            max: 100,
+        });
         assert_eq!(store.iter().count(), 1);
 
-        let vel = Velocity { x: 3.5, y: 7.0, z: 0.0 };
+        let vel = Velocity {
+            x: 3.5,
+            y: 7.0,
+            z: 0.0,
+        };
         store.insert_raw(TypeId::of::<Velocity>(), Box::new(vel));
         assert_eq!(store.len(), 2);
         assert_eq!(store.iter().count(), 2);

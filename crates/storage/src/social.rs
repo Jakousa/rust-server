@@ -3,9 +3,9 @@
 //! Provides topic-based pub/sub broadcasting and point-to-point routing for
 //! global chat, party formation, direct whispers, and guild synchronization.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// Channel scope for chat messages.
@@ -94,7 +94,8 @@ pub enum SocialBusError {
 #[async_trait::async_trait]
 pub trait SocialBus: Send + Sync {
     /// Publishes an envelope to a named topic channel.
-    async fn publish(&self, channel: &str, envelope: &SocialEnvelope) -> Result<(), SocialBusError>;
+    async fn publish(&self, channel: &str, envelope: &SocialEnvelope)
+        -> Result<(), SocialBusError>;
 
     /// Subscribes to a named topic channel, returning a broadcast receiver.
     async fn subscribe(
@@ -129,7 +130,11 @@ impl MemorySocialBus {
 
 #[async_trait::async_trait]
 impl SocialBus for MemorySocialBus {
-    async fn publish(&self, channel: &str, envelope: &SocialEnvelope) -> Result<(), SocialBusError> {
+    async fn publish(
+        &self,
+        channel: &str,
+        envelope: &SocialEnvelope,
+    ) -> Result<(), SocialBusError> {
         let sender = self.get_or_create_sender(channel);
         // Ignore SendError if there are currently no active receivers on the channel
         let _ = sender.send(envelope.clone());
@@ -153,8 +158,8 @@ pub struct RedisSocialBus {
 
 impl RedisSocialBus {
     pub fn new(redis_url: &str) -> Result<Self, SocialBusError> {
-        let client = redis::Client::open(redis_url)
-            .map_err(|e| SocialBusError::Channel(e.to_string()))?;
+        let client =
+            redis::Client::open(redis_url).map_err(|e| SocialBusError::Channel(e.to_string()))?;
         Ok(Self {
             client,
             memory_fallback: MemorySocialBus::new(),
@@ -164,7 +169,11 @@ impl RedisSocialBus {
 
 #[async_trait::async_trait]
 impl SocialBus for RedisSocialBus {
-    async fn publish(&self, channel: &str, envelope: &SocialEnvelope) -> Result<(), SocialBusError> {
+    async fn publish(
+        &self,
+        channel: &str,
+        envelope: &SocialEnvelope,
+    ) -> Result<(), SocialBusError> {
         if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let json = serde_json::to_string(envelope)?;
             let _: Result<(), _> = redis::AsyncCommands::publish(&mut conn, channel, json).await;

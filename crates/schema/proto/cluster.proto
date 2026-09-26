@@ -24,6 +24,7 @@ message RegisterNodeResponse {
   bool success = 1;
   string message = 2;
   uint32 assigned_node_id = 3;
+  uint64 topology_epoch = 4;
 }
 
 message HeartbeatRequest {
@@ -38,6 +39,7 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   bool acknowledged = 1;
   bool should_split = 2;
+  uint64 topology_epoch = 3;
 }
 
 message SplitReportRequest {
@@ -50,6 +52,7 @@ message SplitReportRequest {
 message SplitReportResponse {
   bool acknowledged = 1;
   repeated uint32 assigned_node_ids = 2;
+  uint64 topology_epoch = 3;
 }
 
 // NodeService messages

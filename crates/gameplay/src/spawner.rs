@@ -4,8 +4,8 @@
 //! tick respawn cooldowns, and queue entity instantiations into a deferred
 //! command buffer to preserve strict ECS aliasing safety.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use mmo_core::{
     DomainEvent, EntityDespawnEvent, EntityStore, GameplayPlugin, Guid, Octree, PluginContext,
@@ -213,7 +213,9 @@ impl TickSystem for SpawnerSystem {
 
             if let Some(spawner) = entity.get_component_mut::<SpawnerComponent>() {
                 // Prune dead or despawned entities from tracking without scanning all world entities
-                spawner.spawned_entities.retain(|guid| !dead_or_missing.contains(guid));
+                spawner
+                    .spawned_entities
+                    .retain(|guid| !dead_or_missing.contains(guid));
 
                 if spawner.spawned_entities.len() < spawner.max_active_spawns {
                     if spawner.current_cooldown_secs <= 0.0 {
@@ -236,11 +238,7 @@ impl TickSystem for SpawnerSystem {
         for (spawner_guid, template_id, origin, radius) in spawn_requests {
             if let Some(tmpl) = self.templates.get(&template_id) {
                 // Spawn slightly offset within spawn_radius (deterministic offset based on guid/radius)
-                let spawn_pos = (
-                    origin.0 + radius * 0.5,
-                    origin.1,
-                    origin.2 + radius * 0.5,
-                );
+                let spawn_pos = (origin.0 + radius * 0.5, origin.1, origin.2 + radius * 0.5);
 
                 self.command_buffer.push_spawn(SpawnEntityCommand {
                     spawner_guid,
@@ -365,15 +363,24 @@ mod tests {
         // Verify spawned entity has components attached
         let spawned_ent = store.get_by_guid(spawned_guid).unwrap();
         assert_eq!(
-            spawned_ent.get_component::<HealthComponent>().unwrap().current_hp,
+            spawned_ent
+                .get_component::<HealthComponent>()
+                .unwrap()
+                .current_hp,
             50.0
         );
         assert_eq!(
-            spawned_ent.get_component::<StatsComponent>().unwrap().attack_power,
+            spawned_ent
+                .get_component::<StatsComponent>()
+                .unwrap()
+                .attack_power,
             12
         );
         assert_eq!(
-            spawned_ent.get_component::<NavAgentComponent>().unwrap().speed,
+            spawned_ent
+                .get_component::<NavAgentComponent>()
+                .unwrap()
+                .speed,
             6.0
         );
 

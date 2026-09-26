@@ -3,8 +3,8 @@
 //! Provides item slot grids, weight limits, equipment slot management, encumbrance
 //! movement vetoes, and JSON persistence codecs.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use mmo_core::{
     ComponentStore, EntityStore, Event, EventContext, GameplayPlugin, Guid, HookHandler,
@@ -197,8 +197,7 @@ impl GameplayPlugin for InventoryPlugin {
         ctx.codecs.register::<EquipmentComponent>("equipment");
 
         // 2. Register modular packet handler for module_id = 0x01
-        ctx.packets
-            .register(0x01, Box::new(InventoryPacketHandler));
+        ctx.packets.register(0x01, Box::new(InventoryPacketHandler));
 
         // 3. Register encumbrance veto hook on BeforeMove
         ctx.hooks.register_fn(|event, _event_ctx| {

@@ -87,8 +87,16 @@ impl MetricsAggregator {
             duration_secs: duration,
             total_packets_sent: sent,
             total_packets_received: recv,
-            send_rate_pps: if duration > 0.0 { sent as f64 / duration } else { 0.0 },
-            recv_rate_pps: if duration > 0.0 { recv as f64 / duration } else { 0.0 },
+            send_rate_pps: if duration > 0.0 {
+                sent as f64 / duration
+            } else {
+                0.0
+            },
+            recv_rate_pps: if duration > 0.0 {
+                recv as f64 / duration
+            } else {
+                0.0
+            },
             snapbacks,
             connection_errors: errors,
             min_rtt_ms: to_ms(hist.min()),

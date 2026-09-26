@@ -1,18 +1,17 @@
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use mmo_gateway::{GatewayServer, SessionRouter};
 use mmo_storage::cache::{MemoryCache, RedisCache, SessionCacheBackend};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listen_addr = std::env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-    let default_node_addr = std::env::var("DEFAULT_NODE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:50052".to_string());
+    let default_node_addr =
+        std::env::var("DEFAULT_NODE_ADDR").unwrap_or_else(|_| "127.0.0.1:50052".to_string());
 
-    let director_addr = std::env::var("DIRECTOR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let director_addr =
+        std::env::var("DIRECTOR_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
     let redis_url = std::env::var("REDIS_URL").ok();
 
@@ -37,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(rc)
             }
             Err(e) => {
-                eprintln!("[Gateway] Failed to connect to Redis ({}), falling back to MemoryCache", e);
+                eprintln!(
+                    "[Gateway] Failed to connect to Redis ({}), falling back to MemoryCache",
+                    e
+                );
                 Arc::new(MemoryCache::new())
             }
         },
@@ -46,9 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
-    let server = Arc::new(
-        GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache),
-    );
+    let server = Arc::new(GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache));
 
     // Background worker to consume/log routed packets
     tokio::spawn(async move {
@@ -61,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let listener = server.bind(&listen_addr).await?;
-    println!("Edge Gateway actively listening for client connections on {}", listen_addr);
+    println!(
+        "Edge Gateway actively listening for client connections on {}",
+        listen_addr
+    );
 
     loop {
         match listener.accept().await {

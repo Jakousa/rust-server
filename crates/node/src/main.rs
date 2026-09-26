@@ -22,8 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.0.0.0:50052".to_string())
         .parse()?;
 
-    let director_addr = std::env::var("DIRECTOR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let director_addr =
+        std::env::var("DIRECTOR_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
     let db_url = std::env::var("DATABASE_URL").ok();
 
@@ -35,7 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Director Address : {}", director_addr);
     println!(
         "Database URL     : {}",
-        db_url.as_deref().unwrap_or("Disabled (DATABASE_URL not set)")
+        db_url
+            .as_deref()
+            .unwrap_or("Disabled (DATABASE_URL not set)")
     );
     println!("------------------------------------------------------------");
 
@@ -62,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Start gRPC NodeService server
     let node_service = NodeServiceImpl::new(Arc::clone(&sim));
     tokio::spawn(async move {
-        println!("[Node {}] gRPC service listening on {}", node_id, listen_addr);
+        println!(
+            "[Node {}] gRPC service listening on {}",
+            node_id, listen_addr
+        );
         if let Err(e) = Server::builder()
             .add_service(NodeServiceServer::new(node_service))
             .serve(listen_addr)
@@ -76,7 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_endpoint = director_addr.clone();
     let sim_clone = Arc::clone(&sim);
     tokio::spawn(async move {
-        println!("[Node {}] Attempting connection to Director at {}...", node_id, director_endpoint);
+        println!(
+            "[Node {}] Attempting connection to Director at {}...",
+            node_id, director_endpoint
+        );
         let mut client = loop {
             match DirectorServiceClient::connect(director_endpoint.clone()).await {
                 Ok(c) => {
@@ -111,7 +119,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match client.register_node(reg_req).await {
             Ok(resp) => {
-                println!("[Node {}] Registered with Director: success={}", node_id, resp.into_inner().success);
+                println!(
+                    "[Node {}] Registered with Director: success={}",
+                    node_id,
+                    resp.into_inner().success
+                );
             }
             Err(e) => {
                 eprintln!("[Node {}] Failed to register with Director: {}", node_id, e);

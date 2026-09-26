@@ -71,7 +71,11 @@ pub struct Vec3 {
 }
 
 impl Vec3 {
-    pub const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
+    pub const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
 
     pub fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
@@ -563,7 +567,9 @@ impl ClientPacket {
 
         let mut payload = bytes.split_to(payload_len);
         match opcode {
-            Opcode::Movement => Ok(ClientPacket::Movement(MovementPacket::decode(&mut payload)?)),
+            Opcode::Movement => Ok(ClientPacket::Movement(MovementPacket::decode(
+                &mut payload,
+            )?)),
             Opcode::MovementCorrection => Ok(ClientPacket::MovementCorrection(
                 MovementCorrectionPacket::decode(&mut payload)?,
             )),

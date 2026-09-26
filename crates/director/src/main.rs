@@ -14,23 +14,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
     let coordinator = Arc::new(RwLock::new(GlobalOctreeCoordinator::default()));
 
-    // Background dead node detection loop
-    let reg_clone = Arc::clone(&registry);
+    let service = DirectorServiceImpl::new(registry, coordinator);
+
+    // Background dead node detection and orphaned partition recovery loop
+    let svc_clone = service.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let dead = reg_clone
-                .write()
-                .await
-                .check_dead_nodes(Duration::from_secs(5));
-            if !dead.is_empty() {
-                eprintln!("[Director] Expired dead nodes removed: {:?}", dead);
+            let recovery_events = svc_clone
+                .check_and_recover_dead_nodes(Duration::from_secs(5))
+                .await;
+            if !recovery_events.is_empty() {
+                eprintln!(
+                    "[Director] Recovered {} orphaned partition(s) from expired dead nodes (epoch {}): {:?}",
+                    recovery_events.len(),
+                    recovery_events[0].epoch,
+                    recovery_events
+                );
             }
         }
     });
 
-    let service = DirectorServiceImpl::new(registry, coordinator);
     let addr: SocketAddr = "0.0.0.0:50051".parse()?;
 
     println!("Director gRPC service listening on {}", addr);

@@ -3,8 +3,8 @@
 //! Provides structured quest definitions, objective progression tracking,
 //! event-driven objective completion, and quest reward distribution.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use mmo_core::{GameplayPlugin, PluginContext};
 
@@ -30,13 +30,22 @@ pub enum QuestObjective {
 impl QuestObjective {
     pub fn is_complete(&self) -> bool {
         match *self {
-            Self::KillMonster { required, current, .. } => current >= required,
-            Self::FetchItem { required, current, .. } => current >= required,
+            Self::KillMonster {
+                required, current, ..
+            } => current >= required,
+            Self::FetchItem {
+                required, current, ..
+            } => current >= required,
         }
     }
 
     pub fn advance_kill(&mut self, target_type: u32) -> bool {
-        if let Self::KillMonster { monster_type_id, required, current } = self {
+        if let Self::KillMonster {
+            monster_type_id,
+            required,
+            current,
+        } = self
+        {
             if *monster_type_id == target_type && *current < *required {
                 *current += 1;
                 return true;
@@ -46,7 +55,12 @@ impl QuestObjective {
     }
 
     pub fn advance_fetch(&mut self, target_item: u32, count: u32) -> bool {
-        if let Self::FetchItem { item_id, required, current } = self {
+        if let Self::FetchItem {
+            item_id,
+            required,
+            current,
+        } = self
+        {
             if *item_id == target_item && *current < *required {
                 *current = (*current + count).min(*required);
                 return true;

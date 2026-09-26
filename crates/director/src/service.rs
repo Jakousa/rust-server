@@ -69,6 +69,25 @@ impl DirectorServiceImpl {
             Arc::new(RwLock::new(GlobalOctreeCoordinator::default())),
         )
     }
+
+    /// Checks for dead/unresponsive simulation nodes after `timeout`, evicting them from the registry
+    /// and immediately reassigning their orphaned spatial partitions to surviving nodes.
+    ///
+    /// Maintains strict lock acquisition ordering (`registry` then `coordinator`) to prevent deadlocks.
+    pub async fn check_and_recover_dead_nodes(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<crate::coordinator::PartitionRecoveryEvent> {
+        let mut reg = self.registry.write().await;
+        let dead_nodes = reg.check_dead_nodes(timeout);
+
+        if dead_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut coord = self.coordinator.write().await;
+        coord.recover_orphaned_partitions(&dead_nodes, &mut reg)
+    }
 }
 
 #[tonic::async_trait]
@@ -92,11 +111,13 @@ impl DirectorService for DirectorServiceImpl {
 
         let mut coord = self.coordinator.write().await;
         coord.assign_initial_node(assigned_node_id);
+        let topology_epoch = coord.topology_epoch();
 
         Ok(Response::new(RegisterNodeResponse {
             success: true,
             message: "Simulation node registered successfully".to_string(),
             assigned_node_id,
+            topology_epoch,
         }))
     }
 
@@ -109,17 +130,21 @@ impl DirectorService for DirectorServiceImpl {
         let mut reg = self.registry.write().await;
         let acknowledged = reg.record_heartbeat(&req);
 
+        let coord = self.coordinator.read().await;
+        let topology_epoch = coord.topology_epoch();
+
         if acknowledged {
-            let coord = self.coordinator.read().await;
             let should_split = coord.evaluate_heartbeat(req.node_id, req.entity_count);
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: true,
                 should_split,
+                topology_epoch,
             }))
         } else {
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: false,
                 should_split: false,
+                topology_epoch,
             }))
         }
     }
@@ -146,16 +171,14 @@ impl DirectorService for DirectorServiceImpl {
         let mut reg = self.registry.write().await;
         let mut coord = self.coordinator.write().await;
 
-        let assigned_node_ids = coord.handle_split(
-            req.node_id,
-            original_bounds,
-            child_bounds,
-            &mut reg,
-        );
+        let assigned_node_ids =
+            coord.handle_split(req.node_id, original_bounds, child_bounds, &mut reg);
+        let topology_epoch = coord.topology_epoch();
 
         Ok(Response::new(SplitReportResponse {
             acknowledged: true,
             assigned_node_ids,
+            topology_epoch,
         }))
     }
 }
@@ -173,7 +196,10 @@ mod tests {
         assert_eq!(original, roundtrip);
 
         // Missing min/max
-        let invalid_proto = BoundingBox { min: None, max: None };
+        let invalid_proto = BoundingBox {
+            min: None,
+            max: None,
+        };
         assert!(proto_bbox_to_bounding_box_3d(&invalid_proto).is_none());
     }
 
@@ -306,5 +332,96 @@ mod tests {
         });
         let err = service.report_split(invalid_req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_service_check_and_recover_dead_nodes_with_epoch_tracking() {
+        let service = DirectorServiceImpl::default_service();
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+
+        // 1. Register node 1 (authoritative for root bounds)
+        let reg_resp1 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 1,
+                listen_addr: "127.0.0.1:50051".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reg_resp1.topology_epoch, 1);
+
+        // 2. Register node 2
+        let reg_resp2 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 2,
+                listen_addr: "127.0.0.1:50052".to_string(),
+                bounds: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reg_resp2.topology_epoch, 1);
+
+        // 3. Heartbeat from node 1
+        let hb_resp = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 1,
+                tick_rate: 20.0,
+                entity_count: 5,
+                cpu_percent: 10.0,
+                memory_bytes: 1024,
+                timestamp: 1000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hb_resp.topology_epoch, 1);
+
+        // 4. Split bounds across node 1 and 2
+        let split_resp = service
+            .report_split(Request::new(SplitReportRequest {
+                node_id: 1,
+                original_bounds: Some(bounding_box_3d_to_proto(&bounds)),
+                child_bounds: vec![],
+                total_entities: 60,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(split_resp.topology_epoch, 2);
+
+        // 5. Expire node 1's heartbeat directly in registry
+        {
+            let mut reg = service.registry.write().await;
+            reg.set_last_heartbeat(
+                1,
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            );
+        }
+
+        // 6. Recover dead nodes
+        let recovery = service
+            .check_and_recover_dead_nodes(std::time::Duration::from_secs(5))
+            .await;
+        assert!(!recovery.is_empty());
+        assert_eq!(recovery[0].epoch, 3);
+        assert_eq!(recovery[0].previous_node_id, 1);
+        assert_eq!(recovery[0].new_node_id, 2);
+
+        // 7. Verify subsequent heartbeat returns epoch 3
+        let hb_node2 = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 2,
+                tick_rate: 20.0,
+                entity_count: 10,
+                cpu_percent: 15.0,
+                memory_bytes: 2048,
+                timestamp: 2000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hb_node2.topology_epoch, 3);
     }
 }

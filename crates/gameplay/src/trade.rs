@@ -319,23 +319,55 @@ mod tests {
             currency: 0,
         };
 
-        trade_mgr.get_session_mut(session_id).unwrap().set_offer(p1, offer_a).unwrap();
-        trade_mgr.get_session_mut(session_id).unwrap().set_offer(p2, offer_b).unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(p1, offer_a)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(p2, offer_b)
+            .unwrap();
 
         // Lock step
-        trade_mgr.get_session_mut(session_id).unwrap().lock(p1).unwrap();
-        trade_mgr.get_session_mut(session_id).unwrap().lock(p2).unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p1)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p2)
+            .unwrap();
 
         // Acceptance
-        assert!(!trade_mgr.get_session_mut(session_id).unwrap().accept(p1).unwrap());
-        assert!(trade_mgr.get_session_mut(session_id).unwrap().accept(p2).unwrap());
+        assert!(!trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p1)
+            .unwrap());
+        assert!(trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p2)
+            .unwrap());
 
         // Execute atomic swap using disjoint mutable borrows
         let result = trade_mgr.execute_atomic_swap(session_id, &mut store);
         assert!(result.is_ok());
 
-        let p1_inv = store.get(k1).unwrap().get_component::<InventoryComponent>().unwrap();
-        let p2_inv = store.get(k2).unwrap().get_component::<InventoryComponent>().unwrap();
+        let p1_inv = store
+            .get(k1)
+            .unwrap()
+            .get_component::<InventoryComponent>()
+            .unwrap();
+        let p2_inv = store
+            .get(k2)
+            .unwrap()
+            .get_component::<InventoryComponent>()
+            .unwrap();
 
         // Verify Player 1 now has shield and Player 2 has sword
         assert_eq!(p1_inv.slots[1], Some(shield));

@@ -97,7 +97,9 @@ impl BotSession {
     /// Reads incoming bytes from the gateway socket and parses all completed frames.
     ///
     /// Returns decoded packets and any observed ping RTT latency in milliseconds.
-    pub async fn poll_incoming(&mut self) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
+    pub async fn poll_incoming(
+        &mut self,
+    ) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
         let stream = self.stream.as_mut().ok_or(SessionError::NotConnected)?;
         let mut rtt_ms = None;
 

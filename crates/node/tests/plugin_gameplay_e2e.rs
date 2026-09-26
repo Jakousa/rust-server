@@ -4,8 +4,8 @@
 use mmo_core::guid::EntityType;
 use mmo_core::{BoundingBox3D, Guid};
 use mmo_gameplay::{
-    process_damage_events, CombatPlugin, DamageEvent, HealthComponent,
-    InventoryComponent, InventoryPlugin, ItemStack, StatsComponent, TradePlugin,
+    process_damage_events, CombatPlugin, DamageEvent, HealthComponent, InventoryComponent,
+    InventoryPlugin, ItemStack, StatsComponent, TradePlugin,
 };
 use mmo_node::sim::TickSimulation;
 use mmo_node::snapshotter::WriteBehindSnapshotter;
@@ -111,8 +111,7 @@ async fn test_end_to_end_gameplay_plugins_lifecycle_and_persistence() {
 
     // Capture dynamic snapshot using registered codecs
     let player_entity = sim.entity_store.get_by_guid(player_guid).unwrap();
-    let snapshot =
-        WriteBehindSnapshotter::capture_entity_snapshot(player_entity, &sim.codecs, 1);
+    let snapshot = WriteBehindSnapshotter::capture_entity_snapshot(player_entity, &sim.codecs, 1);
 
     // Verify snapshot captured all registered components
     assert!(snapshot.attributes.get("inventory").is_some());
@@ -128,10 +127,8 @@ async fn test_end_to_end_gameplay_plugins_lifecycle_and_persistence() {
     assert_eq!(loaded_snapshot.guid, player_guid.raw());
 
     // Create a fresh entity without pre-attached components
-    let mut restored_player = mmo_core::Entity::new(
-        Guid(loaded_snapshot.guid),
-        loaded_snapshot.position,
-    );
+    let mut restored_player =
+        mmo_core::Entity::new(Guid(loaded_snapshot.guid), loaded_snapshot.position);
 
     let restored_count = WriteBehindSnapshotter::restore_entity_components(
         &mut restored_player,

@@ -408,9 +408,9 @@ impl Octree {
             OctreeNode::Leaf { .. } => Some(self),
             OctreeNode::Branch { children } => {
                 let idx = self.child_index(pos);
-                children[idx].find_leaf(pos).or_else(|| {
-                    children.iter().find_map(|child| child.find_leaf(pos))
-                })
+                children[idx]
+                    .find_leaf(pos)
+                    .or_else(|| children.iter().find_map(|child| child.find_leaf(pos)))
             }
         }
     }
@@ -424,11 +424,7 @@ impl Octree {
 
     /// Identifies all neighboring leaf octants that share a boundary face or edge within `margin`
     /// of an entity positioned at `pos`.
-    pub fn find_boundary_neighbors(
-        &self,
-        pos: (f32, f32, f32),
-        margin: f32,
-    ) -> Vec<BoundingBox3D> {
+    pub fn find_boundary_neighbors(&self, pos: (f32, f32, f32), margin: f32) -> Vec<BoundingBox3D> {
         if margin <= 0.0 {
             return Vec::new();
         }
@@ -636,12 +632,36 @@ impl Octree {
 
         let mut children_vec = Vec::with_capacity(8);
         for i in 0..8 {
-            let x_min = if (i & 1) == 0 { self.bounds.min.0 } else { mid_x };
-            let x_max = if (i & 1) == 0 { mid_x } else { self.bounds.max.0 };
-            let y_min = if (i & 2) == 0 { self.bounds.min.1 } else { mid_y };
-            let y_max = if (i & 2) == 0 { mid_y } else { self.bounds.max.1 };
-            let z_min = if (i & 4) == 0 { self.bounds.min.2 } else { mid_z };
-            let z_max = if (i & 4) == 0 { mid_z } else { self.bounds.max.2 };
+            let x_min = if (i & 1) == 0 {
+                self.bounds.min.0
+            } else {
+                mid_x
+            };
+            let x_max = if (i & 1) == 0 {
+                mid_x
+            } else {
+                self.bounds.max.0
+            };
+            let y_min = if (i & 2) == 0 {
+                self.bounds.min.1
+            } else {
+                mid_y
+            };
+            let y_max = if (i & 2) == 0 {
+                mid_y
+            } else {
+                self.bounds.max.1
+            };
+            let z_min = if (i & 4) == 0 {
+                self.bounds.min.2
+            } else {
+                mid_z
+            };
+            let z_max = if (i & 4) == 0 {
+                mid_z
+            } else {
+                self.bounds.max.2
+            };
 
             children_vec.push(Octree::with_config(
                 BoundingBox3D::new((x_min, y_min, z_min), (x_max, y_max, z_max)),
@@ -697,11 +717,7 @@ impl Octree {
 /// Returns `base_radius` if `current_density <= max_budget`.
 /// Returns `0.0` if `base_radius <= 0.0` or `max_budget == 0`.
 #[inline]
-pub fn calculate_throttled_aoi(
-    base_radius: f32,
-    current_density: usize,
-    max_budget: usize,
-) -> f32 {
+pub fn calculate_throttled_aoi(base_radius: f32, current_density: usize, max_budget: usize) -> f32 {
     if base_radius <= 0.0 {
         return 0.0;
     }

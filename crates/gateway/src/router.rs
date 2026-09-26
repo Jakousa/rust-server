@@ -33,10 +33,14 @@ impl Clone for SessionRouter {
             router.guid_to_session.insert(*item.key(), *item.value());
         }
         for item in self.guid_to_node.iter() {
-            router.guid_to_node.insert(*item.key(), item.value().clone());
+            router
+                .guid_to_node
+                .insert(*item.key(), item.value().clone());
         }
         for item in self.session_to_node.iter() {
-            router.session_to_node.insert(*item.key(), item.value().clone());
+            router
+                .session_to_node
+                .insert(*item.key(), item.value().clone());
         }
         router
     }
@@ -108,7 +112,8 @@ impl SessionRouter {
         if let Some(session_ref) = self.guid_to_session.get(&guid) {
             let session_id = *session_ref.value();
             drop(session_ref);
-            self.session_to_node.insert(session_id, new_node_address.clone());
+            self.session_to_node
+                .insert(session_id, new_node_address.clone());
         }
         self.guid_to_node.insert(guid, new_node_address);
         existed
@@ -216,8 +221,14 @@ mod tests {
 
         assert_eq!(router.session_count(), 1);
         assert!(!router.is_empty());
-        assert_eq!(router.get_route_by_guid(guid).as_deref(), Some("127.0.0.1:50051"));
-        assert_eq!(router.get_route_by_session(session_id).as_deref(), Some("127.0.0.1:50051"));
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+        assert_eq!(
+            router.get_route_by_session(session_id).as_deref(),
+            Some("127.0.0.1:50051")
+        );
         assert_eq!(router.get_guid_by_session(session_id), Some(guid));
         assert_eq!(router.get_session_by_guid(guid), Some(session_id));
     }
@@ -231,15 +242,27 @@ mod tests {
         let node2 = "127.0.0.1:50052".to_string();
 
         router.register_session(session_id, guid, node1);
-        assert_eq!(router.get_route_by_guid(guid).as_deref(), Some("127.0.0.1:50051"));
-        assert_eq!(router.get_route_by_session(session_id).as_deref(), Some("127.0.0.1:50051"));
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+        assert_eq!(
+            router.get_route_by_session(session_id).as_deref(),
+            Some("127.0.0.1:50051")
+        );
 
         // Perform seamless handover to Node 2
         let updated = router.update_route(guid, node2);
         assert!(updated);
 
-        assert_eq!(router.get_route_by_guid(guid).as_deref(), Some("127.0.0.1:50052"));
-        assert_eq!(router.get_route_by_session(session_id).as_deref(), Some("127.0.0.1:50052"));
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(session_id).as_deref(),
+            Some("127.0.0.1:50052")
+        );
         assert_eq!(router.get_guid_by_session(session_id), Some(guid));
     }
 
@@ -251,7 +274,10 @@ mod tests {
         let node = "127.0.0.1:50051".to_string();
 
         router.register_session(session_id, guid, node);
-        assert_eq!(router.get_route_by_guid(guid).as_deref(), Some("127.0.0.1:50051"));
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50051")
+        );
 
         let removed_guid = router.remove_session(session_id);
         assert_eq!(removed_guid, Some(guid));
@@ -280,10 +306,22 @@ mod tests {
         router.register_session(1, guid1, "node1:50051".into());
         router.register_session(2, guid2, "node2:50052".into());
 
-        assert_eq!(router.get_route_by_guid(guid1).as_deref(), Some("node1:50051"));
-        assert_eq!(router.get_route_by_guid(guid2).as_deref(), Some("node2:50052"));
-        assert_eq!(router.get_route_by_session(1).as_deref(), Some("node1:50051"));
-        assert_eq!(router.get_route_by_session(2).as_deref(), Some("node2:50052"));
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("node1:50051")
+        );
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("node2:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(1).as_deref(),
+            Some("node1:50051")
+        );
+        assert_eq!(
+            router.get_route_by_session(2).as_deref(),
+            Some("node2:50052")
+        );
 
         // Remove session 1
         router.remove_session(1);
@@ -291,8 +329,14 @@ mod tests {
         assert_eq!(router.get_route_by_session(1), None);
 
         // Session 2 intact
-        assert_eq!(router.get_route_by_guid(guid2).as_deref(), Some("node2:50052"));
-        assert_eq!(router.get_route_by_session(2).as_deref(), Some("node2:50052"));
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("node2:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(2).as_deref(),
+            Some("node2:50052")
+        );
     }
 
     #[test]
@@ -309,6 +353,9 @@ mod tests {
         router.register_session(1, guid2, "node2:50052".into());
         assert_eq!(router.get_guid_by_session(1), Some(guid2));
         assert_eq!(router.get_route_by_guid(guid1), None);
-        assert_eq!(router.get_route_by_guid(guid2).as_deref(), Some("node2:50052"));
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("node2:50052")
+        );
     }
 }

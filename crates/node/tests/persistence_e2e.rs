@@ -32,7 +32,12 @@ async fn test_end_to_end_persistence_and_simulation_recovery() {
 
     let player_guid = Guid::new(EntityType::Player, 1, 55001);
     let character = repo
-        .create_character(&account.account_id, player_guid.raw(), "ValiantKnight", (0.0, 0.0, 0.0))
+        .create_character(
+            &account.account_id,
+            player_guid.raw(),
+            "ValiantKnight",
+            (0.0, 0.0, 0.0),
+        )
         .await
         .expect("Failed to create character");
     assert_eq!(character.guid, player_guid.raw());
@@ -99,14 +104,8 @@ async fn test_end_to_end_persistence_and_simulation_recovery() {
     assert_eq!(persisted_snapshot.position, (10.0, 10.0, 5.0));
     assert!((persisted_snapshot.rotation - 0.5).abs() < 1e-5);
     assert_eq!(persisted_snapshot.version, 5);
-    assert_eq!(
-        persisted_snapshot.attributes["level"],
-        json!(15)
-    );
-    assert_eq!(
-        persisted_snapshot.attributes["health"],
-        json!(95)
-    );
+    assert_eq!(persisted_snapshot.attributes["level"], json!(15));
+    assert_eq!(persisted_snapshot.attributes["health"], json!(95));
 
     // Also verify character table position coordinates were updated
     let loaded_character = repo

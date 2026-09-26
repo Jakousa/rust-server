@@ -17,8 +17,16 @@ mod tests {
             node_id: 1,
             listen_addr: "127.0.0.1:50051".to_string(),
             bounds: Some(BoundingBox {
-                min: Some(Vector3 { x: -100.0, y: -100.0, z: -100.0 }),
-                max: Some(Vector3 { x: 100.0, y: 100.0, z: 100.0 }),
+                min: Some(Vector3 {
+                    x: -100.0,
+                    y: -100.0,
+                    z: -100.0,
+                }),
+                max: Some(Vector3 {
+                    x: 100.0,
+                    y: 100.0,
+                    z: 100.0,
+                }),
             }),
         };
         assert_eq!(req.node_id, 1);
@@ -28,8 +36,10 @@ mod tests {
             success: true,
             message: "Node registered".to_string(),
             assigned_node_id: 1,
+            topology_epoch: 1,
         };
         assert!(resp.success);
+        assert_eq!(resp.topology_epoch, 1);
 
         let hb = HeartbeatRequest {
             node_id: 1,
@@ -44,12 +54,28 @@ mod tests {
         let split = SplitReportRequest {
             node_id: 1,
             original_bounds: Some(BoundingBox {
-                min: Some(Vector3 { x: 0.0, y: 0.0, z: 0.0 }),
-                max: Some(Vector3 { x: 100.0, y: 100.0, z: 100.0 }),
+                min: Some(Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }),
+                max: Some(Vector3 {
+                    x: 100.0,
+                    y: 100.0,
+                    z: 100.0,
+                }),
             }),
             child_bounds: vec![BoundingBox {
-                min: Some(Vector3 { x: 0.0, y: 0.0, z: 0.0 }),
-                max: Some(Vector3 { x: 50.0, y: 50.0, z: 50.0 }),
+                min: Some(Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }),
+                max: Some(Vector3 {
+                    x: 50.0,
+                    y: 50.0,
+                    z: 50.0,
+                }),
             }],
             total_entities: 300,
         };
@@ -73,8 +99,16 @@ mod tests {
             source_node_id: 1,
             ghosts: vec![GhostEntity {
                 guid: 100,
-                position: Some(Vector3 { x: 1.0, y: 2.0, z: 3.0 }),
-                velocity: Some(Vector3 { x: 0.1, y: 0.0, z: 0.0 }),
+                position: Some(Vector3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                }),
+                velocity: Some(Vector3 {
+                    x: 0.1,
+                    y: 0.0,
+                    z: 0.0,
+                }),
                 yaw: 1.0,
                 pitch: 0.0,
                 component_data: vec![],

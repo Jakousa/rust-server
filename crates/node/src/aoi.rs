@@ -172,7 +172,8 @@ impl AoiManager {
         let mut jobs = Vec::new();
 
         self.scratch_session_ids.clear();
-        self.scratch_session_ids.extend(self.observers.keys().copied());
+        self.scratch_session_ids
+            .extend(self.observers.keys().copied());
 
         for i in 0..self.scratch_session_ids.len() {
             let session_id = self.scratch_session_ids[i];
@@ -207,17 +208,15 @@ impl AoiManager {
             if total_found > max_entities {
                 // select_nth_unstable_by guarantees elements before `max_entities` are <= element at `max_entities`
                 // in O(N) average time rather than O(N log N) full sort
-                self.scratch_query.select_nth_unstable_by(max_entities, |a, b| {
-                    a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                self.scratch_query
+                    .select_nth_unstable_by(max_entities, |a, b| {
+                        a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+                    });
                 self.scratch_query.truncate(max_entities);
 
                 // Calculate throttled radius
-                let throttled = calculate_throttled_aoi(
-                    observer.config.base_radius,
-                    total_found,
-                    max_entities,
-                );
+                let throttled =
+                    calculate_throttled_aoi(observer.config.base_radius, total_found, max_entities);
                 observer.effective_radius = throttled;
             } else if observer.effective_radius < observer.config.base_radius {
                 // Restore base radius if density subsides
@@ -278,8 +277,7 @@ impl AoiManager {
                     let dist_sq = dx * dx + dy * dy + dz * dz;
 
                     let pos_changed = dist_sq >= observer.config.position_epsilon_sq;
-                    let health_changed =
-                        cached.health != health || cached.max_health != max_health;
+                    let health_changed = cached.health != health || cached.max_health != max_health;
                     let flags_changed = cached.state_flags != state_flags;
                     let periodic_refresh = current_tick.saturating_sub(cached.last_sent_tick)
                         >= observer.config.full_refresh_interval_ticks;

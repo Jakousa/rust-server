@@ -12,10 +12,10 @@
 use mmo_core::guid::EntityType;
 use mmo_core::{BoundingBox3D, Guid};
 use mmo_gameplay::{
-    CombatPlugin, DamageEvent, FsmBrainComponent, FsmState, HealthComponent,
-    LeashComponent, MonsterAiPlugin, NpcMovementPlugin, PerceptionComponent,
-    PerceptionPlugin, SpawnTemplate, SpawnerComponent, SpawnerPlugin, ThreatPlugin,
-    ThreatTableComponent, WaypointComponent, WaypointLoopMode,
+    CombatPlugin, DamageEvent, FsmBrainComponent, FsmState, HealthComponent, LeashComponent,
+    MonsterAiPlugin, NpcMovementPlugin, PerceptionComponent, PerceptionPlugin, SpawnTemplate,
+    SpawnerComponent, SpawnerPlugin, ThreatPlugin, ThreatTableComponent, WaypointComponent,
+    WaypointLoopMode,
 };
 use mmo_node::sim::TickSimulation;
 
@@ -80,8 +80,8 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
         let threat_table = ThreatTableComponent::default_combat();
         let fsm_brain = FsmBrainComponent::new(
             FsmState::Patrol,
-            2.0,  // 2m melee attack range
-            0.5,  // 0.5s attack cooldown
+            2.0, // 2m melee attack range
+            0.5, // 0.5s attack cooldown
             1.0,
             20.0, // 20 damage per attack
         );
@@ -100,7 +100,10 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
     let mob_ent = sim.entity_store.get_by_guid(mob_guid).unwrap();
     assert!(mob_ent.position.0 > 0.0);
     assert_eq!(
-        mob_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
+        mob_ent
+            .get_component::<FsmBrainComponent>()
+            .unwrap()
+            .current_state,
         FsmState::Patrol
     );
 
@@ -118,8 +121,13 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
 
     let mob_ent = sim.entity_store.get_by_guid(mob_guid).unwrap();
     assert_eq!(
-        mob_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
-        FsmState::Chase { target: player_guid }
+        mob_ent
+            .get_component::<FsmBrainComponent>()
+            .unwrap()
+            .current_state,
+        FsmState::Chase {
+            target: player_guid
+        }
     );
 
     // 9. Step simulation until mob closes into 2.0m melee range and attacks
@@ -160,13 +168,24 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
     sim.step_tick();
 
     let mob_ent = sim.entity_store.get_by_guid(mob_guid).unwrap();
-    assert!(mob_ent.get_component::<LeashComponent>().unwrap().is_leashed_out);
+    assert!(
+        mob_ent
+            .get_component::<LeashComponent>()
+            .unwrap()
+            .is_leashed_out
+    );
     assert_eq!(
-        mob_ent.get_component::<ThreatTableComponent>().unwrap().current_target,
+        mob_ent
+            .get_component::<ThreatTableComponent>()
+            .unwrap()
+            .current_target,
         None
     );
     assert!(matches!(
-        mob_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
+        mob_ent
+            .get_component::<FsmBrainComponent>()
+            .unwrap()
+            .current_state,
         FsmState::Evade { .. }
     ));
 
@@ -177,9 +196,17 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
 
     let mob_ent = sim.entity_store.get_by_guid(mob_guid).unwrap();
     assert!(mob_ent.position.0 <= 1.0);
-    assert!(!mob_ent.get_component::<LeashComponent>().unwrap().is_leashed_out);
+    assert!(
+        !mob_ent
+            .get_component::<LeashComponent>()
+            .unwrap()
+            .is_leashed_out
+    );
     assert!(matches!(
-        mob_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
+        mob_ent
+            .get_component::<FsmBrainComponent>()
+            .unwrap()
+            .current_state,
         FsmState::Idle { .. }
     ));
 }

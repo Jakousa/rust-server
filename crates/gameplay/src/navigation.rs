@@ -223,16 +223,17 @@ impl TickSystem for NavSteeringSystem {
 
             // Advance waypoints if arrived
             if should_advance_wp {
-                let next_target = if let Some(waypoints) = entity.get_component_mut::<WaypointComponent>() {
-                    if !waypoints.is_paused {
-                        waypoints.advance();
-                        waypoints.current_waypoint()
+                let next_target =
+                    if let Some(waypoints) = entity.get_component_mut::<WaypointComponent>() {
+                        if !waypoints.is_paused {
+                            waypoints.advance();
+                            waypoints.current_waypoint()
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
                 if let Some(next) = next_target {
                     if let Some(agent) = entity.get_component_mut::<NavAgentComponent>() {
@@ -271,7 +272,7 @@ impl GameplayPlugin for NpcMovementPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mmo_core::{BoundingBox3D, EntityStore, EventQueue, EntityType, Octree};
+    use mmo_core::{BoundingBox3D, EntityStore, EntityType, EventQueue, Octree};
 
     #[test]
     fn test_waypoint_component_modes() {
@@ -341,8 +342,16 @@ mod tests {
 
         let ent = store.get(key).unwrap();
         assert!((ent.position.0 - 5.0).abs() < 1e-4);
-        assert!(!ent.get_component::<NavAgentComponent>().unwrap().has_arrived);
-        assert!(!ent.get_component::<LeashComponent>().unwrap().is_leashed_out);
+        assert!(
+            !ent.get_component::<NavAgentComponent>()
+                .unwrap()
+                .has_arrived
+        );
+        assert!(
+            !ent.get_component::<LeashComponent>()
+                .unwrap()
+                .is_leashed_out
+        );
 
         // Step another 0.5 seconds: reaches 10.0, dist = 0 <= 0.5 tolerance -> arrived!
         {
@@ -358,8 +367,16 @@ mod tests {
 
         let ent = store.get(key).unwrap();
         assert!((ent.position.0 - 10.0).abs() < 1e-4);
-        assert!(ent.get_component::<NavAgentComponent>().unwrap().has_arrived);
-        assert!(!ent.get_component::<LeashComponent>().unwrap().is_leashed_out);
+        assert!(
+            ent.get_component::<NavAgentComponent>()
+                .unwrap()
+                .has_arrived
+        );
+        assert!(
+            !ent.get_component::<LeashComponent>()
+                .unwrap()
+                .is_leashed_out
+        );
 
         // Step outside leash: target at (20.0, 0.0, 0.0)
         store
@@ -381,6 +398,10 @@ mod tests {
         }
 
         let ent = store.get(key).unwrap();
-        assert!(ent.get_component::<LeashComponent>().unwrap().is_leashed_out);
+        assert!(
+            ent.get_component::<LeashComponent>()
+                .unwrap()
+                .is_leashed_out
+        );
     }
 }

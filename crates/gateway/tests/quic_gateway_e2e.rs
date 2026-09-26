@@ -20,15 +20,18 @@ use mmo_gateway::quic::QuicClientSession;
 use mmo_gateway::router::SessionRouter;
 use mmo_gateway::server::GatewayServer;
 use mmo_schema::client::{
-    ClientPacket, EntityDespawnPacket, EntityStatePacket, InteractionPacket, InteractionResultPacket,
-    InteractionType, MovementPacket, PingPacket, Vec3,
+    ClientPacket, EntityDespawnPacket, EntityStatePacket, InteractionPacket,
+    InteractionResultPacket, InteractionType, MovementPacket, PingPacket, Vec3,
 };
 
 #[tokio::test]
 async fn test_quic_gateway_e2e_full_lifecycle() {
     let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(100);
-    let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
+    let server = Arc::new(GatewayServer::with_packet_channel(
+        router.clone(),
+        packet_tx,
+    ));
 
     let session1 = 1001;
     let player1_guid = Guid::new(EntityType::Player, 1, 1001);

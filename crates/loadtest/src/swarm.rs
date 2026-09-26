@@ -73,7 +73,11 @@ impl SwarmManager {
 
         for i in 0..self.config.bot_count {
             let guid = Guid::new(EntityType::Player, 1, (i + 1) as u32);
-            let mut traj = TrajectoryController::new(Vec3::new(0.0, 0.0, 0.0), self.config.max_bot_speed, self.config.bounds);
+            let mut traj = TrajectoryController::new(
+                Vec3::new(0.0, 0.0, 0.0),
+                self.config.max_bot_speed,
+                self.config.bounds,
+            );
             let target_addr = self.config.gateway_addr.clone();
             let metrics = Arc::clone(&self.metrics);
             let mut shutdown_rx = shutdown_tx.subscribe();
@@ -184,7 +188,10 @@ impl SwarmManager {
             bot_handles.push(handle);
         }
 
-        println!("All bots dispatched. Running simulation for {:?}...", self.config.duration);
+        println!(
+            "All bots dispatched. Running simulation for {:?}...",
+            self.config.duration
+        );
         sleep(self.config.duration).await;
 
         // Signal shutdown
@@ -201,10 +208,10 @@ impl SwarmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
     use bytes::BytesMut;
     use mmo_schema::client::ClientPacket;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_swarm_manager_lifecycle() {
@@ -222,7 +229,9 @@ mod tests {
                 let mut buf = BytesMut::with_capacity(1024);
                 if let Ok(n) = s.read_buf(&mut buf).await {
                     if n > 0 {
-                        if let Ok(Some(ClientPacket::Ping(ping))) = ClientPacket::decode_frame(&mut buf) {
+                        if let Ok(Some(ClientPacket::Ping(ping))) =
+                            ClientPacket::decode_frame(&mut buf)
+                        {
                             let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
                                 client_timestamp: ping.timestamp,
                                 server_timestamp: 1000,

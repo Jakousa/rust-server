@@ -3,8 +3,8 @@
 //! Provides guild rosters, permission hierarchies (Member, Officer, Leader),
 //! and a shared transactional [`GuildVault`] bank container.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use mmo_core::{Entity, GameplayPlugin, Guid, PluginContext};
 
@@ -74,7 +74,12 @@ pub struct GuildState {
 }
 
 impl GuildState {
-    pub fn new(guild_id: u64, name: impl Into<String>, leader: Guid, vault_capacity: usize) -> Self {
+    pub fn new(
+        guild_id: u64,
+        name: impl Into<String>,
+        leader: Guid,
+        vault_capacity: usize,
+    ) -> Self {
         let mut members = HashMap::new();
         members.insert(leader, GuildRank::Leader);
 
@@ -142,7 +147,12 @@ impl GuildManager {
     }
 
     /// Adds a member to an existing guild, updating roster and mapping.
-    pub fn add_member(&mut self, guild_id: u64, player: Guid, rank: GuildRank) -> Result<(), &'static str> {
+    pub fn add_member(
+        &mut self,
+        guild_id: u64,
+        player: Guid,
+        rank: GuildRank,
+    ) -> Result<(), &'static str> {
         let guild = self.guilds.get_mut(&guild_id).ok_or("Guild not found")?;
         guild.add_member(player, rank);
         self.player_to_guild.insert(player, guild_id);
@@ -156,14 +166,19 @@ impl GuildManager {
         inv_slot: usize,
         player_entity: &mut Entity,
     ) -> Result<(), &'static str> {
-        let guild_id = *self.player_to_guild.get(&player_guid).ok_or("Player is not in a guild")?;
+        let guild_id = *self
+            .player_to_guild
+            .get(&player_guid)
+            .ok_or("Player is not in a guild")?;
         let guild = self.guilds.get_mut(&guild_id).ok_or("Guild not found")?;
 
         let inv = player_entity
             .get_component_mut::<InventoryComponent>()
             .ok_or("Player has no inventory component")?;
 
-        let item = inv.remove_item(inv_slot).ok_or("No item in specified slot")?;
+        let item = inv
+            .remove_item(inv_slot)
+            .ok_or("No item in specified slot")?;
 
         if let Err(err) = guild.vault.deposit(item.clone()) {
             // Rollback item back to player inventory
@@ -183,10 +198,15 @@ impl GuildManager {
         vault_slot: usize,
         player_entity: &mut Entity,
     ) -> Result<(), &'static str> {
-        let guild_id = *self.player_to_guild.get(&player_guid).ok_or("Player is not in a guild")?;
+        let guild_id = *self
+            .player_to_guild
+            .get(&player_guid)
+            .ok_or("Player is not in a guild")?;
         let guild = self.guilds.get_mut(&guild_id).ok_or("Guild not found")?;
 
-        let rank = guild.get_rank(player_guid).ok_or("Player not found in guild roster")?;
+        let rank = guild
+            .get_rank(player_guid)
+            .ok_or("Player not found in guild roster")?;
         if rank < GuildRank::Officer {
             return Err("Must be an Officer or Leader to withdraw from the guild vault");
         }
@@ -195,7 +215,10 @@ impl GuildManager {
             .get_component_mut::<InventoryComponent>()
             .ok_or("Player has no inventory component")?;
 
-        let item = guild.vault.withdraw(vault_slot).ok_or("No item in specified vault slot")?;
+        let item = guild
+            .vault
+            .withdraw(vault_slot)
+            .ok_or("No item in specified vault slot")?;
 
         if let Err(err) = inv.add_item(item.clone()) {
             // Rollback item back into vault
@@ -249,17 +272,26 @@ mod tests {
         member_entity.add_component(inv);
 
         assert!(mgr.deposit_item(member_guid, 0, &mut member_entity).is_ok());
-        assert_eq!(mgr.get_guild(guild_id).unwrap().vault.slots[0], Some(ore.clone()));
+        assert_eq!(
+            mgr.get_guild(guild_id).unwrap().vault.slots[0],
+            Some(ore.clone())
+        );
 
         // Normal member tries to withdraw -> Permission denied!
-        assert!(mgr.withdraw_item(member_guid, 0, &mut member_entity).is_err());
+        assert!(mgr
+            .withdraw_item(member_guid, 0, &mut member_entity)
+            .is_err());
 
         // Officer withdraws -> Success!
         let mut officer_entity = Entity::new(officer_guid, (0.0, 0.0, 0.0));
         officer_entity.add_component(InventoryComponent::new(4, 100.0));
 
-        assert!(mgr.withdraw_item(officer_guid, 0, &mut officer_entity).is_ok());
-        let officer_inv = officer_entity.get_component::<InventoryComponent>().unwrap();
+        assert!(mgr
+            .withdraw_item(officer_guid, 0, &mut officer_entity)
+            .is_ok());
+        let officer_inv = officer_entity
+            .get_component::<InventoryComponent>()
+            .unwrap();
         assert_eq!(officer_inv.slots[0], Some(ore));
         assert_eq!(mgr.get_guild(guild_id).unwrap().vault.slots[0], None);
     }

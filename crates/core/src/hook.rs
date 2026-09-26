@@ -40,9 +40,7 @@ pub enum Event {
         position: (f32, f32, f32),
     },
     /// Dispatched when an entity is despawned from the world.
-    OnDespawn {
-        entity: Guid,
-    },
+    OnDespawn { entity: Guid },
     /// Dispatched during the simulation tick for each active entity.
     OnTick {
         entity: Guid,

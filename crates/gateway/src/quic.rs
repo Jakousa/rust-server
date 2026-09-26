@@ -226,7 +226,10 @@ impl QuicClientSession {
     }
 
     /// Sends a reliable packet across the bidirectional stream.
-    pub async fn send_packet_stream(&mut self, pkt: &ClientPacket) -> Result<(), QuicTransportError> {
+    pub async fn send_packet_stream(
+        &mut self,
+        pkt: &ClientPacket,
+    ) -> Result<(), QuicTransportError> {
         self.ensure_bi_stream().await?;
         let encoded = pkt.encode();
         if let Some(ref mut send) = self.send_stream {
@@ -257,7 +260,8 @@ impl QuicClientSession {
 
     /// Closes the QUIC connection cleanly.
     pub fn close(&self, error_code: u32, reason: &str) {
-        self.connection.close(VarInt::from_u32(error_code), reason.as_bytes());
+        self.connection
+            .close(VarInt::from_u32(error_code), reason.as_bytes());
     }
 }
 
@@ -268,13 +272,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_quic_self_signed_cert_and_endpoint_roundtrip() {
-        let (certs, key) = generate_self_signed_cert(&["localhost", "127.0.0.1"])
-            .expect("generate cert");
+        let (certs, key) =
+            generate_self_signed_cert(&["localhost", "127.0.0.1"]).expect("generate cert");
         assert!(!certs.is_empty());
 
         let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server_endpoint = create_quic_server(server_addr, certs, key)
-            .expect("create server endpoint");
+        let server_endpoint =
+            create_quic_server(server_addr, certs, key).expect("create server endpoint");
         let bound_addr = server_endpoint.local_addr().expect("local addr");
 
         // Spawn a basic echo server task
@@ -320,7 +324,10 @@ mod tests {
 
         // 2. Test Stream flow
         let ping_pkt = ClientPacket::Ping(PingPacket { timestamp: 999 });
-        client.send_packet_stream(&ping_pkt).await.expect("send stream");
+        client
+            .send_packet_stream(&ping_pkt)
+            .await
+            .expect("send stream");
         let echoed_ping = client.recv_packet_stream().await.expect("recv stream");
         assert_eq!(echoed_ping, ping_pkt);
 

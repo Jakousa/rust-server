@@ -27,21 +27,45 @@ pub fn subdivide_bounds(bounds: &BoundingBox3D) -> [BoundingBox3D; 8] {
 
     [
         // Index 0: ---
-        BoundingBox3D::new((bounds.min.0, bounds.min.1, bounds.min.2), (mid_x, mid_y, mid_z)),
+        BoundingBox3D::new(
+            (bounds.min.0, bounds.min.1, bounds.min.2),
+            (mid_x, mid_y, mid_z),
+        ),
         // Index 1: +--
-        BoundingBox3D::new((mid_x, bounds.min.1, bounds.min.2), (bounds.max.0, mid_y, mid_z)),
+        BoundingBox3D::new(
+            (mid_x, bounds.min.1, bounds.min.2),
+            (bounds.max.0, mid_y, mid_z),
+        ),
         // Index 2: -+-
-        BoundingBox3D::new((bounds.min.0, mid_y, bounds.min.2), (mid_x, bounds.max.1, mid_z)),
+        BoundingBox3D::new(
+            (bounds.min.0, mid_y, bounds.min.2),
+            (mid_x, bounds.max.1, mid_z),
+        ),
         // Index 3: ++-
-        BoundingBox3D::new((mid_x, mid_y, bounds.min.2), (bounds.max.0, bounds.max.1, mid_z)),
+        BoundingBox3D::new(
+            (mid_x, mid_y, bounds.min.2),
+            (bounds.max.0, bounds.max.1, mid_z),
+        ),
         // Index 4: --+
-        BoundingBox3D::new((bounds.min.0, bounds.min.1, mid_z), (mid_x, mid_y, bounds.max.2)),
+        BoundingBox3D::new(
+            (bounds.min.0, bounds.min.1, mid_z),
+            (mid_x, mid_y, bounds.max.2),
+        ),
         // Index 5: +-+
-        BoundingBox3D::new((mid_x, bounds.min.1, mid_z), (bounds.max.0, mid_y, bounds.max.2)),
+        BoundingBox3D::new(
+            (mid_x, bounds.min.1, mid_z),
+            (bounds.max.0, mid_y, bounds.max.2),
+        ),
         // Index 6: -++
-        BoundingBox3D::new((bounds.min.0, mid_y, mid_z), (mid_x, bounds.max.1, bounds.max.2)),
+        BoundingBox3D::new(
+            (bounds.min.0, mid_y, mid_z),
+            (mid_x, bounds.max.1, bounds.max.2),
+        ),
         // Index 7: +++
-        BoundingBox3D::new((mid_x, mid_y, mid_z), (bounds.max.0, bounds.max.1, bounds.max.2)),
+        BoundingBox3D::new(
+            (mid_x, mid_y, mid_z),
+            (bounds.max.0, bounds.max.1, bounds.max.2),
+        ),
     ]
 }
 
@@ -235,6 +259,74 @@ impl GlobalOctreeNode {
             }
         }
     }
+
+    /// Recursively collects all leaves assigned to any of `dead_node_ids`.
+    pub fn collect_orphaned_leaves(
+        &self,
+        dead_node_ids: &[u32],
+        orphaned: &mut Vec<(BoundingBox3D, u32)>,
+    ) {
+        match self {
+            GlobalOctreeNode::Leaf {
+                bounds,
+                assigned_node_id,
+                ..
+            } => {
+                if let Some(nid) = *assigned_node_id {
+                    if dead_node_ids.contains(&nid) {
+                        orphaned.push((*bounds, nid));
+                    }
+                }
+            }
+            GlobalOctreeNode::Branch { children, .. } => {
+                for child in children.iter() {
+                    child.collect_orphaned_leaves(dead_node_ids, orphaned);
+                }
+            }
+        }
+    }
+
+    /// Reassigns a specific leaf octant matching `target_bounds` to `new_node_id`.
+    pub fn assign_leaf_node(
+        &mut self,
+        target_bounds: &BoundingBox3D,
+        new_node_id: Option<u32>,
+    ) -> bool {
+        match self {
+            GlobalOctreeNode::Leaf {
+                bounds,
+                assigned_node_id,
+                ..
+            } => {
+                if bounds == target_bounds {
+                    *assigned_node_id = new_node_id;
+                    true
+                } else {
+                    false
+                }
+            }
+            GlobalOctreeNode::Branch { bounds, children } => {
+                if !bounds.intersects(target_bounds) {
+                    return false;
+                }
+                for child in children.iter_mut() {
+                    if child.assign_leaf_node(target_bounds, new_node_id) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Record of an orphaned partition being reassigned to a surviving node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionRecoveryEvent {
+    pub bounds: BoundingBox3D,
+    pub previous_node_id: u32,
+    pub new_node_id: u32,
+    pub epoch: u64,
 }
 
 /// Global coordinator tracking cluster octree spatial partitioning and dynamic subdivision.
@@ -244,6 +336,7 @@ pub struct GlobalOctreeCoordinator {
     pub merge_threshold: u32,
     pub root: GlobalOctreeNode,
     pub spatial_index: Octree,
+    pub topology_epoch: u64,
 }
 
 impl Default for GlobalOctreeCoordinator {
@@ -255,7 +348,11 @@ impl Default for GlobalOctreeCoordinator {
 impl GlobalOctreeCoordinator {
     /// Creates a new `GlobalOctreeCoordinator` with the specified root bounds and default thresholds.
     pub fn new(root_bounds: BoundingBox3D) -> Self {
-        Self::with_thresholds(root_bounds, DEFAULT_SPLIT_THRESHOLD, DEFAULT_MERGE_THRESHOLD)
+        Self::with_thresholds(
+            root_bounds,
+            DEFAULT_SPLIT_THRESHOLD,
+            DEFAULT_MERGE_THRESHOLD,
+        )
     }
 
     /// Creates a new `GlobalOctreeCoordinator` with custom split and merge thresholds.
@@ -277,7 +374,13 @@ impl GlobalOctreeCoordinator {
             merge_threshold,
             root,
             spatial_index,
+            topology_epoch: 1,
         }
+    }
+
+    /// Returns the current generational topology epoch.
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
     }
 
     /// Returns `true` if an octant's reported entity count meets or exceeds `split_threshold`.
@@ -412,7 +515,8 @@ impl GlobalOctreeCoordinator {
         }
 
         // 4. Update coordinator topology tree
-        let mut assignments_arr: [(BoundingBox3D, u32); 8] = [(original_bounds, reporting_node_id); 8];
+        let mut assignments_arr: [(BoundingBox3D, u32); 8] =
+            [(original_bounds, reporting_node_id); 8];
         for i in 0..8 {
             assignments_arr[i] = (sub_bounds[i], assigned_node_ids[i]);
         }
@@ -426,10 +530,14 @@ impl GlobalOctreeCoordinator {
                 self.spatial_index.remove(guid, center);
             }
         }
-        for (i, (&child, &assigned_id)) in sub_bounds.iter().zip(assigned_node_ids.iter()).enumerate() {
+        for (i, (&child, &assigned_id)) in
+            sub_bounds.iter().zip(assigned_node_ids.iter()).enumerate()
+        {
             let guid = Guid::new(EntityType::Player, assigned_id as u16, i as u32);
             self.spatial_index.insert(guid, child.center());
         }
+
+        self.topology_epoch += 1;
 
         assigned_node_ids
     }
@@ -472,9 +580,72 @@ impl GlobalOctreeCoordinator {
         if merged {
             let guid = Guid::new(EntityType::Player, target_node_id as u16, 0);
             self.spatial_index.insert(guid, parent_bounds.center());
+            self.topology_epoch += 1;
         }
 
         merged
+    }
+
+    /// Scans the topology tree for leaf octants assigned to evicted/dead simulation nodes,
+    /// reassigning each orphaned partition to active surviving nodes balancing cluster load.
+    ///
+    /// Returns a list of `PartitionRecoveryEvent`s describing the reassignments.
+    /// If no active nodes remain, the partitions are set to unassigned (`None`).
+    pub fn recover_orphaned_partitions(
+        &mut self,
+        dead_node_ids: &[u32],
+        registry: &mut NodeRegistry,
+    ) -> Vec<PartitionRecoveryEvent> {
+        if dead_node_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut orphaned = Vec::new();
+        self.root
+            .collect_orphaned_leaves(dead_node_ids, &mut orphaned);
+
+        if orphaned.is_empty() {
+            return Vec::new();
+        }
+
+        self.topology_epoch += 1;
+        let current_epoch = self.topology_epoch;
+        let mut events = Vec::with_capacity(orphaned.len());
+
+        for (bounds, prev_node_id) in orphaned {
+            let active_ids = registry.active_node_ids();
+            let target_node_id = if active_ids.is_empty() {
+                None
+            } else {
+                registry.find_least_loaded_node(&[])
+            };
+
+            self.root.assign_leaf_node(&bounds, target_node_id);
+
+            // Clean up spatial index entry for the previous dead node
+            let center = bounds.center();
+            let query = self.spatial_index.query_radius(center, 0.1);
+            for guid in query {
+                if guid.node_id() as u32 == prev_node_id {
+                    self.spatial_index.remove(guid, center);
+                }
+            }
+
+            if let Some(new_node_id) = target_node_id {
+                registry.add_assigned_bounds(new_node_id, bounds);
+                let guid = Guid::new(EntityType::Player, new_node_id as u16, 0);
+                self.spatial_index.insert(guid, center);
+
+                events.push(PartitionRecoveryEvent {
+                    bounds,
+                    previous_node_id: prev_node_id,
+                    new_node_id,
+                    epoch: current_epoch,
+                });
+            }
+        }
+
+        events
     }
 }
 
@@ -490,9 +661,15 @@ mod tests {
         assert_eq!(children.len(), 8);
 
         // Check child 0: --- -> (0..50, 0..50, 0..50)
-        assert_eq!(children[0], BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 50.0, 50.0)));
+        assert_eq!(
+            children[0],
+            BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 50.0, 50.0))
+        );
         // Check child 7: +++ -> (50..100, 50..100, 50..100)
-        assert_eq!(children[7], BoundingBox3D::new((50.0, 50.0, 50.0), (100.0, 100.0, 100.0)));
+        assert_eq!(
+            children[7],
+            BoundingBox3D::new((50.0, 50.0, 50.0), (100.0, 100.0, 100.0))
+        );
 
         // Child centers
         assert_eq!(children[0].center(), (25.0, 25.0, 25.0));
@@ -584,7 +761,10 @@ mod tests {
 
         // Point in child 1 (50..100, 0..50, 0..50) routes to assigned node
         let expected_node_child1 = assigned_ids[1];
-        assert_eq!(coord.find_node_for_point((75.0, 25.0, 25.0)), Some(expected_node_child1));
+        assert_eq!(
+            coord.find_node_for_point((75.0, 25.0, 25.0)),
+            Some(expected_node_child1)
+        );
 
         // Verify bounds in registry
         let reg_node1 = registry.get_node(node1).unwrap();
@@ -613,7 +793,11 @@ mod tests {
 
         // Root is now a leaf assigned to node2
         match &coord.root {
-            GlobalOctreeNode::Leaf { assigned_node_id, bounds: b, .. } => {
+            GlobalOctreeNode::Leaf {
+                assigned_node_id,
+                bounds: b,
+                ..
+            } => {
                 assert_eq!(*assigned_node_id, Some(node2));
                 assert_eq!(*b, bounds);
             }
@@ -627,5 +811,67 @@ mod tests {
         // Registry bounds updated
         let reg_node2 = registry.get_node(node2).unwrap();
         assert!(reg_node2.assigned_bounds.contains(&bounds));
+    }
+
+    #[test]
+    fn test_recover_orphaned_partitions_reassigns_leaves_and_increments_epoch() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 = registry.register_node("127.0.0.1:50051".to_string(), vec![bounds]);
+        let node2 = registry.register_node("127.0.0.1:50052".to_string(), vec![]);
+        coord.assign_initial_node(node1);
+
+        assert_eq!(coord.topology_epoch(), 1);
+
+        // Split into 8 leaves (assigns some to node1 and some to node2)
+        let _ = coord.handle_split(node1, bounds, vec![], &mut registry);
+        assert_eq!(coord.topology_epoch(), 2);
+
+        // Simulate node1 dying: evict from registry
+        let _ = registry.deregister_node(node1);
+        assert_eq!(registry.active_node_ids(), vec![node2]);
+
+        // Recover orphaned partitions belonging to node1
+        let events = coord.recover_orphaned_partitions(&[node1], &mut registry);
+        assert!(!events.is_empty());
+        assert_eq!(coord.topology_epoch(), 3);
+
+        for event in &events {
+            assert_eq!(event.previous_node_id, node1);
+            assert_eq!(event.new_node_id, node2);
+            assert_eq!(event.epoch, 3);
+        }
+
+        // Verify no point inside bounds points to dead node1
+        assert_eq!(coord.find_node_for_point((25.0, 25.0, 25.0)), Some(node2));
+        assert_eq!(coord.find_node_for_point((75.0, 75.0, 75.0)), Some(node2));
+
+        // Registry for node2 should now have all 8 bounds
+        let reg_node2 = registry.get_node(node2).unwrap();
+        assert_eq!(reg_node2.assigned_bounds.len(), 8);
+    }
+
+    #[test]
+    fn test_recover_orphaned_partitions_total_cluster_blackout() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 = registry.register_node("127.0.0.1:50051".to_string(), vec![bounds]);
+        coord.assign_initial_node(node1);
+
+        // All nodes die
+        let _ = registry.deregister_node(node1);
+        assert!(registry.active_node_ids().is_empty());
+
+        let events = coord.recover_orphaned_partitions(&[node1], &mut registry);
+        // Since no active node exists, events is empty (unassigned rather than reassigned)
+        assert!(events.is_empty());
+        assert_eq!(coord.topology_epoch(), 2);
+
+        // Partition is now unassigned
+        assert_eq!(coord.find_node_for_point((25.0, 25.0, 25.0)), None);
     }
 }

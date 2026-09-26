@@ -219,7 +219,9 @@ impl TickSystem for FsmBrainSystem {
                             let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
                             if dist > brain.attack_range * 1.5 {
-                                brain.current_state = FsmState::Chase { target: target_guid };
+                                brain.current_state = FsmState::Chase {
+                                    target: target_guid,
+                                };
                             } else {
                                 set_nav_target = Some(None); // Remain stationary while in melee attack range
                                 *cooldown_timer -= ctx.dt_sec;
@@ -342,7 +344,10 @@ mod tests {
 
         let monster_ent = store.get(monster_key).unwrap();
         assert!(matches!(
-            monster_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
+            monster_ent
+                .get_component::<FsmBrainComponent>()
+                .unwrap()
+                .current_state,
             FsmState::Idle { .. }
         ));
 
@@ -367,8 +372,13 @@ mod tests {
 
         let monster_ent = store.get(monster_key).unwrap();
         assert_eq!(
-            monster_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
-            FsmState::Chase { target: player_guid }
+            monster_ent
+                .get_component::<FsmBrainComponent>()
+                .unwrap()
+                .current_state,
+            FsmState::Chase {
+                target: player_guid
+            }
         );
 
         // 3. Move monster to (4.0, 0.0, 0.0) so distance to player (5.0, 0.0, 0.0) is 1.0m (within 2.0m attack range)
@@ -431,7 +441,10 @@ mod tests {
 
         let monster_ent = store.get(monster_key).unwrap();
         assert!(matches!(
-            monster_ent.get_component::<FsmBrainComponent>().unwrap().current_state,
+            monster_ent
+                .get_component::<FsmBrainComponent>()
+                .unwrap()
+                .current_state,
             FsmState::Evade { .. }
         ));
     }

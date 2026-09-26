@@ -3,8 +3,8 @@
 //! Provides group creation, invitation staging, member roster synchronization,
 //! and leadership delegation across player entities.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use mmo_core::{GameplayPlugin, Guid, PluginContext};
 
@@ -160,7 +160,10 @@ impl PartyManager {
             .remove(&invitee)
             .ok_or("No pending party invitation for player")?;
 
-        let party = self.parties.get_mut(&party_id).ok_or("Party no longer exists")?;
+        let party = self
+            .parties
+            .get_mut(&party_id)
+            .ok_or("Party no longer exists")?;
         party.add_member(invitee)?;
         self.player_to_party.insert(invitee, party_id);
 

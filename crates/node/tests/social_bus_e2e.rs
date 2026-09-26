@@ -101,7 +101,11 @@ async fn test_cross_node_social_bus_and_party_sync() {
     // Node 2 receives party invite
     let received_action = party_events_rx.recv().await.unwrap();
     match received_action {
-        SocialEnvelope::Party(PartyAction::Invite { party_id: p_id, inviter_guid, invitee_guid }) => {
+        SocialEnvelope::Party(PartyAction::Invite {
+            party_id: p_id,
+            inviter_guid,
+            invitee_guid,
+        }) => {
             assert_eq!(p_id, party_id);
             assert_eq!(inviter_guid, p1_guid.raw());
             assert_eq!(invitee_guid, p2_guid.raw());
@@ -126,7 +130,10 @@ async fn test_cross_node_social_bus_and_party_sync() {
     // Node 1 receives acceptance
     let accept_received = party_events_rx.recv().await.unwrap();
     match accept_received {
-        SocialEnvelope::Party(PartyAction::Accept { party_id: p_id, member_guid }) => {
+        SocialEnvelope::Party(PartyAction::Accept {
+            party_id: p_id,
+            member_guid,
+        }) => {
             assert_eq!(p_id, party_id);
             assert_eq!(member_guid, p2_guid.raw());
         }
@@ -162,7 +169,10 @@ async fn test_cross_node_social_bus_and_party_sync() {
         actor_guid: p1_guid.raw(),
     };
     social_bus
-        .publish(&guild_sync_channel, &SocialEnvelope::Guild(sync_event.clone()))
+        .publish(
+            &guild_sync_channel,
+            &SocialEnvelope::Guild(sync_event.clone()),
+        )
         .await
         .unwrap();
 

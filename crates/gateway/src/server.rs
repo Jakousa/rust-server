@@ -31,10 +31,7 @@ pub enum GatewayError {
     Codec(#[from] ClientCodecError),
 
     #[error("No authoritative route found for session {session_id}, guid: {guid:?}")]
-    NoRouteFound {
-        session_id: u64,
-        guid: Option<Guid>,
-    },
+    NoRouteFound { session_id: u64, guid: Option<Guid> },
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -319,7 +316,8 @@ impl GatewayServer {
         session_id: u64,
         node_address: String,
     ) -> Result<(), GatewayError> {
-        self.router.register_session_fallback(session_id, node_address);
+        self.router
+            .register_session_fallback(session_id, node_address);
         Ok(())
     }
 
@@ -514,7 +512,10 @@ impl GatewayServer {
         let mut buf = BytesMut::with_capacity(8192);
 
         loop {
-            let bytes_read = read_half.read_buf(&mut buf).await.map_err(GatewayError::Io)?;
+            let bytes_read = read_half
+                .read_buf(&mut buf)
+                .await
+                .map_err(GatewayError::Io)?;
             if bytes_read == 0 {
                 // Client cleanly closed connection
                 break;
@@ -909,7 +910,10 @@ mod tests {
         let router = Arc::new(SessionRouter::new());
         let (packet_tx, mut packet_rx) = mpsc::channel(16);
 
-        let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
+        let server = Arc::new(GatewayServer::with_packet_channel(
+            router.clone(),
+            packet_tx,
+        ));
 
         // Bind listener on an ephemeral port
         let listener = server.bind("127.0.0.1:0").await.unwrap();
@@ -1035,7 +1039,8 @@ mod tests {
         assert!(!server.send_packet_to_session(999, &pkt).await.unwrap());
 
         let received1 = rx1.recv().await.expect("received packet bytes");
-        let decoded = ClientPacket::decode_frame(&mut bytes::BytesMut::from(received1.as_ref())).unwrap();
+        let decoded =
+            ClientPacket::decode_frame(&mut bytes::BytesMut::from(received1.as_ref())).unwrap();
         assert_eq!(decoded, Some(pkt.clone()));
 
         // Broadcast
@@ -1090,12 +1095,10 @@ mod tests {
             timestamp: 5000,
         });
 
-        assert!(
-            server_clone
-                .send_packet_to_session(session_id, &entity_state)
-                .await
-                .unwrap()
-        );
+        assert!(server_clone
+            .send_packet_to_session(session_id, &entity_state)
+            .await
+            .unwrap());
 
         // Client reads the framed packet
         let mut read_buf = BytesMut::with_capacity(1024);
@@ -1155,12 +1158,17 @@ mod tests {
 
         let router = Arc::new(SessionRouter::new());
         let (packet_tx, mut packet_rx) = mpsc::channel(100);
-        let server = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
+        let server = Arc::new(GatewayServer::with_packet_channel(
+            router.clone(),
+            packet_tx,
+        ));
 
         let session_id = 99;
         let player_guid = Guid::new(EntityType::Player, 1, 999);
         let node_addr = "127.0.0.1:50051".to_string();
-        server.register_session(session_id, player_guid, node_addr.clone()).unwrap();
+        server
+            .register_session(session_id, player_guid, node_addr.clone())
+            .unwrap();
 
         let quic_endpoint = server
             .bind_quic_self_signed("127.0.0.1:0".parse().unwrap(), &["localhost", "127.0.0.1"])
@@ -1191,10 +1199,11 @@ mod tests {
         });
         client.send_datagram(&move_pkt).expect("send datagram");
 
-        let routed_move = tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
-            .await
-            .expect("timeout waiting for routed movement")
-            .expect("routed move pkt");
+        let routed_move =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
+                .await
+                .expect("timeout waiting for routed movement")
+                .expect("routed move pkt");
         assert_eq!(routed_move.session_id, session_id);
         assert_eq!(routed_move.packet, move_pkt);
 
@@ -1206,18 +1215,25 @@ mod tests {
             action_id: 1,
             payload: Bytes::from_static(&[1, 2, 3]),
         });
-        client.send_packet_stream(&interact_pkt).await.expect("send stream");
-
-        let routed_interact = tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
+        client
+            .send_packet_stream(&interact_pkt)
             .await
-            .expect("timeout waiting for routed interaction")
-            .expect("routed interact pkt");
+            .expect("send stream");
+
+        let routed_interact =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), packet_rx.recv())
+                .await
+                .expect("timeout waiting for routed interaction")
+                .expect("routed interact pkt");
         assert_eq!(routed_interact.session_id, session_id);
         assert_eq!(routed_interact.packet, interact_pkt);
 
         // 3. Bidirectional Stream Ping -> Pong
         let ping_pkt = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 7777 });
-        client.send_packet_stream(&ping_pkt).await.expect("send ping");
+        client
+            .send_packet_stream(&ping_pkt)
+            .await
+            .expect("send ping");
         let pong_pkt = tokio::time::timeout(
             tokio::time::Duration::from_secs(2),
             client.recv_packet_stream(),
@@ -1243,15 +1259,16 @@ mod tests {
             state_flags: 1,
             timestamp: 9000,
         });
-        server.send_packet_to_session(session_id, &entity_state).await.unwrap();
+        server
+            .send_packet_to_session(session_id, &entity_state)
+            .await
+            .unwrap();
 
-        let received_state = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            client.read_datagram(),
-        )
-        .await
-        .expect("timeout waiting for downstream entity state")
-        .expect("read datagram");
+        let received_state =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), client.read_datagram())
+                .await
+                .expect("timeout waiting for downstream entity state")
+                .expect("read datagram");
         assert_eq!(received_state, entity_state);
 
         // Disconnect
@@ -1271,7 +1288,9 @@ mod tests {
         let session_id = 555;
         let player_guid = Guid::new(EntityType::Player, 1, 555);
         let node_addr = "127.0.0.1:50051".to_string();
-        server.register_session(session_id, player_guid, node_addr).unwrap();
+        server
+            .register_session(session_id, player_guid, node_addr)
+            .unwrap();
 
         let srv = server.clone();
         let handle = tokio::spawn(async move {
@@ -1296,5 +1315,3 @@ mod tests {
         drop(client);
     }
 }
-
-

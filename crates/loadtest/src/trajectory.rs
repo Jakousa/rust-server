@@ -141,7 +141,10 @@ mod tests {
 
     #[test]
     fn test_trajectory_controller_stepping() {
-        let bounds = WorldBounds::new(Vec3::new(-100.0, -100.0, -100.0), Vec3::new(100.0, 100.0, 100.0));
+        let bounds = WorldBounds::new(
+            Vec3::new(-100.0, -100.0, -100.0),
+            Vec3::new(100.0, 100.0, 100.0),
+        );
         let mut ctrl = TrajectoryController::new(Vec3::new(10.0, 0.0, 10.0), 10.0, bounds);
 
         let initial_pos = ctrl.position;

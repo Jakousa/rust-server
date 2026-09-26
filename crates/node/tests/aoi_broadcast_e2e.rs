@@ -31,9 +31,15 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
     // 1. Initialize GatewayServer on ephemeral port
     let router = Arc::new(SessionRouter::new());
     let (packet_tx, _packet_rx) = mpsc::channel(100);
-    let gateway = Arc::new(GatewayServer::with_packet_channel(router.clone(), packet_tx));
+    let gateway = Arc::new(GatewayServer::with_packet_channel(
+        router.clone(),
+        packet_tx,
+    ));
 
-    let listener = gateway.bind("127.0.0.1:0").await.expect("bind gateway listener");
+    let listener = gateway
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway listener");
     let gateway_addr = listener.local_addr().expect("local addr");
 
     // 2. Initialize 20 Hz authoritative simulation node
@@ -79,7 +85,9 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
 
     // Allow connection handshake to register session sink
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(gateway.has_session_sink(session_a).expect("sink registered"));
+    assert!(gateway
+        .has_session_sink(session_a)
+        .expect("sink registered"));
 
     // Helper function: ticks simulation, drains broadcast jobs, and forwards to gateway
     async fn forward_aoi_broadcasts(sim: &mut TickSimulation, gw: &GatewayServer) {
@@ -107,10 +115,7 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
     // --- PHASE 2: Player B moves into range (from 55m to 46m) -> Enter: EntityState received ---
     sim.process_client_move_deterministic(player_b, (46.0, 0.0, 0.0), 1.0)
         .expect("valid move into range");
-    sim.entity_store
-        .get_mut_by_guid(player_b)
-        .unwrap()
-        .rotation = std::f32::consts::PI;
+    sim.entity_store.get_mut_by_guid(player_b).unwrap().rotation = std::f32::consts::PI;
 
     forward_aoi_broadcasts(&mut sim, &gateway).await;
 
