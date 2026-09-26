@@ -96,7 +96,10 @@ impl TelemetryServer {
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[Telemetry] Failed to bind admin HTTP listener on {}: {}", addr, e);
+                    eprintln!(
+                        "[Telemetry] Failed to bind admin HTTP listener on {}: {}",
+                        addr, e
+                    );
                     return;
                 }
             };

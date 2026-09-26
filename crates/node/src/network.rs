@@ -353,7 +353,8 @@ impl NodeService for NodeServiceImpl {
                 return Ok(tonic::Response::new(MigrateEntityResponse {
                     success: false,
                     error_code: 1,
-                    error_message: "Missing position coordinates in MigrateEntityRequest".to_string(),
+                    error_message: "Missing position coordinates in MigrateEntityRequest"
+                        .to_string(),
                     acknowledged_guid: req.guid,
                 }));
             }
@@ -406,11 +407,7 @@ impl NodeService for NodeServiceImpl {
 
         // 7. Register AoI observer if an active client session was attached
         if req.session_id != 0 {
-            sim.register_aoi_observer(
-                req.session_id,
-                guid,
-                crate::aoi::ObserverConfig::default(),
-            );
+            sim.register_aoi_observer(req.session_id, guid, crate::aoi::ObserverConfig::default());
         }
 
         metrics::counter!("mmo_migration_inbound_total", "status" => "success").increment(1);
@@ -444,7 +441,9 @@ pub async fn execute_entity_migration(
     let (req, session_id) = {
         let mut sim_guard = sim.write().await;
         if !sim_guard.acquire_migration_lease(guid) {
-            return Err("Failed to acquire migration lease (already migrating or not found)".to_string());
+            return Err(
+                "Failed to acquire migration lease (already migrating or not found)".to_string(),
+            );
         }
         let entity = match sim_guard.entity_store.get_by_guid(guid) {
             Some(e) => e,
@@ -525,7 +524,10 @@ pub async fn execute_entity_migration(
         let mut sim_guard = sim.write().await;
         sim_guard.release_migration_lease(guid);
         metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-        return Err(format!("Recipient rejected migration: {}", resp.error_message));
+        return Err(format!(
+            "Recipient rejected migration: {}",
+            resp.error_message
+        ));
     }
 
     // Step 3: Gateway commit
@@ -1248,7 +1250,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_command_veto_when_target_migrating() {
-        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, test_bounds())));
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            test_bounds(),
+        )));
         let service = NodeServiceImpl::new(Arc::clone(&sim));
 
         let initiator = Guid::new(EntityType::Player, 1, 10);
@@ -1297,7 +1302,10 @@ mod tests {
 
         // Donor Node on Node 1
         let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
-        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, donor_bounds)));
+        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            donor_bounds,
+        )));
 
         let guid = Guid::new(EntityType::Player, 1, 555);
         let target_pos = (55.0, 10.0, 10.0); // Inside Node 2 bounds
@@ -1357,14 +1365,8 @@ mod tests {
         }
 
         // Try migrating to unreachable port
-        let res = execute_entity_migration(
-            Arc::clone(&sim),
-            guid,
-            2,
-            "127.0.0.1:59999",
-            None,
-        )
-        .await;
+        let res =
+            execute_entity_migration(Arc::clone(&sim), guid, 2, "127.0.0.1:59999", None).await;
 
         assert!(res.is_err());
 

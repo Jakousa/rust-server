@@ -1439,10 +1439,16 @@ mod tests {
         assert!(render_active.contains("mmo_gateway_active_sessions"));
 
         let ping = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 12345 });
-        server.send_packet_to_session(session_id, &ping).await.unwrap();
+        server
+            .send_packet_to_session(session_id, &ping)
+            .await
+            .unwrap();
 
         // Saturate buffer and send again to trigger packet drop
-        let dropped = server.send_packet_to_session(session_id, &ping).await.unwrap();
+        let dropped = server
+            .send_packet_to_session(session_id, &ping)
+            .await
+            .unwrap();
         assert!(!dropped);
 
         let render_metrics = telemetry.render_metrics();

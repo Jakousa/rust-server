@@ -711,7 +711,10 @@ impl CharacterRepository {
     }
 
     /// Retrieves an item by its unique instance ID.
-    pub async fn get_item(&self, item_instance_id: &str) -> Result<Option<ItemRecord>, StorageError> {
+    pub async fn get_item(
+        &self,
+        item_instance_id: &str,
+    ) -> Result<Option<ItemRecord>, StorageError> {
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 let row = sqlx::query(
@@ -979,11 +982,14 @@ impl CharacterRepository {
                 }
 
                 // 2. Fetch recipient inventory capacity
-                let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = $1")
-                    .bind(recipient_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let capacity = inv_row.map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30)).unwrap_or(30) as u32;
+                let inv_row =
+                    sqlx::query("SELECT capacity FROM inventories WHERE character_guid = $1")
+                        .bind(recipient_guid as i64)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                let capacity = inv_row
+                    .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
+                    .unwrap_or(30) as u32;
 
                 // 3. Fetch recipient occupied slots
                 let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = $1")
@@ -1008,16 +1014,20 @@ impl CharacterRepository {
 
                 // 4. Verify sender owns each item
                 for item_id in item_instance_ids {
-                    let item_row = sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = $1")
-                        .bind(item_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                    let item_row =
+                        sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = $1")
+                            .bind(item_id)
+                            .fetch_optional(&mut *tx)
+                            .await?;
 
                     match item_row {
                         Some(r) => {
                             let owner: i64 = r.try_get("character_guid")?;
                             if owner as u64 != sender_guid {
-                                return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
+                                return Err(StorageError::ItemNotFound(
+                                    item_id.clone(),
+                                    sender_guid,
+                                ));
                             }
                         }
                         None => {
@@ -1161,8 +1171,12 @@ mod tests {
         let db = Database::connect_memory().await.unwrap();
         let repo = CharacterRepository::new(db);
 
-        repo.create_account("acc_inv", "inventory_user").await.unwrap();
-        repo.create_character("acc_inv", 2001, "Mage", (0.0, 0.0, 0.0)).await.unwrap();
+        repo.create_account("acc_inv", "inventory_user")
+            .await
+            .unwrap();
+        repo.create_character("acc_inv", 2001, "Mage", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
 
         // 1. Check default inventory
         let inv = repo.get_inventory(2001).await.unwrap().unwrap();
@@ -1238,10 +1252,18 @@ mod tests {
         let repo = CharacterRepository::new(db);
 
         // Setup accounts and characters
-        repo.create_account("acc_trade_a", "trader_a").await.unwrap();
-        repo.create_account("acc_trade_b", "trader_b").await.unwrap();
-        repo.create_character("acc_trade_a", 3001, "Alice", (0.0, 0.0, 0.0)).await.unwrap();
-        repo.create_character("acc_trade_b", 3002, "Bob", (0.0, 0.0, 0.0)).await.unwrap();
+        repo.create_account("acc_trade_a", "trader_a")
+            .await
+            .unwrap();
+        repo.create_account("acc_trade_b", "trader_b")
+            .await
+            .unwrap();
+        repo.create_character("acc_trade_a", 3001, "Alice", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        repo.create_character("acc_trade_b", 3002, "Bob", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
 
         // Give Alice 2 items
         let item1 = ItemRecord {
@@ -1294,7 +1316,10 @@ mod tests {
         let fail_trade = repo
             .execute_trade("trade_002", 3001, 3002, &["trade_shield".to_string()])
             .await;
-        assert!(matches!(fail_trade, Err(StorageError::InventoryFull(3002, 1))));
+        assert!(matches!(
+            fail_trade,
+            Err(StorageError::InventoryFull(3002, 1))
+        ));
 
         // Verify Alice STILL owns trade_shield (no partial loss or dupe)
         let alice_items_after = repo.get_character_items(3001).await.unwrap();
@@ -1306,7 +1331,10 @@ mod tests {
         let invalid_owner_trade = repo
             .execute_trade("trade_003", 3001, 3002, &["non_existent_item".to_string()])
             .await;
-        assert!(matches!(invalid_owner_trade, Err(StorageError::ItemNotFound(_, 3001))));
+        assert!(matches!(
+            invalid_owner_trade,
+            Err(StorageError::ItemNotFound(_, 3001))
+        ));
     }
 
     #[tokio::test]
@@ -1314,10 +1342,18 @@ mod tests {
         let db = Database::connect_memory().await.unwrap();
         let repo = CharacterRepository::new(db);
 
-        repo.create_account("acc_deadlock_1", "user_d1").await.unwrap();
-        repo.create_account("acc_deadlock_2", "user_d2").await.unwrap();
-        repo.create_character("acc_deadlock_1", 4001, "PlayerOne", (0.0, 0.0, 0.0)).await.unwrap();
-        repo.create_character("acc_deadlock_2", 4002, "PlayerTwo", (0.0, 0.0, 0.0)).await.unwrap();
+        repo.create_account("acc_deadlock_1", "user_d1")
+            .await
+            .unwrap();
+        repo.create_account("acc_deadlock_2", "user_d2")
+            .await
+            .unwrap();
+        repo.create_character("acc_deadlock_1", 4001, "PlayerOne", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        repo.create_character("acc_deadlock_2", 4002, "PlayerTwo", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
 
         // PlayerOne has item1, PlayerTwo has item2
         repo.add_item(&ItemRecord {
@@ -1330,7 +1366,9 @@ mod tests {
             attributes: serde_json::json!({}),
             created_at: 1000,
             updated_at: 1000,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         repo.add_item(&ItemRecord {
             item_instance_id: "p2_amulet".to_string(),
@@ -1342,18 +1380,24 @@ mod tests {
             attributes: serde_json::json!({}),
             created_at: 1000,
             updated_at: 1000,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Concurrently run PlayerOne -> PlayerTwo and PlayerTwo -> PlayerOne
         let repo1 = repo.clone();
         let repo2 = repo.clone();
 
         let t1 = tokio::spawn(async move {
-            repo1.execute_trade("trade_rev_1", 4001, 4002, &["p1_ring".to_string()]).await
+            repo1
+                .execute_trade("trade_rev_1", 4001, 4002, &["p1_ring".to_string()])
+                .await
         });
 
         let t2 = tokio::spawn(async move {
-            repo2.execute_trade("trade_rev_2", 4002, 4001, &["p2_amulet".to_string()]).await
+            repo2
+                .execute_trade("trade_rev_2", 4002, 4001, &["p2_amulet".to_string()])
+                .await
         });
 
         let (res1, res2) = tokio::join!(t1, t2);
