@@ -107,7 +107,7 @@ async fn test_quic_gateway_e2e_full_lifecycle() {
         target_guid: 9999,
         interaction_type: InteractionType::Attack,
         action_id: 101,
-        payload: vec![10, 20, 30],
+        payload: bytes::Bytes::from_static(&[10, 20, 30]),
     });
     client1
         .send_packet_stream(&interact_pkt)

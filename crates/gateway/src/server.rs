@@ -714,6 +714,7 @@ pub fn is_ephemeral_packet(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use mmo_core::guid::EntityType;
     use mmo_schema::client::{InteractionPacket, InteractionType, MovementPacket, Vec3};
     use tokio::io::AsyncWriteExt;
@@ -745,7 +746,7 @@ mod tests {
             target_guid: target_guid.raw(),
             interaction_type: InteractionType::Attack,
             action_id: 42,
-            payload: vec![1, 2, 3, 4],
+            payload: Bytes::from_static(&[1, 2, 3, 4]),
         });
 
         // 3. Serialize both into wire format bytes
@@ -1143,7 +1144,7 @@ mod tests {
             target_guid: 2,
             interaction_type: InteractionType::Attack,
             action_id: 10,
-            payload: vec![],
+            payload: Bytes::new(),
         });
         assert!(!is_ephemeral_packet(&interact_pkt.encode()));
     }
@@ -1203,7 +1204,7 @@ mod tests {
             target_guid: 555,
             interaction_type: InteractionType::Loot,
             action_id: 1,
-            payload: vec![1, 2, 3],
+            payload: Bytes::from_static(&[1, 2, 3]),
         });
         client.send_packet_stream(&interact_pkt).await.expect("send stream");
 

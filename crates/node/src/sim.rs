@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio::time::MissedTickBehavior;
 
 use mmo_core::{
-    BoundingBox3D, ComponentCodecRegistry, EntityStore, Event, EventQueue, GameplayPlugin, Guid,
-    HookDispatcher, ModularPacketRouter, Octree, PluginManager, TickContext, TickSystem,
+    BoundingBox3D, ComponentCodecRegistry, EntityDespawnEvent, EntityStore, Event, EventQueue,
+    GameplayPlugin, Guid, HookDispatcher, ModularPacketRouter, Octree, PluginManager, TickContext,
+    TickSystem,
 };
 
 use crate::aoi::{AoiBroadcastJob, AoiManager, ObserverConfig, ObserverState};
@@ -145,6 +145,7 @@ impl TickSimulation {
                 self.octree.remove_by_guid(guid);
             }
             self.hooks.dispatch(&Event::OnDespawn { entity: guid });
+            self.event_queue.push(EntityDespawnEvent { guid });
             true
         } else {
             false
@@ -238,16 +239,40 @@ impl TickSimulation {
         self.step(Self::TICK_DT_SEC);
     }
 
-    /// Runs a fixed number of 20 Hz simulation ticks asynchronously.
-    ///
-    /// Each tick executes after a 50ms interval, maintaining a precise 20 Hz rhythm.
-    pub async fn run_ticks(&mut self, count: usize) -> u64 {
-        let mut interval = tokio::time::interval(Self::TICK_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Burst);
+    /// Maximum number of consecutive catch-up ticks executed per cycle before yielding to Tokio.
+    pub const MAX_CATCHUP_TICKS: usize = 3;
 
-        for _ in 0..count {
-            interval.tick().await;
-            self.step_tick();
+    /// Runs a fixed number of 20 Hz simulation ticks asynchronously using a clamped tick accumulator.
+    ///
+    /// Executes at most [`Self::MAX_CATCHUP_TICKS`] catch-up ticks per cycle to prevent the "spiral of death"
+    /// and starvation of Tokio asynchronous I/O tasks.
+    pub async fn run_ticks(&mut self, count: usize) -> u64 {
+        let tick_duration = Self::TICK_INTERVAL;
+        let mut next_tick = tokio::time::Instant::now() + tick_duration;
+        let mut completed = 0;
+
+        while completed < count {
+            let now = tokio::time::Instant::now();
+            if now < next_tick {
+                tokio::time::sleep_until(next_tick).await;
+            }
+
+            let mut catchup = 0;
+            while tokio::time::Instant::now() >= next_tick
+                && completed < count
+                && catchup < Self::MAX_CATCHUP_TICKS
+            {
+                self.step_tick();
+                completed += 1;
+                catchup += 1;
+                next_tick += tick_duration;
+            }
+
+            // Clamp residual lag to prevent spiral of death
+            let now_after = tokio::time::Instant::now();
+            if now_after >= next_tick {
+                next_tick = now_after + tick_duration;
+            }
         }
 
         self.tick_counter

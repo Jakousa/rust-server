@@ -147,14 +147,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 3. Fixed 20 Hz (50ms) simulation game loop
+    // 3. Fixed 20 Hz (50ms) simulation game loop with clamped tick accumulator
     println!("[Node {}] Starting 20 Hz simulation tick loop...", node_id);
-    let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
-    tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let tick_duration = Duration::from_millis(50);
+    const MAX_CATCHUP_TICKS: usize = 3;
+    let mut next_tick = tokio::time::Instant::now() + tick_duration;
 
     loop {
-        tick_interval.tick().await;
-        let mut sim_guard = sim.write().await;
-        sim_guard.step_tick();
+        let now = tokio::time::Instant::now();
+        if now < next_tick {
+            tokio::time::sleep_until(next_tick).await;
+        }
+
+        let mut catchup = 0;
+        while tokio::time::Instant::now() >= next_tick && catchup < MAX_CATCHUP_TICKS {
+            let mut sim_guard = sim.write().await;
+            sim_guard.step_tick();
+            catchup += 1;
+            next_tick += tick_duration;
+        }
+
+        // Clamp residual lag to prevent spiral of death
+        let now_after = tokio::time::Instant::now();
+        if now_after >= next_tick {
+            next_tick = now_after + tick_duration;
+        }
     }
 }

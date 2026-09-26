@@ -127,6 +127,14 @@ impl ComponentCodecRegistry {
 /// Marker trait for domain events that can be enqueued into [`EventQueue`].
 pub trait DomainEvent: 'static + Send + Sync {}
 
+/// Domain event emitted when an entity is removed/despawned from simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityDespawnEvent {
+    pub guid: crate::guid::Guid,
+}
+
+impl DomainEvent for EntityDespawnEvent {}
+
 /// Type-erased event queue for deferred domain events.
 #[derive(Default)]
 pub struct EventQueue {

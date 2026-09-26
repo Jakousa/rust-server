@@ -34,9 +34,15 @@ pub struct Database {
 impl Database {
     /// Connects to a SQLite database using the provided connection string.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        let opts = SqliteConnectOptions::from_str(url)?
+        let mut opts = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(5));
+
+        if !url.contains(":memory:") {
+            opts = opts
+                .pragma("journal_mode", "WAL")
+                .pragma("synchronous", "NORMAL");
+        }
 
         let pool = SqlitePoolOptions::new()
             .max_connections(10)
@@ -141,5 +147,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(count.0, 3);
+    }
+
+    #[tokio::test]
+    async fn test_database_wal_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_wal.db");
+        let url = format!("sqlite://{}", db_path.display());
+
+        let db = Database::connect(&url).await.unwrap();
+
+        let row: (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(row.0.to_lowercase(), "wal");
     }
 }

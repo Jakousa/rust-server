@@ -4,7 +4,7 @@
 //! client-gateway and gateway-node communications (movement, entity state sync,
 //! and interaction actions).
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 /// Protocol magic header: 2 bytes `0x4D, 0x4D` ("MM" for MMO).
@@ -250,7 +250,7 @@ pub struct InteractionPacket {
     pub target_guid: u64,
     pub interaction_type: InteractionType,
     pub action_id: u32,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl InteractionPacket {
@@ -284,8 +284,7 @@ impl InteractionPacket {
                 got: src.remaining(),
             });
         }
-        let mut payload = vec![0u8; payload_len];
-        src.copy_to_slice(&mut payload);
+        let payload = src.copy_to_bytes(payload_len);
 
         Ok(Self {
             source_guid,
@@ -534,8 +533,8 @@ impl ClientPacket {
         frame.to_vec()
     }
 
-    /// Deserializes a single framed packet from a slice.
-    pub fn decode(bytes: &[u8]) -> Result<Self, ClientCodecError> {
+    /// Deserializes a single framed packet from an owned `Bytes` buffer without payload copying.
+    pub fn decode_bytes(mut bytes: Bytes) -> Result<Self, ClientCodecError> {
         if bytes.len() < HEADER_SIZE {
             return Err(ClientCodecError::BufferTooShort {
                 expected: HEADER_SIZE,
@@ -543,8 +542,7 @@ impl ClientPacket {
             });
         }
 
-        let mut header_slice = &bytes[0..HEADER_SIZE];
-        let magic = header_slice.get_u16_le();
+        let magic = bytes.get_u16_le();
         if magic != PACKET_MAGIC {
             return Err(ClientCodecError::InvalidMagic {
                 expected: PACKET_MAGIC,
@@ -552,18 +550,18 @@ impl ClientPacket {
             });
         }
 
-        let opcode_val = header_slice.get_u16_le();
+        let opcode_val = bytes.get_u16_le();
         let opcode = Opcode::from_u16(opcode_val)?;
-        let payload_len = header_slice.get_u32_le() as usize;
+        let payload_len = bytes.get_u32_le() as usize;
 
-        if bytes.len() - HEADER_SIZE < payload_len {
+        if bytes.remaining() < payload_len {
             return Err(ClientCodecError::LengthMismatch {
                 expected: payload_len,
-                got: bytes.len() - HEADER_SIZE,
+                got: bytes.remaining(),
             });
         }
 
-        let mut payload = &bytes[HEADER_SIZE..HEADER_SIZE + payload_len];
+        let mut payload = bytes.split_to(payload_len);
         match opcode {
             Opcode::Movement => Ok(ClientPacket::Movement(MovementPacket::decode(&mut payload)?)),
             Opcode::MovementCorrection => Ok(ClientPacket::MovementCorrection(
@@ -584,6 +582,11 @@ impl ClientPacket {
             Opcode::Ping => Ok(ClientPacket::Ping(PingPacket::decode(&mut payload)?)),
             Opcode::Pong => Ok(ClientPacket::Pong(PongPacket::decode(&mut payload)?)),
         }
+    }
+
+    /// Deserializes a single framed packet from a slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ClientCodecError> {
+        Self::decode_bytes(Bytes::copy_from_slice(bytes))
     }
 
     /// Streaming frame decoder for parsing incoming packets from a `BytesMut` buffer.
@@ -610,8 +613,8 @@ impl ClientPacket {
             return Ok(None);
         }
 
-        let frame_bytes = buf.split_to(total_frame_size);
-        let packet = Self::decode(&frame_bytes)?;
+        let frame_bytes = buf.split_to(total_frame_size).freeze();
+        let packet = Self::decode_bytes(frame_bytes)?;
         Ok(Some(packet))
     }
 }
@@ -670,7 +673,7 @@ mod tests {
             target_guid: 200,
             interaction_type: InteractionType::Attack,
             action_id: 99,
-            payload: vec![1, 2, 3, 4, 5],
+            payload: Bytes::from_static(&[1, 2, 3, 4, 5]),
         });
 
         let encoded = pkt.encode();

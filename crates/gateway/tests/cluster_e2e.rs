@@ -220,7 +220,7 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
         target_guid: 0,
         interaction_type: InteractionType::Talk,
         action_id: 1,
-        payload: vec![1, 2, 3],
+        payload: bytes::Bytes::from_static(&[1, 2, 3]),
     };
     frame_buf.clear();
     frame_buf.extend_from_slice(&ClientPacket::Interaction(interact_pkt).encode());

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use mmo_core::{GameplayPlugin, Guid, PluginContext, TickContext, TickSystem};
+use mmo_core::{EntityDespawnEvent, GameplayPlugin, Guid, PluginContext, TickContext, TickSystem};
 
 use crate::combat::{DamageEvent, HealthComponent};
 use crate::navigation::LeashComponent;
@@ -163,21 +163,35 @@ impl TickSystem for ThreatSystem {
         }
 
         // 3. Inspect leash reset and target validity for all entities with ThreatTableComponent
-        let living_guids: std::collections::HashSet<Guid> = ctx
-            .entities
-            .iter()
-            .filter_map(|(_, ent)| {
-                if let Some(health) = ent.get_component::<HealthComponent>() {
-                    if !health.is_dead {
-                        Some(ent.guid)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(ent.guid)
+        let despawns = ctx.events.drain::<EntityDespawnEvent>();
+        let mut invalid_targets: std::collections::HashSet<Guid> =
+            despawns.iter().map(|e| e.guid).collect();
+
+        // Collect unique current targets to evaluate
+        let mut targets_to_check = Vec::new();
+        for (_key, entity) in ctx.entities.iter() {
+            if let Some(tt) = entity.get_component::<ThreatTableComponent>() {
+                if let Some(target) = tt.current_target {
+                    targets_to_check.push(target);
                 }
-            })
-            .collect();
+            }
+        }
+
+        // Check health of active targets only (O(K_targets) instead of O(N_world))
+        for target in targets_to_check {
+            match ctx.entities.get_by_guid(target) {
+                Some(target_ent) => {
+                    if let Some(health) = target_ent.get_component::<HealthComponent>() {
+                        if health.is_dead {
+                            invalid_targets.insert(target);
+                        }
+                    }
+                }
+                None => {
+                    invalid_targets.insert(target);
+                }
+            }
+        }
 
         for (_key, entity) in ctx.entities.iter_mut() {
             let is_leashed_out = entity
@@ -190,11 +204,16 @@ impl TickSystem for ThreatSystem {
                     // Leash exceeded: wipe threat and drop combat
                     threat_table.clear();
                 } else if let Some(target_guid) = threat_table.current_target {
-                    if !living_guids.contains(&target_guid) {
+                    if invalid_targets.contains(&target_guid) {
                         threat_table.remove_target(target_guid);
                     }
                 }
             }
+        }
+
+        // Re-push despawn events so other systems can process them
+        for despawn in despawns {
+            ctx.events.push(despawn);
         }
     }
 }

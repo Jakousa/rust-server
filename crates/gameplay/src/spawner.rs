@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use mmo_core::{
-    DomainEvent, EntityStore, GameplayPlugin, Guid, Octree, PluginContext, TickContext,
-    TickSystem,
+    DomainEvent, EntityDespawnEvent, EntityStore, GameplayPlugin, Guid, Octree, PluginContext,
+    TickContext, TickSystem,
 };
 
 use crate::combat::{HealthComponent, StatsComponent};
@@ -175,24 +175,36 @@ impl TickSystem for SpawnerSystem {
 
     #[allow(clippy::type_complexity)]
     fn update(&mut self, ctx: &mut TickContext) {
-        // Collect living GUIDs to prune dead/missing spawns without borrowing conflicts
-        let living_guids: std::collections::HashSet<Guid> = ctx
-            .entities
-            .iter()
-            .filter_map(|(_, ent)| {
-                if let Some(health) = ent.get_component::<HealthComponent>() {
-                    if !health.is_dead {
-                        Some(ent.guid)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(ent.guid)
-                }
-            })
-            .collect();
+        // Drain despawn events to prune despawned entities reactively
+        let despawns = ctx.events.drain::<EntityDespawnEvent>();
+        let mut dead_or_missing: std::collections::HashSet<Guid> =
+            despawns.iter().map(|e| e.guid).collect();
 
-        // Collect spawners needing evaluation
+        // 1. Identify only the specific entities tracked by spawners
+        let mut tracked_guids = Vec::new();
+        for (_key, entity) in ctx.entities.iter() {
+            if let Some(spawner) = entity.get_component::<SpawnerComponent>() {
+                tracked_guids.extend(spawner.spawned_entities.iter().copied());
+            }
+        }
+
+        // Check health of tracked entities only (O(K_spawned) instead of O(N_world))
+        for guid in tracked_guids {
+            match ctx.entities.get_by_guid(guid) {
+                Some(ent) => {
+                    if let Some(health) = ent.get_component::<HealthComponent>() {
+                        if health.is_dead {
+                            dead_or_missing.insert(guid);
+                        }
+                    }
+                }
+                None => {
+                    dead_or_missing.insert(guid);
+                }
+            }
+        }
+
+        // 2. Evaluate spawners needing evaluation
         let mut spawn_requests: Vec<(Guid, u32, (f32, f32, f32), f32)> = Vec::new();
 
         for (_key, entity) in ctx.entities.iter_mut() {
@@ -200,8 +212,8 @@ impl TickSystem for SpawnerSystem {
             let spawner_guid = entity.guid;
 
             if let Some(spawner) = entity.get_component_mut::<SpawnerComponent>() {
-                // Prune dead or despawned entities from tracking
-                spawner.spawned_entities.retain(|guid| living_guids.contains(guid));
+                // Prune dead or despawned entities from tracking without scanning all world entities
+                spawner.spawned_entities.retain(|guid| !dead_or_missing.contains(guid));
 
                 if spawner.spawned_entities.len() < spawner.max_active_spawns {
                     if spawner.current_cooldown_secs <= 0.0 {
@@ -253,6 +265,11 @@ impl TickSystem for SpawnerSystem {
                 Guid::new(mmo_core::EntityType::Npc, node_id, seq)
             });
             self.next_sequence = seq;
+        }
+
+        // Re-push despawn events so subsequent systems can also consume them
+        for despawn in despawns {
+            ctx.events.push(despawn);
         }
     }
 }

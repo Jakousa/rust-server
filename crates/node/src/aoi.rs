@@ -91,6 +91,8 @@ pub struct AoiManager {
     // Reusable scratch buffers to eliminate per-tick heap allocations
     scratch_query: Vec<(Guid, (f32, f32, f32), f32)>,
     scratch_visible_guids: HashSet<Guid>,
+    scratch_session_ids: Vec<u64>,
+    scratch_exited_guids: Vec<Guid>,
 }
 
 impl Default for AoiManager {
@@ -107,6 +109,8 @@ impl AoiManager {
             guid_to_session: HashMap::new(),
             scratch_query: Vec::with_capacity(512),
             scratch_visible_guids: HashSet::with_capacity(512),
+            scratch_session_ids: Vec::with_capacity(64),
+            scratch_exited_guids: Vec::with_capacity(128),
         }
     }
 
@@ -167,9 +171,11 @@ impl AoiManager {
     ) -> Vec<AoiBroadcastJob> {
         let mut jobs = Vec::new();
 
-        let session_ids: Vec<u64> = self.observers.keys().copied().collect();
+        self.scratch_session_ids.clear();
+        self.scratch_session_ids.extend(self.observers.keys().copied());
 
-        for session_id in session_ids {
+        for i in 0..self.scratch_session_ids.len() {
+            let session_id = self.scratch_session_ids[i];
             let observer = match self.observers.get_mut(&session_id) {
                 Some(obs) => obs,
                 None => continue,
@@ -197,19 +203,22 @@ impl AoiManager {
 
             // 3. Dynamic density throttling
             let total_found = self.scratch_query.len();
-            if total_found > observer.config.max_entities {
-                // Sort by distance squared ascending so nearest entities are preserved
-                self.scratch_query.sort_unstable_by(|a, b| {
+            let max_entities = observer.config.max_entities;
+            if total_found > max_entities {
+                // select_nth_unstable_by guarantees elements before `max_entities` are <= element at `max_entities`
+                // in O(N) average time rather than O(N log N) full sort
+                self.scratch_query.select_nth_unstable_by(max_entities, |a, b| {
                     a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                self.scratch_query.truncate(max_entities);
+
                 // Calculate throttled radius
                 let throttled = calculate_throttled_aoi(
                     observer.config.base_radius,
                     total_found,
-                    observer.config.max_entities,
+                    max_entities,
                 );
                 observer.effective_radius = throttled;
-                self.scratch_query.truncate(observer.config.max_entities);
             } else if observer.effective_radius < observer.config.base_radius {
                 // Restore base radius if density subsides
                 observer.effective_radius = observer.config.base_radius;
@@ -224,14 +233,14 @@ impl AoiManager {
             let mut packets = Vec::new();
 
             // 5. Detect exits (was in observed_entities, but not in current visible set)
-            let mut exited_guids = Vec::new();
+            self.scratch_exited_guids.clear();
             for &observed_guid in observer.observed_entities.keys() {
                 if !self.scratch_visible_guids.contains(&observed_guid) {
-                    exited_guids.push(observed_guid);
+                    self.scratch_exited_guids.push(observed_guid);
                 }
             }
 
-            for exited_guid in exited_guids {
+            for &exited_guid in &self.scratch_exited_guids {
                 observer.observed_entities.remove(&exited_guid);
                 packets.push(ClientPacket::EntityDespawn(EntityDespawnPacket {
                     entity_id: exited_guid.raw(),
