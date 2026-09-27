@@ -5,7 +5,10 @@
 
 use bytes::BytesMut;
 use mmo_core::guid::Guid;
-use mmo_schema::client::{ClientCodecError, ClientPacket, MovementPacket, PingPacket, Vec3};
+use mmo_schema::client::{
+    delta_flags, ClientAckPacket, ClientCodecError, ClientPacket, MovementPacket, PingPacket, Vec3,
+};
+use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,12 +30,16 @@ pub enum SessionError {
 /// Active virtual bot session.
 pub struct BotSession {
     pub guid: Guid,
+    pub session_id: u64,
     stream: Option<TcpStream>,
     read_buf: BytesMut,
     pub current_position: Vec3,
     pub current_velocity: Vec3,
     pub last_ping_sent: Option<(u64, Instant)>,
     pub snapback_count: u64,
+    pub last_observed_tick: u64,
+    pub total_bytes_received: u64,
+    pub known_entities: HashMap<u64, Vec3>,
 }
 
 impl BotSession {
@@ -40,12 +47,16 @@ impl BotSession {
     pub fn new(guid: Guid, initial_pos: Vec3) -> Self {
         Self {
             guid,
+            session_id: 0,
             stream: None,
             read_buf: BytesMut::with_capacity(4096),
             current_position: initial_pos,
             current_velocity: Vec3::ZERO,
             last_ping_sent: None,
             snapback_count: 0,
+            last_observed_tick: 0,
+            total_bytes_received: 0,
+            known_entities: HashMap::new(),
         }
     }
 
@@ -111,6 +122,7 @@ impl BotSession {
                 "Connection closed by server",
             )));
         }
+        self.total_bytes_received += bytes_read as u64;
 
         let mut packets = Vec::new();
         while let Some(packet) = ClientPacket::decode_frame(&mut self.read_buf)? {
@@ -129,12 +141,52 @@ impl BotSession {
                     self.current_position = corr.corrected_position;
                     self.current_velocity = Vec3::ZERO;
                 }
+                ClientPacket::EntityDeltaBatch(batch) => {
+                    self.last_observed_tick = self.last_observed_tick.max(batch.server_tick);
+                    for &despawn_id in &batch.despawns {
+                        self.known_entities.remove(&despawn_id);
+                    }
+                    for delta in &batch.deltas {
+                        if delta.field_mask & delta_flags::MASK_KEYFRAME != 0 {
+                            self.known_entities.insert(
+                                delta.entity_id,
+                                Vec3::new(delta.position.0, delta.position.1, delta.position.2),
+                            );
+                        } else if let Some(ent) = self.known_entities.get_mut(&delta.entity_id) {
+                            if delta.field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
+                                ent.x += delta.position.0;
+                            }
+                            if delta.field_mask & delta_flags::MASK_DELTA_POS_Y != 0 {
+                                ent.y += delta.position.1;
+                            }
+                            if delta.field_mask & delta_flags::MASK_DELTA_POS_Z != 0 {
+                                ent.z += delta.position.2;
+                            }
+                        }
+                    }
+                }
+                ClientPacket::EntityState(state) => {
+                    self.known_entities.insert(state.entity_id, state.position);
+                }
+                ClientPacket::EntityDespawn(despawn) => {
+                    self.known_entities.remove(&despawn.entity_id);
+                }
                 _ => {}
             }
             packets.push(packet);
         }
 
         Ok((packets, rtt_ms))
+    }
+
+    /// Dispatches a baseline acknowledgement confirming the latest observed tick.
+    pub async fn send_ack(&mut self, session_id: u64) -> Result<(), SessionError> {
+        let packet = ClientPacket::ClientAck(ClientAckPacket {
+            session_id,
+            observed_tick: self.last_observed_tick,
+            ack_mask: 0,
+        });
+        self.send_packet(&packet).await
     }
 }
 

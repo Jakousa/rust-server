@@ -137,4 +137,38 @@ proptest! {
 
         prop_assert!(second_result.is_some());
     }
+
+    #[test]
+    fn prop_test_quantize_delta_roundtrip(val in -254.9f32..254.9f32) {
+        let q = mmo_schema::quantize::quantize_delta_i16(val);
+        let reconstructed = mmo_schema::quantize::dequantize_delta_i16(q);
+        let error = (val - reconstructed).abs();
+        prop_assert!(error <= 0.008, "Error {} exceeded 8mm tolerance for {}", error, val);
+    }
+
+    #[test]
+    fn prop_test_quantize_yaw_roundtrip(yaw in -100.0f32..100.0f32) {
+        let q = mmo_schema::quantize::quantize_yaw_u8(yaw);
+        let reconstructed = mmo_schema::quantize::dequantize_yaw_u8(q);
+        let diff = (yaw.rem_euclid(2.0 * std::f32::consts::PI) - reconstructed).abs();
+        let angular_error = diff.min((2.0 * std::f32::consts::PI - diff).abs());
+        let max_error_rad = (1.5 / 180.0) * std::f32::consts::PI;
+        prop_assert!(angular_error <= max_error_rad, "Yaw error {} exceeded 1.5 deg for {}", angular_error, yaw);
+    }
+
+    #[test]
+    fn prop_test_quantize_never_panics(fuzz_val in any::<f32>()) {
+        let _ = mmo_schema::quantize::quantize_delta_i16(fuzz_val);
+        let _ = mmo_schema::quantize::quantize_yaw_u8(fuzz_val);
+        let _ = mmo_schema::quantize::quantize_pitch_i8(fuzz_val);
+        let _ = mmo_schema::quantize::quantize_velocity_i16(fuzz_val);
+    }
+
+    #[test]
+    fn prop_test_varint_u64_roundtrip(val in any::<u64>()) {
+        let mut buf = bytes::BytesMut::new();
+        mmo_schema::bitpack::put_varint_u64(&mut buf, val);
+        let decoded = mmo_schema::bitpack::get_varint_u64(&mut buf).unwrap();
+        prop_assert_eq!(val, decoded);
+    }
 }

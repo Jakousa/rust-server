@@ -39,6 +39,8 @@ pub struct TickSimulation {
     pub migrating_leases: HashMap<Guid, Instant>,
     pub last_migration_ticks: HashMap<Guid, u64>,
     pub current_time: Instant,
+    pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
+    pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
 }
 
 impl TickSimulation {
@@ -69,6 +71,8 @@ impl TickSimulation {
             Box::new(mmo_core::AttributeTickSystem),
         ];
 
+        let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
+
         Self {
             node_id,
             entity_store: EntityStore::new(),
@@ -88,7 +92,21 @@ impl TickSimulation {
             migrating_leases: HashMap::new(),
             last_migration_ticks: HashMap::new(),
             current_time: Instant::now(),
+            ack_sender,
+            ack_receiver,
         }
+    }
+
+    /// Returns a cloned sender for pushing client ACKs into the non-blocking channel.
+    pub fn ack_sender(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket> {
+        self.ack_sender.clone()
+    }
+
+    /// Queues a client ACK into the simulation's non-blocking channel.
+    pub fn queue_client_ack(&self, ack: mmo_schema::client::ClientAckPacket) {
+        let _ = self.ack_sender.send(ack);
     }
 
     /// Returns the current simulation monotonic timestamp.
@@ -253,6 +271,16 @@ impl TickSimulation {
         let start = std::time::Instant::now();
         self.tick_counter += 1;
         self.advance_time(Duration::from_secs_f32(dt_sec));
+
+        // 0. Drain pending client baseline ACKs in batch without lock contention
+        while let Ok(ack) = self.ack_receiver.try_recv() {
+            self.aoi.process_ack(
+                ack.session_id,
+                ack.observed_tick,
+                ack.ack_mask,
+                self.tick_counter,
+            );
+        }
 
         // 1. Run batch tick systems registered by plugins
         let mut tick_ctx = TickContext {

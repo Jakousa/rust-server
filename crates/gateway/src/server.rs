@@ -87,7 +87,11 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
         ClientPacket::Interaction(p) => Some(Guid::from_raw(p.source_guid)),
         ClientPacket::EntityState(p) => Some(Guid::from_raw(p.entity_id)),
         ClientPacket::EntityDespawn(p) => Some(Guid::from_raw(p.entity_id)),
-        ClientPacket::InteractionResult(_) | ClientPacket::Ping(_) | ClientPacket::Pong(_) => None,
+        ClientPacket::InteractionResult(_)
+        | ClientPacket::Ping(_)
+        | ClientPacket::Pong(_)
+        | ClientPacket::EntityDeltaBatch(_)
+        | ClientPacket::ClientAck(_) => None,
     }
 }
 

@@ -5,7 +5,9 @@ pub mod cluster {
     tonic::include_proto!("mmo.cluster");
 }
 
+pub mod bitpack;
 pub mod client;
+pub mod quantize;
 
 #[cfg(test)]
 mod tests {
