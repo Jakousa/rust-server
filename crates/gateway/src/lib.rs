@@ -6,6 +6,7 @@
 pub mod quic;
 pub mod router;
 pub mod server;
+pub mod webtransport;
 
 pub use quic::{
     create_quic_server, generate_self_signed_cert, make_insecure_client_config, make_server_config,

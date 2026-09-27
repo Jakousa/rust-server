@@ -174,12 +174,40 @@ impl PacketDispatcher {
     }
 }
 
+/// Sinks for forwarding outgoing packets to a connected client session.
+#[derive(Clone)]
+pub struct SessionSink {
+    /// Bounded channel for unreliable datagrams (e.g. movement, entity deltas). Drops on full.
+    pub datagram_tx: mpsc::Sender<Bytes>,
+    /// Unbounded channel for reliable packets (e.g. interaction results, trades, auth). Never dropped under backpressure.
+    pub stream_tx: mpsc::UnboundedSender<Bytes>,
+}
+
+impl SessionSink {
+    pub fn new(datagram_tx: mpsc::Sender<Bytes>, stream_tx: mpsc::UnboundedSender<Bytes>) -> Self {
+        Self {
+            datagram_tx,
+            stream_tx,
+        }
+    }
+}
+
+impl From<mpsc::Sender<Bytes>> for SessionSink {
+    fn from(datagram_tx: mpsc::Sender<Bytes>) -> Self {
+        let (stream_tx, _) = mpsc::unbounded_channel();
+        Self {
+            datagram_tx,
+            stream_tx,
+        }
+    }
+}
+
 /// RAII guard that ensures session routes, sinks, and writer tasks are cleanly
 /// deregistered when a client connection handler terminates or is cancelled.
 pub struct SessionDropGuard {
     pub session_id: u64,
     pub router: Arc<SessionRouter>,
-    pub session_sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
+    pub session_sinks: Arc<DashMap<u64, SessionSink>>,
     pub cache: Option<Arc<dyn SessionCacheBackend>>,
     pub writer_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -262,7 +290,7 @@ pub struct GatewayServer {
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     cache: Option<Arc<dyn SessionCacheBackend>>,
     social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
-    session_sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
+    session_sinks: Arc<DashMap<u64, SessionSink>>,
 }
 
 impl GatewayServer {
@@ -472,22 +500,22 @@ impl GatewayServer {
         Ok(guid)
     }
 
-    /// Registers a downstream packet sender for a client session.
+    /// Registers a downstream packet sink for a client session.
     pub fn register_session_sink(
         &self,
         session_id: u64,
-        sender: mpsc::Sender<Bytes>,
+        sink: impl Into<SessionSink>,
     ) -> Result<(), GatewayError> {
-        self.session_sinks.insert(session_id, sender);
+        self.session_sinks.insert(session_id, sink.into());
         metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
         Ok(())
     }
 
-    /// Removes a downstream packet sender for a client session.
+    /// Removes a downstream packet sink for a client session.
     pub fn remove_session_sink(
         &self,
         session_id: u64,
-    ) -> Result<Option<mpsc::Sender<Bytes>>, GatewayError> {
+    ) -> Result<Option<SessionSink>, GatewayError> {
         let res = self.session_sinks.remove(&session_id).map(|(_, s)| s);
         metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
         Ok(res)
@@ -504,6 +532,10 @@ impl GatewayServer {
     }
 
     /// Sends raw framed bytes downstream to a specific client session without blocking.
+    ///
+    /// Ephemeral packets (e.g. movement, entity deltas) are routed to the bounded datagram channel
+    /// (dropping on saturation), while reliable packets (e.g. interactions, trades, auth) are routed
+    /// to the unbounded reliable stream channel (never dropped under backpressure).
     pub async fn send_bytes_to_session(
         &self,
         session_id: u64,
@@ -511,21 +543,29 @@ impl GatewayServer {
     ) -> Result<bool, GatewayError> {
         if let Some(entry) = self.session_sinks.get(&session_id) {
             let byte_len = bytes.len() as u64;
-            match entry.value().try_send(bytes) {
-                Ok(_) => {
-                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(byte_len);
-                    Ok(true)
+            let sink = entry.value();
+            let is_ephemeral = is_ephemeral_packet(&bytes);
+            let sent = if is_ephemeral {
+                match sink.datagram_tx.try_send(bytes) {
+                    Ok(_) => true,
+                    Err(_) => {
+                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                        false
+                    }
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Buffer saturated - slow consumer drop
-                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
-                    Ok(false)
+            } else {
+                match sink.stream_tx.send(bytes) {
+                    Ok(_) => true,
+                    Err(_) => {
+                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                        false
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
-                    Ok(false)
-                }
+            };
+            if sent {
+                metrics::counter!("mmo_gateway_bytes_sent_total").increment(byte_len);
             }
+            Ok(sent)
         } else {
             Ok(false)
         }
@@ -547,9 +587,16 @@ impl GatewayServer {
     pub async fn broadcast_packet(&self, packet: &ClientPacket) -> Result<usize, GatewayError> {
         let encoded = Bytes::from(packet.encode());
         let byte_len = encoded.len() as u64;
+        let is_ephemeral = is_ephemeral_packet(&encoded);
         let mut sent_count = 0;
         for entry in self.session_sinks.iter() {
-            if entry.value().try_send(encoded.clone()).is_ok() {
+            let sink = entry.value();
+            let success = if is_ephemeral {
+                sink.datagram_tx.try_send(encoded.clone()).is_ok()
+            } else {
+                sink.stream_tx.send(encoded.clone()).is_ok()
+            };
+            if success {
                 sent_count += 1;
             } else {
                 metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
@@ -578,14 +625,26 @@ impl GatewayServer {
         session_id: u64,
     ) -> Result<(), GatewayError> {
         let (mut read_half, mut write_half) = socket.into_split();
-        let (downstream_tx, mut downstream_rx) = mpsc::channel::<Bytes>(1024);
+        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
 
-        self.register_session_sink(session_id, downstream_tx)?;
+        self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
 
         let writer_handle = tokio::spawn(async move {
-            while let Some(bytes) = downstream_rx.recv().await {
-                if write_half.write_all(&bytes).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(bytes) = stream_rx.recv() => {
+                        if write_half.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(bytes) = datagram_rx.recv() => {
+                        if write_half.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    else => break,
                 }
             }
         });
@@ -657,6 +716,22 @@ impl GatewayServer {
         self.bind_quic(addr, certs, key)
     }
 
+    /// Binds a WebTransport HTTP/3 UDP connection listener to the specified address with development self-signed certificates.
+    pub async fn bind_webtransport(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<crate::webtransport::WebTransportServer, crate::webtransport::WebTransportError>
+    {
+        crate::webtransport::WebTransportServer::bind(
+            addr,
+            self.router.clone(),
+            self.session_sinks.clone(),
+            self.session_counter.clone(),
+            self.packet_tx.clone(),
+        )
+        .await
+    }
+
     /// Handles an active client QUIC connection:
     /// Multiplexes unreliable datagrams (movement, entity state sync) and reliable streams (interactions, chat),
     /// decodes client packets, forwards routed packets to simulation nodes, and handles downstream broadcasts.
@@ -667,31 +742,33 @@ impl GatewayServer {
     ) -> Result<(), GatewayError> {
         let active_send_stream: Arc<tokio::sync::Mutex<Option<quinn::SendStream>>> =
             Arc::new(tokio::sync::Mutex::new(None));
-        let (downstream_tx, mut downstream_rx) = mpsc::channel::<Bytes>(1024);
+        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
 
-        self.register_session_sink(session_id, downstream_tx)?;
+        self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
 
         let active_stream_writer = active_send_stream.clone();
         let conn_writer = connection.clone();
         let downstream_handle = tokio::spawn(async move {
-            while let Some(bytes) = downstream_rx.recv().await {
-                let is_ephemeral = is_ephemeral_packet(&bytes);
-                let mut sent_datagram = false;
-                if is_ephemeral && conn_writer.send_datagram(bytes.clone()).is_ok() {
-                    sent_datagram = true;
-                }
-                if !sent_datagram {
-                    let mut lock = active_stream_writer.lock().await;
-                    if let Some(ref mut send) = *lock {
-                        if send.write_all(&bytes).await.is_err() {
-                            break;
-                        }
-                    } else if let Ok((mut send, _recv)) = conn_writer.open_bi().await {
-                        if send.write_all(&bytes).await.is_err() {
-                            break;
-                        }
-                        *lock = Some(send);
+            loop {
+                tokio::select! {
+                    Some(bytes) = datagram_rx.recv() => {
+                        let _ = conn_writer.send_datagram(bytes);
                     }
+                    Some(bytes) = stream_rx.recv() => {
+                        let mut lock = active_stream_writer.lock().await;
+                        if let Some(ref mut send) = *lock {
+                            if send.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                        } else if let Ok((mut send, _recv)) = conn_writer.open_bi().await {
+                            if send.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                            *lock = Some(send);
+                        }
+                    }
+                    else => break,
                 }
             }
         });
@@ -818,6 +895,7 @@ pub fn is_ephemeral_packet(bytes: &[u8]) -> bool {
                     | mmo_schema::client::Opcode::MovementCorrection
                     | mmo_schema::client::Opcode::EntityState
                     | mmo_schema::client::Opcode::EntityDespawn
+                    | mmo_schema::client::Opcode::EntityDeltaBatch
                     | mmo_schema::client::Opcode::Ping
                     | mmo_schema::client::Opcode::Pong
             );

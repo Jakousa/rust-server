@@ -16,6 +16,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 dashmap = "6.1"
 metrics = "0.24"
+wtransport = "0.7.2"
 
 [dev-dependencies]
 mmo-node = { path = "../node" }

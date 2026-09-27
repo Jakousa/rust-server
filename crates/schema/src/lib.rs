@@ -1,5 +1,6 @@
 //! Generated Protocol and Schema definitions
 
+#[cfg(feature = "grpc")]
 #[allow(clippy::result_large_err)]
 pub mod cluster {
     tonic::include_proto!("mmo.cluster");
@@ -9,7 +10,7 @@ pub mod bitpack;
 pub mod client;
 pub mod quantize;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grpc"))]
 mod tests {
     use super::cluster::*;
 
