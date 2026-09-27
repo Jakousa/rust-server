@@ -77,17 +77,33 @@ flowchart TD
 
 ---
 
-### Stage 5: Cluster Verification & Git Commit
+### Stage 5: Verification, PR Creation & Auto-Merge
 
 1. For infrastructure or network changes:
    - Build image: `./scripts/cluster.sh build`
    - Import image: `./scripts/cluster.sh import`
    - Deploy manifests: `./scripts/cluster.sh deploy`
    - Verify pod readiness, logs, and telemetry scraping.
-2. Commit all staged files with a clear conventional commit message:
+2. Run mandatory local quality gates:
+   - Formatting: `cargo fmt --all -- --check`
+   - Clippy linter: `cargo clippy --workspace --all-targets -- -D warnings`
+   - Test suite: `cargo test --workspace`
+3. Commit and push on the feature branch (`feat/<change-name>`):
    ```bash
-   git add .
+   git add -A
    git commit -m "feat(<scope>): <description>"
-   git push origin main
+   git push -u origin feat/<change-name>
    ```
-3. Report the completion summary with clickable file links and live verification results.
+4. Create Pull Request and enable Auto-Merge:
+   - `main` strictly requires PRs and green CI before merging. **Never push directly to `main`**.
+   - Create PR:
+     ```bash
+     gh pr create --title "feat(<scope>): <description>" --body "<summary>" --base main
+     ```
+   - Enable auto-merge with squash:
+     ```bash
+     gh pr merge <pr_number> --auto --squash
+     ```
+5. Delegate CI monitoring:
+   - Spawn a lightweight `flash` subagent to monitor the PR check suite (`Lint, Test & Verify`) until merged, and fast-forward local `main`.
+6. Report the completion summary with clickable file links and PR merge status.

@@ -73,41 +73,9 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 ```mermaid
 flowchart LR
     T5["Track 5: Interaction & Ability Primitives\n(DONE)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
+    T6 --> T7["Track 7: Cross-Partition Interaction\n& Boundary Ability Dispatch"]
+    T7 --> T8["Track 8: Playable Visual Client Frontend\n(Bevy or WebAssembly / WebGL)"]
 ```
-
----
-
-### Track 5: Generalized Interaction Engine & Pluggable Ability System
-
-**Goal**: Establish the engine's core interaction and temporal action primitives in `crates/core`, decoupling all game-specific mechanics (spells, combat, gathering, crafting) into modular plugins in `crates/gameplay`.
-
-#### Key Deliverables:
-
-1. **Engine Core: Cancellable Timed Actions (`crates/core`)**:
-   - Generic `TimedAction` / `ActionQueue` component attached to entities.
-   - Configurable action durations and interrupt flags: `CancelOnMovement`, `CancelOnDamage`, `CancelOnStun`, `CancelOnTargetLost`.
-   - Tick-based execution emitting `ActionStartedEvent`, `ActionProgressEvent`, `ActionCompletedEvent`, and `ActionInterruptedEvent`.
-   - Used by plugins for spell casts, weapon reload/windup, item crafting, gathering channels, or warp drive spooling.
-
-2. **Engine Core: Dynamic Attribute & Modifier System (`crates/core`)**:
-   - `AttributeSet` component supporting data-driven numeric properties (scalars, base values, flat/percent modifiers, min/max bounds).
-   - Dynamic regeneration / decay rates evaluated during the 20 Hz simulation tick.
-   - Periodic timed modifiers (Auras / Buffs / Debuffs / DoTs / HoTs) with expiration timers and tick intervals.
-
-3. **Engine Core: Spatial Targeting & Interaction Queries (`crates/core`)**:
-   - Authoritative geometric queries against the 3D Octree: Point-to-Point, Raycast / Line-of-Sight, Cone / Frontal Cleave, and Sphere / Radial AoE.
-   - Validation pipeline: range checks, orientation/facing angle checks, and line-of-sight obstruction guards.
-   - Cross-boundary interaction dispatch: when an action targets an entity on a neighbor simulation node, routing interaction events across nodes via gRPC.
-
-4. **Gameplay Plugin Layer: Pluggable Ability & Combat Systems (`crates/gameplay`)**:
-   - Refactor `CombatPlugin` to consume `AttributeSet` (e.g. `health`, `armor`) and `TimedAction` primitives.
-   - Implement reference `AbilityPlugin`: cooldown tracking, resource costs, instant vs. casted abilities, and damage/heal event emission.
-   - Integrate with existing `ThreatPlugin` and `MonsterAiPlugin`.
-
-5. **Verification Gates**:
-   - Unit and property tests for action interruption under kinematic movement and damage.
-   - Attribute modifier stacking, clamping, and decay determinism tests.
-   - Cross-partition spatial interaction tests between adjacent simulation nodes.
 
 ---
 
@@ -118,4 +86,17 @@ flowchart LR
 #### Key Deliverables:
 1. **Bit-Packed Field Masks**: Variable-length encoding and bitmask flags transmitting only modified entity fields (position $\Delta$, velocity, active animation/action) per tick.
 2. **Quantized Kinematics**: Fixed-point quantization for 3D coordinates and quaternion rotations reducing byte footprint per replicated entity.
-3. **Bandwidth Profiling & Verification**: Benchmark bandwidth savings under 1,000+ bot density before and after delta compression.
+3. **Baseline Acknowledgement (ACK) Protocol**: Client-acknowledged baseline tracking ensuring delta updates are relative to confirmed received states.
+4. **Bandwidth Profiling & Verification**: Benchmark bandwidth savings under 1,000+ bot density before and after delta compression targeting 60%–80% egress reduction.
+
+---
+
+### Track 7: Cross-Partition Interaction & Boundary Ability Dispatch
+
+**Goal**: Seamlessly route abilities, spells, and interactions across spatial partition borders to entities simulated on adjacent nodes via inter-node gRPC channels without desync.
+
+---
+
+### Track 8: Playable Visual Client Frontend (Bevy / WebGL)
+
+**Goal**: Build a lightweight interactive 3D client frontend that connects to the Edge Gateway via QUIC/UDP or WebSockets, rendering other players, combat, cast bars, and real-time movement.
