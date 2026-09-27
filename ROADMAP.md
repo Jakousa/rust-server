@@ -75,22 +75,28 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ---
 
+- [x] **Track 7: Cross-Partition Interaction & Boundary Ability Dispatch**
+  - Unified `SpatialTargetCandidate` primitives and candidate partitioning (`partition_candidates_by_node`) across local entities and replicated boundary ghosts.
+  - Protobuf RPCs (`DispatchAbility`, `DispatchBatchAbility`) and `RemoteAbilityErrorCode` in `crates/schema/proto/cluster.proto`.
+  - Authoritative target-node execution in `NodeServiceImpl` with migration lease freeze checks, vitality verification, active action interruption, and anti-cheat authoritative range re-validation ($1.2\times$ kinematic tolerance).
+  - Outbound `CrossNodeDispatcher` with proactive cooldown and GCD application preventing "boundary dance" spam exploits.
+  - Non-blocking MPSC ability compensation pipeline on `TickSimulation` draining at tick start to cleanly refund resources and reset cooldowns upon RPC failure or timeout ($100\text{ms}$).
+  - Boundary-crossing Area-of-Effect sphere and cone dispatch (`cast_boundary_sphere_aoe`, `resolve_boundary_sphere_aoe`) ensuring concurrent peer dispatch and zero duplicate hits.
+  - Comprehensive end-to-end multi-node integration test suite (`tests/cross_partition_ability_e2e.rs`) verifying remote spells, boundary AoE cleaves, migration freeze vetoes, and out-of-range re-validation refunds.
+
+---
+
 ## Next Engineering Roadmap
 
 ```mermaid
 flowchart LR
-    T6["Track 6: Delta Compression & Bit-Packing\n(DONE)"] --> T7["Track 7: Cross-Partition Interaction\n& Boundary Ability Dispatch"]
+    T6["Track 6: Delta Compression & Bit-Packing\n(DONE)"] --> T7["Track 7: Cross-Partition Interaction\n(DONE)"]
     T7 --> T8["Track 8: Playable Visual Client Frontend\n(Bevy or WebAssembly / WebGL)"]
 ```
-
----
-
-### Track 7: Cross-Partition Interaction & Boundary Ability Dispatch
-
-**Goal**: Seamlessly route abilities, spells, and interactions across spatial partition borders to entities simulated on adjacent nodes via inter-node gRPC channels without desync.
 
 ---
 
 ### Track 8: Playable Visual Client Frontend (Bevy / WebGL)
 
 **Goal**: Build a lightweight interactive 3D client frontend that connects to the Edge Gateway via QUIC/UDP or WebSockets, rendering other players, combat, cast bars, and real-time movement.
+

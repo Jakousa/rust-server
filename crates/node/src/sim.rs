@@ -41,6 +41,17 @@ pub struct TickSimulation {
     pub current_time: Instant,
     pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
     pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
+    pub ability_compensation_sender: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
+    pub ability_compensation_receiver: tokio::sync::mpsc::UnboundedReceiver<AbilityCompensation>,
+}
+
+/// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbilityCompensation {
+    pub caster_guid: Guid,
+    pub ability_id: u32,
+    pub resource_name: Option<String>,
+    pub resource_amount: f32,
 }
 
 impl TickSimulation {
@@ -65,13 +76,17 @@ impl TickSimulation {
         let mut codecs = ComponentCodecRegistry::new();
         codecs.register::<mmo_core::ActionQueue>("action_queue");
         codecs.register::<mmo_core::AttributeSet>("attribute_set");
+        codecs.register::<mmo_gameplay::CooldownTracker>("cooldown_tracker");
 
         let tick_systems: Vec<Box<dyn mmo_core::TickSystem>> = vec![
             Box::new(mmo_core::ActionTickSystem),
             Box::new(mmo_core::AttributeTickSystem),
+            Box::new(mmo_gameplay::AbilityTickSystem),
         ];
 
         let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (ability_compensation_sender, ability_compensation_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         Self {
             node_id,
@@ -94,6 +109,8 @@ impl TickSimulation {
             current_time: Instant::now(),
             ack_sender,
             ack_receiver,
+            ability_compensation_sender,
+            ability_compensation_receiver,
         }
     }
 
@@ -107,6 +124,18 @@ impl TickSimulation {
     /// Queues a client ACK into the simulation's non-blocking channel.
     pub fn queue_client_ack(&self, ack: mmo_schema::client::ClientAckPacket) {
         let _ = self.ack_sender.send(ack);
+    }
+
+    /// Returns a cloned sender for pushing ability compensation events into the non-blocking channel.
+    pub fn ability_compensation_sender(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<AbilityCompensation> {
+        self.ability_compensation_sender.clone()
+    }
+
+    /// Queues an ability compensation event into the simulation's non-blocking channel.
+    pub fn queue_ability_compensation(&self, comp: AbilityCompensation) {
+        let _ = self.ability_compensation_sender.send(comp);
     }
 
     /// Returns the current simulation monotonic timestamp.
@@ -280,6 +309,21 @@ impl TickSimulation {
                 ack.ack_mask,
                 self.tick_counter,
             );
+        }
+
+        // 0.1 Drain pending cross-partition ability compensation refunds
+        while let Ok(comp) = self.ability_compensation_receiver.try_recv() {
+            if let Some(entity) = self.entity_store.get_mut_by_guid(comp.caster_guid) {
+                if let Some(cd) = entity.get_component_mut::<mmo_gameplay::CooldownTracker>() {
+                    cd.reset_cooldown(comp.ability_id);
+                    cd.reset_gcd();
+                }
+                if let Some(ref res_name) = comp.resource_name {
+                    if let Some(attrs) = entity.get_component_mut::<mmo_core::AttributeSet>() {
+                        let _ = attrs.modify_current(res_name, comp.resource_amount);
+                    }
+                }
+            }
         }
 
         // 1. Run batch tick systems registered by plugins

@@ -7,6 +7,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use mmo_core::spatial::{
+    gather_cone_candidates, gather_sphere_candidates, partition_candidates_by_node,
+    SpatialTargetCandidate, Vec3,
+};
 use mmo_core::{
     ActionInterruptFlags, ActionQueue, AttributeSet, DomainEvent, EntityStore, EventQueue,
     GameplayPlugin, Guid, PluginContext, QueuePolicy, TickContext, TickSystem, TimedAction,
@@ -44,6 +48,16 @@ impl CooldownTracker {
         if gcd_sec > 0.0 {
             self.gcd_remaining_sec = self.gcd_remaining_sec.max(gcd_sec);
         }
+    }
+
+    /// Resets the cooldown for a specific ability (e.g. on compensation refund).
+    pub fn reset_cooldown(&mut self, ability_id: u32) {
+        self.ability_cooldowns.remove(&ability_id);
+    }
+
+    /// Resets the global cooldown timer.
+    pub fn reset_gcd(&mut self) {
+        self.gcd_remaining_sec = 0.0;
     }
 
     /// Advances cooldown timers by `dt_sec`, removing expired entries.
@@ -140,6 +154,58 @@ pub fn execute_or_start_ability(
             target: target_guid,
         });
         Ok(true) // Instant completion
+    }
+}
+
+/// Result of resolving candidate targets for a boundary-crossing AoE ability.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryAoeTargeting {
+    pub local_targets: Vec<SpatialTargetCandidate>,
+    pub remote_batches: std::collections::BTreeMap<u32, Vec<SpatialTargetCandidate>>,
+}
+
+/// Gathers candidates within a radial sphere and partitions them by node.
+pub fn resolve_boundary_sphere_aoe(
+    candidates: &[SpatialTargetCandidate],
+    center: Vec3,
+    radius: f32,
+    max_targets: usize,
+    require_alive: bool,
+    local_node_id: u32,
+) -> BoundaryAoeTargeting {
+    let gathered = gather_sphere_candidates(candidates, center, radius, max_targets, require_alive);
+    let (local_targets, remote_batches) = partition_candidates_by_node(&gathered, local_node_id);
+    BoundaryAoeTargeting {
+        local_targets,
+        remote_batches,
+    }
+}
+
+/// Gathers candidates within a cone arc and partitions them by node.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_boundary_cone_aoe(
+    candidates: &[SpatialTargetCandidate],
+    origin: Vec3,
+    facing: Vec3,
+    max_range: f32,
+    half_angle_rad: f32,
+    max_targets: usize,
+    require_alive: bool,
+    local_node_id: u32,
+) -> BoundaryAoeTargeting {
+    let gathered = gather_cone_candidates(
+        candidates,
+        origin,
+        facing,
+        max_range,
+        half_angle_rad,
+        max_targets,
+        require_alive,
+    );
+    let (local_targets, remote_batches) = partition_candidates_by_node(&gathered, local_node_id);
+    BoundaryAoeTargeting {
+        local_targets,
+        remote_batches,
     }
 }
 
@@ -297,5 +363,50 @@ mod tests {
         let started = events.drain::<mmo_core::ActionStartedEvent>();
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].action_id, 20);
+    }
+
+    #[test]
+    fn test_cooldown_reset_and_boundary_aoe() {
+        let mut tracker = CooldownTracker::new();
+        tracker.start_cooldown(42, 10.0, 1.5);
+        assert!(tracker.is_on_cooldown(42));
+
+        tracker.reset_gcd();
+        // Ability 42 still on cooldown
+        assert!(tracker.is_on_cooldown(42));
+
+        tracker.reset_cooldown(42);
+        assert!(!tracker.is_on_cooldown(42));
+
+        // Test boundary AoE candidate partitioning
+        let c1 = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 1, 1),
+            1,
+            Vec3::new(2.0, 0.0, 0.0),
+            true,
+            false,
+        );
+        let c2 = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 2, 2),
+            2,
+            Vec3::new(4.0, 0.0, 0.0),
+            true,
+            false,
+        );
+
+        let targeting = resolve_boundary_sphere_aoe(
+            &[c1.clone(), c2.clone()],
+            Vec3::new(0.0, 0.0, 0.0),
+            10.0,
+            5,
+            true,
+            1,
+        );
+
+        assert_eq!(targeting.local_targets.len(), 1);
+        assert_eq!(targeting.local_targets[0].guid, c1.guid);
+        assert_eq!(targeting.remote_batches.len(), 1);
+        assert_eq!(targeting.remote_batches.get(&2).unwrap().len(), 1);
+        assert_eq!(targeting.remote_batches.get(&2).unwrap()[0].guid, c2.guid);
     }
 }

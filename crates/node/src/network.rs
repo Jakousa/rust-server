@@ -12,8 +12,10 @@ use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::node_service_server::{NodeService, NodeServiceServer};
 use mmo_schema::cluster::{
-    GhostEntity, GhostSyncRequest, GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse,
-    RemoteCommandRequest, RemoteCommandResponse, RouteUpdateRequest, SerializedComponent, Vector3,
+    BatchRemoteAbilityRequest, BatchRemoteAbilityResponse, GhostEntity, GhostSyncRequest,
+    GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse, RemoteAbilityErrorCode,
+    RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest, RemoteCommandResponse,
+    RouteUpdateRequest, SerializedComponent, Vector3,
 };
 
 use crate::sim::TickSimulation;
@@ -424,6 +426,216 @@ impl NodeService for NodeServiceImpl {
             error_message: String::new(),
             acknowledged_guid: req.guid,
         }))
+    }
+
+    /// Dispatches an authoritative remote ability against an entity on this simulation node.
+    async fn dispatch_ability(
+        &self,
+        request: tonic::Request<RemoteAbilityRequest>,
+    ) -> Result<tonic::Response<RemoteAbilityResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut sim = self.sim.write().await;
+        let response = execute_remote_ability(
+            &mut sim,
+            Guid::from_raw(req.caster_guid),
+            Guid::from_raw(req.target_guid),
+            req.caster_position.as_ref(),
+            req.max_range,
+            req.damage,
+            req.healing,
+            req.cast_id,
+        );
+        Ok(tonic::Response::new(response))
+    }
+
+    /// Dispatches batched authoritative remote abilities against multiple entities on this node.
+    async fn dispatch_batch_ability(
+        &self,
+        request: tonic::Request<BatchRemoteAbilityRequest>,
+    ) -> Result<tonic::Response<BatchRemoteAbilityResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut sim = self.sim.write().await;
+        let caster = Guid::from_raw(req.caster_guid);
+        let mut results = Vec::with_capacity(req.target_guids.len());
+
+        for &target_raw in &req.target_guids {
+            let res = execute_remote_ability(
+                &mut sim,
+                caster,
+                Guid::from_raw(target_raw),
+                req.caster_position.as_ref(),
+                req.max_range,
+                req.damage_per_target,
+                req.healing_per_target,
+                req.cast_id,
+            );
+            results.push(res);
+        }
+
+        Ok(tonic::Response::new(BatchRemoteAbilityResponse {
+            success: true,
+            results,
+            cast_id: req.cast_id,
+        }))
+    }
+}
+
+/// Authoritatively executes an incoming remote ability request on a target entity.
+///
+/// Validates:
+/// 1. Target entity presence in `entity_store`.
+/// 2. Migration lease state (rejects if target is migrating).
+/// 3. Authoritative range validation against caster position ($1.2\times$ tolerance for latency/kinematics).
+/// 4. Entity vitality (rejects if dead).
+/// 5. Applies damage or healing, triggers death events, interrupts cancellable timed actions, and modifies attributes.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_remote_ability(
+    sim: &mut TickSimulation,
+    caster_guid: Guid,
+    target_guid: Guid,
+    caster_position: Option<&Vector3>,
+    max_range: f32,
+    damage: u32,
+    healing: u32,
+    cast_id: u64,
+) -> RemoteAbilityResponse {
+    // 1. Target entity validation
+    if !sim.entity_store.contains_guid(target_guid) {
+        return RemoteAbilityResponse {
+            success: false,
+            error_code: RemoteAbilityErrorCode::RemoteAbilityTargetNotFound as i32,
+            error_message: format!(
+                "Target entity {} not found on node {}",
+                target_guid, sim.node_id
+            ),
+            target_guid: target_guid.raw(),
+            current_health: 0,
+            cast_id,
+        };
+    }
+
+    // 2. Migration lease check (strict freeze)
+    if sim.is_migrating(target_guid) {
+        return RemoteAbilityResponse {
+            success: false,
+            error_code: RemoteAbilityErrorCode::RemoteAbilityTargetMigrating as i32,
+            error_message: format!("Target entity {} is currently migrating", target_guid),
+            target_guid: target_guid.raw(),
+            current_health: 0,
+            cast_id,
+        };
+    }
+
+    let entity = match sim.entity_store.get_mut_by_guid(target_guid) {
+        Some(e) => e,
+        None => {
+            return RemoteAbilityResponse {
+                success: false,
+                error_code: RemoteAbilityErrorCode::RemoteAbilityTargetNotFound as i32,
+                error_message: format!("Target entity {} not found in store", target_guid),
+                target_guid: target_guid.raw(),
+                current_health: 0,
+                cast_id,
+            };
+        }
+    };
+
+    // 3. Authoritative Range Re-Validation (Anti-Cheat / Anti-Stale Ghost)
+    if let Some(pos) = caster_position {
+        let caster_pos = mmo_core::Vec3::new(pos.x, pos.y, pos.z);
+        let target_pos =
+            mmo_core::Vec3::new(entity.position.0, entity.position.1, entity.position.2);
+        let dist = caster_pos.distance(&target_pos);
+        let max_allowed = max_range * 1.2;
+        if max_range > 0.0 && dist > max_allowed {
+            return RemoteAbilityResponse {
+                success: false,
+                error_code: RemoteAbilityErrorCode::RemoteAbilityOutOfRange as i32,
+                error_message: format!(
+                    "Target is out of range: {:.2} > max allowed {:.2}",
+                    dist, max_allowed
+                ),
+                target_guid: target_guid.raw(),
+                current_health: 0,
+                cast_id,
+            };
+        }
+    }
+
+    // 4. Alive check
+    if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
+        if health.is_dead {
+            return RemoteAbilityResponse {
+                success: false,
+                error_code: RemoteAbilityErrorCode::RemoteAbilityTargetDead as i32,
+                error_message: format!("Target entity {} is dead", target_guid),
+                target_guid: target_guid.raw(),
+                current_health: 0,
+                cast_id,
+            };
+        }
+    }
+
+    // 5. Apply effects
+    let mut current_health = 0u32;
+    if damage > 0 {
+        let effective_damage =
+            if let Some(stats) = entity.get_component::<mmo_gameplay::combat::StatsComponent>() {
+                stats.mitigate_damage(damage as f32)
+            } else {
+                damage as f32
+            };
+
+        let mut died = false;
+        if let Some(health) = entity.get_component_mut::<mmo_gameplay::HealthComponent>() {
+            died = health.take_damage(effective_damage);
+            current_health = health.current_hp.round() as u32;
+        }
+
+        if died {
+            sim.event_queue.push(mmo_gameplay::combat::EntityDiedEvent {
+                entity: target_guid,
+                killer: Some(caster_guid),
+            });
+        }
+
+        // Interrupt active action if configured with cancel_on_damage
+        if let Some(queue) = entity.get_component_mut::<mmo_core::ActionQueue>() {
+            let should_interrupt = queue
+                .current()
+                .map(|a| a.interrupt_flags.cancel_on_damage)
+                .unwrap_or(false);
+            if should_interrupt {
+                queue.interrupt(
+                    target_guid,
+                    mmo_core::InterruptReason::Damage,
+                    &mut sim.event_queue,
+                );
+            }
+        }
+
+        if let Some(attrs) = entity.get_component_mut::<mmo_core::AttributeSet>() {
+            let _ = attrs.modify_current("health", -effective_damage);
+        }
+    } else if healing > 0 {
+        if let Some(health) = entity.get_component_mut::<mmo_gameplay::HealthComponent>() {
+            health.heal(healing as f32);
+            current_health = health.current_hp.round() as u32;
+        }
+        if let Some(attrs) = entity.get_component_mut::<mmo_core::AttributeSet>() {
+            let _ = attrs.modify_current("health", healing as f32);
+        }
+    } else if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
+        current_health = health.current_hp.round() as u32;
+    }
+
+    RemoteAbilityResponse {
+        success: true,
+        error_code: RemoteAbilityErrorCode::RemoteAbilitySuccess as i32,
+        error_message: String::new(),
+        target_guid: target_guid.raw(),
+        current_health,
+        cast_id,
     }
 }
 
@@ -1383,5 +1595,259 @@ mod tests {
             assert_eq!(s.entity_store.get_by_guid(guid).unwrap().position, pos);
             assert!(!s.is_migrating(guid));
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_remote_ability_damage_and_interrupt() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let target_guid = Guid::new(EntityType::Player, 1, 101);
+        let caster_guid = Guid::new(EntityType::Player, 2, 202);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(target_guid, (10.0, 0.0, 0.0));
+
+            let mut q = mmo_core::ActionQueue::new();
+            let action = mmo_core::TimedAction::new(
+                1,
+                2.0,
+                mmo_core::ActionInterruptFlags {
+                    cancel_on_damage: true,
+                    cancel_on_movement: false,
+                    cancel_on_stun: true,
+                    cancel_on_target_lost: true,
+                },
+                None,
+            );
+            q.start_action(
+                target_guid,
+                action,
+                mmo_core::QueuePolicy::Replace,
+                &mut s.event_queue,
+            )
+            .unwrap();
+
+            let ent = s.entity_store.get_mut_by_guid(target_guid).unwrap();
+            ent.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+            ent.add_component(q);
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let req = RemoteAbilityRequest {
+            ability_id: 1,
+            caster_guid: caster_guid.raw(),
+            target_guid: target_guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 20.0,
+            damage: 35,
+            healing: 0,
+            resource_cost: 10,
+            cast_id: 1,
+        };
+
+        let resp = service
+            .dispatch_ability(tonic::Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(
+            resp.error_code,
+            RemoteAbilityErrorCode::RemoteAbilitySuccess as i32
+        );
+        assert_eq!(resp.current_health, 65);
+
+        // Verify action queue interrupted
+        let s = sim.read().await;
+        let ent = s.entity_store.get_by_guid(target_guid).unwrap();
+        let q = ent.get_component::<mmo_core::ActionQueue>().unwrap();
+        assert!(q.current().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_remote_ability_out_of_range() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let target_guid = Guid::new(EntityType::Player, 1, 102);
+        let caster_guid = Guid::new(EntityType::Player, 2, 203);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(target_guid, (50.0, 0.0, 0.0));
+            let ent = s.entity_store.get_mut_by_guid(target_guid).unwrap();
+            ent.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let req = RemoteAbilityRequest {
+            ability_id: 1,
+            caster_guid: caster_guid.raw(),
+            target_guid: target_guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 30.0, // max allowed 36.0, dist is 50.0
+            damage: 30,
+            healing: 0,
+            resource_cost: 10,
+            cast_id: 2,
+        };
+
+        let resp = service
+            .dispatch_ability(tonic::Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.success);
+        assert_eq!(
+            resp.error_code,
+            RemoteAbilityErrorCode::RemoteAbilityOutOfRange as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_remote_ability_target_dead_and_migrating() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let dead_guid = Guid::new(EntityType::Player, 1, 103);
+        let migrating_guid = Guid::new(EntityType::Player, 1, 104);
+        let caster_guid = Guid::new(EntityType::Player, 2, 204);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(dead_guid, (5.0, 0.0, 0.0));
+            let ent_dead = s.entity_store.get_mut_by_guid(dead_guid).unwrap();
+            let mut health = mmo_gameplay::HealthComponent::new(100.0, 0.0);
+            health.take_damage(100.0); // is_dead = true
+            ent_dead.add_component(health);
+
+            s.spawn_entity(migrating_guid, (6.0, 0.0, 0.0));
+            let ent_mig = s.entity_store.get_mut_by_guid(migrating_guid).unwrap();
+            ent_mig.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+            assert!(s.acquire_migration_lease(migrating_guid));
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        // Test dead target
+        let req_dead = RemoteAbilityRequest {
+            ability_id: 1,
+            caster_guid: caster_guid.raw(),
+            target_guid: dead_guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 20.0,
+            damage: 20,
+            healing: 0,
+            resource_cost: 5,
+            cast_id: 3,
+        };
+        let resp_dead = service
+            .dispatch_ability(tonic::Request::new(req_dead))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_dead.success);
+        assert_eq!(
+            resp_dead.error_code,
+            RemoteAbilityErrorCode::RemoteAbilityTargetDead as i32
+        );
+
+        // Test migrating target
+        let req_mig = RemoteAbilityRequest {
+            ability_id: 1,
+            caster_guid: caster_guid.raw(),
+            target_guid: migrating_guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 20.0,
+            damage: 20,
+            healing: 0,
+            resource_cost: 5,
+            cast_id: 4,
+        };
+        let resp_mig = service
+            .dispatch_ability(tonic::Request::new(req_mig))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_mig.success);
+        assert_eq!(
+            resp_mig.error_code,
+            RemoteAbilityErrorCode::RemoteAbilityTargetMigrating as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_batch_ability() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let t1 = Guid::new(EntityType::Player, 1, 105);
+        let t2 = Guid::new(EntityType::Player, 1, 106);
+        let caster = Guid::new(EntityType::Player, 2, 205);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(t1, (2.0, 0.0, 0.0));
+            s.entity_store
+                .get_mut_by_guid(t1)
+                .unwrap()
+                .add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+
+            s.spawn_entity(t2, (3.0, 0.0, 0.0));
+            s.entity_store
+                .get_mut_by_guid(t2)
+                .unwrap()
+                .add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let req = BatchRemoteAbilityRequest {
+            ability_id: 10,
+            caster_guid: caster.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 15.0,
+            damage_per_target: 40,
+            healing_per_target: 0,
+            target_guids: vec![t1.raw(), t2.raw()],
+            cast_id: 5,
+        };
+
+        let resp = service
+            .dispatch_batch_ability(tonic::Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].current_health, 60);
+        assert_eq!(resp.results[1].current_health, 60);
     }
 }
