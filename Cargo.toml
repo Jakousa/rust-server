@@ -8,5 +8,6 @@ members = [
     "crates/loadtest",
     "crates/storage",
     "crates/gameplay",
+    "crates/client-wasm",
 ]
 resolver = "2"

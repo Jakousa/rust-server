@@ -1,0 +1,9 @@
+schema_version: "1.0"
+change_id: "track8-visual-client-webtransport"
+title: "Track 8: Playable Visual Client Frontend & WebTransport Gateway Ingress"
+created_at: "2026-09-26T22:17:00-04:00"
+authors:
+  - "Antigravity Pair Programming Agent"
+status: "proposed"
+target_branch: "main"
+feature_branch: "feat/track8-visual-client-webtransport"

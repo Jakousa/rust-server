@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenSpec MMO - Web Visual Inspector</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <!-- HUD Telemetry & Diagnostics Overlay -->
+  <div id="hud-overlay">
+    <div class="hud-panel connection-panel">
+      <div class="panel-header">
+        <span class="status-indicator disconnected" id="status-dot"></span>
+        <span class="panel-title">WebTransport Gateway</span>
+      </div>
+      <div class="hud-row">
+        <label for="gateway-url">URL:</label>
+        <input type="text" id="gateway-url" value="https://127.0.0.1:4433" />
+      </div>
+      <div class="hud-row">
+        <label for="cert-hash">Cert Hash:</label>
+        <input type="text" id="cert-hash" placeholder="Auto / SHA-256 Hex" />
+      </div>
+      <div class="hud-buttons">
+        <button id="btn-connect" class="primary-btn">Connect</button>
+        <button id="btn-disconnect" class="danger-btn" disabled>Disconnect</button>
+      </div>
+    </div>
+
+    <div class="hud-panel telemetry-panel">
+      <div class="panel-header">
+        <span class="panel-title">Live Telemetry</span>
+        <span id="fps-counter" class="metric-highlight">60 FPS</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-item"><span class="stat-label">Ping:</span> <span id="val-ping" class="stat-val">-- ms</span></div>
+        <div class="stat-item"><span class="stat-label">Server Tick:</span> <span id="val-tick" class="stat-val">0</span></div>
+        <div class="stat-item"><span class="stat-label">Baseline:</span> <span id="val-baseline" class="stat-val">0</span></div>
+        <div class="stat-item"><span class="stat-label">Entities:</span> <span id="val-entities" class="stat-val">0</span></div>
+        <div class="stat-item"><span class="stat-label">Packets In:</span> <span id="val-packets" class="stat-val">0</span></div>
+        <div class="stat-item"><span class="stat-label">Bandwidth:</span> <span id="val-bandwidth" class="stat-val">0 KB/s</span></div>
+      </div>
+      <div class="player-pos-row">
+        <span class="stat-label">Pos:</span>
+        <span id="val-pos" class="stat-val font-mono">X: 0.0, Y: 0.0, Z: 0.0</span>
+      </div>
+    </div>
+
+    <div class="hud-panel debug-panel">
+      <div class="panel-header">
+        <span class="panel-title">Visual Debug Toggles</span>
+      </div>
+      <div class="checkbox-row">
+        <label><input type="checkbox" id="toggle-partitions" checked /> Partition Boundaries</label>
+        <label><input type="checkbox" id="toggle-aoi" checked /> AOI Radius (80m)</label>
+        <label><input type="checkbox" id="toggle-wireframe" /> Wireframe Mode</label>
+      </div>
+    </div>
+
+    <div class="hud-panel controls-hint">
+      <div class="hint-title">Controls</div>
+      <div class="hint-text">WASD: Move | Q/E: Rotate Yaw | Space: Cast Ability | Mouse: Pan View</div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

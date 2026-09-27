@@ -86,17 +86,29 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ---
 
+- [x] **Track 8: Playable Visual Client Frontend & WebTransport Gateway Ingress**
+  - High-performance HTTP/3 WebTransport ingress on `GatewayServer` (`crates/gateway/src/webtransport.rs`) running over QUIC/UDP with decoupled datagram and stream egress tasks.
+  - Development self-signed ECDSA certificate generator with strict validity duration (< 14 days per W3C specification) and SHA-256 fingerprint extraction for browser certificate pinning.
+  - Zero Server Pollution: Pure Rust WebAssembly leaf crate (`crates/client-wasm`) compiled for `wasm32-unknown-unknown` and native Linux, serving as the single source of truth for packet decoding, Track 6 delta decompression, and fixed-point dequantization.
+  - Client-side temporal entity smoothing in `crates/client-wasm/src/interp.rs` featuring 100ms jitter buffer, shortest-arc spherical yaw LERP, 20m snapback threshold, and starvation velocity clamp.
+  - Interactive 3D Web Visual Inspector (`web/`) built with Vite and Three.js, rendering coordinate ground grids, spatial partition boundary planes, AOI radius indicator (80m), local and remote player capsules, and hostile NPC cubes with floating health bars.
+  - Full end-to-end integration test (`crates/gateway/tests/webtransport_e2e.rs`) verifying WebTransport handshake, datagram movement ingestion, delta batch broadcast egress, and reliable stream interactions.
+
+---
+
 ## Next Engineering Roadmap
 
 ```mermaid
 flowchart LR
-    T6["Track 6: Delta Compression & Bit-Packing\n(DONE)"] --> T7["Track 7: Cross-Partition Interaction\n(DONE)"]
-    T7 --> T8["Track 8: Playable Visual Client Frontend\n(Bevy or WebAssembly / WebGL)"]
+    T7["Track 7: Cross-Partition Interaction\n(DONE)"] --> T8["Track 8: Visual Client & WebTransport\n(DONE)"]
+    T8 --> T9["Track 9: Dynamic Partition Rebalancing\n& Hotspot Mitigation"]
+    T9 --> T10["Track 10: Cross-Node Economy & Auction House"]
 ```
 
 ---
 
-### Track 8: Playable Visual Client Frontend (Bevy / WebGL)
+### Track 9: Dynamic Spatial Partition Rebalancing & Hotspot Mitigation
 
-**Goal**: Build a lightweight interactive 3D client frontend that connects to the Edge Gateway via QUIC/UDP or WebSockets, rendering other players, combat, cast bars, and real-time movement.
+**Goal**: Implement adaptive cluster load balancing where overloaded spatial partitions split dynamically along octree bounds, migrating dense player hotspots to newly provisioned nodes without disconnecting sessions.
+
 
