@@ -1,101 +1,93 @@
 # Distributed Rust MMO Server Platform
 
-A distributed, server-authoritative, spatial simulation engine and modular gameplay platform written in Rust.
+A high-performance, server-authoritative, spatially partitioned virtual world simulation engine and modular gameplay platform written in Rust.
 
 ---
 
 ## Core Philosophy & Design Principles
 
-This project is not merely a single-game server; it is a **genre-agnostic virtual world simulation platform**. It solves the hardest problems in distributed systems—spatial partitioning, authoritative synchronization, zero-duplication entity migration, state persistence, and low-latency edge ingress—while leaving gameplay rules entirely to modular plugins.
+This project is a **genre-agnostic virtual world simulation engine**. It solves the hardest distributed systems challenges—elastic 3D spatial partitioning, authoritative state synchronization, zero-duplication live entity migration, high-throughput delta compression, ACID persistence, and browser-native HTTP/3 WebTransport ingress—while isolating gameplay rules into decoupled plugins.
 
-Whether the world being simulated is a fantasy tab-target RPG, a space trading simulation, a physics-driven survival sandbox, or a social virtual world, the engine substrate remains identical.
+Whether the simulated universe is a fantasy MMORPG, a space trading simulation, a physics-driven survival sandbox, or a dense virtual meta-world, the engine substrate remains unchanged.
 
+```mermaid
+flowchart TD
+    subgraph Clients["Clients & Edge Ingress"]
+        C1["Native Client\n(QUIC / UDP / TLS 1.3)"]
+        C2["Web Inspector\n(HTTP/3 WebTransport / WASM)"]
+        C3["Legacy TCP Client\n(TCP Framing)"]
+    end
+
+    subgraph Edge["Edge Tier"]
+        GW["Edge Gateway (mmo-gateway)\n- Lock-Free DashMap Session Routing\n- Decoupled Datagram & Stream Sinks\n- Dynamic Route Invalidation"]
+    end
+
+    subgraph Cluster["Distributed Simulation Cluster"]
+        DIR["Cluster Director (mmo-director)\n- Global Octree Spatial Balancing\n- Heartbeat Aggregation\n- Autonomous Orphan Partition Failover"]
+        N1["Simulation Node 1 (mmo-node)\n- 20 Hz Authoritative Tick\n- Kinematic Anti-Cheat\n- AoI Interest Management"]
+        N2["Simulation Node 2 (mmo-node)\n- 20 Hz Authoritative Tick\n- Dynamic Entity Migration\n- Cross-Partition RPC Dispatch"]
+    end
+
+    subgraph Storage["Persistence & Coordination"]
+        DB[("PostgreSQL / SQLite\n- Write-Behind Coalesced Snapshots\n- ACID Player-to-Player Trading")]
+        BUS["Social & Event Bus\n- Whispers, Global Chat, Party Sync"]
+    end
+
+    Clients --> Edge
+    Edge <--> Cluster
+    Cluster <--> Storage
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        GAMEPLAY MODULES / PLUGINS                      │
-│   e.g. Combat, Threat Tables, Spells, Inventory, Quests, Guilds, AI    │
-│   (Implements GameplayPlugin, dynamic components, deferred events)    │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ registers codecs, hooks, systems
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                       ENGINE SIMULATION SUBSTRATE                      │
-│                                                                        │
-│  1. Spatial Substrate (3D Octree) 3. State & Persistence               │
-│     • Dynamic domain balancing       • Dynamic ECS ComponentStore      │
-│     • Area of Interest (AoI)         • Async Write-Behind DB (PG/SQL)  │
-│     • 2-Phase Live Entity Migration  • Atomic Cross-Entity Txns        │
-│                                                                        │
-│  2. Authoritative Time & Network  4. Extensible Systems Runtime        │
-│     • 20 Hz Fixed Tick Simulation    • Type-erased EventQueue          │
-│     • Kinematic Anti-Cheat & Jitter  • Lifecycle Hooks (Before/On)     │
-│     • Edge Ingress (QUIC/UDP/TCP)    • ModularPacketRouter             │
-│     • Lock-Free Route Dispatch       • Interaction & Action Primitives │
-└────────────────────────────────────────────────────────────────────────┘
-```
 
-### 1. The Genre-Agnostic Substrate
-The engine core (`crates/core`, `crates/node`, `crates/director`, `crates/gateway`) has **zero knowledge** of high-fantasy RPG tropes like "mana", "spellbooks", "global cooldowns", or "threat tables". Instead, the engine provides generalized simulation primitives:
-- **Spatial Interaction & Targeting**: Cone, sphere, ray, and neighbor queries against the 3D Octree.
-- **Cancellable Timed Actions**: Abstract tasks with durations and interruption flags (movement, damage, stun), usable as spell cast bars, lockpicking, weapon reloading, or warp-drive spooling.
-- **Dynamic Attribute Sets**: Keyed scalar properties with modifiers, clamps, and regeneration curves.
-- **Entity Identity & Components**: 64-bit generational GUIDs with dynamic, type-erased component stores.
+---
 
-### 2. Strict Server Authority & Anti-Cheat
-Clients submit movement intentions and interaction requests; the server simulates truth. The 20 Hz fixed-step loop validates kinematic boundaries, sequence continuity, and jitter-tolerant elapsed time ($\Delta t$) to eliminate speed hacking, teleportation, and state desynchronization.
+## 1. The Genre-Agnostic Substrate
 
-### 3. Elastic Spatial Distribution & Zero-Downtime Migration
+The engine core (`crates/core`, `crates/node`, `crates/director`, `crates/gateway`) contains **zero assumptions** about specific game genres or RPG tropes. Instead, it provides generalized mathematical and spatial primitives:
+- **Spatial Queries & Targeting**: 3D Octree point-range, cone/cleave arcs, spherical radial gathers, and raycast Line-of-Sight against AABB bounding volumes.
+- **Cancellable Timed Actions**: Generalized tasks with durations and interruption flags (movement displacement, damage events, stuns), powering ability cast bars, lockpicking, weapon reloading, or warp-drive spooling.
+- **Dynamic Attribute Sets**: Keyed scalar properties with modifiers, clamps, and passive regeneration tick curves.
+- **Entity Identity & Components**: 64-bit generational GUIDs with type-erased dynamic ECS component stores.
+
+## 2. Strict Server Authority & Anti-Cheat
+
+Clients submit movement intentions and interaction requests; the server computes ground truth. The 20 Hz fixed-step loop validates kinematic boundaries, sequence continuity, and jitter-tolerant elapsed time ($\Delta t$) to eliminate speed hacking, teleportation, and state desynchronization.
+
+## 3. Elastic Spatial Distribution & Zero-Downtime Migration
+
 Worlds are partitioned across multiple simulation nodes using a dynamic 3D Octree coordinated by the central Director. When an entity crosses partition boundaries, a Two-Phase Migration Protocol transfers authority with zero entity duplication, freezes local state during transit, and dynamically invalidates Edge Gateway routes without disconnecting the client.
 
-### 4. Decoupled Gameplay via Plugins
-Gameplay rules are isolated in self-contained plugins implementing [`GameplayPlugin`]. Plugins register dynamic serialization codecs, subscribe to synchronous lifecycle hooks ([`HookDispatcher`]), dispatch domain events through deferred queues ([`EventQueue`]), and attach batch tick systems ([`TickSystem`]) without touching core simulation code.
+## 4. Cross-Partition Interactions & Boundary Dispatches
 
-### 5. Resilient, Production-Ready Cluster
-The cluster runs hermetically in Kubernetes (local `k3d` or cloud). The Director autonomously detects node failure within 5 seconds and reassigns orphaned spatial partitions; the Gateway dynamically redirects client traffic; persistence is backed by a production dual-engine PostgreSQL and SQLite storage layer with atomic transaction guarantees.
+Entities can target and interact with replicated ghost entities residing across spatial partition boundaries. Outbound RPC dispatchers automatically apply speculative cooldowns, re-validate ranges on authoritative recipient nodes ($1.2\times$ kinematic tolerance), and drain non-blocking compensation pipelines to refund resources if target nodes fail or timeout.
+
+## 5. High-Throughput Delta Compression & Bit-Packing
+
+Network bandwidth is minimized using LEB128 varints, sub-byte bit-packing, and fixed-point quantization ($1/128\text{m}$ resolution, 8-bit yaw/pitch, 16-bit velocity). A baseline acknowledgement protocol achieves **88.05% bandwidth egress reduction** under dense 1,000-entity clusters.
+
+## 6. Zero-Install WebTransport & WebAssembly Ingress
+
+Alongside native QUIC UDP and TCP, the Edge Gateway exposes an HTTP/3 WebTransport listener with self-signed certificate fingerprint pinning. The companion browser client compiles pure Rust decoding and interpolation into WebAssembly (`crates/client-wasm`), powering an interactive 3D Web Inspector (`web/`) with zero duplicated serialization code.
 
 ---
 
 ## Workspace Architecture
 
-- **[`crates/core`](crates/core)**: The simulation foundation. Contains 64-bit GUIDs, dynamic ECS [`ComponentStore`](crates/core/src/entity.rs), Sparse 3D Octree spatial indexing, synchronous veto hooks ([`HookDispatcher`](crates/core/src/hook.rs)), open type-erased event queues ([`EventQueue`](crates/core/src/plugin.rs)), dynamic component serialization ([`ComponentCodecRegistry`](crates/core/src/plugin.rs)), and Prometheus telemetry endpoints.
-- **[`crates/schema`](crates/schema)**: Protocol definitions. Contains FlatBuffers binary wire protocols for zero-copy client-server framing and gRPC / Tonic service schemas for internal cluster coordination (`ClusterDirector`, `ClusterNode`, `GatewayService`).
-- **[`crates/node`](crates/node)**: Authoritative 20 Hz simulation daemon. Executes kinematic movement validation, Area of Interest (AoI) distance queries with $O(N)$ density throttling, live two-phase entity migration, and asynchronous write-behind database snapshotting.
-- **[`crates/director`](crates/director)**: Cluster orchestrator. Manages node discovery, spatial boundary coordination, heartbeat health liveness, and automated orphan partition failover recovery.
-- **[`crates/gateway`](crates/gateway)**: Edge ingress proxy. Handles dual TCP/QUIC UDP packet termination, session multiplexing, lock-free routing via `DashMap`, non-blocking downstream dispatch, and dynamic route handover on entity migration or node failover.
-- **[`crates/storage`](crates/storage)**: Distributed persistence. Dual-backend async SQL engine supporting distributed PostgreSQL (`postgres://`) and hermetic SQLite (`sqlite:`), automated schema migrations, and atomic ACID transaction protocols (e.g. deadlock-free player-to-player item trading).
-- **[`crates/gameplay`](crates/gameplay)**: Pluggable gameplay modules implementing the [`GameplayPlugin`](crates/core/src/plugin.rs) trait:
-  - `CombatPlugin`: Health pools, armor mitigation, batch regen tick system, damage processing.
-  - `ThreatPlugin`: Bounded hate tables, target switching thresholds, damage/healing threat accounting.
-  - `InventoryPlugin`: Container bags, equipment constraints, encumbrance veto hooks.
-  - `TradePlugin`: Atomic two-player trade transactions with mutual confirmation and distance guards.
-  - `LootPlugin` & `QuestPlugin`: Probability drop tables, quest objectives, and reward distribution.
-  - `GuildPlugin` & `PartyPlugin`: Multi-member rosters, party sync, and shared transactional vaults.
-  - `MonsterAiPlugin`, `PerceptionPlugin`, `SpawnerPlugin`: Autonomous NPC perception scanning, finite state machines, and population-managed respawners.
-- **[`crates/loadtest`](crates/loadtest)**: Distributed scale and chaos testing generator. Simulates thousands of concurrent virtual bot connections with configurable trajectory profiles (`RandomWalk`, `HotspotClustering`, `CombatInteraction`) and latency percentile metrics.
-
----
-
-## Cluster Operations & Quickstart
-
-Cluster lifecycle and testing are abstracted into single-step commands via [`scripts/cluster.sh`](scripts/cluster.sh):
-
-```bash
-# 1. Provision local Kubernetes cluster with port forwards
-./scripts/cluster.sh up
-
-# 2. Build images and deploy cluster (Director, Gateway, Nodes, Postgres, Grafana)
-./scripts/cluster.sh all
-
-# 3. Check cluster status
-./scripts/cluster.sh status
-
-# 4. Run bot swarm load test (e.g. 1,000 bots, 10s duration, hotspot behavior)
-./scripts/cluster.sh loadtest 1000 10 hotspot
-
-# 5. Run end-to-end chaos failover & recovery test
-./scripts/cluster.sh chaos
-
-# 6. Fast iteration: rebuild code, re-import image, and rolling restart
-./scripts/cluster.sh reload
+```
+rust-server/
+├── crates/
+│   ├── core/         # Generational GUIDs, dynamic ECS ComponentStore, Sparse 3D Octree, veto hooks, Prometheus metrics
+│   ├── schema/       # Wire protocols, LEB128 varints, bitpack codecs, and gRPC cluster coordination schemas
+│   ├── node/         # Authoritative 20 Hz simulation daemon, kinematics anti-cheat, AoI management, live migration
+│   ├── director/     # Global cluster orchestrator, node discovery, spatial domain balancing, orphan failover
+│   ├── gateway/      # Edge ingress proxy, dual TCP / native QUIC / HTTP/3 WebTransport termination, lock-free routing
+│   ├── storage/      # Dual SQL engine (PostgreSQL & SQLite), automated migrations, ACID trade transactions, write-behind DB
+│   ├── gameplay/     # Pluggable modules: Combat, Threat, Inventory, Trade, Loot, Quests, Guilds, Parties, NPC AI
+│   ├── loadtest/     # Scale & chaos test bot swarm generator (RandomWalk, HotspotClustering, CombatInteraction)
+│   └── client-wasm/  # Pure Rust WebAssembly leaf crate: zero-copy Float32Array render buffer, delta decoding, interpolation
+├── web/              # Interactive 3D Web Visual Inspector (Vite + Three.js), developer HUD, WASD controls
+├── k8s/              # Kubernetes manifests (Director, Gateway, Nodes, PostgreSQL, Prometheus, Grafana)
+├── openspec/         # Rigorous OpenSpec specifications, delta specs, proposals, and design documents
+└── scripts/          # Cluster lifecycle, chaos failover testing, and deployment automation scripts
 ```
 
 ---
@@ -115,3 +107,59 @@ Cluster lifecycle and testing are abstracted into single-step commands via [`scr
 - [x] **Track 2: Dynamic Spatial Partitioning & Live Entity Migration**: Two-Phase Entity Migration Protocol with strict state freeze leases, zero-duplication guarantees, live Edge Gateway routing updates, and boundary hysteresis margins.
 - [x] **Track 3: Production Distributed Storage (PostgreSQL)**: Multi-backend SQL storage abstraction, automated schema migrations, deadlock-free ACID item trading, and batched persistence.
 - [x] **Track 4: Kubernetes Scale & Chaos Testing**: Headless bot swarm generator with hotspot steering, sequence-aware jitter-tolerant kinematics, autonomous 3.5s dead-node orphan recovery, and unified cluster command abstractions.
+- [x] **Track 5: Interaction Primitives & Pluggable Abilities**: Cancellable timed action state machines, dynamic attribute sets with aura modifiers, authoritative 3D spatial target queries (cone/sphere/raycast), and ability cooldown pipelines.
+- [x] **Track 6: Network Delta Compression & Bandwidth Bit-Packing**: LEB128 varints, fixed-point kinematic quantization ($1/128\text{m}$ resolution), baseline acknowledgement replication, and **88.05% bandwidth egress reduction**.
+- [x] **Track 7: Cross-Partition Interaction & Boundary Ability Dispatch**: Cross-node ability execution, ghost entity targeting, boundary AoE sphere/cone multi-dispatch, anti-cheat range re-validation, and non-blocking compensation pipelines.
+- [x] **Track 8: Playable Visual Client Frontend & WebTransport Gateway Ingress**: HTTP/3 WebTransport ingress over QUIC/UDP with decoupled datagram/stream sinks, zero-server-pollution Rust WebAssembly leaf crate (`crates/client-wasm`), and interactive 3D Web Visual Inspector (`web/`).
+
+---
+
+## Quickstart & Local Development
+
+### 1. Rust Workspace Build & Test
+```bash
+# Check formatting and strict linter
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run all unit and integration tests across the workspace
+cargo test --workspace
+```
+
+### 2. Launching the Web Visual Inspector Frontend
+```bash
+# Navigate to web application directory
+cd web
+
+# Install dependencies (first time only)
+npm install
+
+# Run Vite development server (hot-reloading at http://localhost:3000)
+npm run dev
+
+# Or build standalone production bundle
+npm run build
+```
+
+### 3. Cluster Operations via Docker & Kubernetes
+Cluster lifecycle and chaos testing are abstracted into single-step commands via [`scripts/cluster.sh`](scripts/cluster.sh):
+
+```bash
+# 1. Provision local Kubernetes cluster (k3d) with port forwards
+./scripts/cluster.sh up
+
+# 2. Build images and deploy cluster (Director, Gateway, Nodes, Postgres, Grafana)
+./scripts/cluster.sh all
+
+# 3. Check cluster status and node health
+./scripts/cluster.sh status
+
+# 4. Run bot swarm load test (e.g. 1,000 bots, 10s duration, hotspot behavior)
+./scripts/cluster.sh loadtest 1000 10 hotspot
+
+# 5. Run end-to-end chaos failover & recovery test
+./scripts/cluster.sh chaos
+
+# 6. Fast iteration: rebuild code, re-import image, and rolling restart
+./scripts/cluster.sh reload
+```

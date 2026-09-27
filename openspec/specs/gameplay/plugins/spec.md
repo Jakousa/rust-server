@@ -41,3 +41,10 @@ The engine SHALL support modular packet routing where client packets with module
 #### Scenario: Handling plugin-specific packet
 - **WHEN** a client sends an action packet addressed to a registered module opcode
 - **THEN** the core router SHALL forward the payload to the registered plugin handler with the invoking entity GUID and session context
+
+### Requirement: Event-Driven Despawn and Death Pruning
+Gameplay plugins tracking entity references SHALL subscribe to entity despawn and death notifications to prune stale references reactively without executing full-world entity iterations every tick.
+
+#### Scenario: Reactive cleanup on entity despawn
+- **WHEN** an entity despawns or dies in the simulation
+- **THEN** registered gameplay plugins (such as spawner and threat tracking) SHALL receive notification and remove stale GUID references from internal tracking structures without querying all entities in the entity store

@@ -1,22 +1,54 @@
 # MMO Cluster Architecture & Engineering Roadmap
 
-This document outlines the architectural milestones, completed foundations, and scheduled engineering tracks for the distributed Rust MMO server cluster.
+This document outlines the architectural milestones, completed foundations, and scheduled engineering tracks for the distributed Rust MMO server platform.
 
 ---
 
-## Current Architecture Status (September 2026)
+## Current Architecture Status
 
 The cluster is built around an authoritative, distributed tick-based simulation architecture:
-- **Director (`crates/director`)**: Global cluster orchestrator managing simulation node discovery, 3D Octree spatial domain coordination, heartbeat aggregation, and orphan partition recovery.
-- **Simulation Nodes (`crates/node`)**: Authoritative 20 Hz fixed-tick simulation nodes executing kinematics validation, Area of Interest (AoI) interest management, hook pipelines, and asynchronous write-behind SQLite snapshotting.
-- **Edge Gateway (`crates/gateway`)**: Dual TCP/QUIC edge ingress proxy handling client packet framing, session multiplexing, lock-free routing via `DashMap`, non-blocking downstream dispatch, and session cache coordination.
-- **Shared Core & Schema (`crates/core`, `crates/schema`)**: Zero-copy packet framing, Entity-Component registry, math/octree primitives, and unified HTTP Prometheus/Health telemetry.
-- **Local Kubernetes Orchestration (`k8s/`, `scripts/cluster.sh`)**: Local `k3d` multi-service deployment with native Kubernetes health/readiness probes, pod-level Prometheus metric scraping on uniform port 9091, and Grafana datasource integration.
+- **Director (`crates/director`)**: Global cluster orchestrator managing simulation node discovery, 3D Octree spatial domain coordination, heartbeat aggregation, and autonomous orphan partition failover.
+- **Simulation Nodes (`crates/node`)**: Authoritative 20 Hz fixed-tick simulation nodes executing kinematics validation, Area of Interest (AoI) interest management, hook pipelines, pluggable gameplay systems, and asynchronous write-behind database persistence.
+- **Edge Gateway (`crates/gateway`)**: Ingress proxy terminating TCP, native QUIC UDP (TLS 1.3), and HTTP/3 WebTransport with decoupled datagram/stream sinks, lock-free routing via `DashMap`, non-blocking downstream dispatch, and dynamic route handover.
+- **Shared Core & Schema (`crates/core`, `crates/schema`)**: Zero-copy packet framing, 64-bit generational GUIDs, dynamic ECS ComponentStore, math/octree primitives, LEB128 varints, bitpack codecs, and unified Prometheus HTTP metrics.
+- **Rust WebAssembly Core & Visual Inspector (`crates/client-wasm`, `web/`)**: Zero-server-pollution Rust WebAssembly leaf crate providing client-side delta decompression, fixed-point dequantization, and temporal Hermite/LERP interpolation for an interactive 3D Web Inspector (Vite + Three.js).
+- **Storage Tier (`crates/storage`)**: Dual-engine SQL persistence supporting distributed PostgreSQL (`postgres://`) and hermetic SQLite (`sqlite:`), automated schema migrations, and deadlock-free ACID item trading.
+- **Kubernetes Orchestration (`k8s/`, `scripts/cluster.sh`)**: Local `k3d` multi-service deployment with native Kubernetes health/readiness probes, pod-level Prometheus metric scraping on port 9091, and Grafana datasource integration.
 
 ---
 
-## Completed Phases
+## Engineering Tracks Progression
 
+```mermaid
+flowchart TD
+    subgraph Completed["Completed Architectural Tracks"]
+        T1["Track 1: Production Observability & Health"]
+        T2["Track 2: Dynamic Partitioning & Migration"]
+        T3["Track 3: Distributed Storage (PostgreSQL)"]
+        T4["Track 4: Kubernetes Scale & Chaos Testing"]
+        T5["Track 5: Interaction Primitives & Abilities"]
+        T6["Track 6: Delta Compression & Bit-Packing"]
+        T7["Track 7: Cross-Partition Interaction"]
+        T8["Track 8: Visual Client & WebTransport"]
+        
+        T1 --> T2 --> T3 --> T4 --> T5 --> T6 --> T7 --> T8
+    end
+
+    subgraph Upcoming["Future Engineering Roadmap"]
+        T9["Track 9: Dynamic Spatial Partition Rebalancing\n& Hotspot Mitigation"]
+        T10["Track 10: Cross-Node Economy & Auction House"]
+        T11["Track 11: World Persistence & Voxel/Heightmap Streaming"]
+        T12["Track 12: Geo-Distributed Edge Gateways & Anycast Routing"]
+        
+        T8 --> T9 --> T10 --> T11 --> T12
+    end
+```
+
+---
+
+## Completed Architectural Milestones
+
+### Foundation Hardening (Phases 1–3)
 - [x] **Phase 1 P0: Security & Concurrency Hardening**
   - Monotonic server-side timestamps preventing client speed hacks and time banking.
   - Command initiator authentication preventing cross-entity spoofing.
@@ -33,6 +65,10 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Strict hierarchical lock acquisition preventing deadlocks across registry and coordinator.
   - Comprehensive `proptest` suites for packet codecs and octree spatial queries.
   - GitHub Actions CI pipeline enforcing tests and clippy gates.
+
+---
+
+### Core Infrastructure Tracks (Tracks 1–4)
 - [x] **Track 1: Production Observability, Metrics & Health Telemetry**
   - Unified `TelemetryServer` in `crates/core` with `/metrics`, `/healthz`, and `/ready`.
   - Prometheus metrics instrumentation across Node, Gateway, and Director.
@@ -49,7 +85,6 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Deadlock-free ACID player-to-player item trade protocol with strict GUID lock ordering and full transaction rollback on capacity exhaustion.
   - Batched statement execution in `save_snapshot_batch` eliminating network round-trip overhead.
   - Live PostgreSQL deployment in Kubernetes (`k8s/base/postgres.yaml`) with connection health telemetry.
-
 - [x] **Track 4: Kubernetes Scale & Chaos Testing (10k Bot Ingestion & Failover)**
   - Enhanced headless bot swarm generator in `crates/loadtest` with `RandomWalk`, `HotspotClustering`, and `CombatInteraction` profiles.
   - Jitter-tolerant movement kinematics validator in `crates/node` eliminating false-positive speed-hack snapbacks during high load bursts.
@@ -58,6 +93,9 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Automated chaos test suite (`scripts/chaos.sh`) verifying autonomous dead-node detection within 3.5s, orphaned spatial partition recovery, Edge Gateway route propagation (200 routes updated), and StatefulSet node resurrection.
   - Scaled benchmark with 1,000 bots delivering 15,967 packets/s, 0 snapback rejections, and p99 RTT latency of 1.58 ms.
 
+---
+
+### Advanced Networking, Gameplay & Frontend (Tracks 5–8)
 - [x] **Track 5: Interaction Primitives & Pluggable Abilities**
   - Genre-agnostic cancellable timed action state machine (`TimedAction`, `ActionQueue`, `ActionTickSystem`).
   - Dynamic attribute and aura modifier container (`AttributeSet`, `AttributeTickSystem`, order-independent modifier stacking, bounds clamping, passive tick regen).
@@ -73,8 +111,6 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Non-blocking ACK ingress via unbounded MPSC channels drained in batch without lock contention.
   - Automated benchmark verifying **88.05% bandwidth egress reduction** under 1,000 entity density (dropping 3.4 MB to 0.39 MB) and bounded memory ($< 20\text{ MB}$ typical, $\le 252\text{ MB}$ worst-case 3s lag).
 
----
-
 - [x] **Track 7: Cross-Partition Interaction & Boundary Ability Dispatch**
   - Unified `SpatialTargetCandidate` primitives and candidate partitioning (`partition_candidates_by_node`) across local entities and replicated boundary ghosts.
   - Protobuf RPCs (`DispatchAbility`, `DispatchBatchAbility`) and `RemoteAbilityErrorCode` in `crates/schema/proto/cluster.proto`.
@@ -83,8 +119,6 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Non-blocking MPSC ability compensation pipeline on `TickSimulation` draining at tick start to cleanly refund resources and reset cooldowns upon RPC failure or timeout ($100\text{ms}$).
   - Boundary-crossing Area-of-Effect sphere and cone dispatch (`cast_boundary_sphere_aoe`, `resolve_boundary_sphere_aoe`) ensuring concurrent peer dispatch and zero duplicate hits.
   - Comprehensive end-to-end multi-node integration test suite (`tests/cross_partition_ability_e2e.rs`) verifying remote spells, boundary AoE cleaves, migration freeze vetoes, and out-of-range re-validation refunds.
-
----
 
 - [x] **Track 8: Playable Visual Client Frontend & WebTransport Gateway Ingress**
   - High-performance HTTP/3 WebTransport ingress on `GatewayServer` (`crates/gateway/src/webtransport.rs`) running over QUIC/UDP with decoupled datagram and stream egress tasks.
@@ -96,19 +130,48 @@ The cluster is built around an authoritative, distributed tick-based simulation 
 
 ---
 
-## Next Engineering Roadmap
-
-```mermaid
-flowchart LR
-    T7["Track 7: Cross-Partition Interaction\n(DONE)"] --> T8["Track 8: Visual Client & WebTransport\n(DONE)"]
-    T8 --> T9["Track 9: Dynamic Partition Rebalancing\n& Hotspot Mitigation"]
-    T9 --> T10["Track 10: Cross-Node Economy & Auction House"]
-```
-
----
+## Upcoming Engineering Tracks
 
 ### Track 9: Dynamic Spatial Partition Rebalancing & Hotspot Mitigation
 
-**Goal**: Implement adaptive cluster load balancing where overloaded spatial partitions split dynamically along octree bounds, migrating dense player hotspots to newly provisioned nodes without disconnecting sessions.
+**Problem**: When hundreds of players congregate in a single spatial area (e.g. world boss arena, city marketplace), the responsible simulation node experiences CPU saturation while adjacent partition nodes remain idle.
 
+**Scope & Technical Goals**:
+1. **Octree Sub-Domain Splitting**: Enhance `ClusterDirector` to continuously monitor per-node tick execution duration and entity density. When a partition's density exceeds a saturation threshold (e.g., $> 500$ entities or $> 35\text{ms}$ tick duration), the director divides the octant into sub-octants.
+2. **Dynamic Worker Node Provisioning**: Assign newly divided octants to available idle or scale-out simulation nodes.
+3. **Continuous Boundary Smoothing**: Dynamically adjust partition boundary planes using an elastic centroid-repulsion algorithm to balance computational load while minimizing boundary-crossing rate.
+4. **Zero-Disconnect Batch Handover**: Extend Two-Phase Migration to support concurrent batch handovers of up to 500 entities across partition splits.
 
+---
+
+### Track 10: Cross-Node Distributed Economy, Transactional Vaults & Auction House
+
+**Problem**: Modern MMO economies require cross-node marketplace order matching, player-to-player escrow trades, and shared guild vaults without race conditions, currency duplication, or inventory loss during node failure.
+
+**Scope & Technical Goals**:
+1. **Distributed Two-Phase Commit (2PC) Coordinator**: Coordinate multi-entity, multi-node item and currency transfers with pre-commit reservation locks and automatic abort rollbacks.
+2. **Asynchronous Auction House Engine**: Cluster-wide order book service (`AuctionService`) managing listings, bids, buyouts, and expiration timers.
+3. **Escrow State Machine**: Immutable item and currency escrow states in PostgreSQL with strict lease timeouts.
+4. **Real-Time Market Notifications**: Publish auction outbid, sold, and delivery events across `SocialBus` to notify players regardless of connected partition node.
+
+---
+
+### Track 11: Real-Time World Persistence & Streaming Voxel / Heightmap Terrain
+
+**Problem**: Dynamic virtual worlds require authoritative terrain deformation, constructible fortifications, and persistent environmental state streamed on-demand within each player's Area of Interest.
+
+**Scope & Technical Goals**:
+1. **Sparse Voxel Octree Terrain Representation**: Efficient 3D chunked volumetric terrain storage supporting point digging, building, and destruction.
+2. **Delta Chunk Streaming via AoI**: Integrate terrain chunk boundaries into `SpatialOctree` AoI queries, streaming compressed voxel deltas over WebTransport / QUIC datagrams.
+3. **Asynchronous Chunk Write-Behind**: Persist modified terrain chunks to PostgreSQL using LZ4-compressed binary blobs with coalesced dirty-chunk queues.
+
+---
+
+### Track 12: Geo-Distributed Edge Gateways & Anycast Routing
+
+**Problem**: Players distributed worldwide (Americas, Europe, Asia) experience high RTT when connecting directly to a centralized data center.
+
+**Scope & Technical Goals**:
+1. **Geo-Distributed Gateway Ingress**: Deploy edge gateways globally with Anycast DNS / BGP routing terminating TLS and WebTransport close to the user.
+2. **Optimized Backhaul Forwarding**: Multiplex edge traffic to regional simulation clusters over persistent, high-bandwidth QUIC tunnels.
+3. **Cross-Region Session Handover**: Seamlessly migrate player sessions across gateways during intercontinental travels without requiring game client re-authentication.
