@@ -2,19 +2,21 @@
 
 This document captures the comprehensive codebase quality audit, architectural risk evaluation, and prioritized refactoring roadmap performed on September 23, 2026.
 
+> **Audit Status**: All findings documented below have been **RESOLVED & VERIFIED** across Phases 1–3 and Tracks 1–8. This document is retained for historical traceability and architectural rationale.
+
 ---
 
-## Executive Summary
+## Executive Summary (Resolution Status)
 
-| Category | Health | Critical Risks Identified | Refactoring Urgency |
+| Category | Initial Health | Critical Risks Identified | Status / Resolution |
 | :--- | :---: | :--- | :---: |
-| **Kinematics & Anti-Cheat** | ⚠️ At Risk | Client can spoof delta time (`dt_sec = 100.0`) to bypass speed validation | **P0 (Immediate)** |
-| **Concurrency & Gateway** | ⚠️ At Risk | Atomic cache-line contention on `Arc<RwLock<SessionRouter>>` per packet; stream write stalls | **P0 (Immediate)** |
-| **Memory & Allocations** | ⚠️ Moderate | Heap allocation per packet in wire codec; per-tick vector allocations in AoI & gameplay | **P1 (High)** |
-| **Simulation Loop** | ⚠️ Moderate | Randomized entity iteration order (non-deterministic); potential spiral of death in missed ticks | **P1 (High)** |
-| **Storage & Persistence** | ⚠️ Moderate | SQLite missing WAL mode (`journal_mode=WAL`); write-behind snapshotter has unbounded queue | **P1 (High)** |
-| **Cluster Orchestration** | ⚠️ Moderate | Node death leaves orphaned octree bounding boxes without reassignment; lacks epoch fencing | **P2 (Medium)** |
-| **Testing & Tooling** | 🟢 Solid | 58 tests passing; lacks fuzzing (`proptest`), chaos network tests, and GitHub Actions CI | **P2 (Medium)** |
+| **Kinematics & Anti-Cheat** | ⚠️ At Risk | Client can spoof delta time (`dt_sec = 100.0`) to bypass speed validation | ✅ **Resolved (Phase 1)** |
+| **Concurrency & Gateway** | ⚠️ At Risk | Atomic cache-line contention on `Arc<RwLock<SessionRouter>>`; stream write stalls | ✅ **Resolved (Phase 1 & Track 8)** |
+| **Memory & Allocations** | ⚠️ Moderate | Heap allocation per packet in wire codec; per-tick vector allocations in AoI & gameplay | ✅ **Resolved (Phase 2 & Track 6)** |
+| **Simulation Loop** | ⚠️ Moderate | Randomized entity iteration order; potential spiral of death in missed ticks | ✅ **Resolved (Phase 2)** |
+| **Storage & Persistence** | ⚠️ Moderate | SQLite missing WAL mode; write-behind snapshotter has unbounded queue | ✅ **Resolved (Phase 2 & Track 3)** |
+| **Cluster Orchestration** | ⚠️ Moderate | Node death leaves orphaned octree bounding boxes without reassignment | ✅ **Resolved (Phase 3 & Track 4)** |
+| **Testing & Tooling** | 🟢 Solid | Lacked property tests (`proptest`), chaos network tests, and GitHub Actions CI | ✅ **Resolved (Phase 3 & Track 4)** |
 
 ---
 
