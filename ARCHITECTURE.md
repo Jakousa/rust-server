@@ -120,7 +120,7 @@ The network protocol operates across three transport mechanisms:
 2. **Native QUIC UDP (Client)**: TLS 1.3 encryption with sub-millisecond datagram delivery.
 3. **Framed TCP (Fallback)**: 8-byte header (`[0x4D, 0x4D]`, opcode `u16`, length `u32`).
 
-### Bit-Packing & Quantization (Track 6)
+### Bit-Packing & Quantization
 To minimize network egress bandwidth:
 - **LEB128 Varints**: Entity IDs and field masks encoded with 7-bit variable-length chunks.
 - **Fixed-Point Coordinates**: Delta positions quantized to $1/128\text{m}$ resolution ($\approx 7.8\text{mm}$ error).
