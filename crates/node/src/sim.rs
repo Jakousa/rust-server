@@ -60,6 +60,15 @@ impl TickSimulation {
         bounds: BoundingBox3D,
         kinematics: KinematicValidator,
     ) -> Self {
+        let mut codecs = ComponentCodecRegistry::new();
+        codecs.register::<mmo_core::ActionQueue>("action_queue");
+        codecs.register::<mmo_core::AttributeSet>("attribute_set");
+
+        let tick_systems: Vec<Box<dyn mmo_core::TickSystem>> = vec![
+            Box::new(mmo_core::ActionTickSystem),
+            Box::new(mmo_core::AttributeTickSystem),
+        ];
+
         Self {
             node_id,
             entity_store: EntityStore::new(),
@@ -68,10 +77,10 @@ impl TickSimulation {
             kinematics,
             tick_counter: 0,
             ghost_store: GhostStore::new(),
-            codecs: ComponentCodecRegistry::new(),
+            codecs,
             event_queue: EventQueue::new(),
             packets: ModularPacketRouter::new(),
-            tick_systems: Vec::new(),
+            tick_systems,
             plugin_manager: PluginManager::new(),
             aoi: AoiManager::new(),
             pending_broadcast_jobs: Vec::new(),
@@ -479,6 +488,29 @@ impl TickSimulation {
         });
         if ctx.is_canceled() {
             return Err(current_pos);
+        }
+
+        // Synchronous Action Interruption on movement
+        let dx = new_pos.0 - current_pos.0;
+        let dy = new_pos.1 - current_pos.1;
+        let dz = new_pos.2 - current_pos.2;
+        let moved = (dx * dx + dy * dy + dz * dz) > 1e-4;
+        if moved {
+            if let Some(entity) = self.entity_store.get_mut_by_guid(guid) {
+                if let Some(queue) = entity.get_component_mut::<mmo_core::ActionQueue>() {
+                    let should_interrupt = queue
+                        .current()
+                        .map(|a| a.interrupt_flags.cancel_on_movement)
+                        .unwrap_or(false);
+                    if should_interrupt {
+                        queue.interrupt(
+                            guid,
+                            mmo_core::InterruptReason::Movement,
+                            &mut self.event_queue,
+                        );
+                    }
+                }
+            }
         }
 
         // 7. Update EntityStore position
@@ -1017,5 +1049,50 @@ mod tests {
         sim.advance_time(std::time::Duration::from_millis(1));
         let res2 = sim.process_client_move_with_seq(guid, (51.0, 50.0, 0.0), 2);
         assert_eq!(res2, Ok((51.0, 50.0, 0.0)));
+    }
+
+    #[test]
+    fn test_process_client_move_interrupts_active_action() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let guid = Guid::new(EntityType::Player, 1, 888);
+        assert!(sim.spawn_entity(guid, (50.0, 50.0, 0.0)));
+
+        // Attach an active ActionQueue with cancel_on_movement: true
+        let mut queue = mmo_core::ActionQueue::new();
+        let action = mmo_core::TimedAction::new(
+            999,
+            5.0,
+            mmo_core::ActionInterruptFlags {
+                cancel_on_movement: true,
+                cancel_on_damage: true,
+                cancel_on_stun: true,
+                cancel_on_target_lost: true,
+            },
+            None,
+        );
+        let mut events = mmo_core::EventQueue::new();
+        queue
+            .start_action(guid, action, mmo_core::QueuePolicy::Replace, &mut events)
+            .unwrap();
+        sim.entity_store
+            .get_mut_by_guid(guid)
+            .unwrap()
+            .add_component(queue);
+
+        // Move entity within valid speed cap (0.3 units <= 0.5 max displacement per nominal tick)
+        let move_res = sim.process_client_move_with_seq(guid, (50.3, 50.0, 0.0), 1);
+        assert_eq!(move_res, Ok((50.3, 50.0, 0.0)));
+
+        // ActionQueue should now be empty (aborted)
+        let ent = sim.entity_store.get_by_guid(guid).unwrap();
+        let q = ent.get_component::<mmo_core::ActionQueue>().unwrap();
+        assert!(!q.is_busy());
+
+        // EventQueue should contain ActionInterruptedEvent
+        let interrupted = sim.event_queue.drain::<mmo_core::ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].action_id, 999);
+        assert_eq!(interrupted[0].reason, mmo_core::InterruptReason::Movement);
     }
 }

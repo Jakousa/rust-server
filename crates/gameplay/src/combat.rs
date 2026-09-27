@@ -169,6 +169,22 @@ pub fn process_damage_events(
                 died_events.push(death_event);
             }
         }
+
+        // 1. Interrupt active action if configured with cancel_on_damage
+        if let Some(queue) = target_entity.get_component_mut::<mmo_core::ActionQueue>() {
+            let should_interrupt = queue
+                .current()
+                .map(|a| a.interrupt_flags.cancel_on_damage)
+                .unwrap_or(false);
+            if should_interrupt {
+                queue.interrupt(dmg.target, mmo_core::InterruptReason::Damage, event_queue);
+            }
+        }
+
+        // 2. Synchronize with dynamic AttributeSet if attached
+        if let Some(attrs) = target_entity.get_component_mut::<mmo_core::AttributeSet>() {
+            let _ = attrs.modify_current("health", -effective_damage);
+        }
     }
 
     for death in &died_events {
@@ -271,5 +287,70 @@ mod tests {
             .unwrap();
         assert!(victim_hp.is_dead);
         assert_eq!(victim_hp.current_hp, 0.0);
+    }
+
+    #[test]
+    fn test_damage_interrupts_action_and_modifies_attribute_set() {
+        let mut store = EntityStore::new();
+        let mut queue = EventQueue::new();
+
+        let attacker = Guid::new(EntityType::Player, 1, 10);
+        let victim = Guid::new(EntityType::Player, 1, 20);
+
+        let v_key = store.spawn(victim, (0.0, 0.0, 0.0));
+        let ent = store.get_mut(v_key).unwrap();
+
+        // 1. Attach AttributeSet with health
+        let mut attrs = mmo_core::AttributeSet::new();
+        attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        ent.add_component(attrs);
+
+        // 2. Attach ActionQueue with active action (cancel_on_damage = true)
+        let mut action_queue = mmo_core::ActionQueue::new();
+        let action = mmo_core::TimedAction::new(
+            55,
+            3.0,
+            mmo_core::ActionInterruptFlags {
+                cancel_on_movement: true,
+                cancel_on_damage: true,
+                cancel_on_stun: true,
+                cancel_on_target_lost: true,
+            },
+            None,
+        );
+        action_queue
+            .start_action(victim, action, mmo_core::QueuePolicy::Replace, &mut queue)
+            .unwrap();
+        ent.add_component(action_queue);
+
+        // Drain start event
+        let _ = queue.drain::<mmo_core::ActionStartedEvent>();
+
+        // 3. Push damage event
+        queue.push(DamageEvent {
+            source: attacker,
+            target: victim,
+            raw_damage: 25.0,
+        });
+
+        process_damage_events(&mut queue, &mut store);
+
+        // Verify action was aborted with Damage reason
+        let ent = store.get_by_guid(victim).unwrap();
+        let aq = ent.get_component::<mmo_core::ActionQueue>().unwrap();
+        assert!(!aq.is_busy());
+
+        let interrupted = queue.drain::<mmo_core::ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].action_id, 55);
+        assert_eq!(interrupted[0].reason, mmo_core::InterruptReason::Damage);
+
+        // Verify AttributeSet health was decremented by 25.0 -> 75.0
+        let current_hp = ent
+            .get_component::<mmo_core::AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap();
+        assert_eq!(current_hp, 75.0);
     }
 }

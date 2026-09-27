@@ -58,13 +58,21 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Automated chaos test suite (`scripts/chaos.sh`) verifying autonomous dead-node detection within 3.5s, orphaned spatial partition recovery, Edge Gateway route propagation (200 routes updated), and StatefulSet node resurrection.
   - Scaled benchmark with 1,000 bots delivering 15,967 packets/s, 0 snapback rejections, and p99 RTT latency of 1.58 ms.
 
+- [x] **Track 5: Interaction Primitives & Pluggable Abilities**
+  - Genre-agnostic cancellable timed action state machine (`TimedAction`, `ActionQueue`, `ActionTickSystem`).
+  - Dynamic attribute and aura modifier container (`AttributeSet`, `AttributeTickSystem`, order-independent modifier stacking, bounds clamping, passive tick regen).
+  - Authoritative 3D spatial target queries against `Octree`: Point range, Cone / Cleave arcs, Sphere radial gathering, and Raycast Line-of-Sight against AABB bounding volumes.
+  - Kinematic movement validation automatically aborting active actions upon non-zero displacement when `cancel_on_movement` is enabled.
+  - Pluggable `AbilityPlugin` with `CooldownTracker`, shared GCD timers, resource cost validation, and instant vs. casted activations.
+  - Integration with `CombatPlugin` synchronizing damage events with `AttributeSet` health and action interruption on damage.
+
 ---
 
 ## Next Engineering Roadmap
 
 ```mermaid
 flowchart LR
-    T5["Track 5: Interaction Primitives & Pluggable Abilities\n(Timed Actions, Dynamic Attributes, Spatial Queries)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
+    T5["Track 5: Interaction & Ability Primitives\n(DONE)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
 ```
 
 ---
