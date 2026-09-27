@@ -237,6 +237,12 @@ impl NodeServiceImpl {
     pub fn into_server(self) -> NodeServiceServer<Self> {
         NodeServiceServer::new(self)
     }
+
+    /// Enqueues an incoming client ACK packet into the simulation node's non-blocking channel.
+    pub async fn queue_client_ack(&self, ack: mmo_schema::client::ClientAckPacket) {
+        let sim = self.sim.read().await;
+        sim.queue_client_ack(ack);
+    }
 }
 
 #[tonic::async_trait]

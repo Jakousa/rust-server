@@ -7,6 +7,12 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+use crate::bitpack::{get_varint_u32, get_varint_u64, put_varint_u32, put_varint_u64};
+use crate::quantize::{
+    dequantize_delta_i16, dequantize_pitch_i8, dequantize_velocity_i16, dequantize_yaw_u8,
+    quantize_delta_i16, quantize_pitch_i8, quantize_velocity_i16, quantize_yaw_u8,
+};
+
 /// Protocol magic header: 2 bytes `0x4D, 0x4D` ("MM" for MMO).
 pub const PACKET_MAGIC: u16 = 0x4D4D;
 
@@ -44,6 +50,8 @@ pub enum Opcode {
     EntityDespawn = 0x0006,
     Ping = 0x0007,
     Pong = 0x0008,
+    EntityDeltaBatch = 0x0009,
+    ClientAck = 0x000A,
 }
 
 impl Opcode {
@@ -57,6 +65,8 @@ impl Opcode {
             0x0006 => Ok(Opcode::EntityDespawn),
             0x0007 => Ok(Opcode::Ping),
             0x0008 => Ok(Opcode::Pong),
+            0x0009 => Ok(Opcode::EntityDeltaBatch),
+            0x000A => Ok(Opcode::ClientAck),
             other => Err(ClientCodecError::UnknownOpcode(other)),
         }
     }
@@ -71,6 +81,8 @@ impl Opcode {
             Opcode::EntityDespawn => "EntityDespawn",
             Opcode::Ping => "Ping",
             Opcode::Pong => "Pong",
+            Opcode::EntityDeltaBatch => "EntityDeltaBatch",
+            Opcode::ClientAck => "ClientAck",
         }
     }
 }
@@ -498,6 +510,315 @@ impl PongPacket {
     }
 }
 
+/// Field mask flags indicating which entity attributes are present in an `EntityDeltaState`.
+pub mod delta_flags {
+    /// Full keyframe: absolute position coordinates are sent as 3x f32.
+    pub const MASK_KEYFRAME: u16 = 1 << 0;
+    /// Quantized position delta X present (i16).
+    pub const MASK_DELTA_POS_X: u16 = 1 << 1;
+    /// Quantized position delta Y present (i16).
+    pub const MASK_DELTA_POS_Y: u16 = 1 << 2;
+    /// Quantized position delta Z present (i16).
+    pub const MASK_DELTA_POS_Z: u16 = 1 << 3;
+    /// Quantized 3D velocity present (3x i16).
+    pub const MASK_VELOCITY: u16 = 1 << 4;
+    /// Quantized 8-bit yaw present (u8).
+    pub const MASK_YAW: u16 = 1 << 5;
+    /// Quantized 8-bit pitch present (i8).
+    pub const MASK_PITCH: u16 = 1 << 6;
+    /// Varint current health present.
+    pub const MASK_HEALTH: u16 = 1 << 7;
+    /// Varint max health present.
+    pub const MASK_MAX_HEALTH: u16 = 1 << 8;
+    /// Varint state flags present.
+    pub const MASK_STATE_FLAGS: u16 = 1 << 9;
+    /// Varint action/animation ID present.
+    pub const MASK_ACTION_ID: u16 = 1 << 10;
+}
+
+/// A single entity's compressed delta update within an `EntityDeltaBatchPacket`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDeltaState {
+    pub entity_id: u64,
+    pub field_mask: u16,
+    pub position: (f32, f32, f32),
+    pub velocity: (f32, f32, f32),
+    pub yaw: f32,
+    pub pitch: f32,
+    pub health: u32,
+    pub max_health: u32,
+    pub state_flags: u32,
+    pub action_id: u32,
+}
+
+impl Default for EntityDeltaState {
+    fn default() -> Self {
+        Self {
+            entity_id: 0,
+            field_mask: 0,
+            position: (0.0, 0.0, 0.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 0,
+            max_health: 0,
+            state_flags: 0,
+            action_id: 0,
+        }
+    }
+}
+
+impl EntityDeltaState {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.entity_id);
+        dst.put_u16_le(self.field_mask);
+
+        if self.field_mask & delta_flags::MASK_KEYFRAME != 0 {
+            dst.put_f32_le(self.position.0);
+            dst.put_f32_le(self.position.1);
+            dst.put_f32_le(self.position.2);
+        } else {
+            if self.field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
+                dst.put_i16_le(quantize_delta_i16(self.position.0));
+            }
+            if self.field_mask & delta_flags::MASK_DELTA_POS_Y != 0 {
+                dst.put_i16_le(quantize_delta_i16(self.position.1));
+            }
+            if self.field_mask & delta_flags::MASK_DELTA_POS_Z != 0 {
+                dst.put_i16_le(quantize_delta_i16(self.position.2));
+            }
+        }
+
+        if self.field_mask & delta_flags::MASK_VELOCITY != 0 {
+            dst.put_i16_le(quantize_velocity_i16(self.velocity.0));
+            dst.put_i16_le(quantize_velocity_i16(self.velocity.1));
+            dst.put_i16_le(quantize_velocity_i16(self.velocity.2));
+        }
+
+        if self.field_mask & delta_flags::MASK_YAW != 0 {
+            dst.put_u8(quantize_yaw_u8(self.yaw));
+        }
+
+        if self.field_mask & delta_flags::MASK_PITCH != 0 {
+            dst.put_i8(quantize_pitch_i8(self.pitch));
+        }
+
+        if self.field_mask & delta_flags::MASK_HEALTH != 0 {
+            put_varint_u32(dst, self.health);
+        }
+
+        if self.field_mask & delta_flags::MASK_MAX_HEALTH != 0 {
+            put_varint_u32(dst, self.max_health);
+        }
+
+        if self.field_mask & delta_flags::MASK_STATE_FLAGS != 0 {
+            put_varint_u32(dst, self.state_flags);
+        }
+
+        if self.field_mask & delta_flags::MASK_ACTION_ID != 0 {
+            put_varint_u32(dst, self.action_id);
+        }
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let entity_id = get_varint_u64(src)?;
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let field_mask = src.get_u16_le();
+
+        let mut position = (0.0, 0.0, 0.0);
+        if field_mask & delta_flags::MASK_KEYFRAME != 0 {
+            if src.remaining() < 12 {
+                return Err(ClientCodecError::BufferTooShort {
+                    expected: 12,
+                    got: src.remaining(),
+                });
+            }
+            position = (src.get_f32_le(), src.get_f32_le(), src.get_f32_le());
+        } else {
+            if field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
+                if src.remaining() < 2 {
+                    return Err(ClientCodecError::BufferTooShort {
+                        expected: 2,
+                        got: src.remaining(),
+                    });
+                }
+                position.0 = dequantize_delta_i16(src.get_i16_le());
+            }
+            if field_mask & delta_flags::MASK_DELTA_POS_Y != 0 {
+                if src.remaining() < 2 {
+                    return Err(ClientCodecError::BufferTooShort {
+                        expected: 2,
+                        got: src.remaining(),
+                    });
+                }
+                position.1 = dequantize_delta_i16(src.get_i16_le());
+            }
+            if field_mask & delta_flags::MASK_DELTA_POS_Z != 0 {
+                if src.remaining() < 2 {
+                    return Err(ClientCodecError::BufferTooShort {
+                        expected: 2,
+                        got: src.remaining(),
+                    });
+                }
+                position.2 = dequantize_delta_i16(src.get_i16_le());
+            }
+        }
+
+        let mut velocity = (0.0, 0.0, 0.0);
+        if field_mask & delta_flags::MASK_VELOCITY != 0 {
+            if src.remaining() < 6 {
+                return Err(ClientCodecError::BufferTooShort {
+                    expected: 6,
+                    got: src.remaining(),
+                });
+            }
+            velocity = (
+                dequantize_velocity_i16(src.get_i16_le()),
+                dequantize_velocity_i16(src.get_i16_le()),
+                dequantize_velocity_i16(src.get_i16_le()),
+            );
+        }
+
+        let mut yaw = 0.0;
+        if field_mask & delta_flags::MASK_YAW != 0 {
+            if !src.has_remaining() {
+                return Err(ClientCodecError::BufferTooShort {
+                    expected: 1,
+                    got: 0,
+                });
+            }
+            yaw = dequantize_yaw_u8(src.get_u8());
+        }
+
+        let mut pitch = 0.0;
+        if field_mask & delta_flags::MASK_PITCH != 0 {
+            if !src.has_remaining() {
+                return Err(ClientCodecError::BufferTooShort {
+                    expected: 1,
+                    got: 0,
+                });
+            }
+            pitch = dequantize_pitch_i8(src.get_i8());
+        }
+
+        let mut health = 0;
+        if field_mask & delta_flags::MASK_HEALTH != 0 {
+            health = get_varint_u32(src)?;
+        }
+
+        let mut max_health = 0;
+        if field_mask & delta_flags::MASK_MAX_HEALTH != 0 {
+            max_health = get_varint_u32(src)?;
+        }
+
+        let mut state_flags = 0;
+        if field_mask & delta_flags::MASK_STATE_FLAGS != 0 {
+            state_flags = get_varint_u32(src)?;
+        }
+
+        let mut action_id = 0;
+        if field_mask & delta_flags::MASK_ACTION_ID != 0 {
+            action_id = get_varint_u32(src)?;
+        }
+
+        Ok(Self {
+            entity_id,
+            field_mask,
+            position,
+            velocity,
+            yaw,
+            pitch,
+            health,
+            max_health,
+            state_flags,
+            action_id,
+        })
+    }
+}
+
+/// Server broadcast containing batched entity delta states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDeltaBatchPacket {
+    pub server_tick: u64,
+    pub baseline_tick: u64,
+    pub despawns: Vec<u64>,
+    pub deltas: Vec<EntityDeltaState>,
+}
+
+impl EntityDeltaBatchPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.server_tick);
+        put_varint_u64(dst, self.baseline_tick);
+        put_varint_u32(dst, self.despawns.len() as u32);
+        for &d in &self.despawns {
+            put_varint_u64(dst, d);
+        }
+        put_varint_u32(dst, self.deltas.len() as u32);
+        for delta in &self.deltas {
+            delta.encode(dst);
+        }
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let server_tick = get_varint_u64(src)?;
+        let baseline_tick = get_varint_u64(src)?;
+        let despawn_len = get_varint_u32(src)? as usize;
+        let mut despawns = Vec::with_capacity(despawn_len.min(1024));
+        for _ in 0..despawn_len {
+            despawns.push(get_varint_u64(src)?);
+        }
+        let delta_len = get_varint_u32(src)? as usize;
+        let mut deltas = Vec::with_capacity(delta_len.min(1024));
+        for _ in 0..delta_len {
+            deltas.push(EntityDeltaState::decode(src)?);
+        }
+        Ok(Self {
+            server_tick,
+            baseline_tick,
+            despawns,
+            deltas,
+        })
+    }
+}
+
+/// Client acknowledgement carrying the latest observed server tick and a 32-tick loss recovery mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAckPacket {
+    pub session_id: u64,
+    pub observed_tick: u64,
+    pub ack_mask: u32,
+}
+
+impl ClientAckPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.session_id);
+        put_varint_u64(dst, self.observed_tick);
+        dst.put_u32_le(self.ack_mask);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let session_id = get_varint_u64(src)?;
+        let observed_tick = get_varint_u64(src)?;
+        if src.remaining() < 4 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 4,
+                got: src.remaining(),
+            });
+        }
+        let ack_mask = src.get_u32_le();
+        Ok(Self {
+            session_id,
+            observed_tick,
+            ack_mask,
+        })
+    }
+}
+
 /// Top-level client packet enum encompassing all protocol messages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientPacket {
@@ -509,6 +830,8 @@ pub enum ClientPacket {
     EntityDespawn(EntityDespawnPacket),
     Ping(PingPacket),
     Pong(PongPacket),
+    EntityDeltaBatch(EntityDeltaBatchPacket),
+    ClientAck(ClientAckPacket),
 }
 
 impl ClientPacket {
@@ -522,6 +845,8 @@ impl ClientPacket {
             ClientPacket::EntityDespawn(_) => Opcode::EntityDespawn,
             ClientPacket::Ping(_) => Opcode::Ping,
             ClientPacket::Pong(_) => Opcode::Pong,
+            ClientPacket::EntityDeltaBatch(_) => Opcode::EntityDeltaBatch,
+            ClientPacket::ClientAck(_) => Opcode::ClientAck,
         }
     }
 
@@ -538,6 +863,8 @@ impl ClientPacket {
             ClientPacket::EntityDespawn(p) => p.encode(&mut payload_buf),
             ClientPacket::Ping(p) => p.encode(&mut payload_buf),
             ClientPacket::Pong(p) => p.encode(&mut payload_buf),
+            ClientPacket::EntityDeltaBatch(p) => p.encode(&mut payload_buf),
+            ClientPacket::ClientAck(p) => p.encode(&mut payload_buf),
         }
 
         let payload_len = payload_buf.len() as u32;
@@ -600,6 +927,12 @@ impl ClientPacket {
             )?)),
             Opcode::Ping => Ok(ClientPacket::Ping(PingPacket::decode(&mut payload)?)),
             Opcode::Pong => Ok(ClientPacket::Pong(PongPacket::decode(&mut payload)?)),
+            Opcode::EntityDeltaBatch => Ok(ClientPacket::EntityDeltaBatch(
+                EntityDeltaBatchPacket::decode(&mut payload)?,
+            )),
+            Opcode::ClientAck => Ok(ClientPacket::ClientAck(ClientAckPacket::decode(
+                &mut payload,
+            )?)),
         }
     }
 
@@ -819,16 +1152,80 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_opcode() {
-        let mut buf = BytesMut::new();
-        buf.put_u16_le(PACKET_MAGIC);
-        buf.put_u16_le(0x9999); // unknown opcode
-        buf.put_u32_le(0);
+    fn test_client_ack_packet_roundtrip() {
+        let ack = ClientPacket::ClientAck(ClientAckPacket {
+            session_id: 12345,
+            observed_tick: 500,
+            ack_mask: 0b1111_0000_1010_0101,
+        });
+        let encoded = ack.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("Failed to decode ClientAck");
+        assert_eq!(ack, decoded);
+    }
 
-        let err = ClientPacket::decode(&buf).unwrap_err();
-        match err {
-            ClientCodecError::UnknownOpcode(0x9999) => {}
-            _ => panic!("Expected UnknownOpcode error"),
+    #[test]
+    fn test_entity_delta_batch_packet_roundtrip() {
+        let batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 100,
+            baseline_tick: 95,
+            despawns: vec![10, 20, 30],
+            deltas: vec![
+                EntityDeltaState {
+                    entity_id: 101,
+                    field_mask: delta_flags::MASK_KEYFRAME
+                        | delta_flags::MASK_VELOCITY
+                        | delta_flags::MASK_YAW,
+                    position: (100.5, 20.25, -50.75),
+                    velocity: (1.2, 0.0, -0.5),
+                    yaw: std::f32::consts::PI * 0.5,
+                    pitch: 0.0,
+                    health: 100,
+                    max_health: 100,
+                    state_flags: 0,
+                    action_id: 0,
+                },
+                EntityDeltaState {
+                    entity_id: 102,
+                    field_mask: delta_flags::MASK_DELTA_POS_X
+                        | delta_flags::MASK_DELTA_POS_Z
+                        | delta_flags::MASK_YAW
+                        | delta_flags::MASK_HEALTH,
+                    position: (0.125, 0.0, -0.25),
+                    velocity: (0.0, 0.0, 0.0),
+                    yaw: std::f32::consts::PI * 1.5,
+                    pitch: 0.0,
+                    health: 85,
+                    max_health: 100,
+                    state_flags: 0,
+                    action_id: 0,
+                },
+            ],
+        });
+
+        let encoded = batch.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("Failed to decode EntityDeltaBatch");
+
+        match (&batch, &decoded) {
+            (
+                ClientPacket::EntityDeltaBatch(orig_batch),
+                ClientPacket::EntityDeltaBatch(dec_batch),
+            ) => {
+                assert_eq!(orig_batch.server_tick, dec_batch.server_tick);
+                assert_eq!(orig_batch.baseline_tick, dec_batch.baseline_tick);
+                assert_eq!(orig_batch.despawns, dec_batch.despawns);
+                assert_eq!(orig_batch.deltas.len(), dec_batch.deltas.len());
+
+                // First entity: keyframe
+                assert_eq!(dec_batch.deltas[0].entity_id, 101);
+                assert_eq!(dec_batch.deltas[0].position, (100.5, 20.25, -50.75));
+
+                // Second entity: delta
+                assert_eq!(dec_batch.deltas[1].entity_id, 102);
+                assert!((dec_batch.deltas[1].position.0 - 0.125).abs() < 0.008);
+                assert!((dec_batch.deltas[1].position.2 - (-0.25)).abs() < 0.008);
+                assert_eq!(dec_batch.deltas[1].health, 85);
+            }
+            _ => panic!("Expected EntityDeltaBatch"),
         }
     }
 }

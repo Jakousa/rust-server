@@ -66,28 +66,22 @@ The cluster is built around an authoritative, distributed tick-based simulation 
   - Pluggable `AbilityPlugin` with `CooldownTracker`, shared GCD timers, resource cost validation, and instant vs. casted activations.
   - Integration with `CombatPlugin` synchronizing damage events with `AttributeSet` health and action interruption on damage.
 
+- [x] **Track 6: Network Delta Compression & Bandwidth Bit-Packing**
+  - Variable-length LEB128 varint encoding and arbitrary-bit-width streaming codec (`BitWriter`, `BitReader`).
+  - Fixed-point kinematic quantization: delta positions ($1/128\text{m}$ resolution, $\approx 7.8\text{mm}$ error), 8-bit yaw ($\approx 1.41^\circ$), 8-bit pitch, and 16-bit velocity.
+  - Robust Baseline Acknowledgement protocol (`ClientAckPacket`, `EntityDeltaBatchPacket`) with anti-cheat future-tick spoofing protection and teleportation keyframe elevation ($> 255.0\text{m}$).
+  - Non-blocking ACK ingress via unbounded MPSC channels drained in batch without lock contention.
+  - Automated benchmark verifying **88.05% bandwidth egress reduction** under 1,000 entity density (dropping 3.4 MB to 0.39 MB) and bounded memory ($< 20\text{ MB}$ typical, $\le 252\text{ MB}$ worst-case 3s lag).
+
 ---
 
 ## Next Engineering Roadmap
 
 ```mermaid
 flowchart LR
-    T5["Track 5: Interaction & Ability Primitives\n(DONE)"] --> T6["Track 6: Network Delta Compression\n& Bandwidth Bit-Packing"]
-    T6 --> T7["Track 7: Cross-Partition Interaction\n& Boundary Ability Dispatch"]
+    T6["Track 6: Delta Compression & Bit-Packing\n(DONE)"] --> T7["Track 7: Cross-Partition Interaction\n& Boundary Ability Dispatch"]
     T7 --> T8["Track 8: Playable Visual Client Frontend\n(Bevy or WebAssembly / WebGL)"]
 ```
-
----
-
-### Track 6: Network Delta Compression & Bandwidth Bit-Packing
-
-**Goal**: Minimize egress bandwidth consumption by implementing bit-packed delta state compression for high-frequency AoI entity replication.
-
-#### Key Deliverables:
-1. **Bit-Packed Field Masks**: Variable-length encoding and bitmask flags transmitting only modified entity fields (position $\Delta$, velocity, active animation/action) per tick.
-2. **Quantized Kinematics**: Fixed-point quantization for 3D coordinates and quaternion rotations reducing byte footprint per replicated entity.
-3. **Baseline Acknowledgement (ACK) Protocol**: Client-acknowledged baseline tracking ensuring delta updates are relative to confirmed received states.
-4. **Bandwidth Profiling & Verification**: Benchmark bandwidth savings under 1,000+ bot density before and after delta compression targeting 60%–80% egress reduction.
 
 ---
 

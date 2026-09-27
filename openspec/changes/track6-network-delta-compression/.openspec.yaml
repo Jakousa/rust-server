@@ -1,0 +1,8 @@
+schema: spec-driven
+change: track6-network-delta-compression
+status: draft
+created: "2026-09-26"
+authors:
+  - MMO Architecture Team
+reviewers:
+  - Architecture Reviewer (Pro Model)

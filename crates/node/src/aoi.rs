@@ -4,13 +4,17 @@
 //! entity visibility deltas (`entered`, `updated`, `exited`), performs
 //! dynamic density-based radius throttling, and produces binary broadcast packets.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use mmo_core::guid::Guid;
 use mmo_core::octree::calculate_throttled_aoi;
 use mmo_core::{EntityStore, Octree};
 use mmo_gameplay::combat::HealthComponent;
-use mmo_schema::client::{ClientPacket, EntityDespawnPacket, EntityStatePacket, Vec3};
+use mmo_schema::client::{
+    delta_flags, ClientPacket, EntityDeltaBatchPacket, EntityDeltaState, EntityDespawnPacket,
+    EntityStatePacket, Vec3,
+};
+use mmo_schema::quantize::is_teleport_delta;
 
 /// Configuration parameters for an Area-of-Interest observer.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +29,10 @@ pub struct ObserverConfig {
     pub full_refresh_interval_ticks: u64,
     /// Whether to include the observer's own entity in AoI packets. Default is false.
     pub include_self: bool,
+    /// Whether to compress entity updates into batched delta state packets. Default is false.
+    pub enable_delta_compression: bool,
+    /// Maximum number of historical tick snapshots retained for delta differencing. Default is 60 (3 seconds at 20 Hz).
+    pub history_depth_ticks: usize,
 }
 
 impl Default for ObserverConfig {
@@ -35,6 +43,8 @@ impl Default for ObserverConfig {
             position_epsilon_sq: 0.0001,
             full_refresh_interval_ticks: 20,
             include_self: false,
+            enable_delta_compression: false,
+            history_depth_ticks: 60,
         }
     }
 }
@@ -51,6 +61,75 @@ pub struct CachedEntityState {
     pub last_sent_tick: u64,
 }
 
+/// Historical snapshot of all visible entity states sent to an observer at a specific tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObserverTickSnapshot {
+    pub tick: u64,
+    pub states: HashMap<Guid, CachedEntityState>,
+}
+
+/// Baseline tracking state for delta compression.
+#[derive(Debug, Clone)]
+pub struct BaselineTracker {
+    /// Confirmed baseline tick acknowledged by the client.
+    pub confirmed_baseline_tick: Option<u64>,
+    /// Bounded ring buffer of recent tick snapshots sent to the client.
+    pub history: VecDeque<ObserverTickSnapshot>,
+    /// Maximum history depth before oldest snapshots are dropped.
+    pub max_history_depth: usize,
+}
+
+impl BaselineTracker {
+    pub fn new(max_depth: usize) -> Self {
+        let capacity = max_depth.clamp(10, 120);
+        Self {
+            confirmed_baseline_tick: None,
+            history: VecDeque::with_capacity(capacity),
+            max_history_depth: capacity,
+        }
+    }
+
+    /// Records a new snapshot for `tick`. If history exceeds `max_history_depth`, drops the oldest.
+    pub fn record_snapshot(&mut self, tick: u64, states: HashMap<Guid, CachedEntityState>) {
+        if self.history.len() >= self.max_history_depth {
+            self.history.pop_front();
+        }
+        self.history
+            .push_back(ObserverTickSnapshot { tick, states });
+    }
+
+    /// Finds the snapshot for `tick`, if present.
+    pub fn get_snapshot(&self, tick: u64) -> Option<&ObserverTickSnapshot> {
+        self.history.iter().find(|s| s.tick == tick)
+    }
+
+    /// Processes an incoming ACK from the client.
+    ///
+    /// Returns `true` if valid and applied, or `false` if rejected (e.g. future tick spoofing).
+    pub fn process_ack(&mut self, observed_tick: u64, _ack_mask: u32, current_tick: u64) -> bool {
+        if observed_tick > current_tick {
+            // Anti-cheat: reject future-tick spoofing attempt that would purge baseline history
+            return false;
+        }
+
+        let new_base = match self.confirmed_baseline_tick {
+            Some(curr) => curr.max(observed_tick),
+            None => observed_tick,
+        };
+        self.confirmed_baseline_tick = Some(new_base);
+
+        // Prune history older than the confirmed baseline tick
+        while let Some(front) = self.history.front() {
+            if front.tick < new_base {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+        true
+    }
+}
+
 /// State tracking for an active player session observer.
 #[derive(Debug, Clone)]
 pub struct ObserverState {
@@ -59,18 +138,21 @@ pub struct ObserverState {
     pub config: ObserverConfig,
     pub effective_radius: f32,
     pub observed_entities: HashMap<Guid, CachedEntityState>,
+    pub baseline_tracker: BaselineTracker,
 }
 
 impl ObserverState {
     /// Creates a new `ObserverState` initialized with the given configuration.
     pub fn new(session_id: u64, player_guid: Guid, config: ObserverConfig) -> Self {
         let base_radius = config.base_radius;
+        let depth = config.history_depth_ticks;
         Self {
             session_id,
             player_guid,
             config,
             effective_radius: base_radius,
             observed_entities: HashMap::new(),
+            baseline_tracker: BaselineTracker::new(depth),
         }
     }
 }
@@ -166,6 +248,24 @@ impl AoiManager {
         self.observers.len()
     }
 
+    /// Processes an incoming client ACK for an observer session, advancing the confirmed baseline.
+    ///
+    /// Validates `observed_tick <= current_tick` to protect against future-tick spoofing DoS attacks.
+    pub fn process_ack(
+        &mut self,
+        session_id: u64,
+        observed_tick: u64,
+        ack_mask: u32,
+        current_tick: u64,
+    ) -> bool {
+        if let Some(obs) = self.observers.get_mut(&session_id) {
+            obs.baseline_tracker
+                .process_ack(observed_tick, ack_mask, current_tick)
+        } else {
+            false
+        }
+    }
+
     /// Evaluates AoI visibility for all observers and generates broadcast jobs.
     pub fn update_observers(
         &mut self,
@@ -244,57 +344,273 @@ impl AoiManager {
                 }
             }
 
-            for &exited_guid in &self.scratch_exited_guids {
-                observer.observed_entities.remove(&exited_guid);
-                packets.push(ClientPacket::EntityDespawn(EntityDespawnPacket {
-                    entity_id: exited_guid.raw(),
-                }));
-            }
+            if observer.config.enable_delta_compression {
+                // === DELTA COMPRESSION MODE ===
+                let mut despawns = Vec::new();
+                for &exited_guid in &self.scratch_exited_guids {
+                    observer.observed_entities.remove(&exited_guid);
+                    despawns.push(exited_guid.raw());
+                }
 
-            // 6. Detect enters and updates
-            for &(visible_guid, pos, _) in &self.scratch_query {
-                let ent = match entity_store.get_by_guid(visible_guid) {
-                    Some(e) => e,
-                    None => continue,
+                let baseline_tick_opt = observer.baseline_tracker.confirmed_baseline_tick;
+                let is_baseline_expired = match baseline_tick_opt {
+                    Some(t) => current_tick.saturating_sub(t) > 40, // 2s baseline timeout -> fallback
+                    None => true,
+                };
+                let effective_baseline_tick = if is_baseline_expired {
+                    0
+                } else {
+                    baseline_tick_opt.unwrap_or(0)
                 };
 
-                let (health, max_health, state_flags) = ent
-                    .components
-                    .get_component::<HealthComponent>()
-                    .map(|h| {
-                        (
-                            h.current_hp as u32,
-                            h.max_hp as u32,
-                            if h.is_dead { 1 } else { 0 },
-                        )
-                    })
-                    .unwrap_or((100, 100, 0));
+                let baseline_snapshot = if effective_baseline_tick > 0 {
+                    observer
+                        .baseline_tracker
+                        .get_snapshot(effective_baseline_tick)
+                } else {
+                    None
+                };
 
-                let yaw = ent.rotation;
-                let pitch = 0.0;
-                let velocity = (0.0, 0.0, 0.0);
+                let mut batch_deltas = Vec::new();
 
-                if let Some(cached) = observer.observed_entities.get_mut(&visible_guid) {
-                    // Check if updated
-                    let dx = pos.0 - cached.position.0;
-                    let dy = pos.1 - cached.position.1;
-                    let dz = pos.2 - cached.position.2;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                for &(visible_guid, pos, _) in &self.scratch_query {
+                    let ent = match entity_store.get_by_guid(visible_guid) {
+                        Some(e) => e,
+                        None => continue,
+                    };
 
-                    let pos_changed = dist_sq >= observer.config.position_epsilon_sq;
-                    let health_changed = cached.health != health || cached.max_health != max_health;
-                    let flags_changed = cached.state_flags != state_flags;
-                    let periodic_refresh = current_tick.saturating_sub(cached.last_sent_tick)
-                        >= observer.config.full_refresh_interval_ticks;
+                    let (health, max_health, state_flags) = ent
+                        .components
+                        .get_component::<HealthComponent>()
+                        .map(|h| {
+                            (
+                                h.current_hp as u32,
+                                h.max_hp as u32,
+                                if h.is_dead { 1 } else { 0 },
+                            )
+                        })
+                        .unwrap_or((100, 100, 0));
 
-                    if pos_changed || health_changed || flags_changed || periodic_refresh {
-                        cached.position = pos;
-                        cached.velocity = velocity;
-                        cached.yaw = yaw;
-                        cached.health = health;
-                        cached.max_health = max_health;
-                        cached.state_flags = state_flags;
-                        cached.last_sent_tick = current_tick;
+                    let yaw = ent.rotation;
+                    let pitch = 0.0;
+                    let velocity = (0.0, 0.0, 0.0);
+
+                    let mut delta_entry = None;
+
+                    if let Some(base_state) =
+                        baseline_snapshot.and_then(|s| s.states.get(&visible_guid))
+                    {
+                        let dx = pos.0 - base_state.position.0;
+                        let dy = pos.1 - base_state.position.1;
+                        let dz = pos.2 - base_state.position.2;
+                        let is_teleport = is_teleport_delta(dx, dy, dz);
+                        let periodic_refresh = current_tick
+                            .saturating_sub(base_state.last_sent_tick)
+                            >= observer.config.full_refresh_interval_ticks;
+
+                        if is_teleport || periodic_refresh {
+                            let mut field_mask = delta_flags::MASK_KEYFRAME;
+                            if velocity != (0.0, 0.0, 0.0) {
+                                field_mask |= delta_flags::MASK_VELOCITY;
+                            }
+                            field_mask |= delta_flags::MASK_YAW;
+                            field_mask |= delta_flags::MASK_HEALTH
+                                | delta_flags::MASK_MAX_HEALTH
+                                | delta_flags::MASK_STATE_FLAGS;
+
+                            delta_entry = Some(EntityDeltaState {
+                                entity_id: visible_guid.raw(),
+                                field_mask,
+                                position: pos,
+                                velocity,
+                                yaw,
+                                pitch,
+                                health,
+                                max_health,
+                                state_flags,
+                                action_id: 0,
+                            });
+                        } else {
+                            let mut field_mask = 0u16;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            if dist_sq >= observer.config.position_epsilon_sq {
+                                if dx.abs() >= 0.0039 {
+                                    field_mask |= delta_flags::MASK_DELTA_POS_X;
+                                }
+                                if dy.abs() >= 0.0039 {
+                                    field_mask |= delta_flags::MASK_DELTA_POS_Y;
+                                }
+                                if dz.abs() >= 0.0039 {
+                                    field_mask |= delta_flags::MASK_DELTA_POS_Z;
+                                }
+                            }
+                            if velocity != base_state.velocity {
+                                field_mask |= delta_flags::MASK_VELOCITY;
+                            }
+                            let yaw_diff = (yaw.rem_euclid(2.0 * std::f32::consts::PI)
+                                - base_state.yaw.rem_euclid(2.0 * std::f32::consts::PI))
+                            .abs();
+                            if yaw_diff > 0.02 {
+                                field_mask |= delta_flags::MASK_YAW;
+                            }
+                            if health != base_state.health {
+                                field_mask |= delta_flags::MASK_HEALTH;
+                            }
+                            if max_health != base_state.max_health {
+                                field_mask |= delta_flags::MASK_MAX_HEALTH;
+                            }
+                            if state_flags != base_state.state_flags {
+                                field_mask |= delta_flags::MASK_STATE_FLAGS;
+                            }
+
+                            if field_mask != 0 {
+                                delta_entry = Some(EntityDeltaState {
+                                    entity_id: visible_guid.raw(),
+                                    field_mask,
+                                    position: (dx, dy, dz),
+                                    velocity,
+                                    yaw,
+                                    pitch,
+                                    health,
+                                    max_health,
+                                    state_flags,
+                                    action_id: 0,
+                                });
+                            }
+                        }
+                    } else {
+                        // New entrant or unacknowledged baseline: full keyframe
+                        let mut field_mask = delta_flags::MASK_KEYFRAME;
+                        if velocity != (0.0, 0.0, 0.0) {
+                            field_mask |= delta_flags::MASK_VELOCITY;
+                        }
+                        field_mask |= delta_flags::MASK_YAW;
+                        field_mask |= delta_flags::MASK_HEALTH
+                            | delta_flags::MASK_MAX_HEALTH
+                            | delta_flags::MASK_STATE_FLAGS;
+
+                        delta_entry = Some(EntityDeltaState {
+                            entity_id: visible_guid.raw(),
+                            field_mask,
+                            position: pos,
+                            velocity,
+                            yaw,
+                            pitch,
+                            health,
+                            max_health,
+                            state_flags,
+                            action_id: 0,
+                        });
+                    }
+
+                    if let Some(entry) = delta_entry {
+                        batch_deltas.push(entry);
+                        observer.observed_entities.insert(
+                            visible_guid,
+                            CachedEntityState {
+                                position: pos,
+                                velocity,
+                                yaw,
+                                health,
+                                max_health,
+                                state_flags,
+                                last_sent_tick: current_tick,
+                            },
+                        );
+                    }
+                }
+
+                if !batch_deltas.is_empty() || !despawns.is_empty() {
+                    packets.push(ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+                        server_tick: current_tick,
+                        baseline_tick: effective_baseline_tick,
+                        despawns,
+                        deltas: batch_deltas,
+                    }));
+                }
+
+                // Record tick snapshot into history buffer
+                observer
+                    .baseline_tracker
+                    .record_snapshot(current_tick, observer.observed_entities.clone());
+            } else {
+                // === LEGACY UNCOMPRESSED MODE ===
+                for &exited_guid in &self.scratch_exited_guids {
+                    observer.observed_entities.remove(&exited_guid);
+                    packets.push(ClientPacket::EntityDespawn(EntityDespawnPacket {
+                        entity_id: exited_guid.raw(),
+                    }));
+                }
+
+                for &(visible_guid, pos, _) in &self.scratch_query {
+                    let ent = match entity_store.get_by_guid(visible_guid) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+
+                    let (health, max_health, state_flags) = ent
+                        .components
+                        .get_component::<HealthComponent>()
+                        .map(|h| {
+                            (
+                                h.current_hp as u32,
+                                h.max_hp as u32,
+                                if h.is_dead { 1 } else { 0 },
+                            )
+                        })
+                        .unwrap_or((100, 100, 0));
+
+                    let yaw = ent.rotation;
+                    let pitch = 0.0;
+                    let velocity = (0.0, 0.0, 0.0);
+
+                    if let Some(cached) = observer.observed_entities.get_mut(&visible_guid) {
+                        let dx = pos.0 - cached.position.0;
+                        let dy = pos.1 - cached.position.1;
+                        let dz = pos.2 - cached.position.2;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+
+                        let pos_changed = dist_sq >= observer.config.position_epsilon_sq;
+                        let health_changed =
+                            cached.health != health || cached.max_health != max_health;
+                        let flags_changed = cached.state_flags != state_flags;
+                        let periodic_refresh = current_tick.saturating_sub(cached.last_sent_tick)
+                            >= observer.config.full_refresh_interval_ticks;
+
+                        if pos_changed || health_changed || flags_changed || periodic_refresh {
+                            cached.position = pos;
+                            cached.velocity = velocity;
+                            cached.yaw = yaw;
+                            cached.health = health;
+                            cached.max_health = max_health;
+                            cached.state_flags = state_flags;
+                            cached.last_sent_tick = current_tick;
+
+                            packets.push(ClientPacket::EntityState(EntityStatePacket {
+                                entity_id: visible_guid.raw(),
+                                position: Vec3::new(pos.0, pos.1, pos.2),
+                                velocity: Vec3::new(velocity.0, velocity.1, velocity.2),
+                                yaw,
+                                pitch,
+                                health,
+                                max_health,
+                                state_flags,
+                                timestamp: timestamp_ms,
+                            }));
+                        }
+                    } else {
+                        observer.observed_entities.insert(
+                            visible_guid,
+                            CachedEntityState {
+                                position: pos,
+                                velocity,
+                                yaw,
+                                health,
+                                max_health,
+                                state_flags,
+                                last_sent_tick: current_tick,
+                            },
+                        );
 
                         packets.push(ClientPacket::EntityState(EntityStatePacket {
                             entity_id: visible_guid.raw(),
@@ -308,32 +624,6 @@ impl AoiManager {
                             timestamp: timestamp_ms,
                         }));
                     }
-                } else {
-                    // New enter!
-                    observer.observed_entities.insert(
-                        visible_guid,
-                        CachedEntityState {
-                            position: pos,
-                            velocity,
-                            yaw,
-                            health,
-                            max_health,
-                            state_flags,
-                            last_sent_tick: current_tick,
-                        },
-                    );
-
-                    packets.push(ClientPacket::EntityState(EntityStatePacket {
-                        entity_id: visible_guid.raw(),
-                        position: Vec3::new(pos.0, pos.1, pos.2),
-                        velocity: Vec3::new(velocity.0, velocity.1, velocity.2),
-                        yaw,
-                        pitch,
-                        health,
-                        max_health,
-                        state_flags,
-                        timestamp: timestamp_ms,
-                    }));
                 }
             }
 
@@ -545,6 +835,144 @@ mod tests {
         // Verify that the 5 closest entities (IDs 2, 3, 4, 5, 6) were the ones observed
         for i in 2..=6 {
             assert!(obs.observed_entities.contains_key(&make_guid(i)));
+        }
+    }
+
+    #[test]
+    fn test_baseline_tracker_ack_advancement_and_pruning() {
+        let mut tracker = BaselineTracker::new(10);
+        let mut map = HashMap::new();
+        map.insert(
+            make_guid(1),
+            CachedEntityState {
+                position: (1.0, 2.0, 3.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                last_sent_tick: 1,
+            },
+        );
+
+        for tick in 1..=5 {
+            tracker.record_snapshot(tick, map.clone());
+        }
+        assert_eq!(tracker.history.len(), 5);
+
+        // ACK tick 3
+        let acked = tracker.process_ack(3, 0, 5);
+        assert!(acked);
+        assert_eq!(tracker.confirmed_baseline_tick, Some(3));
+        // Ticks 1 and 2 pruned, 3, 4, 5 remain
+        assert_eq!(tracker.history.len(), 3);
+        assert_eq!(tracker.history.front().unwrap().tick, 3);
+    }
+
+    #[test]
+    fn test_baseline_tracker_anti_cheat_future_tick_rejection() {
+        let mut tracker = BaselineTracker::new(10);
+        tracker.record_snapshot(1, HashMap::new());
+        tracker.record_snapshot(2, HashMap::new());
+
+        // Attempt future tick spoofing (tick 100 > current tick 5)
+        let acked = tracker.process_ack(100, 0, 5);
+        assert!(!acked); // Rejected!
+        assert_eq!(tracker.confirmed_baseline_tick, None);
+        assert_eq!(tracker.history.len(), 2); // History preserved!
+    }
+
+    #[test]
+    fn test_delta_compression_enter_delta_and_teleport() {
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0));
+        let mut octree = Octree::new(bounds);
+
+        let player = make_guid(1);
+        let npc = make_guid(2);
+
+        store.spawn(player, (100.0, 100.0, 100.0));
+        octree.insert(player, (100.0, 100.0, 100.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: true,
+            ..Default::default()
+        };
+        aoi.register_observer(10, player, config);
+
+        // Spawn NPC at (105, 100, 100)
+        store.spawn(npc, (105.0, 100.0, 100.0));
+        octree.insert(npc, (105.0, 100.0, 100.0));
+
+        // Tick 1: NPC enters -> keyframe inside EntityDeltaBatchPacket
+        let jobs = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].packets.len(), 1);
+        match &jobs[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert_eq!(batch.server_tick, 1);
+                assert_eq!(batch.baseline_tick, 0); // initial keyframe
+                assert_eq!(batch.deltas.len(), 1);
+                let d = &batch.deltas[0];
+                assert_eq!(d.entity_id, npc.raw());
+                assert_ne!(d.field_mask & delta_flags::MASK_KEYFRAME, 0);
+                assert_eq!(d.position, (105.0, 100.0, 100.0));
+            }
+            other => panic!("Expected EntityDeltaBatch, got {:?}", other),
+        }
+
+        // Client ACKs tick 1
+        assert!(aoi.process_ack(10, 1, 0, 1));
+
+        // Move NPC slightly (+0.5m on X)
+        let ent = store.get_mut_by_guid(npc).unwrap();
+        ent.position = (105.5, 100.0, 100.0);
+        octree.remove(npc, (105.0, 100.0, 100.0));
+        octree.insert(npc, (105.5, 100.0, 100.0));
+
+        // Tick 2: NPC delta update
+        let jobs = aoi.update_observers(&store, &octree, 2, 1050);
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert_eq!(batch.server_tick, 2);
+                assert_eq!(batch.baseline_tick, 1);
+                assert_eq!(batch.deltas.len(), 1);
+                let d = &batch.deltas[0];
+                assert_eq!(d.entity_id, npc.raw());
+                assert_eq!(d.field_mask & delta_flags::MASK_KEYFRAME, 0); // Not a keyframe!
+                assert_ne!(d.field_mask & delta_flags::MASK_DELTA_POS_X, 0);
+                assert!((d.position.0 - 0.5).abs() < 0.008);
+            }
+            other => panic!("Expected EntityDeltaBatch, got {:?}", other),
+        }
+
+        // Client ACKs tick 2
+        assert!(aoi.process_ack(10, 2, 0, 2));
+
+        // Teleport NPC by 300m (> 255.0m max delta)
+        let ent = store.get_mut_by_guid(npc).unwrap();
+        ent.position = (105.5 + 300.0, 100.0, 100.0);
+        let player_ent = store.get_mut_by_guid(player).unwrap();
+        player_ent.position = (400.0, 100.0, 100.0); // Move player along so NPC remains in 50m radius
+        octree.remove(npc, (105.5, 100.0, 100.0));
+        octree.insert(npc, (405.5, 100.0, 100.0));
+
+        // Tick 3: Teleport should elevate to MASK_KEYFRAME
+        let jobs = aoi.update_observers(&store, &octree, 3, 1100);
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert_eq!(batch.server_tick, 3);
+                assert_eq!(batch.deltas.len(), 1);
+                let d = &batch.deltas[0];
+                assert_eq!(d.entity_id, npc.raw());
+                assert_ne!(d.field_mask & delta_flags::MASK_KEYFRAME, 0); // Forced keyframe on teleport!
+                assert_eq!(d.position, (405.5, 100.0, 100.0));
+            }
+            other => panic!("Expected EntityDeltaBatch, got {:?}", other),
         }
     }
 }
