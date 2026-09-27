@@ -160,6 +160,118 @@ pub fn query_sphere_targets(
     scored
 }
 
+/// Candidate entity for spatial target selection (local entity or ghost replica).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpatialTargetCandidate {
+    pub guid: Guid,
+    pub owning_node_id: u32,
+    pub position: Vec3,
+    pub is_alive: bool,
+    pub is_friendly: bool,
+}
+
+impl SpatialTargetCandidate {
+    pub fn new(
+        guid: Guid,
+        owning_node_id: u32,
+        position: Vec3,
+        is_alive: bool,
+        is_friendly: bool,
+    ) -> Self {
+        Self {
+            guid,
+            owning_node_id,
+            position,
+            is_alive,
+            is_friendly,
+        }
+    }
+}
+
+/// Filters and sorts candidate targets within a spherical radius around `center`.
+///
+/// Returns candidates sorted in ascending order by distance to `center`.
+pub fn gather_sphere_candidates(
+    candidates: &[SpatialTargetCandidate],
+    center: Vec3,
+    radius: f32,
+    max_targets: usize,
+    require_alive: bool,
+) -> Vec<SpatialTargetCandidate> {
+    let mut scored: Vec<(&SpatialTargetCandidate, f32)> = candidates
+        .iter()
+        .filter(|c| !require_alive || c.is_alive)
+        .filter_map(|c| {
+            let dist = center.distance(&c.position);
+            if dist <= radius {
+                Some((c, dist))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(max_targets);
+    scored.into_iter().map(|(c, _)| c.clone()).collect()
+}
+
+/// Filters and sorts candidate targets within a cone/cleave arc.
+///
+/// Returns candidates sorted in ascending order by distance to `origin`.
+pub fn gather_cone_candidates(
+    candidates: &[SpatialTargetCandidate],
+    origin: Vec3,
+    facing: Vec3,
+    max_range: f32,
+    half_angle_rad: f32,
+    max_targets: usize,
+    require_alive: bool,
+) -> Vec<SpatialTargetCandidate> {
+    let mut scored: Vec<(&SpatialTargetCandidate, f32)> = candidates
+        .iter()
+        .filter(|c| !require_alive || c.is_alive)
+        .filter_map(|c| {
+            match validate_cone_target(origin, facing, c.position, max_range, half_angle_rad) {
+                Ok(dist) => Some((c, dist)),
+                Err(_) => None,
+            }
+        })
+        .collect();
+
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(max_targets);
+    scored.into_iter().map(|(c, _)| c.clone()).collect()
+}
+
+/// Partitions a list of target candidates into local candidates and peer node batches.
+///
+/// Peer node batches are grouped deterministically in a [`std::collections::BTreeMap`] keyed by node ID.
+pub fn partition_candidates_by_node(
+    candidates: &[SpatialTargetCandidate],
+    local_node_id: u32,
+) -> (
+    Vec<SpatialTargetCandidate>,
+    std::collections::BTreeMap<u32, Vec<SpatialTargetCandidate>>,
+) {
+    let mut local = Vec::new();
+    let mut remote_batches: std::collections::BTreeMap<u32, Vec<SpatialTargetCandidate>> =
+        std::collections::BTreeMap::new();
+
+    for candidate in candidates {
+        if candidate.owning_node_id == local_node_id {
+            local.push(candidate.clone());
+        } else {
+            remote_batches
+                .entry(candidate.owning_node_id)
+                .or_default()
+                .push(candidate.clone());
+        }
+    }
+
+    (local, remote_batches)
+}
+
 /// Checks whether a ray from `origin` to `target` intersects an Axis-Aligned Bounding Box (AABB)
 /// using the slab method.
 ///
@@ -320,5 +432,76 @@ mod tests {
         // Obstacle behind target: X in [25, 30]
         let behind_target = BoundingBox3D::new((25.0, -2.0, -2.0), (30.0, 2.0, 2.0));
         assert!(!ray_intersects_aabb(origin, target, &behind_target));
+    }
+
+    #[test]
+    fn test_candidate_gathering_and_partitioning() {
+        let c_local = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 1, 1),
+            1,
+            Vec3::new(3.0, 0.0, 0.0),
+            true,
+            false,
+        );
+        let c_remote1 = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 2, 2),
+            2,
+            Vec3::new(1.0, 0.0, 0.0),
+            true,
+            false,
+        );
+        let c_remote2 = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 3, 3),
+            3,
+            Vec3::new(6.0, 0.0, 0.0),
+            true,
+            false,
+        );
+        let c_dead = SpatialTargetCandidate::new(
+            Guid::new(EntityType::Player, 2, 4),
+            2,
+            Vec3::new(2.0, 0.0, 0.0),
+            false,
+            false,
+        );
+
+        let all = vec![
+            c_local.clone(),
+            c_remote1.clone(),
+            c_remote2.clone(),
+            c_dead.clone(),
+        ];
+
+        // Sphere gathering requiring alive
+        let in_sphere = gather_sphere_candidates(&all, Vec3::new(0.0, 0.0, 0.0), 5.0, 10, true);
+        assert_eq!(in_sphere.len(), 2);
+        // Sorted ascending: c_remote1 (dist 1.0), c_local (dist 3.0)
+        assert_eq!(in_sphere[0].guid, c_remote1.guid);
+        assert_eq!(in_sphere[1].guid, c_local.guid);
+
+        // Partitioning
+        let (local, remote_batches) = partition_candidates_by_node(&in_sphere, 1);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].guid, c_local.guid);
+
+        assert_eq!(remote_batches.len(), 1);
+        let batch_node2 = remote_batches.get(&2).expect("node 2 batch exists");
+        assert_eq!(batch_node2.len(), 1);
+        assert_eq!(batch_node2[0].guid, c_remote1.guid);
+
+        // Cone gathering
+        let in_cone = gather_cone_candidates(
+            &all,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+            std::f32::consts::FRAC_PI_4,
+            10,
+            true,
+        );
+        assert_eq!(in_cone.len(), 3);
+        assert_eq!(in_cone[0].guid, c_remote1.guid);
+        assert_eq!(in_cone[1].guid, c_local.guid);
+        assert_eq!(in_cone[2].guid, c_remote2.guid);
     }
 }

@@ -143,6 +143,58 @@ message ReassignNodeRoutesResponse {
   uint32 reassigned_count = 2;
 }
 
+// Remote Ability Dispatch messages
+enum RemoteAbilityErrorCode {
+  REMOTE_ABILITY_SUCCESS = 0;
+  REMOTE_ABILITY_TARGET_NOT_FOUND = 1;
+  REMOTE_ABILITY_TARGET_DEAD = 2;
+  REMOTE_ABILITY_TARGET_MIGRATING = 3;
+  REMOTE_ABILITY_OUT_OF_RANGE = 4;
+  REMOTE_ABILITY_INTERNAL_ERROR = 5;
+}
+
+message RemoteAbilityRequest {
+  uint32 ability_id = 1;
+  uint64 caster_guid = 2;
+  uint64 target_guid = 3;
+  uint32 source_node_id = 4;
+  uint32 target_node_id = 5;
+  Vector3 caster_position = 6;
+  float max_range = 7;
+  uint32 damage = 8;
+  uint32 healing = 9;
+  uint32 resource_cost = 10;
+  uint64 cast_id = 11;
+}
+
+message RemoteAbilityResponse {
+  bool success = 1;
+  RemoteAbilityErrorCode error_code = 2;
+  string error_message = 3;
+  uint64 target_guid = 4;
+  uint32 current_health = 5;
+  uint64 cast_id = 6;
+}
+
+message BatchRemoteAbilityRequest {
+  uint32 ability_id = 1;
+  uint64 caster_guid = 2;
+  uint32 source_node_id = 3;
+  uint32 target_node_id = 4;
+  Vector3 caster_position = 5;
+  float max_range = 6;
+  uint32 damage_per_target = 7;
+  uint32 healing_per_target = 8;
+  repeated uint64 target_guids = 9;
+  uint64 cast_id = 10;
+}
+
+message BatchRemoteAbilityResponse {
+  bool success = 1;
+  repeated RemoteAbilityResponse results = 2;
+  uint64 cast_id = 3;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -154,9 +206,12 @@ service NodeService {
   rpc RemoteCommand (RemoteCommandRequest) returns (RemoteCommandResponse);
   rpc SyncGhosts (GhostSyncRequest) returns (GhostSyncResponse);
   rpc MigrateEntity (MigrateEntityRequest) returns (MigrateEntityResponse);
+  rpc DispatchAbility (RemoteAbilityRequest) returns (RemoteAbilityResponse);
+  rpc DispatchBatchAbility (BatchRemoteAbilityRequest) returns (BatchRemoteAbilityResponse);
 }
 
 service GatewayService {
   rpc UpdateRoute (RouteUpdateRequest) returns (RouteUpdateResponse);
   rpc ReassignNodeRoutes (ReassignNodeRoutesRequest) returns (ReassignNodeRoutesResponse);
 }
+
