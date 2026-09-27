@@ -92,25 +92,17 @@ rust-server/
 
 ---
 
-## Completed Architectural Milestones
+## Key Platform Capabilities
 
-- [x] **Core Primitives & Simulation Foundation**: 64-bit GUIDs, generational arena entity storage, Sparse 3D Octree with boundary neighbor discovery, and 20 Hz tick simulation.
-- [x] **Cluster Infrastructure & Load Testing**: gRPC Cluster Director dynamic boundary balancing, Edge Gateway packet routing and dynamic handoff, headless virtual bot load test harness.
-- [x] **Zero-Downtime Persistence**: Write-behind coalescing snapshotter with SQLite/PostgreSQL storage repositories and Redis session caching.
-- [x] **Decoupled Gameplay Plugin Architecture**: Standalone plugin lifecycle, open typed event queue with veto hooks, dynamic component serialization codec registry, and modular packet routing.
-- [x] **Classic MMO Content Plugins**: Reference implementations for Inventory/Equipment, Combat/Stats/HealthRegen, Atomic Two-Player Trade, Loot Tables & Containers, Quests & Objectives, Guild Rosters & Vaults, and Parties.
-- [x] **Cross-Node Gameplay & Social Bus**: Cluster message broker (`SocialBus` with Memory and Redis backends) bridging whispers, global chat channels, party state sync, and guild vault updates across simulation nodes and edge gateways.
-- [x] **Autonomous NPC & Monster AI**: Completely decoupled ECS-native systems for kinematic navigation, entity-driven spawners, sensory perception scanning, threat/hate tables, and modular FSM behaviors.
-- [x] **Client AoI Packet Broadcasting**: Real-time position and state replication (`EntityState` and `EntityDespawn` packets) pushed from simulation nodes through the Edge Gateway to connected clients within the 3D Octree visibility radius with dynamic density throttling.
-- [x] **Native QUIC UDP Transport**: Edge Gateway hybrid UDP transport using `quinn` with TLS 1.3, combining unreliable datagrams (ephemeral movement and AoI entity state sync) with multiplexed reliable streams (transactional interactions and chat).
-- [x] **Track 1: Production Observability, Metrics & Health Telemetry**: Unified `TelemetryServer` in `crates/core` with `/metrics`, `/healthz`, and `/ready`, Kubernetes probes, and Grafana dashboards.
-- [x] **Track 2: Dynamic Spatial Partitioning & Live Entity Migration**: Two-Phase Entity Migration Protocol with strict state freeze leases, zero-duplication guarantees, live Edge Gateway routing updates, and boundary hysteresis margins.
-- [x] **Track 3: Production Distributed Storage (PostgreSQL)**: Multi-backend SQL storage abstraction, automated schema migrations, deadlock-free ACID item trading, and batched persistence.
-- [x] **Track 4: Kubernetes Scale & Chaos Testing**: Headless bot swarm generator with hotspot steering, sequence-aware jitter-tolerant kinematics, autonomous 3.5s dead-node orphan recovery, and unified cluster command abstractions.
-- [x] **Track 5: Interaction Primitives & Pluggable Abilities**: Cancellable timed action state machines, dynamic attribute sets with aura modifiers, authoritative 3D spatial target queries (cone/sphere/raycast), and ability cooldown pipelines.
-- [x] **Track 6: Network Delta Compression & Bandwidth Bit-Packing**: LEB128 varints, fixed-point kinematic quantization ($1/128\text{m}$ resolution), baseline acknowledgement replication, and **88.05% bandwidth egress reduction**.
-- [x] **Track 7: Cross-Partition Interaction & Boundary Ability Dispatch**: Cross-node ability execution, ghost entity targeting, boundary AoE sphere/cone multi-dispatch, anti-cheat range re-validation, and non-blocking compensation pipelines.
-- [x] **Track 8: Playable Visual Client Frontend & WebTransport Gateway Ingress**: HTTP/3 WebTransport ingress over QUIC/UDP with decoupled datagram/stream sinks, zero-server-pollution Rust WebAssembly leaf crate (`crates/client-wasm`), and interactive 3D Web Visual Inspector (`web/`).
+- **Elastic 3D Spatial Partitioning**: Dynamic Sparse 3D Octree world partitioning coordinated by the Director, with Two-Phase Live Entity Migration transferring authority across partition boundaries with zero entity duplication, input freeze leases, and dynamic gateway route invalidation.
+- **Strict Server Authority & Kinematic Anti-Cheat**: 20 Hz fixed-step simulation loop calculating elapsed time strictly via server monotonic clocks, enforcing sequence continuity, and validating kinematic boundaries to eliminate speed hacks, teleportation, and time banking.
+- **Cross-Partition Interaction & Boundary Targeting**: Unified targeting across local entities and replicated boundary ghosts, cross-node ability RPC dispatch, anti-cheat range re-validation ($1.2\times$ kinematic tolerance), and non-blocking MPSC resource compensation pipelines.
+- **High-Throughput Delta Compression & Bit-Packing**: LEB128 varints, sub-byte bit-packing, and fixed-point quantization ($1/128\text{m}$ position, 8-bit yaw/pitch, 16-bit velocity) paired with a baseline acknowledgement protocol delivering an **88.05% bandwidth egress reduction**.
+- **Multi-Transport Edge Ingress**: Hybrid Edge Gateway supporting HTTP/3 WebTransport (browser), native QUIC UDP with TLS 1.3 (client), and framed TCP with lock-free `DashMap` session routing and decoupled datagram/stream egress sinks.
+- **Browser WebAssembly Client & 3D Inspector**: Zero-server-pollution Rust WebAssembly leaf crate (`crates/client-wasm`) compiled via `wasm-bindgen`, client-side Hermite/LERP temporal smoothing, and an interactive Three.js 3D Web Visual Inspector (`web/`) with live HUD telemetry.
+- **Pluggable ECS Gameplay & AI**: Decoupled plugin architecture implementing [`GameplayPlugin`](crates/core/src/plugin.rs) with open typed event queues, dynamic component serialization codecs, cancellable timed actions, dynamic attribute sets, and autonomous FSM-driven NPC AI.
+- **Production Distributed Persistence**: Dual-engine SQL persistence supporting distributed PostgreSQL and hermetic SQLite, automated schema migrations, deadlock-free ACID item trading, and asynchronous write-behind coalesced snapshots.
+- **Cluster Resilience & Chaos Validation**: Autonomous 3.5s dead-node detection and orphan partition failover, headless bot swarm generator (10k bot capacity) with trajectory profiles, and local Kubernetes (`k3d`) deployment with Grafana observability.
 
 ---
 
