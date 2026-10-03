@@ -1,0 +1,9 @@
+schema_version: "1.0"
+change_id: "dynamic-spatial-partition-rebalancing"
+title: "Dynamic Spatial Partition Rebalancing, Hotspot Mitigation & Zero-Disconnect Batch Handover"
+created_at: "2026-10-03T00:55:00Z"
+authors:
+  - "Antigravity Engineering Team"
+status: "proposed"
+target_branch: "main"
+feature_branch: "feat/dynamic-spatial-partition-rebalancing"

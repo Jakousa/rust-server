@@ -1,7 +1,7 @@
 //! Generated Protocol and Schema definitions
 
 #[cfg(feature = "grpc")]
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::double_must_use)]
 pub mod cluster {
     tonic::include_proto!("mmo.cluster");
 }
@@ -51,8 +51,15 @@ mod tests {
             cpu_percent: 12.5,
             memory_bytes: 1024 * 1024 * 64,
             timestamp: 1700000000,
+            tick_duration_ms: 12.5,
+            entity_centroid: Some(Vector3 {
+                x: 10.0,
+                y: 0.0,
+                z: -5.0,
+            }),
         };
         assert_eq!(hb.entity_count, 150);
+        assert_eq!(hb.tick_duration_ms, 12.5);
 
         let split = SplitReportRequest {
             node_id: 1,
@@ -174,5 +181,34 @@ mod tests {
             error_message: String::new(),
         };
         assert!(route_resp.success);
+
+        let batch_req = BatchMigrateEntityRequest {
+            source_node_id: 1,
+            target_node_id: 2,
+            topology_epoch: 2,
+            entities: vec![req],
+        };
+        assert_eq!(batch_req.entities.len(), 1);
+
+        let batch_resp = BatchMigrateEntityResponse {
+            success: true,
+            migrated_count: 1,
+            error_message: String::new(),
+        };
+        assert!(batch_resp.success);
+        assert_eq!(batch_resp.migrated_count, 1);
+
+        let batch_route_req = BatchRouteUpdateRequest {
+            updates: vec![route_req],
+        };
+        assert_eq!(batch_route_req.updates.len(), 1);
+
+        let batch_route_resp = BatchRouteUpdateResponse {
+            success: true,
+            updated_count: 1,
+            error_message: String::new(),
+        };
+        assert!(batch_route_resp.success);
+        assert_eq!(batch_route_resp.updated_count, 1);
     }
 }

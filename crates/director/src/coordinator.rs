@@ -13,6 +13,12 @@ pub const DEFAULT_SPLIT_THRESHOLD: u32 = 50;
 /// Default threshold of total entities in an octant's subtree before merging.
 pub const DEFAULT_MERGE_THRESHOLD: u32 = 10;
 
+/// Default threshold of tick execution duration (in milliseconds) before triggering a split.
+pub const DEFAULT_TICK_SATURATION_MS: f32 = 35.0;
+
+/// Default cooldown duration between splits on a partition.
+pub const DEFAULT_SPLIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Default global bounding box covering the entire world.
 pub const DEFAULT_WORLD_BOUNDS: BoundingBox3D = BoundingBox3D {
     min: (-1000.0, -1000.0, -1000.0),
@@ -318,6 +324,35 @@ impl GlobalOctreeNode {
             }
         }
     }
+
+    /// Updates bounds of a leaf octant matching `old_bounds` to `new_bounds`.
+    pub fn update_leaf_bounds(
+        &mut self,
+        old_bounds: &BoundingBox3D,
+        new_bounds: BoundingBox3D,
+    ) -> bool {
+        match self {
+            GlobalOctreeNode::Leaf { bounds, .. } => {
+                if bounds == old_bounds {
+                    *bounds = new_bounds;
+                    true
+                } else {
+                    false
+                }
+            }
+            GlobalOctreeNode::Branch { bounds, children } => {
+                if !bounds.intersects(old_bounds) {
+                    return false;
+                }
+                for child in children.iter_mut() {
+                    if child.update_leaf_bounds(old_bounds, new_bounds) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 /// Record of an orphaned partition being reassigned to a surviving node.
@@ -334,6 +369,9 @@ pub struct PartitionRecoveryEvent {
 pub struct GlobalOctreeCoordinator {
     pub split_threshold: u32,
     pub merge_threshold: u32,
+    pub tick_saturation_ms: f32,
+    pub split_cooldown: std::time::Duration,
+    pub last_split_times: std::collections::HashMap<u32, std::time::Instant>,
     pub root: GlobalOctreeNode,
     pub spatial_index: Octree,
     pub topology_epoch: u64,
@@ -361,6 +399,23 @@ impl GlobalOctreeCoordinator {
         split_threshold: u32,
         merge_threshold: u32,
     ) -> Self {
+        Self::with_full_thresholds(
+            root_bounds,
+            split_threshold,
+            merge_threshold,
+            DEFAULT_TICK_SATURATION_MS,
+            DEFAULT_SPLIT_COOLDOWN,
+        )
+    }
+
+    /// Creates a new `GlobalOctreeCoordinator` with custom thresholds, saturation time, and split cooldown.
+    pub fn with_full_thresholds(
+        root_bounds: BoundingBox3D,
+        split_threshold: u32,
+        merge_threshold: u32,
+        tick_saturation_ms: f32,
+        split_cooldown: std::time::Duration,
+    ) -> Self {
         let root = GlobalOctreeNode::Leaf {
             bounds: root_bounds,
             assigned_node_id: None,
@@ -372,6 +427,9 @@ impl GlobalOctreeCoordinator {
         Self {
             split_threshold,
             merge_threshold,
+            tick_saturation_ms,
+            split_cooldown,
+            last_split_times: std::collections::HashMap::new(),
             root,
             spatial_index,
             topology_epoch: 1,
@@ -386,6 +444,21 @@ impl GlobalOctreeCoordinator {
     /// Returns `true` if an octant's reported entity count meets or exceeds `split_threshold`.
     pub fn should_split(&self, entity_count: u32) -> bool {
         entity_count >= self.split_threshold
+    }
+
+    /// Returns `true` if a node should split based on entity count or tick duration, respecting the split cooldown.
+    pub fn should_split_node(
+        &self,
+        node_id: u32,
+        entity_count: u32,
+        tick_duration_ms: f32,
+    ) -> bool {
+        if let Some(last_split) = self.last_split_times.get(&node_id) {
+            if last_split.elapsed() < self.split_cooldown {
+                return false;
+            }
+        }
+        entity_count >= self.split_threshold || tick_duration_ms >= self.tick_saturation_ms
     }
 
     /// Returns `true` if an octant's entity count drops to or below `merge_threshold`.
@@ -429,8 +502,13 @@ impl GlobalOctreeCoordinator {
     }
 
     /// Evaluates whether an incoming heartbeat triggers a split recommendation.
-    pub fn evaluate_heartbeat(&self, _node_id: u32, entity_count: u32) -> bool {
-        self.should_split(entity_count)
+    pub fn evaluate_heartbeat(
+        &self,
+        node_id: u32,
+        entity_count: u32,
+        tick_duration_ms: f32,
+    ) -> bool {
+        self.should_split_node(node_id, entity_count, tick_duration_ms)
     }
 
     /// Handles an octant split report from a simulation node.
@@ -476,19 +554,15 @@ impl GlobalOctreeCoordinator {
                 .filter(|&id| id != reporting_node_id)
                 .collect();
 
-            // Sort other_nodes by load (entity_count, cpu_percent, node_id)
+            // Sort other_nodes by composite load score
             other_nodes.sort_by(|&a, &b| {
                 let na = registry.get_node(a);
                 let nb = registry.get_node(b);
                 match (na, nb) {
                     (Some(na), Some(nb)) => na
-                        .entity_count
-                        .cmp(&nb.entity_count)
-                        .then_with(|| {
-                            na.cpu_percent
-                                .partial_cmp(&nb.cpu_percent)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                        .load_score()
+                        .partial_cmp(&nb.load_score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| na.node_id.cmp(&nb.node_id)),
                     _ => a.cmp(&b),
                 }
@@ -537,9 +611,86 @@ impl GlobalOctreeCoordinator {
             self.spatial_index.insert(guid, child.center());
         }
 
+        self.last_split_times
+            .insert(reporting_node_id, std::time::Instant::now());
         self.topology_epoch += 1;
 
         assigned_node_ids
+    }
+
+    /// Smooths the dividing boundary between two adjacent leaf nodes based on entity centroids.
+    ///
+    /// Clamps centroids within each node's assigned bounds.
+    /// If entity density ratio exceeds 2.0x, calculates an elastic displacement:
+    /// delta = min(25.0, 0.1 * ((count_a - count_b)/(count_a + count_b)) * distance)
+    /// Damped by hysteresis (at least 1.0m shift required).
+    /// Returns the adjusted bounding boxes if shifted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn smooth_adjacent_boundaries(
+        &mut self,
+        node_a: u32,
+        centroid_a: (f32, f32, f32),
+        count_a: u32,
+        node_b: u32,
+        centroid_b: (f32, f32, f32),
+        count_b: u32,
+        registry: &mut NodeRegistry,
+    ) -> Option<(BoundingBox3D, BoundingBox3D)> {
+        let bounds_a_list = self.get_assigned_bounds_for_node(node_a);
+        let bounds_b_list = self.get_assigned_bounds_for_node(node_b);
+
+        for ba in &bounds_a_list {
+            for bb in &bounds_b_list {
+                // Check if ba and bb are adjacent along X axis (ba on left, bb on right)
+                if (ba.max.0 - bb.min.0).abs() < 0.001
+                    && (ba.min.1 - bb.min.1).abs() < 0.001
+                    && (ba.max.1 - bb.max.1).abs() < 0.001
+                    && (ba.min.2 - bb.min.2).abs() < 0.001
+                    && (ba.max.2 - bb.max.2).abs() < 0.001
+                {
+                    // Strict anti-cheat coordinate clamping to assigned bounds
+                    let ca_x = centroid_a.0.clamp(ba.min.0, ba.max.0);
+                    let cb_x = centroid_b.0.clamp(bb.min.0, bb.max.0);
+
+                    let na = count_a as f32;
+                    let nb = count_b as f32;
+                    if na + nb == 0.0 {
+                        continue;
+                    }
+
+                    // Check density ratio >= 2.0x
+                    if na >= 2.0 * nb || nb >= 2.0 * na {
+                        let imbalance = (na - nb) / (na + nb);
+                        let dist = (cb_x - ca_x).abs().max(10.0);
+                        let shift = (imbalance * 0.1 * dist).clamp(-25.0, 25.0);
+
+                        if shift.abs() >= 1.0 {
+                            let new_split_x = ba.max.0 + shift;
+                            // Ensure bounds do not collapse
+                            if new_split_x > ba.min.0 + 10.0 && new_split_x < bb.max.0 - 10.0 {
+                                let new_ba =
+                                    BoundingBox3D::new(ba.min, (new_split_x, ba.max.1, ba.max.2));
+                                let new_bb =
+                                    BoundingBox3D::new((new_split_x, bb.min.1, bb.min.2), bb.max);
+
+                                self.root.update_leaf_bounds(ba, new_ba);
+                                self.root.update_leaf_bounds(bb, new_bb);
+
+                                registry.remove_assigned_bounds(node_a, ba);
+                                registry.add_assigned_bounds(node_a, new_ba);
+                                registry.remove_assigned_bounds(node_b, bb);
+                                registry.add_assigned_bounds(node_b, new_bb);
+
+                                self.topology_epoch += 1;
+                                metrics::counter!("mmo_boundary_adjustments_total").increment(1);
+                                return Some((new_ba, new_bb));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Handles merging 8 child octants back into a single parent octant.
@@ -693,9 +844,10 @@ mod tests {
         assert!(coord.should_split(50));
         assert!(coord.should_split(1000));
 
-        // Evaluate heartbeat split recommendation
-        assert!(!coord.evaluate_heartbeat(1, 40));
-        assert!(coord.evaluate_heartbeat(1, 60));
+        // Evaluate heartbeat split recommendation (entity count or tick duration saturation)
+        assert!(!coord.evaluate_heartbeat(1, 40, 15.0));
+        assert!(coord.evaluate_heartbeat(1, 60, 15.0));
+        assert!(coord.evaluate_heartbeat(1, 10, 36.0));
 
         // Custom thresholds
         let custom_coord = GlobalOctreeCoordinator::with_thresholds(bounds, 30, 8);
@@ -873,5 +1025,117 @@ mod tests {
 
         // Partition is now unassigned
         assert_eq!(coord.find_node_for_point((25.0, 25.0, 25.0)), None);
+    }
+
+    #[test]
+    fn test_saturation_split_and_cooldown() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 = registry.register_node("127.0.0.1:50051".to_string(), vec![bounds]);
+        coord.assign_initial_node(node1);
+
+        // Before split: split recommendation fires on saturation
+        assert!(coord.should_split_node(node1, 10, 40.0));
+
+        // Perform split
+        let _ = coord.handle_split(node1, bounds, vec![], &mut registry);
+
+        // Immediately after split: cooldown prevents split even under high saturation
+        assert!(!coord.should_split_node(node1, 1000, 50.0));
+    }
+
+    #[test]
+    fn test_smooth_adjacent_boundaries() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(root_bounds);
+        let mut registry = NodeRegistry::new();
+
+        let bound_a = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let bound_b = BoundingBox3D::new((100.0, 0.0, 0.0), (200.0, 100.0, 100.0));
+
+        let node_a = registry.register_node("127.0.0.1:50051".to_string(), vec![bound_a]);
+        let node_b = registry.register_node("127.0.0.1:50052".to_string(), vec![bound_b]);
+
+        // Manually setup coordinator root with these two leaf octants as a branch or leaf assignments
+        let mut leaves_arr = [(bound_a, node_a); 8];
+        leaves_arr[0] = (bound_a, node_a);
+        leaves_arr[1] = (bound_b, node_b);
+        for item in leaves_arr.iter_mut().skip(2) {
+            *item = (bound_b, node_b);
+        }
+        coord.root = GlobalOctreeNode::Branch {
+            bounds: root_bounds,
+            children: Box::new([
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_a,
+                    assigned_node_id: Some(node_a),
+                    entity_count: 300,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 50,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 0,
+                },
+            ]),
+        };
+
+        let initial_epoch = coord.topology_epoch();
+
+        // Node A has 300 entities (hotspot), Node B has 50 entities (ratio 6:1 > 2.0x)
+        // With extreme spoofed coordinate (99999.0), it should be clamped inside bound_a
+        let smoothed = coord.smooth_adjacent_boundaries(
+            node_a,
+            (99999.0, 50.0, 50.0), // spoofed coordinate clamped to 100.0
+            300,
+            node_b,
+            (150.0, 50.0, 50.0),
+            50,
+            &mut registry,
+        );
+
+        assert!(smoothed.is_some());
+        let (new_ba, new_bb) = smoothed.unwrap();
+        // Boundary should shift to the right (> 100.0) towards Node B
+        assert!(new_ba.max.0 > 100.0);
+        assert_eq!(new_ba.max.0, new_bb.min.0);
+        assert_eq!(coord.topology_epoch(), initial_epoch + 1);
+
+        // Registry should also reflect updated bounds
+        let reg_a = registry.get_node(node_a).unwrap();
+        assert_eq!(reg_a.assigned_bounds, vec![new_ba]);
+        let reg_b = registry.get_node(node_b).unwrap();
+        assert_eq!(reg_b.assigned_bounds, vec![new_bb]);
     }
 }

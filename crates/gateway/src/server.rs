@@ -20,7 +20,8 @@ use mmo_core::guid::Guid;
 use mmo_schema::client::{ClientCodecError, ClientPacket};
 use mmo_schema::cluster::gateway_service_server::{GatewayService, GatewayServiceServer};
 use mmo_schema::cluster::{
-    ReassignNodeRoutesRequest, ReassignNodeRoutesResponse, RouteUpdateRequest, RouteUpdateResponse,
+    BatchRouteUpdateRequest, BatchRouteUpdateResponse, ReassignNodeRoutesRequest,
+    ReassignNodeRoutesResponse, RouteUpdateRequest, RouteUpdateResponse,
 };
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
@@ -261,6 +262,27 @@ impl GatewayService for GatewayServiceImpl {
         metrics::counter!("mmo_gateway_route_updates_total").increment(1);
         Ok(tonic::Response::new(RouteUpdateResponse {
             success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    async fn update_batch_routes(
+        &self,
+        request: tonic::Request<BatchRouteUpdateRequest>,
+    ) -> Result<tonic::Response<BatchRouteUpdateResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut count = 0;
+        for u in req.updates {
+            let guid = Guid::from_raw(u.guid);
+            self.router
+                .update_route_with_session(guid, u.session_id, u.node_address);
+            count += 1;
+        }
+        metrics::counter!("mmo_gateway_batch_route_updates_total").increment(1);
+        metrics::counter!("mmo_gateway_route_updates_total").increment(count as u64);
+        Ok(tonic::Response::new(BatchRouteUpdateResponse {
+            success: true,
+            updated_count: count as u32,
             error_message: String::new(),
         }))
     }
@@ -1572,6 +1594,70 @@ mod tests {
         );
         assert_eq!(
             router.get_route_by_session(session_id).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_service_update_batch_routes() {
+        let router = Arc::new(SessionRouter::new());
+        let service = GatewayServiceImpl::new(Arc::clone(&router));
+
+        let guid1 = Guid::new(mmo_core::guid::EntityType::Player, 1, 101);
+        let guid2 = Guid::new(mmo_core::guid::EntityType::Player, 1, 102);
+        let s1 = 81;
+        let s2 = 82;
+        let initial_node = "127.0.0.1:50051".to_string();
+
+        router.register_session(s1, guid1, initial_node.clone());
+        router.register_session(s2, guid2, initial_node.clone());
+
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+
+        let batch_req = tonic::Request::new(mmo_schema::cluster::BatchRouteUpdateRequest {
+            updates: vec![
+                RouteUpdateRequest {
+                    guid: guid1.raw(),
+                    session_id: s1,
+                    node_address: "127.0.0.1:50052".to_string(),
+                },
+                RouteUpdateRequest {
+                    guid: guid2.raw(),
+                    session_id: s2,
+                    node_address: "127.0.0.1:50052".to_string(),
+                },
+            ],
+        });
+
+        let resp = service
+            .update_batch_routes(batch_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.updated_count, 2);
+
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+        assert_eq!(
+            router.get_route_by_guid(guid2).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(s1).as_deref(),
+            Some("127.0.0.1:50052")
+        );
+        assert_eq!(
+            router.get_route_by_session(s2).as_deref(),
             Some("127.0.0.1:50052")
         );
     }

@@ -18,7 +18,22 @@ pub struct RegisteredNode {
     pub entity_count: u32,
     pub cpu_percent: f32,
     pub memory_bytes: u64,
+    pub tick_duration_ms: f32,
+    pub entity_centroid: (f32, f32, f32),
     pub assigned_bounds: Vec<BoundingBox3D>,
+}
+
+impl RegisteredNode {
+    /// Computes composite load score:
+    /// Load = 0.5 * entities + 0.25 * cpu_percent + 0.25 * tick_duration_ms
+    pub fn load_score(&self) -> f32 {
+        let w_entities = 0.5;
+        let w_cpu = 0.25;
+        let w_tick = 0.25;
+        (self.entity_count as f32 * w_entities)
+            + (self.cpu_percent * w_cpu)
+            + (self.tick_duration_ms * w_tick)
+    }
 }
 
 /// Registry of active simulation nodes in the cluster.
@@ -49,6 +64,8 @@ impl NodeRegistry {
             entity_count: 0,
             cpu_percent: 0.0,
             memory_bytes: 0,
+            tick_duration_ms: 0.0,
+            entity_centroid: (0.0, 0.0, 0.0),
             assigned_bounds: bounds,
         };
 
@@ -80,6 +97,8 @@ impl NodeRegistry {
             entity_count: 0,
             cpu_percent: 0.0,
             memory_bytes: 0,
+            tick_duration_ms: 0.0,
+            entity_centroid: (0.0, 0.0, 0.0),
             assigned_bounds: bounds,
         };
 
@@ -96,6 +115,21 @@ impl NodeRegistry {
             node.entity_count = request.entity_count;
             node.cpu_percent = request.cpu_percent;
             node.memory_bytes = request.memory_bytes;
+            if node.tick_duration_ms == 0.0 {
+                node.tick_duration_ms = request.tick_duration_ms;
+            } else {
+                node.tick_duration_ms =
+                    0.8 * node.tick_duration_ms + 0.2 * request.tick_duration_ms;
+            }
+            if let Some(c) = &request.entity_centroid {
+                let mut centroid = (c.x, c.y, c.z);
+                if let Some(bound) = node.assigned_bounds.first() {
+                    centroid.0 = centroid.0.clamp(bound.min.0, bound.max.0);
+                    centroid.1 = centroid.1.clamp(bound.min.1, bound.max.1);
+                    centroid.2 = centroid.2.clamp(bound.min.2, bound.max.2);
+                }
+                node.entity_centroid = centroid;
+            }
             true
         } else {
             false
@@ -164,7 +198,7 @@ impl NodeRegistry {
         self.nodes.is_empty()
     }
 
-    /// Finds the least loaded active node (lowest `entity_count`, breaking ties with `cpu_percent`).
+    /// Finds the least loaded active node using composite load scoring (`load_score`).
     ///
     /// Ignores node IDs in `excluding`. If all nodes are excluded, falls back to any active node.
     pub fn find_least_loaded_node(&self, excluding: &[u32]) -> Option<u32> {
@@ -173,13 +207,9 @@ impl NodeRegistry {
             .values()
             .filter(|n| !excluding.contains(&n.node_id))
             .min_by(|a, b| {
-                a.entity_count
-                    .cmp(&b.entity_count)
-                    .then_with(|| {
-                        a.cpu_percent
-                            .partial_cmp(&b.cpu_percent)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                a.load_score()
+                    .partial_cmp(&b.load_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.node_id.cmp(&b.node_id))
             })
             .map(|n| n.node_id);
@@ -188,13 +218,9 @@ impl NodeRegistry {
             self.nodes
                 .values()
                 .min_by(|a, b| {
-                    a.entity_count
-                        .cmp(&b.entity_count)
-                        .then_with(|| {
-                            a.cpu_percent
-                                .partial_cmp(&b.cpu_percent)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                    a.load_score()
+                        .partial_cmp(&b.load_score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.node_id.cmp(&b.node_id))
                 })
                 .map(|n| n.node_id)
@@ -282,6 +308,12 @@ mod tests {
             cpu_percent: 23.5,
             memory_bytes: 1024 * 1024 * 128,
             timestamp: 123456789,
+            tick_duration_ms: 15.0,
+            entity_centroid: Some(mmo_schema::cluster::Vector3 {
+                x: 5.0,
+                y: 10.0,
+                z: 15.0,
+            }),
         };
 
         let updated = registry.record_heartbeat(&hb);
@@ -291,6 +323,8 @@ mod tests {
         assert_eq!(node.entity_count, 75);
         assert!((node.cpu_percent - 23.5).abs() < f32::EPSILON);
         assert_eq!(node.memory_bytes, 1024 * 1024 * 128);
+        assert!((node.tick_duration_ms - 15.0).abs() < f32::EPSILON);
+        assert_eq!(node.entity_centroid, (5.0, 10.0, 15.0));
 
         // Unknown node heartbeat should return false
         let unknown_hb = HeartbeatRequest {
@@ -300,6 +334,8 @@ mod tests {
             cpu_percent: 5.0,
             memory_bytes: 1024,
             timestamp: 123456789,
+            tick_duration_ms: 5.0,
+            entity_centroid: None,
         };
         assert!(!registry.record_heartbeat(&unknown_hb));
     }
@@ -344,6 +380,8 @@ mod tests {
             cpu_percent: 50.0,
             memory_bytes: 0,
             timestamp: 0,
+            tick_duration_ms: 25.0,
+            entity_centroid: None,
         });
 
         registry.record_heartbeat(&HeartbeatRequest {
@@ -353,6 +391,8 @@ mod tests {
             cpu_percent: 10.0,
             memory_bytes: 0,
             timestamp: 0,
+            tick_duration_ms: 5.0,
+            entity_centroid: None,
         });
 
         registry.record_heartbeat(&HeartbeatRequest {
@@ -362,6 +402,8 @@ mod tests {
             cpu_percent: 20.0,
             memory_bytes: 0,
             timestamp: 0,
+            tick_duration_ms: 12.0,
+            entity_centroid: None,
         });
 
         assert_eq!(registry.find_least_loaded_node(&[]), Some(id2));

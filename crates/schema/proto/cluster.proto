@@ -34,6 +34,8 @@ message HeartbeatRequest {
   float cpu_percent = 4;
   uint64 memory_bytes = 5;
   uint64 timestamp = 6;
+  float tick_duration_ms = 7;
+  Vector3 entity_centroid = 8;
 }
 
 message HeartbeatResponse {
@@ -121,6 +123,19 @@ message MigrateEntityResponse {
   uint64 acknowledged_guid = 4;
 }
 
+message BatchMigrateEntityRequest {
+  uint32 source_node_id = 1;
+  uint32 target_node_id = 2;
+  uint64 topology_epoch = 3;
+  repeated MigrateEntityRequest entities = 4;
+}
+
+message BatchMigrateEntityResponse {
+  bool success = 1;
+  uint32 migrated_count = 2;
+  string error_message = 3;
+}
+
 // Gateway Ingress Route Update messages
 message RouteUpdateRequest {
   uint64 guid = 1;
@@ -131,6 +146,16 @@ message RouteUpdateRequest {
 message RouteUpdateResponse {
   bool success = 1;
   string error_message = 2;
+}
+
+message BatchRouteUpdateRequest {
+  repeated RouteUpdateRequest updates = 1;
+}
+
+message BatchRouteUpdateResponse {
+  bool success = 1;
+  uint32 updated_count = 2;
+  string error_message = 3;
 }
 
 message ReassignNodeRoutesRequest {
@@ -206,12 +231,14 @@ service NodeService {
   rpc RemoteCommand (RemoteCommandRequest) returns (RemoteCommandResponse);
   rpc SyncGhosts (GhostSyncRequest) returns (GhostSyncResponse);
   rpc MigrateEntity (MigrateEntityRequest) returns (MigrateEntityResponse);
+  rpc MigrateBatchEntities (BatchMigrateEntityRequest) returns (BatchMigrateEntityResponse);
   rpc DispatchAbility (RemoteAbilityRequest) returns (RemoteAbilityResponse);
   rpc DispatchBatchAbility (BatchRemoteAbilityRequest) returns (BatchRemoteAbilityResponse);
 }
 
 service GatewayService {
   rpc UpdateRoute (RouteUpdateRequest) returns (RouteUpdateResponse);
+  rpc UpdateBatchRoutes (BatchRouteUpdateRequest) returns (BatchRouteUpdateResponse);
   rpc ReassignNodeRoutes (ReassignNodeRoutesRequest) returns (ReassignNodeRoutesResponse);
 }
 

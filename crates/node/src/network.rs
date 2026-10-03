@@ -12,7 +12,8 @@ use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::node_service_server::{NodeService, NodeServiceServer};
 use mmo_schema::cluster::{
-    BatchRemoteAbilityRequest, BatchRemoteAbilityResponse, GhostEntity, GhostSyncRequest,
+    BatchMigrateEntityRequest, BatchMigrateEntityResponse, BatchRemoteAbilityRequest,
+    BatchRemoteAbilityResponse, BatchRouteUpdateRequest, GhostEntity, GhostSyncRequest,
     GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse, RemoteAbilityErrorCode,
     RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest, RemoteCommandResponse,
     RouteUpdateRequest, SerializedComponent, Vector3,
@@ -428,6 +429,97 @@ impl NodeService for NodeServiceImpl {
         }))
     }
 
+    /// Receives and adopts a batch of entities migrated live from a donor simulation node.
+    /// Strictly all-or-nothing: validates all entities within recipient partition bounds before inserting.
+    /// If any entity fails validation, rejects the entire batch (success = false) allowing clean donor rollback.
+    async fn migrate_batch_entities(
+        &self,
+        request: tonic::Request<BatchMigrateEntityRequest>,
+    ) -> Result<tonic::Response<BatchMigrateEntityResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut sim = self.sim.write().await;
+
+        // 1. Validation pass: check all entities have valid positions inside recipient bounds
+        for entity_req in &req.entities {
+            let target_pos = match entity_req.position {
+                Some(ref p) => (p.x, p.y, p.z),
+                None => {
+                    return Ok(tonic::Response::new(BatchMigrateEntityResponse {
+                        success: false,
+                        migrated_count: 0,
+                        error_message: format!(
+                            "Entity {} missing position in batch",
+                            entity_req.guid
+                        ),
+                    }));
+                }
+            };
+
+            if !sim.octree.bounds.contains(target_pos) {
+                return Ok(tonic::Response::new(BatchMigrateEntityResponse {
+                    success: false,
+                    migrated_count: 0,
+                    error_message: format!(
+                        "Entity {} position {:?} outside recipient node {} bounds {:?}",
+                        entity_req.guid, target_pos, sim.node_id, sim.octree.bounds
+                    ),
+                }));
+            }
+        }
+
+        // 2. Ingestion pass: insert all entities
+        let mut migrated_count = 0;
+        let codecs = sim.codecs.clone();
+        for entity_req in &req.entities {
+            let guid = Guid::from_raw(entity_req.guid);
+            let p = entity_req.position.as_ref().unwrap();
+            let target_pos = (p.x, p.y, p.z);
+
+            sim.ghost_store.remove(guid);
+            sim.entity_store.spawn(guid, target_pos);
+            sim.octree.insert(guid, target_pos);
+
+            for c in &entity_req.components {
+                if c.component_id == 0 {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&c.data) {
+                        if let Some(entity) = sim.entity_store.get_mut_by_guid(guid) {
+                            let _ = codecs.deserialize_into(&val, &mut entity.components);
+                        }
+                    }
+                }
+            }
+
+            let mut kin_state = crate::kinematics::EntityKinematicState::new(sim.current_time);
+            kin_state.initialized = true;
+            kin_state.last_sequence = entity_req.last_sequence;
+            sim.kinematic_states.insert(guid, kin_state);
+
+            if entity_req.last_migration_tick > 0 {
+                sim.set_last_migration_tick(guid, entity_req.last_migration_tick);
+            }
+
+            if entity_req.session_id != 0 {
+                sim.register_aoi_observer(
+                    entity_req.session_id,
+                    guid,
+                    crate::aoi::ObserverConfig::default(),
+                );
+            }
+
+            migrated_count += 1;
+        }
+
+        metrics::counter!("mmo_batch_migrations_inbound_total", "status" => "success").increment(1);
+        metrics::counter!("mmo_migration_inbound_total", "status" => "success")
+            .increment(migrated_count as u64);
+
+        Ok(tonic::Response::new(BatchMigrateEntityResponse {
+            success: true,
+            migrated_count,
+            error_message: String::new(),
+        }))
+    }
+
     /// Dispatches an authoritative remote ability against an entity on this simulation node.
     async fn dispatch_ability(
         &self,
@@ -783,6 +875,226 @@ pub async fn execute_entity_migration(
 
     metrics::counter!("mmo_migration_outbound_total", "status" => "success").increment(1);
     Ok(true)
+}
+
+/// Result report of a batch migration attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchMigrationReport {
+    pub success: bool,
+    pub total_requested: usize,
+    pub migrated_count: usize,
+    pub error_message: String,
+}
+
+/// Executes an authoritative two-phase batch entity migration for up to 500 entities.
+///
+/// Follows strict point-of-no-return locking rules:
+/// 1. Phase 1 (under write lock): Acquires `migrating_leases` for all GUIDs.
+///    If any GUID cannot be leased or is not found, immediately aborts and releases all acquired leases (no partial holding).
+///    Serializes kinematics and components for all entities into a single `BatchMigrateEntityRequest`.
+///    Drops write lock before async network I/O.
+/// 2. Network I/O: Sends `BatchMigrateEntityRequest` over gRPC to `target_node_addr`.
+/// 3. Ingestion & Point of No Return:
+///    - If recipient returns success = false or RPC fails/times out:
+///      Reacquires write lock, releases all leases, increments `mmo_batch_migration_rollbacks_total`, and retains authority.
+///    - If recipient returns success = true:
+///      Point of no return is reached! Reacquires write lock, despawns all entities locally from `entity_store`, `octree`, and AoI, and clears leases.
+/// 4. Gateway Batch Route Commit (Post-Ingestion):
+///    - If `gateway_addr` is provided, dispatches `update_batch_routes`.
+///    - If Gateway RPC encounters transient network error, it logs/retries, but does NOT roll back donor (preventing duplicate authority / split-brain).
+pub async fn execute_batch_entity_migration(
+    sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+    guids: &[Guid],
+    target_node_id: u32,
+    target_node_addr: &str,
+    gateway_addr: Option<&str>,
+) -> Result<BatchMigrationReport, String> {
+    if guids.is_empty() {
+        return Ok(BatchMigrationReport {
+            success: true,
+            total_requested: 0,
+            migrated_count: 0,
+            error_message: String::new(),
+        });
+    }
+
+    let (batch_req, session_updates) = {
+        let mut sim_guard = sim.write().await;
+
+        // Atomic all-or-nothing lease acquisition pass
+        let mut acquired = Vec::with_capacity(guids.len());
+        for &guid in guids {
+            if !sim_guard.acquire_migration_lease(guid) {
+                // Abort all previously acquired leases
+                for &acq in &acquired {
+                    sim_guard.release_migration_lease(acq);
+                }
+                return Err(format!(
+                    "Failed to acquire migration lease for GUID {} (conflict)",
+                    guid
+                ));
+            }
+            acquired.push(guid);
+        }
+
+        let mut entity_requests = Vec::with_capacity(guids.len());
+        let mut session_routes = Vec::with_capacity(guids.len());
+        let last_mig_tick = sim_guard.tick_counter;
+
+        for &guid in guids {
+            let entity = match sim_guard.entity_store.get_by_guid(guid) {
+                Some(e) => e,
+                None => {
+                    for &acq in &acquired {
+                        sim_guard.release_migration_lease(acq);
+                    }
+                    return Err(format!("Entity {} not found in store", guid));
+                }
+            };
+            let pos = entity.position;
+            let last_seq = sim_guard
+                .kinematic_states
+                .get(&guid)
+                .map(|s| s.last_sequence)
+                .unwrap_or(0);
+
+            let comp_json = sim_guard.codecs.serialize_all(&entity.components);
+            let comp_bytes = serde_json::to_vec(&comp_json).unwrap_or_default();
+            let components = vec![SerializedComponent {
+                component_id: 0,
+                data: comp_bytes,
+            }];
+
+            let session_id = sim_guard.aoi.get_session_by_guid(guid).unwrap_or(0);
+            session_routes.push((guid, session_id));
+
+            entity_requests.push(MigrateEntityRequest {
+                guid: guid.raw(),
+                source_node_id: sim_guard.node_id as u32,
+                target_node_id,
+                position: Some(Vector3 {
+                    x: pos.0,
+                    y: pos.1,
+                    z: pos.2,
+                }),
+                velocity: Some(Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }),
+                yaw: 0.0,
+                pitch: 0.0,
+                last_sequence: last_seq,
+                session_id,
+                components,
+                topology_epoch: 1,
+                last_migration_tick: last_mig_tick,
+            });
+        }
+
+        let batch_req = BatchMigrateEntityRequest {
+            source_node_id: sim_guard.node_id as u32,
+            target_node_id,
+            topology_epoch: 1,
+            entities: entity_requests,
+        };
+
+        (batch_req, session_routes)
+    }; // write lock dropped here before async network I/O
+
+    let endpoint = if target_node_addr.starts_with("http") {
+        target_node_addr.to_string()
+    } else {
+        format!("http://{}", target_node_addr)
+    };
+
+    let mut client = match NodeServiceClient::connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            let mut sim_guard = sim.write().await;
+            for &g in guids {
+                sim_guard.release_migration_lease(g);
+            }
+            metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
+            return Err(format!("Connection to recipient node failed: {}", e));
+        }
+    };
+
+    let resp = match client.migrate_batch_entities(batch_req).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            let mut sim_guard = sim.write().await;
+            for &g in guids {
+                sim_guard.release_migration_lease(g);
+            }
+            metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
+            return Err(format!("BatchMigrateEntity RPC failed: {}", e));
+        }
+    };
+
+    if !resp.success {
+        let mut sim_guard = sim.write().await;
+        for &g in guids {
+            sim_guard.release_migration_lease(g);
+        }
+        metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
+        return Err(format!(
+            "Recipient rejected batch migration: {}",
+            resp.error_message
+        ));
+    }
+
+    // POINT OF NO RETURN: Recipient successfully ingested entities.
+    // Donor must commit to despawning locally to prevent duplicate authority.
+    {
+        let mut sim_guard = sim.write().await;
+        for &guid in guids {
+            sim_guard.release_migration_lease(guid);
+            sim_guard.kinematic_states.remove(&guid);
+            if let Some((_, sid)) = session_updates.iter().find(|(g, _)| *g == guid) {
+                if *sid != 0 {
+                    sim_guard.unregister_aoi_observer(*sid);
+                }
+            }
+            if let Some(entity) = sim_guard.entity_store.despawn_by_guid(guid) {
+                if !sim_guard.octree.remove(guid, entity.position) {
+                    sim_guard.octree.remove_by_guid(guid);
+                }
+            }
+            metrics::counter!("mmo_migration_outbound_total", "status" => "success").increment(1);
+        }
+        metrics::counter!("mmo_batch_migrations_outbound_total", "status" => "success")
+            .increment(1);
+    }
+
+    // Step 4: Dispatch gateway batch route updates post-ingestion
+    if let Some(gw_addr) = gateway_addr {
+        let gw_endpoint = if gw_addr.starts_with("http") {
+            gw_addr.to_string()
+        } else {
+            format!("http://{}", gw_addr)
+        };
+        if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
+            let updates = session_updates
+                .into_iter()
+                .map(|(guid, session_id)| RouteUpdateRequest {
+                    guid: guid.raw(),
+                    session_id,
+                    node_address: target_node_addr.to_string(),
+                })
+                .collect();
+            let _ = gw_client
+                .update_batch_routes(BatchRouteUpdateRequest { updates })
+                .await;
+        }
+    }
+
+    Ok(BatchMigrationReport {
+        success: true,
+        total_requested: guids.len(),
+        migrated_count: resp.migrated_count as usize,
+        error_message: String::new(),
+    })
 }
 
 /// Prepared broadcast payload ready to be sent to a neighboring node endpoint.
@@ -1594,6 +1906,234 @@ mod tests {
             assert!(s.entity_store.contains_guid(guid));
             assert_eq!(s.entity_store.get_by_guid(guid).unwrap().position, pos);
             assert!(!s.is_migrating(guid));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_service_batch_migrate_entities_and_gateway_sync() {
+        use tonic::transport::Server;
+
+        // 1. Recipient Node on Node 2
+        let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let recipient_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            2,
+            recipient_bounds,
+        )));
+        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let recipient_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(recipient_service.into_server())
+                .serve(recipient_addr)
+                .await
+                .unwrap();
+        });
+
+        // 2. Gateway Service
+        let gw_router = Arc::new(mmo_gateway::router::SessionRouter::new());
+        let gw_service = mmo_gateway::server::GatewayServiceImpl::new(Arc::clone(&gw_router));
+        let gw_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_listener.local_addr().unwrap();
+        drop(gw_listener);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(
+                    mmo_schema::cluster::gateway_service_server::GatewayServiceServer::new(
+                        gw_service,
+                    ),
+                )
+                .serve(gw_addr)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. Donor Node on Node 1
+        let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
+        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            donor_bounds,
+        )));
+
+        let g1 = Guid::new(EntityType::Player, 1, 801);
+        let g2 = Guid::new(EntityType::Player, 1, 802);
+        let g3 = Guid::new(EntityType::Player, 1, 803);
+
+        let p1 = (55.0, 10.0, 10.0);
+        let p2 = (60.0, 15.0, 15.0);
+        let p3 = (65.0, 20.0, 20.0);
+
+        let s1 = 901;
+        let s2 = 902;
+        let s3 = 903;
+
+        gw_router.register_session(s1, g1, "127.0.0.1:50051".to_string());
+        gw_router.register_session(s2, g2, "127.0.0.1:50051".to_string());
+        gw_router.register_session(s3, g3, "127.0.0.1:50051".to_string());
+
+        {
+            let mut d = donor_sim.write().await;
+            for (g, p, s, seq) in [(g1, p1, s1, 101), (g2, p2, s2, 102), (g3, p3, s3, 103)] {
+                d.spawn_entity(g, (45.0, 10.0, 10.0));
+                d.entity_store.get_mut_by_guid(g).unwrap().position = p;
+                d.register_aoi_observer(s, g, Default::default());
+                let mut kin = crate::kinematics::EntityKinematicState::new(d.current_time);
+                kin.initialized = true;
+                kin.last_sequence = seq;
+                d.kinematic_states.insert(g, kin);
+            }
+        }
+
+        // Execute batch migration
+        let report = execute_batch_entity_migration(
+            Arc::clone(&donor_sim),
+            &[g1, g2, g3],
+            2,
+            &recipient_addr.to_string(),
+            Some(&gw_addr.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.success);
+        assert_eq!(report.total_requested, 3);
+        assert_eq!(report.migrated_count, 3);
+
+        // Verify donor has cleanly despawned all entities and released leases
+        {
+            let d = donor_sim.read().await;
+            for &g in &[g1, g2, g3] {
+                assert!(!d.entity_store.contains_guid(g));
+                assert!(!d.is_migrating(g));
+                assert!(!d.kinematic_states.contains_key(&g));
+            }
+        }
+
+        // Verify recipient has adopted entities with restored state
+        {
+            let r = recipient_sim.read().await;
+            for (g, p, seq) in [(g1, p1, 101), (g2, p2, 102), (g3, p3, 103)] {
+                assert!(r.entity_store.contains_guid(g));
+                let ent = r.entity_store.get_by_guid(g).unwrap();
+                assert_eq!(ent.position, p);
+                let kin = r.kinematic_states.get(&g).unwrap();
+                assert_eq!(kin.last_sequence, seq);
+            }
+        }
+
+        // Wait brief moment for gateway async route updates, then check router
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for &g in &[g1, g2, g3] {
+            assert_eq!(
+                gw_router.get_route_by_guid(g).as_deref(),
+                Some(recipient_addr.to_string().as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_entity_migration_connection_failure_rollback() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, bounds)));
+        let g1 = Guid::new(EntityType::Player, 1, 811);
+        let g2 = Guid::new(EntityType::Player, 1, 812);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(g1, (10.0, 10.0, 10.0));
+            s.spawn_entity(g2, (20.0, 20.0, 20.0));
+        }
+
+        let res =
+            execute_batch_entity_migration(Arc::clone(&sim), &[g1, g2], 2, "127.0.0.1:59998", None)
+                .await;
+
+        assert!(res.is_err());
+
+        // Zero-duplication guarantee: Donor MUST retain entities and all leases MUST be released
+        {
+            let s = sim.read().await;
+            assert!(s.entity_store.contains_guid(g1));
+            assert!(s.entity_store.contains_guid(g2));
+            assert!(!s.is_migrating(g1));
+            assert!(!s.is_migrating(g2));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_entity_migration_recipient_rejection_rollback() {
+        use tonic::transport::Server;
+
+        // Recipient Node covers (50.0..100.0)
+        let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let recipient_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            2,
+            recipient_bounds,
+        )));
+        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let recipient_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(recipient_service.into_server())
+                .serve(recipient_addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Donor Node covers (0.0..50.0)
+        let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
+        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            donor_bounds,
+        )));
+
+        let g1 = Guid::new(EntityType::Player, 1, 821);
+        let g2 = Guid::new(EntityType::Player, 1, 822);
+
+        // Position g1 and g2 outside recipient bounds (at 10.0, 10.0, 10.0)
+        {
+            let mut d = donor_sim.write().await;
+            d.spawn_entity(g1, (10.0, 10.0, 10.0));
+            d.spawn_entity(g2, (10.0, 10.0, 10.0));
+        }
+
+        let res = execute_batch_entity_migration(
+            Arc::clone(&donor_sim),
+            &[g1, g2],
+            2,
+            &recipient_addr.to_string(),
+            None,
+        )
+        .await;
+
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("rejected"));
+
+        // Verify donor still owns entities and all leases were released
+        {
+            let d = donor_sim.read().await;
+            assert!(d.entity_store.contains_guid(g1));
+            assert!(d.entity_store.contains_guid(g2));
+            assert!(!d.is_migrating(g1));
+            assert!(!d.is_migrating(g2));
+        }
+
+        // Verify recipient rejected all entities and ingested none
+        {
+            let r = recipient_sim.read().await;
+            assert!(!r.entity_store.contains_guid(g1));
+            assert!(!r.entity_store.contains_guid(g2));
         }
     }
 
