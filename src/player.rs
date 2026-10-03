@@ -15,6 +15,22 @@ pub struct MyPlayer {
     players: Arc<Mutex<Vec<PlayerEntity>>>,
 }
 
+const MAX_PLAYER_NAME_CHARS: usize = 32;
+
+fn validate_player_name(name: &str) -> Result<&str, Status> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument("Player name cannot be empty or whitespace"));
+    }
+    if trimmed.chars().count() > MAX_PLAYER_NAME_CHARS {
+        return Err(Status::invalid_argument(format!(
+            "Player name cannot exceed {} characters",
+            MAX_PLAYER_NAME_CHARS
+        )));
+    }
+    Ok(trimmed)
+}
+
 #[tonic::async_trait]
 impl Player for MyPlayer {
     async fn create(
@@ -22,13 +38,7 @@ impl Player for MyPlayer {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateReply>, Status> {
         let name = request.into_inner().name;
-
-        if name.is_empty() {
-            return Err(Status::invalid_argument("Player name is empty"));
-        }
-        if name.len() > 32 {
-            return Err(Status::invalid_argument("Player name is too long"));
-        }
+        validate_player_name(&name)?;
 
         println!(
             "Got a request to create player {:?}",
@@ -59,13 +69,7 @@ impl Player for MyPlayer {
     ) -> Result<Response<UpdateReply>, Status> {
         let req = request.into_inner();
         let name = req.name;
-
-        if name.is_empty() {
-            return Err(Status::invalid_argument("Player name is empty"));
-        }
-        if name.len() > 32 {
-            return Err(Status::invalid_argument("Player name is too long"));
-        }
+        validate_player_name(&name)?;
 
         let x = req.x;
         let y = req.y;
@@ -78,13 +82,11 @@ impl Player for MyPlayer {
         {
             let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            let player = players.iter_mut().find(|x| x.name == name);
+            let player = players
+                .iter_mut()
+                .find(|x| x.name == name)
+                .ok_or_else(|| Status::not_found("Player not found!"))?;
 
-            if player.is_none() {
-                return Err(Status::not_found("Player not found!"));
-            }
-
-            let player = player.unwrap();
             player.position = (x, y, z);
         }
 
@@ -92,5 +94,52 @@ impl Player for MyPlayer {
             message: format!("Player updated successfully!, x: {}, y: {}, z: {}", x, y, z),
         };
         Ok(Response::new(reply))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_player_name_valid() {
+        assert!(validate_player_name("validname").is_ok());
+        assert!(validate_player_name("   trimmedname   ").is_ok());
+        assert_eq!(validate_player_name("   trimmedname   ").unwrap(), "trimmedname");
+        assert!(validate_player_name("一二三四五").is_ok()); // 5 characters, > 5 bytes
+    }
+
+    #[test]
+    fn test_validate_player_name_empty_or_whitespace() {
+        assert_eq!(
+            validate_player_name("").unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            validate_player_name("   ").unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            validate_player_name("\n\t").unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn test_validate_player_name_too_long() {
+        let long_name = "a".repeat(33);
+        assert_eq!(
+            validate_player_name(&long_name).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let exactly_32 = "a".repeat(32);
+        assert!(validate_player_name(&exactly_32).is_ok());
+
+        let long_unicode = "一".repeat(33);
+        assert_eq!(
+            validate_player_name(&long_unicode).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }
