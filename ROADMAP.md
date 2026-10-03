@@ -82,31 +82,20 @@ flowchart LR
 - **Headless Bot Swarm Generator**: Simulates thousands of concurrent bot connections with configurable trajectory profiles (`RandomWalk`, `HotspotClustering`, `CombatInteraction`).
 - **Production Observability**: Prometheus endpoints on port 9091 across all nodes, accompanied by Kubernetes probes and production Grafana dashboards.
 
+### 9. Dynamic Spatial Partition Rebalancing & Hotspot Mitigation
+- **Octree Sub-Domain Splitting & Collapse**: `GlobalOctreeCoordinator` monitors node tick duration and entity load metrics, splitting saturated octants (> 0.85 load, > 40ms tick) into child partitions.
+- **Hysteresis Dampening & Cooldowns**: Spatial cooldown windows and delta margins prevent boundary oscillation and rapid re-triggering under high velocity entity transit.
+- **High-Throughput Batch Entity Migration**: Atomic multi-entity gRPC transfer protocol with automatic rollback and Edge Gateway batch route invalidation.
+
+### 10. Distributed Transactional Containers, Cross-Node Vaults & Generic Escrow
+- **Universal Container Subsystem**: Generic `ContainerId`, ownership models (`Character`, `Guild`, `WorldEntity`, `System`), configurable capacity, and strict access policies (`OwnerOnly`, `PublicReadWrite`, `RoleRestricted`).
+- **Distributed Two-Phase Commit (2PC) Coordinator**: Atomic cross-container transfers with pre-commit reservation locks (`Prepare` -> `Commit` / `Abort`), strict ordered GUID locking (`min(c1, c2)` then `max(c1, c2)`), atomic check-and-delete lease assertion (`WHERE expires_at_epoch_ms > now`), and automated background lease reaper.
+- **Generic Asynchronous Escrow State Machine**: Conditional holding buffers (`Held`, `Settled`, `Refunded`) with constant-time secret hash verification (`subtle::ConstantTimeEq`) and automated timeout refund reaper.
+- **Cluster Ingress & Simulation Ingress**: gRPC `ReserveContainerSlot`, `CommitContainerTransfer`, and `AbortContainerTransfer` RPCs integrated into simulation tick via non-blocking MPSC notification channel.
+
 ---
 
 ## Upcoming Engineering Milestones
-
-### Milestone: Dynamic Spatial Partition Rebalancing & Hotspot Mitigation
-
-**Problem**: When hundreds of players congregate in a single spatial area (e.g. world boss arena, city marketplace), the responsible simulation node experiences CPU saturation while adjacent partition nodes remain idle.
-
-**Technical Scope**:
-1. **Octree Sub-Domain Splitting**: Enhance `ClusterDirector` to continuously monitor per-node tick execution duration and entity density. When a partition's density exceeds a saturation threshold (e.g., $> 500$ entities or $> 35\text{ms}$ tick duration), the director divides the octant into sub-octants.
-2. **Dynamic Worker Node Provisioning**: Assign newly divided octants to available idle or scale-out simulation nodes.
-3. **Continuous Boundary Smoothing**: Dynamically adjust partition boundary planes using an elastic centroid-repulsion algorithm to balance computational load while minimizing boundary-crossing rate.
-4. **Zero-Disconnect Batch Handover**: Extend Two-Phase Migration to support concurrent batch handovers of up to 500 entities across partition splits.
-
----
-
-### Milestone: Cross-Node Distributed Economy, Transactional Vaults & Auction House
-
-**Problem**: Modern MMO economies require cross-node marketplace order matching, player-to-player escrow trades, and shared guild vaults without race conditions, currency duplication, or inventory loss during node failure.
-
-**Technical Scope**:
-1. **Distributed Two-Phase Commit (2PC) Coordinator**: Coordinate multi-entity, multi-node item and currency transfers with pre-commit reservation locks and automatic abort rollbacks.
-2. **Asynchronous Auction House Engine**: Cluster-wide order book service (`AuctionService`) managing listings, bids, buyouts, and expiration timers.
-3. **Escrow State Machine**: Immutable item and currency escrow states in PostgreSQL with strict lease timeouts.
-4. **Real-Time Market Notifications**: Publish auction outbid, sold, and delivery events across `SocialBus` to notify players regardless of connected partition node.
 
 ---
 

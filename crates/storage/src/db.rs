@@ -41,6 +41,36 @@ pub enum StorageError {
 
     #[error("Trade failed: {0}")]
     TradeError(String),
+
+    #[error("Container {0} not found")]
+    ContainerNotFound(u64),
+
+    #[error("Container {0} is full (capacity {1})")]
+    ContainerFull(u64, u32),
+
+    #[error("Slot {0} in container {1} is already occupied")]
+    SlotOccupied(u32, u64),
+
+    #[error("Slot {0} in container {1} is currently reserved")]
+    SlotReserved(u32, u64),
+
+    #[error("Transaction {0} expired or was aborted")]
+    ReservationExpiredOrAborted(String),
+
+    #[error("Escrow {0} not found")]
+    EscrowNotFound(String),
+
+    #[error("Escrow {0} secret mismatch")]
+    EscrowSecretMismatch(String),
+
+    #[error("Escrow {0} has expired")]
+    EscrowExpired(String),
+
+    #[error("Escrow {0} is already settled or refunded")]
+    EscrowAlreadySettled(String),
+
+    #[error("Unauthorized access to container {0}")]
+    UnauthorizedContainerAccess(u64),
 }
 
 /// Database backend variant.
@@ -239,7 +269,8 @@ impl Database {
             r#"
             CREATE TABLE IF NOT EXISTS items (
                 item_instance_id TEXT PRIMARY KEY,
-                character_guid BIGINT NOT NULL,
+                character_guid BIGINT NOT NULL DEFAULT 0,
+                container_id BIGINT NOT NULL DEFAULT 0,
                 item_def_id INTEGER NOT NULL,
                 slot INTEGER NOT NULL,
                 quantity INTEGER NOT NULL DEFAULT 1,
@@ -247,12 +278,14 @@ impl Database {
                 attributes_json TEXT NOT NULL DEFAULT '{}',
                 created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL,
-                FOREIGN KEY (character_guid) REFERENCES characters(guid) ON DELETE CASCADE,
-                CONSTRAINT uq_character_slot UNIQUE(character_guid, slot)
+                CONSTRAINT uq_container_slot UNIQUE(container_id, slot)
             );
             "#,
             r#"
-            CREATE INDEX IF NOT EXISTS idx_items_character_slot ON items(character_guid, slot);
+            CREATE INDEX IF NOT EXISTS idx_items_character_guid ON items(character_guid);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_items_container_slot ON items(container_id, slot);
             "#,
             r#"
             CREATE TABLE IF NOT EXISTS trades (
@@ -270,6 +303,74 @@ impl Database {
             r#"
             CREATE INDEX IF NOT EXISTS idx_trades_recipient ON trades(recipient_guid);
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS containers (
+                container_id BIGINT PRIMARY KEY,
+                owner_type TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                capacity INTEGER NOT NULL,
+                access_policy TEXT NOT NULL,
+                version BIGINT NOT NULL DEFAULT 1,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_containers_owner ON containers (owner_type, owner_id);
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS container_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                tx_id TEXT NOT NULL,
+                container_id BIGINT NOT NULL,
+                slot INTEGER NOT NULL,
+                item_instance_id TEXT,
+                reservation_type TEXT NOT NULL,
+                expires_at_epoch_ms BIGINT NOT NULL,
+                created_at_epoch_ms BIGINT NOT NULL,
+                FOREIGN KEY (container_id) REFERENCES containers(container_id) ON DELETE CASCADE,
+                CONSTRAINT uq_container_slot_res UNIQUE(container_id, slot)
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_reservations_tx ON container_reservations(tx_id);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON container_reservations(expires_at_epoch_ms);
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS escrows (
+                escrow_id TEXT PRIMARY KEY,
+                depositor_container_id BIGINT NOT NULL,
+                beneficiary_container_id BIGINT NOT NULL,
+                escrow_container_id BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                expires_at_epoch_ms BIGINT NOT NULL,
+                created_at_epoch_ms BIGINT NOT NULL,
+                updated_at_epoch_ms BIGINT NOT NULL,
+                FOREIGN KEY (depositor_container_id) REFERENCES containers(container_id) ON DELETE CASCADE,
+                FOREIGN KEY (beneficiary_container_id) REFERENCES containers(container_id) ON DELETE CASCADE,
+                FOREIGN KEY (escrow_container_id) REFERENCES containers(container_id) ON DELETE CASCADE
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_escrows_status_expiry ON escrows(status, expires_at_epoch_ms);
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS container_transactions (
+                tx_id TEXT PRIMARY KEY,
+                src_container_id BIGINT NOT NULL,
+                dst_container_id BIGINT NOT NULL,
+                item_instance_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                timestamp_epoch_ms BIGINT NOT NULL
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_container_tx_time ON container_transactions(timestamp_epoch_ms);
+            "#,
         ];
 
         match &self.backend {
@@ -285,6 +386,48 @@ impl Database {
             }
         }
 
+        self.ensure_items_container_column().await?;
+
+        Ok(())
+    }
+
+    /// Idempotently verifies and backfills `container_id` on the `items` table.
+    async fn ensure_items_container_column(&self) -> Result<(), StorageError> {
+        use sqlx::Row;
+        match &self.backend {
+            DbBackend::Postgres(pool) => {
+                sqlx::query(
+                    "ALTER TABLE items ADD COLUMN IF NOT EXISTS container_id BIGINT DEFAULT 0",
+                )
+                .execute(pool)
+                .await?;
+                sqlx::query(
+                    "UPDATE items SET container_id = character_guid WHERE container_id = 0",
+                )
+                .execute(pool)
+                .await?;
+            }
+            DbBackend::Sqlite(pool) => {
+                let cols = sqlx::query("PRAGMA table_info(items)")
+                    .fetch_all(pool)
+                    .await?;
+                let has_col = cols.iter().any(|r| {
+                    r.try_get::<String, _>("name")
+                        .map(|n| n == "container_id")
+                        .unwrap_or(false)
+                });
+                if !has_col {
+                    sqlx::query("ALTER TABLE items ADD COLUMN container_id BIGINT DEFAULT 0")
+                        .execute(pool)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE items SET container_id = character_guid WHERE container_id = 0",
+                    )
+                    .execute(pool)
+                    .await?;
+                }
+            }
+        }
         Ok(())
     }
 }

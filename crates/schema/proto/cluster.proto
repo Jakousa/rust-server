@@ -220,6 +220,44 @@ message BatchRemoteAbilityResponse {
   uint64 cast_id = 3;
 }
 
+// Container Transaction Messages
+message ReserveContainerSlotRequest {
+  string tx_id = 1;
+  uint64 container_id = 2;
+  int32 slot = 3;
+  string item_instance_id = 4;
+  string reservation_type = 5; // "transfer_out" or "transfer_in"
+  uint64 lease_duration_ms = 6;
+}
+
+message ReserveContainerSlotResponse {
+  bool success = 1;
+  string error_message = 2;
+  string reservation_id = 3;
+  uint64 expires_at_epoch_ms = 4;
+}
+
+message CommitContainerTransferRequest {
+  string tx_id = 1;
+}
+
+message CommitContainerTransferResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 src_container_id = 3;
+  uint64 dst_container_id = 4;
+  string item_instance_id = 5;
+}
+
+message AbortContainerTransferRequest {
+  string tx_id = 1;
+}
+
+message AbortContainerTransferResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -234,6 +272,9 @@ service NodeService {
   rpc MigrateBatchEntities (BatchMigrateEntityRequest) returns (BatchMigrateEntityResponse);
   rpc DispatchAbility (RemoteAbilityRequest) returns (RemoteAbilityResponse);
   rpc DispatchBatchAbility (BatchRemoteAbilityRequest) returns (BatchRemoteAbilityResponse);
+  rpc ReserveContainerSlot (ReserveContainerSlotRequest) returns (ReserveContainerSlotResponse);
+  rpc CommitContainerTransfer (CommitContainerTransferRequest) returns (CommitContainerTransferResponse);
+  rpc AbortContainerTransfer (AbortContainerTransferRequest) returns (AbortContainerTransferResponse);
 }
 
 service GatewayService {

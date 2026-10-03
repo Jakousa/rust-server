@@ -1,5 +1,6 @@
 pub mod action;
 pub mod attribute;
+pub mod container;
 pub mod entity;
 pub mod guid;
 pub mod hook;
@@ -15,6 +16,9 @@ pub use action::{
 pub use attribute::{
     AttributeSet, AttributeTickSystem, AttributeValue, AuraExpiredEvent, ModifierType,
     TimedModifier,
+};
+pub use container::{
+    ContainerAccessPolicy, ContainerError, ContainerId, ContainerOwner, ContainerSlot,
 };
 pub use entity::{ComponentStore, Entity, EntityKey, EntityStore};
 pub use guid::{EntityType, Guid};

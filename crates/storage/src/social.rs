@@ -73,12 +73,28 @@ pub enum GuildSyncAction {
     },
 }
 
+/// Container and escrow synchronization action across simulation nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerSyncAction {
+    Transferred {
+        tx_id: String,
+        src_container_id: u64,
+        dst_container_id: u64,
+        item_instance_id: String,
+    },
+    EscrowUpdated {
+        escrow_id: String,
+        status: String,
+    },
+}
+
 /// Universal wrapper envelope dispatched across social bus channels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SocialEnvelope {
     Chat(ChatMessage),
     Party(PartyAction),
     Guild(GuildSyncAction),
+    Container(ContainerSyncAction),
 }
 
 /// Errors occurring during social bus operations.

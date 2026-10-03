@@ -44,6 +44,10 @@ pub struct TickSimulation {
     pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
     pub ability_compensation_sender: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
     pub ability_compensation_receiver: tokio::sync::mpsc::UnboundedReceiver<AbilityCompensation>,
+    pub container_transfer_sender:
+        tokio::sync::mpsc::UnboundedSender<ContainerTransferNotification>,
+    pub container_transfer_receiver:
+        tokio::sync::mpsc::UnboundedReceiver<ContainerTransferNotification>,
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -53,6 +57,17 @@ pub struct AbilityCompensation {
     pub ability_id: u32,
     pub resource_name: Option<String>,
     pub resource_amount: f32,
+}
+
+/// Notification event dispatched when a container transfer is finalized or aborted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerTransferNotification {
+    pub tx_id: String,
+    pub src_container_id: u64,
+    pub dst_container_id: u64,
+    pub item_instance_id: String,
+    pub success: bool,
+    pub error_message: Option<String>,
 }
 
 impl TickSimulation {
@@ -88,6 +103,8 @@ impl TickSimulation {
         let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ability_compensation_sender, ability_compensation_receiver) =
             tokio::sync::mpsc::unbounded_channel();
+        let (container_transfer_sender, container_transfer_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         Self {
             node_id,
@@ -113,6 +130,8 @@ impl TickSimulation {
             ack_receiver,
             ability_compensation_sender,
             ability_compensation_receiver,
+            container_transfer_sender,
+            container_transfer_receiver,
         }
     }
 
@@ -121,6 +140,18 @@ impl TickSimulation {
         &self,
     ) -> tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket> {
         self.ack_sender.clone()
+    }
+
+    /// Returns a cloned sender for container transfer notifications.
+    pub fn container_transfer_sender(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<ContainerTransferNotification> {
+        self.container_transfer_sender.clone()
+    }
+
+    /// Enqueues a container transfer notification into the simulation node's non-blocking channel.
+    pub fn queue_container_transfer(&self, notif: ContainerTransferNotification) {
+        let _ = self.container_transfer_sender.send(notif);
     }
 
     /// Queues a client ACK into the simulation's non-blocking channel.
@@ -327,6 +358,9 @@ impl TickSimulation {
                 }
             }
         }
+
+        // 0.2 Drain pending container transfer notifications
+        while let Ok(_notif) = self.container_transfer_receiver.try_recv() {}
 
         // 1. Run batch tick systems registered by plugins
         let mut tick_ctx = TickContext {

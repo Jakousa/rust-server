@@ -24,5 +24,5 @@ pub use network::{
     GhostBroadcaster, GhostRecord, GhostStore, MigrationError, NetworkError, NodeServiceImpl,
     RemoteCommandErrorCode,
 };
-pub use sim::{AbilityCompensation, TickSimulation};
+pub use sim::{AbilityCompensation, ContainerTransferNotification, TickSimulation};
 pub use snapshotter::WriteBehindSnapshotter;
