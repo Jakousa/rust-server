@@ -1,0 +1,22 @@
+<<<<<<< SEARCH
+pub struct Slice {
+=======
+#[derive(Debug)]
+pub struct Slice {
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    pub fn get_entities(&self) -> &Vec<Entity> {
+        &self.entities
+    }
+=======
+    pub fn get_entities(&self) -> &[Entity] {
+        &self.entities
+    }
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        return (x && y) || (x && z) || (y && z);
+    }
+=======
+        (x && y) || (x && z) || (y && z)
+    }
+>>>>>>> REPLACE
