@@ -3,9 +3,6 @@ use tonic::transport::Server;
 use proto::player_server::PlayerServer;
 
 mod player;
-mod world;
-mod entity;
-mod slice;
 
 mod proto {
     tonic::include_proto!("game");
@@ -18,10 +15,9 @@ mod proto {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
-        .build_v1alpha()
-        .unwrap();
+        .build_v1alpha()?;
 
-    let addr = "[::1]:50051".parse().unwrap();
+    let addr = "[::1]:50051".parse()?;
 
     println!("GameServer listening on {}", addr);
 
