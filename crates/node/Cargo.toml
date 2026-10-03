@@ -12,6 +12,7 @@ mmo-storage = { path = "../storage" }
 mmo-gameplay = { path = "../gameplay" }
 serde_json = "1.0"
 metrics = "0.24"
+thiserror = "2.0"
 
 
 [dev-dependencies]

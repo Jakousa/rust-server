@@ -55,6 +55,28 @@ impl std::fmt::Display for NetworkError {
 
 impl std::error::Error for NetworkError {}
 
+/// Strongly typed errors that can occur during single-entity or batch migration.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum MigrationError {
+    #[error("Failed to acquire migration lease for GUID {0} (already migrating or not found)")]
+    LeaseConflict(Guid),
+
+    #[error("Entity {0} not found in entity store")]
+    EntityNotFound(Guid),
+
+    #[error("Connection to recipient node failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("Migration RPC failed: {0}")]
+    RpcFailed(String),
+
+    #[error("Recipient rejected migration: {0}")]
+    RecipientRejected(String),
+
+    #[error("Missing required 3D position vector for GUID {0}")]
+    MissingPosition(Guid),
+}
+
 /// Record representing a replicated ghost entity on a boundary node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GhostRecord {
@@ -472,8 +494,19 @@ impl NodeService for NodeServiceImpl {
         let codecs = sim.codecs.clone();
         for entity_req in &req.entities {
             let guid = Guid::from_raw(entity_req.guid);
-            let p = entity_req.position.as_ref().unwrap();
-            let target_pos = (p.x, p.y, p.z);
+            let target_pos = match &entity_req.position {
+                Some(p) => (p.x, p.y, p.z),
+                None => {
+                    return Ok(tonic::Response::new(BatchMigrateEntityResponse {
+                        success: false,
+                        migrated_count,
+                        error_message: format!(
+                            "Entity {} missing 3D position vector in ingestion pass",
+                            entity_req.guid
+                        ),
+                    }));
+                }
+            };
 
             sim.ghost_store.remove(guid);
             sim.entity_store.spawn(guid, target_pos);
@@ -747,19 +780,17 @@ pub async fn execute_entity_migration(
     target_node_id: u32,
     target_node_addr: &str,
     gateway_addr: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<bool, MigrationError> {
     let (req, session_id) = {
         let mut sim_guard = sim.write().await;
         if !sim_guard.acquire_migration_lease(guid) {
-            return Err(
-                "Failed to acquire migration lease (already migrating or not found)".to_string(),
-            );
+            return Err(MigrationError::LeaseConflict(guid));
         }
         let entity = match sim_guard.entity_store.get_by_guid(guid) {
             Some(e) => e,
             None => {
                 sim_guard.release_migration_lease(guid);
-                return Err("Entity not found in store".to_string());
+                return Err(MigrationError::EntityNotFound(guid));
             }
         };
         let pos = entity.position;
@@ -816,7 +847,7 @@ pub async fn execute_entity_migration(
             let mut sim_guard = sim.write().await;
             sim_guard.release_migration_lease(guid);
             metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-            return Err(format!("Connection to recipient node failed: {}", e));
+            return Err(MigrationError::ConnectionFailed(e.to_string()));
         }
     };
 
@@ -826,7 +857,7 @@ pub async fn execute_entity_migration(
             let mut sim_guard = sim.write().await;
             sim_guard.release_migration_lease(guid);
             metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-            return Err(format!("MigrateEntity RPC failed: {}", e));
+            return Err(MigrationError::RpcFailed(e.to_string()));
         }
     };
 
@@ -834,10 +865,7 @@ pub async fn execute_entity_migration(
         let mut sim_guard = sim.write().await;
         sim_guard.release_migration_lease(guid);
         metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-        return Err(format!(
-            "Recipient rejected migration: {}",
-            resp.error_message
-        ));
+        return Err(MigrationError::RecipientRejected(resp.error_message));
     }
 
     // Step 3: Gateway commit
@@ -908,7 +936,7 @@ pub async fn execute_batch_entity_migration(
     target_node_id: u32,
     target_node_addr: &str,
     gateway_addr: Option<&str>,
-) -> Result<BatchMigrationReport, String> {
+) -> Result<BatchMigrationReport, MigrationError> {
     if guids.is_empty() {
         return Ok(BatchMigrationReport {
             success: true,
@@ -929,10 +957,7 @@ pub async fn execute_batch_entity_migration(
                 for &acq in &acquired {
                     sim_guard.release_migration_lease(acq);
                 }
-                return Err(format!(
-                    "Failed to acquire migration lease for GUID {} (conflict)",
-                    guid
-                ));
+                return Err(MigrationError::LeaseConflict(guid));
             }
             acquired.push(guid);
         }
@@ -948,7 +973,7 @@ pub async fn execute_batch_entity_migration(
                     for &acq in &acquired {
                         sim_guard.release_migration_lease(acq);
                     }
-                    return Err(format!("Entity {} not found in store", guid));
+                    return Err(MigrationError::EntityNotFound(guid));
                 }
             };
             let pos = entity.position;
@@ -1016,7 +1041,7 @@ pub async fn execute_batch_entity_migration(
                 sim_guard.release_migration_lease(g);
             }
             metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
-            return Err(format!("Connection to recipient node failed: {}", e));
+            return Err(MigrationError::ConnectionFailed(e.to_string()));
         }
     };
 
@@ -1028,7 +1053,7 @@ pub async fn execute_batch_entity_migration(
                 sim_guard.release_migration_lease(g);
             }
             metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
-            return Err(format!("BatchMigrateEntity RPC failed: {}", e));
+            return Err(MigrationError::RpcFailed(e.to_string()));
         }
     };
 
@@ -1038,10 +1063,7 @@ pub async fn execute_batch_entity_migration(
             sim_guard.release_migration_lease(g);
         }
         metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
-        return Err(format!(
-            "Recipient rejected batch migration: {}",
-            resp.error_message
-        ));
+        return Err(MigrationError::RecipientRejected(resp.error_message));
     }
 
     // POINT OF NO RETURN: Recipient successfully ingested entities.
@@ -2117,8 +2139,7 @@ mod tests {
         )
         .await;
 
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("rejected"));
+        assert!(matches!(res, Err(MigrationError::RecipientRejected(_))));
 
         // Verify donor still owns entities and all leases were released
         {

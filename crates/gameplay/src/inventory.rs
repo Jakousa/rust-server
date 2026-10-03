@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use mmo_core::{
     ComponentStore, EntityStore, Event, EventContext, GameplayPlugin, Guid, HookHandler,
-    ModularPacketHandler, PluginContext,
+    ModularPacketHandler, PacketHandlerError, PluginContext,
 };
 
 /// Represents an item stack with quantity and unit weight.
@@ -134,16 +134,19 @@ impl ModularPacketHandler for InventoryPacketHandler {
         sub_opcode: u16,
         payload: &[u8],
         entities: &mut EntityStore,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, PacketHandlerError> {
         let entity = entities
             .get_mut_by_guid(entity_guid)
-            .ok_or_else(|| format!("Entity {:?} not found", entity_guid))?;
+            .ok_or(PacketHandlerError::EntityNotFound(entity_guid))?;
 
         match sub_opcode {
             // Sub-opcode 1: Equip item from inventory slot into equipment slot
             1 => {
                 if payload.len() < 2 {
-                    return Err("Equip payload must contain slot and equip slot index".into());
+                    return Err(PacketHandlerError::MalformedPayload {
+                        module_id: 0x01,
+                        message: "Equip payload must contain slot and equip slot index".to_string(),
+                    });
                 }
                 let inv_slot = payload[0] as usize;
                 let equip_slot = match payload[1] {
@@ -156,10 +159,12 @@ impl ModularPacketHandler for InventoryPacketHandler {
 
                 let inv = entity
                     .get_component_mut::<InventoryComponent>()
-                    .ok_or("No InventoryComponent on entity")?;
-                let item = inv
-                    .remove_item(inv_slot)
-                    .ok_or("No item in specified inventory slot")?;
+                    .ok_or_else(|| {
+                        PacketHandlerError::Custom("No InventoryComponent on entity".to_string())
+                    })?;
+                let item = inv.remove_item(inv_slot).ok_or_else(|| {
+                    PacketHandlerError::Custom("No item in specified inventory slot".to_string())
+                })?;
 
                 let equip = match entity.get_component_mut::<EquipmentComponent>() {
                     Some(eq) => eq,
@@ -172,13 +177,17 @@ impl ModularPacketHandler for InventoryPacketHandler {
                 let old_item = equip.equip(equip_slot, item);
                 if let Some(old) = old_item {
                     // Put previous equipped item back into inventory if possible
-                    let inv = entity.get_component_mut::<InventoryComponent>().unwrap();
-                    let _ = inv.add_item(old);
+                    if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
+                        let _ = inv.add_item(old);
+                    }
                 }
 
                 Ok(Some(vec![1])) // Success response
             }
-            _ => Err(format!("Unknown inventory sub_opcode {}", sub_opcode)),
+            _ => Err(PacketHandlerError::MalformedPayload {
+                module_id: 0x01,
+                message: format!("Unknown inventory sub_opcode {}", sub_opcode),
+            }),
         }
     }
 }

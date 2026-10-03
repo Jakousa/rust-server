@@ -364,6 +364,24 @@ pub struct PartitionRecoveryEvent {
     pub epoch: u64,
 }
 
+/// Context for an adjacent node participating in spatial boundary smoothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeSmoothingContext {
+    pub node_id: u32,
+    pub centroid: (f32, f32, f32),
+    pub entity_count: u32,
+}
+
+impl NodeSmoothingContext {
+    pub fn new(node_id: u32, centroid: (f32, f32, f32), entity_count: u32) -> Self {
+        Self {
+            node_id,
+            centroid,
+            entity_count,
+        }
+    }
+}
+
 /// Global coordinator tracking cluster octree spatial partitioning and dynamic subdivision.
 #[derive(Debug)]
 pub struct GlobalOctreeCoordinator {
@@ -625,19 +643,14 @@ impl GlobalOctreeCoordinator {
     /// delta = min(25.0, 0.1 * ((count_a - count_b)/(count_a + count_b)) * distance)
     /// Damped by hysteresis (at least 1.0m shift required).
     /// Returns the adjusted bounding boxes if shifted.
-    #[allow(clippy::too_many_arguments)]
     pub fn smooth_adjacent_boundaries(
         &mut self,
-        node_a: u32,
-        centroid_a: (f32, f32, f32),
-        count_a: u32,
-        node_b: u32,
-        centroid_b: (f32, f32, f32),
-        count_b: u32,
+        primary: NodeSmoothingContext,
+        neighbor: NodeSmoothingContext,
         registry: &mut NodeRegistry,
     ) -> Option<(BoundingBox3D, BoundingBox3D)> {
-        let bounds_a_list = self.get_assigned_bounds_for_node(node_a);
-        let bounds_b_list = self.get_assigned_bounds_for_node(node_b);
+        let bounds_a_list = self.get_assigned_bounds_for_node(primary.node_id);
+        let bounds_b_list = self.get_assigned_bounds_for_node(neighbor.node_id);
 
         for ba in &bounds_a_list {
             for bb in &bounds_b_list {
@@ -649,11 +662,11 @@ impl GlobalOctreeCoordinator {
                     && (ba.max.2 - bb.max.2).abs() < 0.001
                 {
                     // Strict anti-cheat coordinate clamping to assigned bounds
-                    let ca_x = centroid_a.0.clamp(ba.min.0, ba.max.0);
-                    let cb_x = centroid_b.0.clamp(bb.min.0, bb.max.0);
+                    let ca_x = primary.centroid.0.clamp(ba.min.0, ba.max.0);
+                    let cb_x = neighbor.centroid.0.clamp(bb.min.0, bb.max.0);
 
-                    let na = count_a as f32;
-                    let nb = count_b as f32;
+                    let na = primary.entity_count as f32;
+                    let nb = neighbor.entity_count as f32;
                     if na + nb == 0.0 {
                         continue;
                     }
@@ -676,10 +689,10 @@ impl GlobalOctreeCoordinator {
                                 self.root.update_leaf_bounds(ba, new_ba);
                                 self.root.update_leaf_bounds(bb, new_bb);
 
-                                registry.remove_assigned_bounds(node_a, ba);
-                                registry.add_assigned_bounds(node_a, new_ba);
-                                registry.remove_assigned_bounds(node_b, bb);
-                                registry.add_assigned_bounds(node_b, new_bb);
+                                registry.remove_assigned_bounds(primary.node_id, ba);
+                                registry.add_assigned_bounds(primary.node_id, new_ba);
+                                registry.remove_assigned_bounds(neighbor.node_id, bb);
+                                registry.add_assigned_bounds(neighbor.node_id, new_bb);
 
                                 self.topology_epoch += 1;
                                 metrics::counter!("mmo_boundary_adjustments_total").increment(1);
@@ -1116,12 +1129,8 @@ mod tests {
         // Node A has 300 entities (hotspot), Node B has 50 entities (ratio 6:1 > 2.0x)
         // With extreme spoofed coordinate (99999.0), it should be clamped inside bound_a
         let smoothed = coord.smooth_adjacent_boundaries(
-            node_a,
-            (99999.0, 50.0, 50.0), // spoofed coordinate clamped to 100.0
-            300,
-            node_b,
-            (150.0, 50.0, 50.0),
-            50,
+            NodeSmoothingContext::new(node_a, (99999.0, 50.0, 50.0), 300),
+            NodeSmoothingContext::new(node_b, (150.0, 50.0, 50.0), 50),
             &mut registry,
         );
 

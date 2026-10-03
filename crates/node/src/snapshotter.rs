@@ -161,8 +161,8 @@ impl WriteBehindSnapshotter {
         let attributes = codecs.serialize_all(&entity.components);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         EntitySnapshot {
             guid: entity.guid.0,
@@ -190,7 +190,7 @@ impl WriteBehindSnapshotter {
         entity: &mut mmo_core::Entity,
         snapshot: &EntitySnapshot,
         codecs: &mmo_core::ComponentCodecRegistry,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, mmo_core::CodecError> {
         codecs.deserialize_into(&snapshot.attributes, &mut entity.components)
     }
 }

@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve(listen_addr)
             .await
         {
-            eprintln!("[Node {}] gRPC Server failed: {}", node_id, e);
+            eprintln!("[Node {node_id}] gRPC Server failed: {e}");
         }
     });
 
@@ -90,14 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sim_clone = Arc::clone(&sim);
     let telemetry_clone = telemetry.clone();
     tokio::spawn(async move {
-        println!(
-            "[Node {}] Attempting connection to Director at {}...",
-            node_id, director_endpoint
-        );
+        println!("[Node {node_id}] Attempting connection to Director at {director_endpoint}...");
         let mut client = loop {
             match DirectorServiceClient::connect(director_endpoint.clone()).await {
                 Ok(c) => {
-                    println!("[Node {}] Connected to Director.", node_id);
+                    println!("[Node {node_id}] Connected to Director.");
                     break c;
                 }
                 Err(_) => {
@@ -121,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         let reg_req = RegisterNodeRequest {
-            node_id: node_id as u32,
+            node_id: u32::from(node_id),
             listen_addr: listen_addr.to_string(),
             bounds: proto_bounds,
         };
@@ -129,16 +126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match client.register_node(reg_req).await {
             Ok(resp) => {
                 let success = resp.into_inner().success;
-                println!(
-                    "[Node {}] Registered with Director: success={}",
-                    node_id, success
-                );
+                println!("[Node {node_id}] Registered with Director: success={success}");
                 if success {
                     telemetry_clone.mark_ready();
                 }
             }
             Err(e) => {
-                eprintln!("[Node {}] Failed to register with Director: {}", node_id, e);
+                eprintln!("[Node {node_id}] Failed to register with Director: {e}");
             }
         }
 
@@ -165,11 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
 
             let hb = HeartbeatRequest {
-                node_id: node_id as u32,
+                node_id: u32::from(node_id),
                 tick_rate: 20.0,
                 entity_count,
                 cpu_percent: 5.0,
@@ -184,14 +178,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let inner = resp.into_inner();
                     if !inner.acknowledged {
                         let reg_req = RegisterNodeRequest {
-                            node_id: node_id as u32,
+                            node_id: u32::from(node_id),
                             listen_addr: listen_addr.to_string(),
                             bounds: proto_bounds,
                         };
                         if let Ok(reg_resp) = client.register_node(reg_req).await {
                             println!(
-                                "[Node {}] Re-registered with Director after unacknowledged heartbeat: success={}",
-                                node_id,
+                                "[Node {node_id}] Re-registered with Director after unacknowledged heartbeat: success={}",
                                 reg_resp.into_inner().success
                             );
                         }
@@ -209,29 +202,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }),
                         });
                         let split_req = mmo_schema::cluster::SplitReportRequest {
-                            node_id: node_id as u32,
+                            node_id: u32::from(node_id),
                             original_bounds: proto_bounds,
                             child_bounds: vec![],
                             total_entities: entity_count,
                         };
                         if let Ok(split_resp) = client.report_split(split_req).await {
                             println!(
-                                "[Node {}] Split reported, assigned nodes: {:?}",
-                                node_id,
+                                "[Node {node_id}] Split reported, assigned nodes: {:?}",
                                 split_resp.into_inner().assigned_node_ids
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Node {}] Heartbeat send failed: {}", node_id, e);
+                    eprintln!("[Node {node_id}] Heartbeat send failed: {e}");
                 }
             }
         }
     });
 
     // 3. Fixed 20 Hz (50ms) simulation game loop with clamped tick accumulator
-    println!("[Node {}] Starting 20 Hz simulation tick loop...", node_id);
+    println!("[Node {node_id}] Starting 20 Hz simulation tick loop...");
     let tick_duration = Duration::from_millis(50);
     const MAX_CATCHUP_TICKS: usize = 3;
     let mut next_tick = tokio::time::Instant::now() + tick_duration;

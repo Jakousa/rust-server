@@ -27,10 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .unwrap_or(5000);
         let dead_timeout = Duration::from_millis(dead_timeout_ms);
-        eprintln!(
-            "[Director] Starting dead node detector loop (timeout={}ms)",
-            dead_timeout_ms
-        );
+        eprintln!("[Director] Starting dead node detector loop (timeout={dead_timeout_ms}ms)");
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut tick_count = 0u64;
         loop {
@@ -39,8 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if tick_count.is_multiple_of(10) {
                 let reg_len = svc_clone.registry.read().await.len();
                 eprintln!(
-                    "[Director] Dead node check tick #{}, registered nodes: {}",
-                    tick_count, reg_len
+                    "[Director] Dead node check tick #{tick_count}, registered nodes: {reg_len}"
                 );
             }
             let recovery_events = svc_clone.check_and_recover_dead_nodes(dead_timeout).await;
@@ -73,9 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         if let Ok(resp) = client.reassign_node_routes(req).await {
                             eprintln!(
-                                "[Director] Propagated route reassignment: {} -> {} ({} routes updated)",
-                                dead_addr,
-                                new_addr,
+                                "[Director] Propagated route reassignment: {dead_addr} -> {new_addr} ({} routes updated)",
                                 resp.into_inner().reassigned_count
                             );
                         }
@@ -97,8 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.spawn(admin_addr);
     telemetry.mark_ready();
 
-    println!("Director gRPC service listening on {}", addr);
-    println!("Director Admin service listening on {}", admin_addr);
+    println!("Director gRPC service listening on {addr}");
+    println!("Director Admin service listening on {admin_addr}");
     Server::builder()
         .add_service(DirectorServiceServer::new(service))
         .serve(addr)
