@@ -22,13 +22,21 @@ impl Player for MyPlayer {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateReply>, Status> {
         let name = request.into_inner().name;
+
+        if name.is_empty() {
+            return Err(Status::invalid_argument("Player name is empty"));
+        }
+        if name.len() > 32 {
+            return Err(Status::invalid_argument("Player name is too long"));
+        }
+
         println!(
             "Got a request to create player {:?}",
             name
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if players.iter().any(|x| x.name == name) {
                 return Err(Status::already_exists("Player already exists!"));
@@ -51,6 +59,14 @@ impl Player for MyPlayer {
     ) -> Result<Response<UpdateReply>, Status> {
         let req = request.into_inner();
         let name = req.name;
+
+        if name.is_empty() {
+            return Err(Status::invalid_argument("Player name is empty"));
+        }
+        if name.len() > 32 {
+            return Err(Status::invalid_argument("Player name is too long"));
+        }
+
         let x = req.x;
         let y = req.y;
         let z = req.z;
@@ -60,11 +76,11 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             let player = players.iter_mut().find(|x| x.name == name);
 
-            if player == None {
+            if player.is_none() {
                 return Err(Status::not_found("Player not found!"));
             }
 
