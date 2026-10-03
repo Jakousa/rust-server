@@ -28,14 +28,14 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut players = self.players.lock().map_err(|_| Status::internal("Internal error: player lock poisoned"))?;
 
             if players.iter().any(|x| x.name == name) {
                 return Err(Status::already_exists("Player already exists!"));
             }
 
             players.push(PlayerEntity {
-                name: name.clone(),
+                name,
                 position: (0, 0, 0),
             });
         }
@@ -60,7 +60,7 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut players = self.players.lock().map_err(|_| Status::internal("Internal error: player lock poisoned"))?;
 
             let player = players.iter_mut().find(|x| x.name == name)
                 .ok_or_else(|| Status::not_found("Player not found!"))?;
@@ -69,8 +69,96 @@ impl Player for MyPlayer {
         }
 
         let reply = UpdateReply {
-            message: format!("Player updated successfully!, x: {}, y: {}, z: {}", x, y, z),
+            message: format!("Player updated successfully: x: {x}, y: {y}, z: {z}"),
         };
         Ok(Response::new(reply))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_player_success() {
+        let player_service = MyPlayer::default();
+        let request = Request::new(CreateRequest {
+            name: "test_player".to_string(),
+        });
+
+        let response = player_service.create(request).await;
+        assert!(response.is_ok());
+        let response_inner = response.unwrap().into_inner();
+        assert_eq!(response_inner.message, "Player created successfully!");
+
+        // Verify state
+        let players = player_service.players.lock().unwrap();
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].name, "test_player");
+    }
+
+    #[tokio::test]
+    async fn test_create_player_duplicate() {
+        let player_service = MyPlayer::default();
+
+        // Add initial player
+        let request1 = Request::new(CreateRequest {
+            name: "test_player".to_string(),
+        });
+        let _ = player_service.create(request1).await;
+
+        // Try adding duplicate
+        let request2 = Request::new(CreateRequest {
+            name: "test_player".to_string(),
+        });
+
+        let response = player_service.create(request2).await;
+        assert!(response.is_err());
+        let status = response.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn test_update_player_success() {
+        let player_service = MyPlayer::default();
+
+        // Setup initial player
+        let request_create = Request::new(CreateRequest {
+            name: "test_player".to_string(),
+        });
+        let _ = player_service.create(request_create).await;
+
+        let request_update = Request::new(UpdateRequest {
+            name: "test_player".to_string(),
+            x: 10,
+            y: 20,
+            z: 30,
+        });
+
+        let response = player_service.update(request_update).await;
+        assert!(response.is_ok());
+        let response_inner = response.unwrap().into_inner();
+        assert_eq!(response_inner.message, "Player updated successfully: x: 10, y: 20, z: 30");
+
+        // Verify updated state
+        let players = player_service.players.lock().unwrap();
+        assert_eq!(players[0].position, (10, 20, 30));
+    }
+
+    #[tokio::test]
+    async fn test_update_player_not_found() {
+        let player_service = MyPlayer::default();
+
+        let request = Request::new(UpdateRequest {
+            name: "unknown_player".to_string(),
+            x: 1,
+            y: 2,
+            z: 3,
+        });
+
+        let response = player_service.update(request).await;
+        assert!(response.is_err());
+        let status = response.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }
