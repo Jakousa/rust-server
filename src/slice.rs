@@ -48,3 +48,37 @@ impl Slice {
         return (x && y) || (x && z) || (y && z);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_existing_entity() {
+        let mut slice = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let entity_id = Uuid::new_v4();
+        let entity = Entity::new(Some(entity_id), (1, 1, 1));
+
+        slice.add_entity(entity);
+        assert_eq!(slice.get_entities().len(), 1);
+
+        slice.remove_entity(entity_id);
+        assert_eq!(slice.get_entities().len(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_entity() {
+        let mut slice = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let entity_id = Uuid::new_v4();
+        let entity = Entity::new(Some(entity_id), (1, 1, 1));
+
+        slice.add_entity(entity);
+        assert_eq!(slice.get_entities().len(), 1);
+
+        let nonexistent_id = Uuid::new_v4();
+        slice.remove_entity(nonexistent_id);
+
+        assert_eq!(slice.get_entities().len(), 1);
+        assert_eq!(slice.get_entities()[0].id, entity_id);
+    }
+}
