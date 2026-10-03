@@ -1,5 +1,5 @@
-use tonic::{Request, Response, Status};
 use std::sync::{Arc, Mutex};
+use tonic::{Request, Response, Status};
 
 use crate::proto::player_server::Player;
 use crate::proto::{CreateReply, CreateRequest, UpdateReply, UpdateRequest};
@@ -22,10 +22,7 @@ impl Player for MyPlayer {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateReply>, Status> {
         let name = request.into_inner().name;
-        println!(
-            "Got a request to create player {:?}",
-            name
-        );
+        println!("Got a request to create player {:?}", name);
 
         {
             let mut players = self.players.lock().unwrap();
@@ -41,7 +38,7 @@ impl Player for MyPlayer {
         }
 
         let reply = CreateReply {
-            message: format!("Player created successfully!"),
+            message: "Player created successfully!".to_string(),
         };
         Ok(Response::new(reply))
     }
@@ -54,17 +51,14 @@ impl Player for MyPlayer {
         let x = req.x;
         let y = req.y;
         let z = req.z;
-        println!(
-            "Got a request to update player {:?}",
-            name
-        );
+        println!("Got a request to update player {:?}", name);
 
         {
             let mut players = self.players.lock().unwrap();
 
             let player = players.iter_mut().find(|x| x.name == name);
 
-            if player == None {
+            if player.is_none() {
                 return Err(Status::not_found("Player not found!"));
             }
 

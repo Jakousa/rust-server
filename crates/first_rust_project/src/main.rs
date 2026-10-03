@@ -1,12 +1,13 @@
+#![allow(dead_code)]
 use tonic::transport::Server;
 
 use proto::player_server::PlayerServer;
 use world::World;
 
-mod player;
-mod world;
 mod entity;
+mod player;
 mod slice;
+mod world;
 
 mod proto {
     tonic::include_proto!("game");
@@ -32,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         slice::Slice::new(None, (10, 10, 10), (0, 10, 0)),
         slice::Slice::new(None, (10, 10, 10), (10, 10, 0)),
     ];
-    let world = World::new(slices);
+    let _world = World::new(slices);
 
     Server::builder()
         .add_service(reflection_service)

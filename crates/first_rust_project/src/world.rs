@@ -24,8 +24,8 @@ impl World {
         }
 
         World {
-            slices: slices,
-            slice_neighbours: slice_neighbours,
+            slices,
+            slice_neighbours,
         }
     }
 
