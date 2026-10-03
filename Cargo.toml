@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    ".",
     "crates/core",
     "crates/schema",
     "crates/director",
@@ -11,3 +12,19 @@ members = [
     "crates/client-wasm",
 ]
 resolver = "2"
+
+[package]
+name = "first_rust_project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uuid = { version = "1.11.0", features = ["v4"] }
+tonic = "0.12.3"
+prost = "0.13"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
+tonic-reflection = "0.12.3"
+mmo-schema = { path = "crates/schema" }
+
+[build-dependencies]
+tonic-build = "0.12.3"

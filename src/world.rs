@@ -52,3 +52,57 @@ impl World {
         Some(entities)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_world_new_empty() {
+        let world = World::new(vec![]);
+        assert_eq!(world.slices.len(), 0);
+        assert_eq!(world.slice_neighbours.len(), 0);
+    }
+
+    #[test]
+    fn test_world_new_single_slice() {
+        let slice = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let slice_id = slice.get_id();
+        let world = World::new(vec![slice]);
+        assert_eq!(world.slices.len(), 1);
+        assert_eq!(world.slice_neighbours.len(), 1);
+        assert_eq!(world.slice_neighbours.get(&slice_id).unwrap().len(), 1);
+        assert_eq!(world.slice_neighbours.get(&slice_id).unwrap()[0], slice_id);
+    }
+
+    #[test]
+    fn test_world_new_multiple_slices() {
+        let slice1 = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let slice2 = Slice::new(None, (10, 10, 10), (10, 0, 0)); // Neighbour to slice1
+        let slice3 = Slice::new(None, (10, 10, 10), (100, 100, 100)); // Far away
+
+        let id1 = slice1.get_id();
+        let id2 = slice2.get_id();
+        let id3 = slice3.get_id();
+
+        let world = World::new(vec![slice1, slice2, slice3]);
+
+        assert_eq!(world.slices.len(), 3);
+        assert_eq!(world.slice_neighbours.len(), 3);
+
+        let neighbours1 = world.slice_neighbours.get(&id1).unwrap();
+        assert_eq!(neighbours1.len(), 2);
+        assert!(neighbours1.contains(&id1));
+        assert!(neighbours1.contains(&id2));
+
+        let neighbours2 = world.slice_neighbours.get(&id2).unwrap();
+        assert_eq!(neighbours2.len(), 2);
+        assert!(neighbours2.contains(&id2));
+        assert!(neighbours2.contains(&id1));
+
+        let neighbours3 = world.slice_neighbours.get(&id3).unwrap();
+        assert_eq!(neighbours3.len(), 1);
+        assert!(neighbours3.contains(&id3));
+    }
+}
