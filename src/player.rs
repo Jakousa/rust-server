@@ -41,7 +41,7 @@ impl Player for MyPlayer {
         }
 
         let reply = CreateReply {
-            message: format!("Player created successfully!"),
+            message: "Player created successfully!".to_string(),
         };
         Ok(Response::new(reply))
     }
