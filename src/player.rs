@@ -28,7 +28,7 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if players.iter().any(|x| x.name == name) {
                 return Err(Status::already_exists("Player already exists!"));
@@ -41,7 +41,7 @@ impl Player for MyPlayer {
         }
 
         let reply = CreateReply {
-            message: format!("Player created successfully!"),
+            message: "Player created successfully!".to_string(),
         };
         Ok(Response::new(reply))
     }
@@ -60,15 +60,11 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            let player = players.iter_mut().find(|x| x.name == name);
+            let player = players.iter_mut().find(|x| x.name == name)
+                .ok_or_else(|| Status::not_found("Player not found!"))?;
 
-            if player == None {
-                return Err(Status::not_found("Player not found!"));
-            }
-
-            let player = player.unwrap();
             player.position = (x, y, z);
         }
 
