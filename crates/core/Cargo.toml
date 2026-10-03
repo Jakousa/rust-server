@@ -1,7 +1,10 @@
 [package]
+
 name = "mmo-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 slotmap = "1.0"
@@ -19,3 +22,6 @@ tower = { version = "0.5", features = ["util"] }
 
 
 
+
+[lints]
+workspace = true
