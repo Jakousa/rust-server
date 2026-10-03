@@ -45,6 +45,6 @@ impl Slice {
         let y = y1 == y2 || y2 == y1 + s1y || y1 == y2 + s2y;
         let z = z1 == z2 || z2 == z1 + s1z || z1 == z2 + s2z;
 
-        return (x && y) || (x && z) || (y && z);
+        (x && y) || (x && z) || (y && z)
     }
 }
