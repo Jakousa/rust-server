@@ -35,10 +35,12 @@ macro_rules! parse_character_record {
     }};
 }
 
+#[macro_export]
 macro_rules! parse_item_record {
     ($r:expr) => {{
         let item_instance_id: String = $r.try_get("item_instance_id")?;
         let character_guid: i64 = $r.try_get("character_guid")?;
+        let container_id: i64 = $r.try_get("container_id").unwrap_or(character_guid);
         let item_def_id: i32 = $r.try_get("item_def_id")?;
         let slot: i32 = $r.try_get("slot")?;
         let quantity: i32 = $r.try_get("quantity")?;
@@ -51,6 +53,11 @@ macro_rules! parse_item_record {
         ItemRecord {
             item_instance_id,
             character_guid: character_guid as u64,
+            container_id: if container_id == 0 {
+                character_guid as u64
+            } else {
+                container_id as u64
+            },
             item_def_id: item_def_id as u32,
             slot: slot as u32,
             quantity: quantity as u32,
@@ -665,17 +672,23 @@ impl CharacterRepository {
     /// Adds an item instance to a character's inventory slot.
     pub async fn add_item(&self, item: &ItemRecord) -> Result<(), StorageError> {
         let attrs_str = serde_json::to_string(&item.attributes)?;
+        let container_id = if item.container_id == 0 {
+            item.character_guid
+        } else {
+            item.container_id
+        };
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO items (item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO items (item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
                 )
                 .bind(&item.item_instance_id)
                 .bind(item.character_guid as i64)
+                .bind(container_id as i64)
                 .bind(item.item_def_id as i32)
                 .bind(item.slot as i32)
                 .bind(item.quantity as i32)
@@ -689,12 +702,13 @@ impl CharacterRepository {
             DbBackend::Postgres(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO items (item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    INSERT INTO items (item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     "#,
                 )
                 .bind(&item.item_instance_id)
                 .bind(item.character_guid as i64)
+                .bind(container_id as i64)
                 .bind(item.item_def_id as i32)
                 .bind(item.slot as i32)
                 .bind(item.quantity as i32)
@@ -718,7 +732,7 @@ impl CharacterRepository {
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 let row = sqlx::query(
-                    "SELECT item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?",
+                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?",
                 )
                 .bind(item_instance_id)
                 .fetch_optional(pool)
@@ -732,7 +746,7 @@ impl CharacterRepository {
             }
             DbBackend::Postgres(pool) => {
                 let row = sqlx::query(
-                    "SELECT item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = $1",
+                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = $1",
                 )
                 .bind(item_instance_id)
                 .fetch_optional(pool)
@@ -755,7 +769,7 @@ impl CharacterRepository {
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 let rows = sqlx::query(
-                    "SELECT item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = ? ORDER BY slot ASC",
+                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = ? ORDER BY slot ASC",
                 )
                 .bind(character_guid as i64)
                 .fetch_all(pool)
@@ -769,7 +783,7 @@ impl CharacterRepository {
             }
             DbBackend::Postgres(pool) => {
                 let rows = sqlx::query(
-                    "SELECT item_instance_id, character_guid, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = $1 ORDER BY slot ASC",
+                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = $1 ORDER BY slot ASC",
                 )
                 .bind(character_guid as i64)
                 .fetch_all(pool)
@@ -914,8 +928,9 @@ impl CharacterRepository {
                     // 5. Transfer items to recipient free slots
                     for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
                         sqlx::query(
-                            "UPDATE items SET character_guid = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
+                            "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
                         )
+                        .bind(recipient_guid as i64)
                         .bind(recipient_guid as i64)
                         .bind(*target_slot as i32)
                         .bind(now)
@@ -1039,8 +1054,9 @@ impl CharacterRepository {
                 // 5. Transfer items to recipient free slots
                 for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
                     sqlx::query(
-                        "UPDATE items SET character_guid = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4",
+                        "UPDATE items SET character_guid = $1, container_id = $2, slot = $3, updated_at = $4 WHERE item_instance_id = $5",
                     )
+                    .bind(recipient_guid as i64)
                     .bind(recipient_guid as i64)
                     .bind(*target_slot as i32)
                     .bind(now)
@@ -1191,6 +1207,7 @@ mod tests {
         let item1 = ItemRecord {
             item_instance_id: "item_sword_1".to_string(),
             character_guid: 2001,
+            container_id: 2001,
             item_def_id: 101,
             slot: 0,
             quantity: 1,
@@ -1204,6 +1221,7 @@ mod tests {
         let item2 = ItemRecord {
             item_instance_id: "item_potion_1".to_string(),
             character_guid: 2001,
+            container_id: 2001,
             item_def_id: 202,
             slot: 1,
             quantity: 5,
@@ -1229,6 +1247,7 @@ mod tests {
         let colliding_item = ItemRecord {
             item_instance_id: "item_colliding".to_string(),
             character_guid: 2001,
+            container_id: 2001,
             item_def_id: 999,
             slot: 0, // already occupied
             quantity: 1,
@@ -1269,6 +1288,7 @@ mod tests {
         let item1 = ItemRecord {
             item_instance_id: "trade_sword".to_string(),
             character_guid: 3001,
+            container_id: 3001,
             item_def_id: 100,
             slot: 0,
             quantity: 1,
@@ -1280,6 +1300,7 @@ mod tests {
         let item2 = ItemRecord {
             item_instance_id: "trade_shield".to_string(),
             character_guid: 3001,
+            container_id: 3001,
             item_def_id: 101,
             slot: 1,
             quantity: 1,
@@ -1359,6 +1380,7 @@ mod tests {
         repo.add_item(&ItemRecord {
             item_instance_id: "p1_ring".to_string(),
             character_guid: 4001,
+            container_id: 4001,
             item_def_id: 301,
             slot: 0,
             quantity: 1,
@@ -1373,6 +1395,7 @@ mod tests {
         repo.add_item(&ItemRecord {
             item_instance_id: "p2_amulet".to_string(),
             character_guid: 4002,
+            container_id: 4002,
             item_def_id: 302,
             slot: 0,
             quantity: 1,

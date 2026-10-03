@@ -12,14 +12,16 @@ use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::node_service_server::{NodeService, NodeServiceServer};
 use mmo_schema::cluster::{
-    BatchMigrateEntityRequest, BatchMigrateEntityResponse, BatchRemoteAbilityRequest,
-    BatchRemoteAbilityResponse, BatchRouteUpdateRequest, GhostEntity, GhostSyncRequest,
-    GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse, RemoteAbilityErrorCode,
-    RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest, RemoteCommandResponse,
+    AbortContainerTransferRequest, AbortContainerTransferResponse, BatchMigrateEntityRequest,
+    BatchMigrateEntityResponse, BatchRemoteAbilityRequest, BatchRemoteAbilityResponse,
+    BatchRouteUpdateRequest, CommitContainerTransferRequest, CommitContainerTransferResponse,
+    GhostEntity, GhostSyncRequest, GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse,
+    RemoteAbilityErrorCode, RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest,
+    RemoteCommandResponse, ReserveContainerSlotRequest, ReserveContainerSlotResponse,
     RouteUpdateRequest, SerializedComponent, Vector3,
 };
 
-use crate::sim::TickSimulation;
+use crate::sim::{ContainerTransferNotification, TickSimulation};
 
 /// Component storing velocity vector for entities.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -250,12 +252,27 @@ pub fn make_remote_command(
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     pub sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+    pub transaction_coord: Option<Arc<mmo_storage::TransactionCoordinator>>,
 }
 
 impl NodeServiceImpl {
     /// Creates a new `NodeServiceImpl` sharing the simulation state.
     pub fn new(sim: Arc<tokio::sync::RwLock<TickSimulation>>) -> Self {
-        Self { sim }
+        Self {
+            sim,
+            transaction_coord: None,
+        }
+    }
+
+    /// Creates a new `NodeServiceImpl` configured with a distributed transaction coordinator.
+    pub fn with_coordinator(
+        sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+        coord: Arc<mmo_storage::TransactionCoordinator>,
+    ) -> Self {
+        Self {
+            sim,
+            transaction_coord: Some(coord),
+        }
     }
 
     /// Creates a Tonic gRPC [`NodeServiceServer`] wrapping this implementation.
@@ -602,6 +619,169 @@ impl NodeService for NodeServiceImpl {
             results,
             cast_id: req.cast_id,
         }))
+    }
+
+    /// Reserves a container slot on this node for cross-node two-phase transfers.
+    async fn reserve_container_slot(
+        &self,
+        request: tonic::Request<ReserveContainerSlotRequest>,
+    ) -> Result<tonic::Response<ReserveContainerSlotResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let coord = match &self.transaction_coord {
+            Some(c) => c,
+            None => {
+                return Ok(tonic::Response::new(ReserveContainerSlotResponse {
+                    success: false,
+                    error_message: "Transaction coordinator not configured on this node"
+                        .to_string(),
+                    reservation_id: String::new(),
+                    expires_at_epoch_ms: 0,
+                }));
+            }
+        };
+
+        if req.slot < 0 {
+            return Ok(tonic::Response::new(ReserveContainerSlotResponse {
+                success: false,
+                error_message: format!("Negative slot index invalid: {}", req.slot),
+                reservation_id: String::new(),
+                expires_at_epoch_ms: 0,
+            }));
+        }
+
+        let item_opt = if req.item_instance_id.is_empty() {
+            None
+        } else {
+            Some(req.item_instance_id.as_str())
+        };
+
+        match coord
+            .reserve_slot(
+                &req.tx_id,
+                req.container_id,
+                req.slot as u32,
+                item_opt,
+                &req.reservation_type,
+                req.lease_duration_ms,
+            )
+            .await
+        {
+            Ok(res) => Ok(tonic::Response::new(ReserveContainerSlotResponse {
+                success: true,
+                error_message: String::new(),
+                reservation_id: res.reservation_id,
+                expires_at_epoch_ms: res.expires_at_epoch_ms as u64,
+            })),
+            Err(e) => Ok(tonic::Response::new(ReserveContainerSlotResponse {
+                success: false,
+                error_message: e.to_string(),
+                reservation_id: String::new(),
+                expires_at_epoch_ms: 0,
+            })),
+        }
+    }
+
+    /// Commits an active two-phase container transfer atomically.
+    async fn commit_container_transfer(
+        &self,
+        request: tonic::Request<CommitContainerTransferRequest>,
+    ) -> Result<tonic::Response<CommitContainerTransferResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let coord = match &self.transaction_coord {
+            Some(c) => c,
+            None => {
+                return Ok(tonic::Response::new(CommitContainerTransferResponse {
+                    success: false,
+                    error_message: "Transaction coordinator not configured on this node"
+                        .to_string(),
+                    src_container_id: 0,
+                    dst_container_id: 0,
+                    item_instance_id: String::new(),
+                }));
+            }
+        };
+
+        match coord.commit_transfer(&req.tx_id).await {
+            Ok(tx_rec) => {
+                let sim = self.sim.read().await;
+                sim.queue_container_transfer(ContainerTransferNotification {
+                    tx_id: tx_rec.tx_id.clone(),
+                    src_container_id: tx_rec.src_container_id,
+                    dst_container_id: tx_rec.dst_container_id,
+                    item_instance_id: tx_rec.item_instance_id.clone(),
+                    success: true,
+                    error_message: None,
+                });
+
+                Ok(tonic::Response::new(CommitContainerTransferResponse {
+                    success: true,
+                    error_message: String::new(),
+                    src_container_id: tx_rec.src_container_id,
+                    dst_container_id: tx_rec.dst_container_id,
+                    item_instance_id: tx_rec.item_instance_id,
+                }))
+            }
+            Err(e) => {
+                let sim = self.sim.read().await;
+                sim.queue_container_transfer(ContainerTransferNotification {
+                    tx_id: req.tx_id.clone(),
+                    src_container_id: 0,
+                    dst_container_id: 0,
+                    item_instance_id: String::new(),
+                    success: false,
+                    error_message: Some(e.to_string()),
+                });
+
+                Ok(tonic::Response::new(CommitContainerTransferResponse {
+                    success: false,
+                    error_message: e.to_string(),
+                    src_container_id: 0,
+                    dst_container_id: 0,
+                    item_instance_id: String::new(),
+                }))
+            }
+        }
+    }
+
+    /// Aborts an active two-phase container transfer and rolls back reservations.
+    async fn abort_container_transfer(
+        &self,
+        request: tonic::Request<AbortContainerTransferRequest>,
+    ) -> Result<tonic::Response<AbortContainerTransferResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let coord = match &self.transaction_coord {
+            Some(c) => c,
+            None => {
+                return Ok(tonic::Response::new(AbortContainerTransferResponse {
+                    success: false,
+                    error_message: "Transaction coordinator not configured on this node"
+                        .to_string(),
+                }));
+            }
+        };
+
+        match coord.abort_transfer(&req.tx_id).await {
+            Ok(_) => {
+                let sim = self.sim.read().await;
+                sim.queue_container_transfer(ContainerTransferNotification {
+                    tx_id: req.tx_id,
+                    src_container_id: 0,
+                    dst_container_id: 0,
+                    item_instance_id: String::new(),
+                    success: false,
+                    error_message: Some("Transaction aborted".to_string()),
+                });
+
+                Ok(tonic::Response::new(AbortContainerTransferResponse {
+                    success: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(tonic::Response::new(AbortContainerTransferResponse {
+                success: false,
+                error_message: e.to_string(),
+            })),
+        }
     }
 }
 
@@ -2410,5 +2590,172 @@ mod tests {
         assert_eq!(resp.results.len(), 2);
         assert_eq!(resp.results[0].current_health, 60);
         assert_eq!(resp.results[1].current_health, 60);
+    }
+
+    #[tokio::test]
+    async fn test_node_service_container_transfer_reserve_commit_and_mpsc_notification() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let db = mmo_storage::Database::connect_memory().await.unwrap();
+
+        let container_repo = mmo_storage::ContainerRepository::new(db.clone());
+        let c1 = mmo_storage::ContainerRecord {
+            container_id: 8001,
+            owner_type: "character".to_string(),
+            owner_id: "2001".to_string(),
+            name: "Vault A".to_string(),
+            capacity: 10,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        let c2 = mmo_storage::ContainerRecord {
+            container_id: 8002,
+            owner_type: "character".to_string(),
+            owner_id: "2002".to_string(),
+            name: "Vault B".to_string(),
+            capacity: 10,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        container_repo.create_container(&c1).await.unwrap();
+        container_repo.create_container(&c2).await.unwrap();
+
+        let char_repo = mmo_storage::CharacterRepository::new(db.clone());
+        let item = mmo_storage::ItemRecord {
+            item_instance_id: "xnode_item_1".to_string(),
+            character_guid: 2001,
+            container_id: 8001,
+            item_def_id: 777,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item).await.unwrap();
+
+        let coord = Arc::new(mmo_storage::TransactionCoordinator::new(db));
+        let service = NodeServiceImpl::with_coordinator(Arc::clone(&sim), coord);
+
+        // 1. Reserve source slot
+        let res_out = service
+            .reserve_container_slot(tonic::Request::new(ReserveContainerSlotRequest {
+                tx_id: "tx_grpc_1".to_string(),
+                container_id: 8001,
+                slot: 0,
+                item_instance_id: "xnode_item_1".to_string(),
+                reservation_type: "transfer_out".to_string(),
+                lease_duration_ms: 5000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res_out.success);
+        assert!(!res_out.reservation_id.is_empty());
+
+        // 2. Reserve destination slot
+        let res_in = service
+            .reserve_container_slot(tonic::Request::new(ReserveContainerSlotRequest {
+                tx_id: "tx_grpc_1".to_string(),
+                container_id: 8002,
+                slot: 3,
+                item_instance_id: String::new(),
+                reservation_type: "transfer_in".to_string(),
+                lease_duration_ms: 5000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res_in.success);
+
+        // 3. Commit transfer
+        let commit_res = service
+            .commit_container_transfer(tonic::Request::new(CommitContainerTransferRequest {
+                tx_id: "tx_grpc_1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(commit_res.success);
+        assert_eq!(commit_res.src_container_id, 8001);
+        assert_eq!(commit_res.dst_container_id, 8002);
+        assert_eq!(commit_res.item_instance_id, "xnode_item_1");
+
+        // 4. Verify item moved in storage
+        let item_moved = char_repo.get_item("xnode_item_1").await.unwrap().unwrap();
+        assert_eq!(item_moved.container_id, 8002);
+        assert_eq!(item_moved.slot, 3);
+
+        // 5. Verify non-blocking MPSC notification received in simulation tick
+        {
+            let mut s = sim.write().await;
+            let notif = s.container_transfer_receiver.try_recv().unwrap();
+            assert_eq!(notif.tx_id, "tx_grpc_1");
+            assert!(notif.success);
+            assert_eq!(notif.src_container_id, 8001);
+            assert_eq!(notif.dst_container_id, 8002);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_service_container_transfer_abort_and_mpsc_notification() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let db = mmo_storage::Database::connect_memory().await.unwrap();
+
+        let container_repo = mmo_storage::ContainerRepository::new(db.clone());
+        let c1 = mmo_storage::ContainerRecord {
+            container_id: 8101,
+            owner_type: "character".to_string(),
+            owner_id: "2001".to_string(),
+            name: "Vault A".to_string(),
+            capacity: 10,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        container_repo.create_container(&c1).await.unwrap();
+
+        let coord = Arc::new(mmo_storage::TransactionCoordinator::new(db));
+        let service = NodeServiceImpl::with_coordinator(Arc::clone(&sim), coord);
+
+        // Reserve slot
+        let res_in = service
+            .reserve_container_slot(tonic::Request::new(ReserveContainerSlotRequest {
+                tx_id: "tx_grpc_abort".to_string(),
+                container_id: 8101,
+                slot: 2,
+                item_instance_id: String::new(),
+                reservation_type: "transfer_in".to_string(),
+                lease_duration_ms: 5000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(res_in.success);
+
+        // Abort transfer
+        let abort_res = service
+            .abort_container_transfer(tonic::Request::new(AbortContainerTransferRequest {
+                tx_id: "tx_grpc_abort".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(abort_res.success);
+
+        // Verify MPSC notification
+        {
+            let mut s = sim.write().await;
+            let notif = s.container_transfer_receiver.try_recv().unwrap();
+            assert_eq!(notif.tx_id, "tx_grpc_abort");
+            assert!(!notif.success);
+        }
     }
 }

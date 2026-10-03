@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: distributed-transactional-containers
+  title: Distributed Transactional Containers, Cross-Node Vaults & Generic Escrow
+  status: proposed
+  created: 2026-10-03
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: storage
+  specs:
+    - specs/storage/distributed-containers/spec.md
