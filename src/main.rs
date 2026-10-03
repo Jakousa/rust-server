@@ -1,7 +1,6 @@
 use tonic::transport::Server;
 
 use proto::player_server::PlayerServer;
-use world::World;
 
 mod player;
 mod world;
@@ -25,14 +24,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse().unwrap();
 
     println!("GameServer listening on {}", addr);
-
-    let slices = vec![
-        slice::Slice::new(None, (10, 10, 10), (0, 0, 0)),
-        slice::Slice::new(None, (10, 10, 10), (10, 0, 0)),
-        slice::Slice::new(None, (10, 10, 10), (0, 10, 0)),
-        slice::Slice::new(None, (10, 10, 10), (10, 10, 0)),
-    ];
-    let world = World::new(slices);
 
     Server::builder()
         .add_service(reflection_service)
