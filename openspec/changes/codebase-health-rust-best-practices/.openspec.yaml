@@ -1,0 +1,13 @@
+schema: "1.0"
+change:
+  name: codebase-health-rust-best-practices
+  title: Codebase Health and Idiomatic Rust Best Practices Refactoring
+  status: proposed
+  type: refactor
+  created_at: 2026-10-03T01:16:00Z
+  authors:
+    - MMO Engineering Team
+  description: >-
+    Comprehensive codebase health refactoring introducing strongly-typed domain errors,
+    defensive panic-free network ingestion, parameter structs for high-arity functions,
+    modern Rust 2021 idioms, and clippy pedantic cleanup across the cluster crates.

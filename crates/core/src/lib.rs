@@ -21,9 +21,9 @@ pub use guid::{EntityType, Guid};
 pub use hook::{Event, EventContext, HookDispatcher, HookHandler};
 pub use octree::{BoundingBox3D, Octree};
 pub use plugin::{
-    ComponentCodec, ComponentCodecRegistry, DomainEvent, EntityDespawnEvent, EventQueue,
-    GameplayPlugin, ModularPacketHandler, ModularPacketRouter, PluginContext, PluginManager,
-    TickContext, TickSystem, TypedComponentCodec,
+    CodecError, ComponentCodec, ComponentCodecRegistry, DomainEvent, EntityDespawnEvent,
+    EventQueue, GameplayPlugin, ModularPacketHandler, ModularPacketRouter, PacketHandlerError,
+    PluginContext, PluginManager, TickContext, TickSystem, TypedComponentCodec,
 };
 pub use spatial::{
     query_sphere_targets, ray_intersects_aabb, validate_cone_target, validate_point_range,

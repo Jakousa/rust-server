@@ -19,8 +19,9 @@ pub use kinematics::{
     EntityKinematicState, KinematicValidator, KinematicViolation, KinematicViolationReason,
 };
 pub use network::{
-    execute_remote_ability, extract_initiator, make_remote_command, BroadcastJob, EntityVelocity,
-    GhostBroadcaster, GhostRecord, GhostStore, NetworkError, NodeServiceImpl,
+    execute_batch_entity_migration, execute_entity_migration, execute_remote_ability,
+    extract_initiator, make_remote_command, BatchMigrationReport, BroadcastJob, EntityVelocity,
+    GhostBroadcaster, GhostRecord, GhostStore, MigrationError, NetworkError, NodeServiceImpl,
     RemoteCommandErrorCode,
 };
 pub use sim::{AbilityCompensation, TickSimulation};

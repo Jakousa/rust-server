@@ -17,6 +17,43 @@ use crate::entity::{ComponentStore, EntityStore};
 use crate::guid::Guid;
 use crate::hook::HookDispatcher;
 
+/// Errors that can occur during dynamic component serialization or deserialization.
+#[derive(Debug, thiserror::Error)]
+pub enum CodecError {
+    #[error("Downcast failed for component '{0}'")]
+    DowncastFailed(&'static str),
+
+    #[error("Serialization failed for component '{type_name}': {source}")]
+    Serialization {
+        type_name: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("Deserialization failed for component '{type_name}': {source}")]
+    Deserialization {
+        type_name: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Errors that can occur during modular client packet dispatch.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PacketHandlerError {
+    #[error("Target entity {0} not found")]
+    EntityNotFound(Guid),
+
+    #[error("No handler registered for module_id {0}")]
+    ModuleNotFound(u16),
+
+    #[error("Malformed packet payload for module {module_id}: {message}")]
+    MalformedPayload { module_id: u16, message: String },
+
+    #[error("Handler error: {0}")]
+    Custom(String),
+}
+
 /// Trait implemented by components that can be serialized/deserialized dynamically.
 pub trait ComponentCodec: Send + Sync {
     /// Friendly type name (e.g. "inventory", "health") used as JSON key.
@@ -24,9 +61,12 @@ pub trait ComponentCodec: Send + Sync {
     /// The runtime `TypeId` of the concrete component.
     fn component_type_id(&self) -> TypeId;
     /// Serializes a boxed component into a JSON Value.
-    fn serialize(&self, boxed: &(dyn Any + Send + Sync)) -> Result<serde_json::Value, String>;
+    fn serialize(&self, boxed: &(dyn Any + Send + Sync)) -> Result<serde_json::Value, CodecError>;
     /// Deserializes a JSON Value into a type-erased component box.
-    fn deserialize(&self, value: serde_json::Value) -> Result<Box<dyn Any + Send + Sync>, String>;
+    fn deserialize(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<Box<dyn Any + Send + Sync>, CodecError>;
 }
 
 /// Generic implementation of [`ComponentCodec`] for any serializable component.
@@ -55,15 +95,25 @@ impl<T: 'static + Send + Sync + Serialize + DeserializeOwned> ComponentCodec
         TypeId::of::<T>()
     }
 
-    fn serialize(&self, boxed: &(dyn Any + Send + Sync)) -> Result<serde_json::Value, String> {
+    fn serialize(&self, boxed: &(dyn Any + Send + Sync)) -> Result<serde_json::Value, CodecError> {
         let concrete = boxed
             .downcast_ref::<T>()
-            .ok_or_else(|| format!("Downcast failed for component {}", self.name))?;
-        serde_json::to_value(concrete).map_err(|e| e.to_string())
+            .ok_or(CodecError::DowncastFailed(self.name))?;
+        serde_json::to_value(concrete).map_err(|source| CodecError::Serialization {
+            type_name: self.name,
+            source,
+        })
     }
 
-    fn deserialize(&self, value: serde_json::Value) -> Result<Box<dyn Any + Send + Sync>, String> {
-        let concrete: T = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    fn deserialize(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<Box<dyn Any + Send + Sync>, CodecError> {
+        let concrete: T =
+            serde_json::from_value(value).map_err(|source| CodecError::Deserialization {
+                type_name: self.name,
+                source,
+            })?;
         Ok(Box::new(concrete))
     }
 }
@@ -108,7 +158,7 @@ impl ComponentCodecRegistry {
         &self,
         attributes: &serde_json::Value,
         store: &mut ComponentStore,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, CodecError> {
         let map = match attributes.as_object() {
             Some(m) => m,
             None => return Ok(0),
@@ -212,7 +262,7 @@ pub trait ModularPacketHandler: Send + Sync {
         sub_opcode: u16,
         payload: &[u8],
         entities: &mut EntityStore,
-    ) -> Result<Option<Vec<u8>>, String>;
+    ) -> Result<Option<Vec<u8>>, PacketHandlerError>;
 }
 
 /// Router dispatching modular packets based on a 16-bit `module_id`.
@@ -239,11 +289,11 @@ impl ModularPacketRouter {
         entity_guid: Guid,
         payload: &[u8],
         entities: &mut EntityStore,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, PacketHandlerError> {
         let handler = self
             .handlers
             .get(&module_id)
-            .ok_or_else(|| format!("No handler registered for module_id {}", module_id))?;
+            .ok_or(PacketHandlerError::ModuleNotFound(module_id))?;
         handler.handle(entity_guid, sub_opcode, payload, entities)
     }
 

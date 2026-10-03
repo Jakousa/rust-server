@@ -26,11 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("          MMO Edge Gateway Daemon Initialized               ");
     println!("============================================================");
-    println!("Listen Address      : {}", listen_addr);
-    println!("Admin Address       : {}", admin_addr);
-    println!("gRPC Address        : {}", grpc_addr);
-    println!("Default Node Route  : {}", default_node_addr);
-    println!("Director Address    : {}", director_addr);
+    println!("Listen Address      : {listen_addr}");
+    println!("Admin Address       : {admin_addr}");
+    println!("gRPC Address        : {grpc_addr}");
+    println!("Default Node Route  : {default_node_addr}");
+    println!("Director Address    : {director_addr}");
     println!(
         "Session Cache       : {}",
         redis_url
@@ -45,13 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache: Arc<dyn SessionCacheBackend> = match redis_url {
         Some(ref url) => match RedisCache::new(url) {
             Ok(rc) => {
-                println!("[Gateway] Connected to Redis session cache at {}", url);
+                println!("[Gateway] Connected to Redis session cache at {url}");
                 Arc::new(rc)
             }
             Err(e) => {
                 eprintln!(
-                    "[Gateway] Failed to connect to Redis ({}), falling back to MemoryCache",
-                    e
+                    "[Gateway] Failed to connect to Redis ({e}), falling back to MemoryCache"
                 );
                 Arc::new(MemoryCache::new())
             }
@@ -75,22 +74,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc_service = server.create_service();
     tokio::spawn(async move {
-        println!("[Gateway] gRPC Service listening on {}", grpc_addr);
+        println!("[Gateway] gRPC Service listening on {grpc_addr}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(grpc_service.into_server())
             .serve(grpc_addr)
             .await
         {
-            eprintln!("[Gateway] gRPC Server failed: {}", e);
+            eprintln!("[Gateway] gRPC Server failed: {e}");
         }
     });
 
     let listener = server.bind(&listen_addr).await?;
     telemetry.mark_ready();
-    println!(
-        "Edge Gateway actively listening for client connections on {}",
-        listen_addr
-    );
+    println!("Edge Gateway actively listening for client connections on {listen_addr}");
 
     loop {
         match listener.accept().await {
@@ -110,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             Err(e) => {
-                eprintln!("[Gateway] Failed to accept client connection: {}", e);
+                eprintln!("[Gateway] Failed to accept client connection: {e}");
             }
         }
     }
