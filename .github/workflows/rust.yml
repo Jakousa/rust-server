@@ -33,8 +33,6 @@ jobs:
 
       - name: Install cargo tools
         uses: cargo-bins/cargo-binstall@main
-        with:
-          version: latest
 
       - name: Install static analysis and coverage tools
         run: cargo binstall -y cargo-deny cargo-machete cargo-llvm-cov cargo-mutants
