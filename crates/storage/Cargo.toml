@@ -1,20 +1,24 @@
 [package]
+
 name = "mmo-storage"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
-mmo-core = { path = "../core" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "macros"] }
 tokio = { version = "1.42", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 redis = { version = "0.27", features = ["tokio-comp"] }
 thiserror = "1.0"
-tracing = "0.1"
 async-trait = "0.1"
 sha2 = "0.10"
 subtle = "2.6"
 
 [dev-dependencies]
 tempfile = "3.14"
+
+[lints]
+workspace = true

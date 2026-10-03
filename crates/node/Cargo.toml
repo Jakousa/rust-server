@@ -1,7 +1,10 @@
 [package]
+
 name = "mmo-node"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 mmo-core = { path = "../core" }
@@ -25,3 +28,6 @@ proptest = "1.6"
 name = "engine_benchmarks"
 path = "../../benches/engine_benchmarks.rs"
 harness = false
+
+[lints]
+workspace = true

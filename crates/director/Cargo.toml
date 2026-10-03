@@ -1,7 +1,10 @@
 [package]
+
 name = "mmo-director"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 mmo-core = { path = "../core" }
@@ -9,3 +12,6 @@ mmo-schema = { path = "../schema" }
 tokio = { version = "1.42", features = ["full"] }
 tonic = "0.12.3"
 metrics = "0.24"
+
+[lints]
+workspace = true

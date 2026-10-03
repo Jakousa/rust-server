@@ -26,10 +26,16 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo tools
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install static analysis and coverage tools
+        run: cargo binstall -y cargo-deny cargo-machete cargo-llvm-cov cargo-mutants
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -37,5 +43,22 @@ jobs:
       - name: Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Workspace Tests
-        run: cargo test --workspace --verbose
+      - name: Supply-Chain and License Audit (cargo-deny)
+        run: cargo deny check
+
+      - name: Unused Dependency Check (cargo-machete)
+        run: cargo machete
+
+      - name: Run Tests with Code Coverage (cargo-llvm-cov)
+        run: cargo llvm-cov --workspace --all-targets --fail-under-lines 80 --lcov --output-path lcov.info
+
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: code-coverage-report
+          path: lcov.info
+
+      - name: Mutation Testing Smoke Check (cargo-mutants)
+        run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs -F "quantize_pitch_i8"
+
