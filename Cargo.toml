@@ -1,3 +1,8 @@
+[package]
+name = "first_rust_project"
+version = "0.1.0"
+edition = "2021"
+
 [workspace]
 members = [
     "crates/core",
@@ -11,3 +16,13 @@ members = [
     "crates/client-wasm",
 ]
 resolver = "2"
+
+[dependencies]
+uuid = { version = "1.0", features = ["v4"] }
+tonic = "0.12.3"
+tonic-reflection = "0.12.3"
+prost = "0.13.4"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+tonic-build = "0.12.3"
