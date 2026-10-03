@@ -146,9 +146,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut hb_interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             hb_interval.tick().await;
-            let entity_count = {
+            let (entity_count, tick_duration_ms, entity_centroid) = {
                 let s = sim_clone.read().await;
-                s.entity_store.count() as u32
+                let count = s.entity_store.count() as u32;
+                let dur = s.last_tick_duration_ms();
+                let centroid = if count > 0 {
+                    let c = s.compute_clamped_centroid(&s.octree.bounds);
+                    Some(Vector3 {
+                        x: c.0,
+                        y: c.1,
+                        z: c.2,
+                    })
+                } else {
+                    None
+                };
+                (count, dur, centroid)
             };
 
             let now = std::time::SystemTime::now()
@@ -163,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_percent: 5.0,
                 memory_bytes: 10_000_000,
                 timestamp: now,
+                tick_duration_ms,
+                entity_centroid,
             };
 
             match client.heartbeat(hb).await {

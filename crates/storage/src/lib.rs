@@ -1,5 +1,7 @@
 //! MMO State Persistence and Storage Tier.
 
+#![allow(clippy::double_must_use)]
+
 pub mod cache;
 pub mod db;
 pub mod models;

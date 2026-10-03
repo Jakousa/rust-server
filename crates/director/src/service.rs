@@ -150,7 +150,8 @@ impl DirectorService for DirectorServiceImpl {
         metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
 
         if acknowledged {
-            let should_split = coord.evaluate_heartbeat(req.node_id, req.entity_count);
+            let should_split =
+                coord.evaluate_heartbeat(req.node_id, req.entity_count, req.tick_duration_ms);
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: true,
                 should_split,
@@ -273,6 +274,8 @@ mod tests {
             cpu_percent: 10.0,
             memory_bytes: 1024,
             timestamp: 1000,
+            tick_duration_ms: 12.0,
+            entity_centroid: None,
         });
         let resp1 = service.heartbeat(hb1).await.unwrap().into_inner();
         assert!(resp1.acknowledged);
@@ -286,6 +289,8 @@ mod tests {
             cpu_percent: 45.0,
             memory_bytes: 2048,
             timestamp: 2000,
+            tick_duration_ms: 15.0,
+            entity_centroid: None,
         });
         let resp2 = service.heartbeat(hb2).await.unwrap().into_inner();
         assert!(resp2.acknowledged);
@@ -299,6 +304,8 @@ mod tests {
             cpu_percent: 5.0,
             memory_bytes: 1024,
             timestamp: 3000,
+            tick_duration_ms: 5.0,
+            entity_centroid: None,
         });
         let resp_unknown = service.heartbeat(hb_unknown).await.unwrap().into_inner();
         assert!(!resp_unknown.acknowledged);
@@ -390,6 +397,8 @@ mod tests {
                 cpu_percent: 10.0,
                 memory_bytes: 1024,
                 timestamp: 1000,
+                tick_duration_ms: 10.0,
+                entity_centroid: None,
             }))
             .await
             .unwrap()
@@ -436,6 +445,8 @@ mod tests {
                 cpu_percent: 15.0,
                 memory_bytes: 2048,
                 timestamp: 2000,
+                tick_duration_ms: 8.0,
+                entity_centroid: None,
             }))
             .await
             .unwrap()

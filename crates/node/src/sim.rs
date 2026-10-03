@@ -39,6 +39,7 @@ pub struct TickSimulation {
     pub migrating_leases: HashMap<Guid, Instant>,
     pub last_migration_ticks: HashMap<Guid, u64>,
     pub current_time: Instant,
+    pub last_tick_duration: Duration,
     pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
     pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
     pub ability_compensation_sender: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
@@ -107,6 +108,7 @@ impl TickSimulation {
             migrating_leases: HashMap::new(),
             last_migration_ticks: HashMap::new(),
             current_time: Instant::now(),
+            last_tick_duration: Duration::from_millis(0),
             ack_sender,
             ack_receiver,
             ability_compensation_sender,
@@ -367,6 +369,7 @@ impl TickSimulation {
 
         // 4. Record simulation loop metrics
         let duration = start.elapsed();
+        self.last_tick_duration = duration;
         let duration_sec = duration.as_secs_f64();
         let node_id_str = self.node_id.to_string();
 
@@ -380,6 +383,35 @@ impl TickSimulation {
             .set(self.entity_store.count() as f64);
         metrics::gauge!("mmo_node_aoi_observers", "node_id" => node_id_str)
             .set(self.aoi.observer_count() as f64);
+    }
+
+    /// Returns the execution duration of the last tick in milliseconds.
+    pub fn last_tick_duration_ms(&self) -> f32 {
+        self.last_tick_duration.as_secs_f32() * 1000.0
+    }
+
+    /// Computes spatial centroid of all active local entities, clamping each entity's
+    /// coordinates to the node's assigned bounding box to prevent malicious centroid spoofing.
+    pub fn compute_clamped_centroid(&self, bounds: &BoundingBox3D) -> (f32, f32, f32) {
+        if self.entity_store.is_empty() {
+            return bounds.center();
+        }
+
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let mut sum_z = 0.0f32;
+        let count = self.entity_store.count() as f32;
+
+        for (_key, entity) in self.entity_store.iter() {
+            let cx = entity.position.0.clamp(bounds.min.0, bounds.max.0);
+            let cy = entity.position.1.clamp(bounds.min.1, bounds.max.1);
+            let cz = entity.position.2.clamp(bounds.min.2, bounds.max.2);
+            sum_x += cx;
+            sum_y += cy;
+            sum_z += cz;
+        }
+
+        (sum_x / count, sum_y / count, sum_z / count)
     }
 
     /// Drains and returns all queued AoI broadcast jobs accumulated during ticks.
@@ -1166,5 +1198,34 @@ mod tests {
         assert_eq!(interrupted.len(), 1);
         assert_eq!(interrupted[0].action_id, 999);
         assert_eq!(interrupted[0].reason, mmo_core::InterruptReason::Movement);
+    }
+
+    #[test]
+    fn test_compute_clamped_centroid() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        // Empty store returns bounds center
+        assert_eq!(sim.compute_clamped_centroid(&bounds), (50.0, 50.0, 50.0));
+
+        let g1 = Guid::new(EntityType::Player, 1, 101);
+        let g2 = Guid::new(EntityType::Player, 1, 102);
+
+        sim.spawn_entity(g1, (20.0, 30.0, 40.0));
+        // Directly spawn into entity_store with spoofed coordinates outside bounds (e.g. 500.0)
+        sim.entity_store.spawn(g2, (500.0, 100.0, 0.0));
+
+        // Coordinate (500.0) should be clamped to bounds.max.0 (100.0)
+        // Average X: (20.0 + 100.0) / 2 = 60.0
+        // Average Y: (30.0 + 100.0) / 2 = 65.0
+        // Average Z: (40.0 + 0.0) / 2 = 20.0
+        let centroid = sim.compute_clamped_centroid(&bounds);
+        assert!((centroid.0 - 60.0).abs() < 0.001);
+        assert!((centroid.1 - 65.0).abs() < 0.001);
+        assert!((centroid.2 - 20.0).abs() < 0.001);
+
+        // Step updates last_tick_duration
+        sim.step(0.05);
+        assert!(sim.last_tick_duration_ms() >= 0.0);
     }
 }
