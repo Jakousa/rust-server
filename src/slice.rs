@@ -48,3 +48,39 @@ impl Slice {
         return (x && y) || (x && z) || (y && z);
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::Entity;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_add_entity() {
+        let mut slice = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let entity_id = Uuid::new_v4();
+        let entity = Entity::new(Some(entity_id), (5, 5, 5));
+
+        slice.add_entity(entity);
+
+        assert_eq!(slice.get_entities().len(), 1);
+        assert_eq!(slice.get_entities()[0].id, entity_id);
+    }
+
+    #[test]
+    fn test_add_multiple_entities() {
+        let mut slice = Slice::new(None, (10, 10, 10), (0, 0, 0));
+        let entity1_id = Uuid::new_v4();
+        let entity1 = Entity::new(Some(entity1_id), (1, 1, 1));
+
+        let entity2_id = Uuid::new_v4();
+        let entity2 = Entity::new(Some(entity2_id), (2, 2, 2));
+
+        slice.add_entity(entity1);
+        slice.add_entity(entity2);
+
+        let entities = slice.get_entities();
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].id, entity1_id);
+        assert_eq!(entities[1].id, entity2_id);
+    }
+}
