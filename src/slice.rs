@@ -48,3 +48,53 @@ impl Slice {
         return (x && y) || (x && z) || (y && z);
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_slice(position: (i32, i32, i32), size: (i32, i32, i32)) -> Slice {
+        Slice::new(None, size, position)
+    }
+
+    #[test]
+    fn test_near_to_identical_position() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((0, 0, 0), (10, 10, 10));
+        assert!(s1.near_to(&s2), "Slices with identical positions should be considered near");
+    }
+
+    #[test]
+    fn test_near_to_adjacent_on_two_axes() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((10, 0, 0), (10, 10, 10));
+        assert!(s1.near_to(&s2), "Slices touching on X boundary and identical on Y/Z should be near");
+    }
+
+    #[test]
+    fn test_near_to_adjacent_on_one_axis() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((10, 10, 0), (10, 10, 10));
+        assert!(s1.near_to(&s2), "Slices touching on X and Y and identical on Z should be near");
+    }
+
+    #[test]
+    fn test_near_to_completely_separate_but_aligned() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((100, 0, 0), (10, 10, 10));
+        assert!(s1.near_to(&s2), "Current logic considers slices near if they align on 2 axes, regardless of distance on the 3rd");
+    }
+
+    #[test]
+    fn test_near_to_completely_separate_unaligned() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((100, 100, 0), (10, 10, 10));
+        assert!(!s1.near_to(&s2), "Slices completely separate and unaligned on 2 axes should not be near");
+    }
+
+    #[test]
+    fn test_near_to_corner_touch() {
+        let s1 = create_slice((0, 0, 0), (10, 10, 10));
+        let s2 = create_slice((10, 10, 10), (10, 10, 10));
+        assert!(s1.near_to(&s2), "Slices touching at a corner should be near");
+    }
+}
