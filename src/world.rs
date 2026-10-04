@@ -33,11 +33,11 @@ impl World {
         self.slices.iter().find(|slice| slice.get_id() == id)
     }
 
-    pub fn get_neighbours(&self, id: Uuid) -> Option<&Vec<Uuid>> {
-        self.slice_neighbours.get(&id)
+    pub fn get_neighbours(&self, id: Uuid) -> Option<&[Uuid]> {
+        self.slice_neighbours.get(&id).map(|v| v.as_slice())
     }
 
-    pub fn get_slice_and_neighbour_entities(&self, id: Uuid) -> Option<Vec<&Vec<Entity>>> {
+    pub fn get_slice_and_neighbour_entities(&self, id: Uuid) -> Option<Vec<&[Entity]>> {
         let slice = self.get_slice(id)?;
         let neighbours = self.get_neighbours(id)?;
 

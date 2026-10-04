@@ -30,7 +30,7 @@ impl Slice {
         self.entities.retain(|entity| entity.id != entity_id);
     }
 
-    pub fn get_entities(&self) -> &Vec<Entity> {
+    pub fn get_entities(&self) -> &[Entity] {
         &self.entities
     }
 
