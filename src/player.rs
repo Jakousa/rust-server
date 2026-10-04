@@ -28,7 +28,11 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().map_err(|_| Status::internal("Internal server error"))?;
+
+            if players.len() >= 100_000 {
+                return Err(Status::resource_exhausted("Server at capacity"));
+            }
 
             if players.iter().any(|x| x.name == name) {
                 return Err(Status::already_exists("Player already exists!"));
@@ -60,11 +64,11 @@ impl Player for MyPlayer {
         );
 
         {
-            let mut players = self.players.lock().unwrap();
+            let mut players = self.players.lock().map_err(|_| Status::internal("Internal server error"))?;
 
             let player = players.iter_mut().find(|x| x.name == name);
 
-            if player == None {
+            if player.is_none() {
                 return Err(Status::not_found("Player not found!"));
             }
 
