@@ -1,7 +1,6 @@
 //! End-to-end integration test for cross-partition container transfers and generic escrow.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use mmo_core::BoundingBox3D;
 use mmo_node::network::NodeServiceImpl;
@@ -242,7 +241,7 @@ async fn test_e2e_cross_partition_container_transfer_and_escrow_lifecycle() {
     // -------------------------------------------------------------
     // PART C: Escrow Timeout Refund
     // -------------------------------------------------------------
-    // Create an expiring escrow from C1 to C2 with 1s TTL
+    // Create an expiring escrow from C1 to C2 with 0s TTL (immediately expired)
     let expiry_secret = "refund_secret";
     let refund_items = vec!["mythic_sword_e2e".to_string()];
 
@@ -254,16 +253,13 @@ async fn test_e2e_cross_partition_container_transfer_and_escrow_lifecycle() {
             c_escrow_id,
             &refund_items,
             expiry_secret,
-            1, // 1 second TTL
+            0, // 0 second TTL - immediately expired
         )
         .await
         .unwrap();
     assert_eq!(expiring_escrow.status, EscrowStatus::Held);
 
-    // Sleep past TTL
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-
-    // Trigger reaper
+    // Trigger reaper directly without sleep
     let refunded_count = escrow_coord.reap_expired_escrows().await.unwrap();
     assert_eq!(refunded_count, 1);
 
