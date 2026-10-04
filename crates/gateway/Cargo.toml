@@ -25,6 +25,10 @@ wtransport = "0.7.2"
 mmo-node = { path = "../node" }
 mmo-director = { path = "../director" }
 
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
 
 
 [lints]
