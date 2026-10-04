@@ -39,13 +39,13 @@ impl Player for MyPlayer {
             }
 
             players.push(PlayerEntity {
-                name: name.clone(),
+                name,
                 position: (0, 0, 0),
             });
         }
 
         let reply = CreateReply {
-            message: format!("Player created successfully!"),
+            message: "Player created successfully!".to_string(),
         };
         Ok(Response::new(reply))
     }
@@ -77,7 +77,7 @@ impl Player for MyPlayer {
         }
 
         let reply = UpdateReply {
-            message: format!("Player updated successfully!, x: {}, y: {}, z: {}", x, y, z),
+            message: format!("Player updated successfully: x: {x}, y: {y}, z: {z}"),
         };
         Ok(Response::new(reply))
     }
