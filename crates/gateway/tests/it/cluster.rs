@@ -12,10 +12,8 @@
 //! - Boundary transition and dynamic gateway route handover from Node 1 to Node 2
 //! - Post-handover authoritative movement and interaction on Node 2
 
-mod common;
-
+use crate::common::TestClusterBuilder;
 use bytes::BytesMut;
-use common::TestClusterBuilder;
 
 use mmo_core::guid::{EntityType, Guid};
 use mmo_core::BoundingBox3D;

@@ -4,12 +4,10 @@
 //! Verifies seamless entity transfer across spatial boundaries, Edge Gateway route update,
 //! and subsequent client packet routing without transport interruption or entity duplication.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::TestClusterBuilder;
+use crate::common::TestClusterBuilder;
 use mmo_core::guid::{EntityType, Guid};
 use mmo_core::BoundingBox3D;
 use mmo_node::network::execute_entity_migration;

@@ -27,6 +27,10 @@ proptest = "1.6"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
 [[bench]]
 name = "engine_benchmarks"
 path = "../../benches/engine_benchmarks.rs"
