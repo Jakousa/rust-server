@@ -773,44 +773,24 @@ impl EscrowCoordinator {
 mod tests {
     use super::*;
     use crate::container_repo::ContainerRepository;
-    use crate::models::{ContainerRecord, ItemRecord};
     use crate::repository::CharacterRepository;
+    use crate::test_helpers::{ContainerRecordBuilder, ItemRecordBuilder};
 
     async fn setup_escrow_containers(db: &Database) -> (u64, u64, u64) {
         let container_repo = ContainerRepository::new(db.clone());
-        let c1 = ContainerRecord {
-            container_id: 7001,
-            owner_type: "character".to_string(),
-            owner_id: "1001".to_string(),
-            name: "Player A".to_string(),
-            capacity: 10,
-            access_policy: "owner_only".to_string(),
-            version: 1,
-            created_at: 1000,
-            updated_at: 1000,
-        };
-        let c2 = ContainerRecord {
-            container_id: 7002,
-            owner_type: "character".to_string(),
-            owner_id: "1002".to_string(),
-            name: "Player B".to_string(),
-            capacity: 10,
-            access_policy: "owner_only".to_string(),
-            version: 1,
-            created_at: 1000,
-            updated_at: 1000,
-        };
-        let c3 = ContainerRecord {
-            container_id: 7003,
-            owner_type: "system".to_string(),
-            owner_id: "escrow".to_string(),
-            name: "System Escrow".to_string(),
-            capacity: 10,
-            access_policy: "owner_only".to_string(),
-            version: 1,
-            created_at: 1000,
-            updated_at: 1000,
-        };
+        let c1 = ContainerRecordBuilder::new(7001)
+            .owner_id("1001")
+            .name("Player A")
+            .build();
+        let c2 = ContainerRecordBuilder::new(7002)
+            .owner_id("1002")
+            .name("Player B")
+            .build();
+        let c3 = ContainerRecordBuilder::new(7003)
+            .owner_type("system")
+            .owner_id("escrow")
+            .name("System Escrow")
+            .build();
         container_repo.create_container(&c1).await.unwrap();
         container_repo.create_container(&c2).await.unwrap();
         container_repo.create_container(&c3).await.unwrap();
@@ -824,18 +804,10 @@ mod tests {
         let char_repo = CharacterRepository::new(db.clone());
         let escrow_coord = EscrowCoordinator::new(db.clone());
 
-        let item = ItemRecord {
-            item_instance_id: "escrow_gem".to_string(),
-            character_guid: 1001,
-            container_id: c_dep,
-            item_def_id: 88,
-            slot: 0,
-            quantity: 1,
-            durability: 100,
-            attributes: serde_json::json!({}),
-            created_at: 1000,
-            updated_at: 1000,
-        };
+        let item = ItemRecordBuilder::new("escrow_gem")
+            .container_id(c_dep)
+            .item_def_id(88)
+            .build();
         char_repo.add_item(&item).await.unwrap();
 
         // 1. Create escrow
@@ -894,18 +866,10 @@ mod tests {
         let char_repo = CharacterRepository::new(db.clone());
         let escrow_coord = EscrowCoordinator::new(db.clone());
 
-        let item = ItemRecord {
-            item_instance_id: "refund_gem".to_string(),
-            character_guid: 1001,
-            container_id: c_dep,
-            item_def_id: 89,
-            slot: 0,
-            quantity: 1,
-            durability: 100,
-            attributes: serde_json::json!({}),
-            created_at: 1000,
-            updated_at: 1000,
-        };
+        let item = ItemRecordBuilder::new("refund_gem")
+            .container_id(c_dep)
+            .item_def_id(89)
+            .build();
         char_repo.add_item(&item).await.unwrap();
 
         escrow_coord
@@ -940,18 +904,10 @@ mod tests {
         let char_repo = CharacterRepository::new(db.clone());
         let escrow_coord = EscrowCoordinator::new(db.clone());
 
-        let item = ItemRecord {
-            item_instance_id: "expire_gem".to_string(),
-            character_guid: 1001,
-            container_id: c_dep,
-            item_def_id: 90,
-            slot: 0,
-            quantity: 1,
-            durability: 100,
-            attributes: serde_json::json!({}),
-            created_at: 1000,
-            updated_at: 1000,
-        };
+        let item = ItemRecordBuilder::new("expire_gem")
+            .container_id(c_dep)
+            .item_def_id(90)
+            .build();
         char_repo.add_item(&item).await.unwrap();
 
         // Create with 0s TTL (immediately expired)

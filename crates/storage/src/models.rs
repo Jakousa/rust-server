@@ -57,6 +57,13 @@ pub struct ItemRecord {
     pub updated_at: i64,
 }
 
+impl ItemRecord {
+    /// Returns a new [`ItemRecordBuilder`] initialized with the given instance ID.
+    pub fn builder(item_instance_id: impl Into<String>) -> crate::test_helpers::ItemRecordBuilder {
+        crate::test_helpers::ItemRecordBuilder::new(item_instance_id)
+    }
+}
+
 /// Trade status for transactional audit logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradeStatus {
@@ -111,6 +118,13 @@ pub struct ContainerRecord {
     pub version: u64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl ContainerRecord {
+    /// Returns a new [`ContainerRecordBuilder`] initialized with the given container ID.
+    pub fn builder(container_id: u64) -> crate::test_helpers::ContainerRecordBuilder {
+        crate::test_helpers::ContainerRecordBuilder::new(container_id)
+    }
 }
 
 /// Temporary slot reservation record for two-phase transfers.
