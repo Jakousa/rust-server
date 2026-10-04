@@ -59,6 +59,13 @@ jobs:
           name: code-coverage-report
           path: lcov.info
 
-      - name: Mutation Testing Smoke Check (cargo-mutants)
-        run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs -F "quantize_pitch_i8"
+      - name: Mutation Testing Gate (cargo-mutants)
+        run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs
+
+      - name: Upload Mutation Testing Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
 

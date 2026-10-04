@@ -6,5 +6,5 @@ web/node_modules
 web/dist
 
 sbxenv.yaml
-mutants.out/
+mutants.out*/
 lcov.info
