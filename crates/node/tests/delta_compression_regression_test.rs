@@ -1,8 +1,16 @@
-//! Bandwidth profiling and verification benchmark for Track 6.
+//! Automated CI regression invariant test for network delta compression.
 //!
-//! Compares uncompressed `EntityStatePacket` replication against bit-packed
-//! `EntityDeltaBatchPacket` replication under 1,000 entity movement density,
-//! and verifies that egress bandwidth reduction exceeds the 60% requirement (targeting 70%-80%).
+//! Verifies bandwidth compression ratio (>60% reduction requirement, targeting 70%-80%)
+//! and memory bounding invariants under latency under 1,000 entity movement density,
+//! rather than serving as a criterion micro-benchmark.
+//!
+//! Specifically validates:
+//! 1. `test_bandwidth_compression_under_1000_entity_density`: Compares uncompressed
+//!    `EntityStatePacket` replication against bit-packed `EntityDeltaBatchPacket` replication,
+//!    asserting egress bandwidth reduction meets or exceeds 60%.
+//! 2. `test_baseline_tracker_memory_bounding_under_latency`: Verifies memory bounding
+//!    invariants for session snapshot history under healthy latency (<20 MB) and worst-case
+//!    lag (<=400 MB for 1,000 sessions).
 
 use mmo_core::guid::Guid;
 use mmo_core::{BoundingBox3D, EntityStore, Octree};
@@ -143,7 +151,7 @@ fn test_bandwidth_compression_under_1000_entity_density() {
     let savings_pct = savings * 100.0;
 
     println!("============================================================");
-    println!("     BANDWIDTH DELTA COMPRESSION BENCHMARK REPORT           ");
+    println!("     BANDWIDTH DELTA COMPRESSION REGRESSION REPORT          ");
     println!("============================================================");
     println!("Entities in AoI     : {}", NUM_ENTITIES);
     println!("Simulation Ticks    : {}", NUM_TICKS);
