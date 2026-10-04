@@ -976,4 +976,60 @@ mod tests {
         let item_after = char_repo.get_item("expire_gem").await.unwrap().unwrap();
         assert_eq!(item_after.container_id, c_dep);
     }
+
+    #[tokio::test]
+    async fn test_escrow_error_branches_and_helpers() {
+        assert_eq!(hash_secret("abc"), hash_secret("abc"));
+        assert_ne!(hash_secret("abc"), hash_secret("def"));
+
+        let db = Database::connect_memory().await.unwrap();
+        let (c_dep, c_ben, c_esc) = setup_escrow_containers(&db).await;
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+
+        // 1. get_escrow for non-existent returns None
+        assert!(escrow_coord
+            .get_escrow("no_such_escrow")
+            .await
+            .unwrap()
+            .is_none());
+
+        // 2. release_escrow on non-existent returns EscrowNotFound
+        let release_err = escrow_coord.release_escrow("missing", "secret").await;
+        assert!(matches!(release_err, Err(StorageError::EscrowNotFound(_))));
+
+        // 3. refund_escrow on non-existent returns EscrowNotFound
+        let refund_err = escrow_coord.refund_escrow("missing").await;
+        assert!(matches!(refund_err, Err(StorageError::EscrowNotFound(_))));
+
+        // 4. create_escrow with invalid container returns ContainerNotFound
+        let bad_cont = escrow_coord
+            .create_escrow(
+                "err_esc_1",
+                99999,
+                c_ben,
+                c_esc,
+                &["dummy".to_string()],
+                "s",
+                60,
+            )
+            .await;
+        assert!(matches!(
+            bad_cont,
+            Err(StorageError::ContainerNotFound(99999))
+        ));
+
+        // 5. create_escrow with missing item returns ItemNotFound
+        let bad_item = escrow_coord
+            .create_escrow(
+                "err_esc_2",
+                c_dep,
+                c_ben,
+                c_esc,
+                &["non_existent_item".to_string()],
+                "s",
+                60,
+            )
+            .await;
+        assert!(matches!(bad_item, Err(StorageError::ItemNotFound(..))));
+    }
 }

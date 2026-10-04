@@ -274,4 +274,147 @@ mod tests {
         assert_eq!(equip.unequip(&EquipSlot::Boots), Some(boots));
         assert_eq!(equip.get_equipped(&EquipSlot::Boots), None);
     }
+
+    #[test]
+    fn test_inventory_remove_and_bounds() {
+        let mut inv = InventoryComponent::new(2, 100.0);
+        let item = ItemStack::new(1, "Dagger", 1, 2.0);
+        let slot = inv.add_item(item.clone()).unwrap();
+        assert_eq!(slot, 0);
+
+        assert_eq!(inv.remove_item(10), None);
+        assert_eq!(inv.remove_item(0), Some(item));
+        assert_eq!(inv.remove_item(0), None);
+    }
+
+    #[test]
+    fn test_check_encumbrance_helper() {
+        let mut store = ComponentStore::new();
+        assert!(!check_encumbrance(&store));
+
+        let mut inv = InventoryComponent::new(2, 10.0);
+        inv.add_item(ItemStack::new(1, "Anvil", 1, 15.0)).unwrap();
+        store.add_component(inv);
+        assert!(check_encumbrance(&store));
+    }
+
+    #[test]
+    fn test_inventory_plugin_and_hook() {
+        use mmo_core::{
+            ComponentCodecRegistry, HookDispatcher, ModularPacketRouter, PluginManager,
+        };
+
+        let plugin = InventoryPlugin;
+        assert_eq!(plugin.id(), "inventory");
+
+        let mut mgr = PluginManager::new();
+        mgr.add_plugin(Box::new(InventoryPlugin));
+        let mut hooks = HookDispatcher::new();
+        let mut codecs = ComponentCodecRegistry::new();
+        let mut event_queue = mmo_core::EventQueue::new();
+        let mut packets = ModularPacketRouter::new();
+        let mut tick_systems = Vec::new();
+        mgr.build_all(
+            &mut hooks,
+            &mut codecs,
+            &mut event_queue,
+            &mut packets,
+            &mut tick_systems,
+        );
+
+        let handler = EncumbranceHookHandler;
+        let mut event_ctx = EventContext::new();
+        let event = Event::BeforeMove {
+            entity: Guid::new(mmo_core::EntityType::Player, 1, 1),
+            from: (0.0, 0.0, 0.0),
+            to: (1.0, 0.0, 0.0),
+        };
+        handler.handle(&event, &mut event_ctx);
+    }
+
+    #[test]
+    fn test_inventory_packet_handler_flows() {
+        use mmo_core::EntityType;
+
+        let handler = InventoryPacketHandler;
+        let mut entities = EntityStore::new();
+        let guid = Guid::new(EntityType::Player, 1, 42);
+
+        // 1. Entity not found
+        let err = handler.handle(guid, 1, &[0, 0], &mut entities);
+        assert!(matches!(err, Err(PacketHandlerError::EntityNotFound(_))));
+
+        // Create entity without inventory
+        entities.spawn(guid, (0.0, 0.0, 0.0));
+
+        // 2. Malformed payload
+        let err = handler.handle(guid, 1, &[0], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
+
+        // 3. Unknown sub-opcode
+        let err = handler.handle(guid, 99, &[0, 0], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
+
+        // 4. Missing InventoryComponent
+        let err = handler.handle(guid, 1, &[0, 0], &mut entities);
+        assert!(matches!(err, Err(PacketHandlerError::Custom(_))));
+
+        // Add inventory
+        let inv = InventoryComponent::new(5, 100.0);
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        entity.add_component(inv);
+
+        // 5. Empty slot
+        let err = handler.handle(guid, 1, &[0, 0], &mut entities);
+        assert!(matches!(err, Err(PacketHandlerError::Custom(_))));
+
+        // 6. Successful equip (Head = 0)
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+        inv_mut
+            .add_item(ItemStack::new(50, "Helm", 1, 5.0))
+            .unwrap();
+        inv_mut
+            .add_item(ItemStack::new(51, "Crown", 1, 4.0))
+            .unwrap();
+
+        let ok = handler.handle(guid, 1, &[0, 0], &mut entities);
+        assert_eq!(ok.unwrap(), Some(vec![1]));
+
+        // 7. Equip second item into same slot (swap / returns old to inventory)
+        let ok = handler.handle(guid, 1, &[1, 0], &mut entities);
+        assert_eq!(ok.unwrap(), Some(vec![1]));
+
+        // Verify equipment has Crown and inventory received old Helm
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let eq = entity.get_component::<EquipmentComponent>().unwrap();
+        assert_eq!(eq.get_equipped(&EquipSlot::Head).unwrap().item_id, 51);
+        let inv = entity.get_component::<InventoryComponent>().unwrap();
+        assert_eq!(inv.slots[0].as_ref().unwrap().item_id, 50);
+
+        // 8. Equip into Chest (1), MainHand (2), OffHand (3), Boots (4)
+        for (sub_slot, equip_slot) in [
+            (1, EquipSlot::Chest),
+            (2, EquipSlot::MainHand),
+            (3, EquipSlot::OffHand),
+            (4, EquipSlot::Boots),
+        ] {
+            let entity = entities.get_mut_by_guid(guid).unwrap();
+            let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+            let idx = inv_mut
+                .add_item(ItemStack::new(100 + sub_slot as u32, "Gear", 1, 1.0))
+                .unwrap();
+            let ok = handler.handle(guid, 1, &[idx as u8, sub_slot], &mut entities);
+            assert!(ok.is_ok());
+            let entity = entities.get_mut_by_guid(guid).unwrap();
+            let eq = entity.get_component::<EquipmentComponent>().unwrap();
+            assert!(eq.get_equipped(&equip_slot).is_some());
+        }
+    }
 }

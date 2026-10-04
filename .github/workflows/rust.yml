@@ -50,7 +50,7 @@ jobs:
         run: cargo machete
 
       - name: Run Tests with Code Coverage (cargo-llvm-cov)
-        run: cargo llvm-cov --workspace --all-targets --fail-under-lines 80 --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 85 --lcov --output-path lcov.info
 
       - name: Upload Coverage Artifact
         uses: actions/upload-artifact@v4
