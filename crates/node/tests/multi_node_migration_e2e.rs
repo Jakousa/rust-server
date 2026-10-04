@@ -16,6 +16,19 @@ use mmo_schema::client::{ClientPacket, MovementPacket};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
+async fn wait_for_ready(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Server at {} did not become ready", addr);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     // -------------------------------------------------------------------------
@@ -78,6 +91,10 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
             .unwrap();
     });
 
+    // Synchronize until all gRPC servers are ready to accept connections
+    wait_for_ready(gw_grpc_addr).await;
+    wait_for_ready(recipient_addr).await;
+    wait_for_ready(donor_addr).await;
     // -------------------------------------------------------------------------
     // 4. Register client session on Gateway routed to Node 1
     // -------------------------------------------------------------------------
@@ -144,8 +161,19 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
 
     assert_eq!(migration_result, Ok(true));
 
-    // Allow async route invalidation propagation
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Deterministically await gateway route invalidation propagation
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if router.get_route_by_guid(player_guid).as_deref()
+            == Some(recipient_addr.to_string().as_str())
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Timed out waiting for route to propagate to gateway");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 
     // -------------------------------------------------------------------------
     // 7. Verification: Zero entity duplication and zero loss

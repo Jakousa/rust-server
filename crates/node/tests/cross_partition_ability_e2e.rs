@@ -22,6 +22,57 @@ use mmo_node::TickSimulation;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
+async fn wait_for_ready(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Server at {} did not become ready", addr);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn wait_for_health(node: &tokio::sync::RwLock<TickSimulation>, guid: Guid, expected_hp: f32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let sim = node.read().await;
+            if let Some(ent) = sim.entity_store.get_by_guid(guid) {
+                if let Some(health) = ent.get_component::<HealthComponent>() {
+                    if (health.current_hp - expected_hp).abs() < f32::EPSILON {
+                        return;
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for entity {:?} health to reach {}",
+                guid, expected_hp
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn wait_for_compensation(node: &tokio::sync::RwLock<TickSimulation>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let sim = node.read().await;
+            if !sim.ability_compensation_receiver.is_empty() {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Timed out waiting for ability compensation to arrive");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
 async fn create_node(
     node_id: u16,
     bounds: BoundingBox3D,
@@ -45,6 +96,8 @@ async fn create_node(
             .unwrap();
     });
 
+    wait_for_ready(addr).await;
+
     (sim, addr)
 }
 
@@ -59,8 +112,6 @@ async fn test_e2e_cross_partition_targeted_ability() {
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
     )
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let caster = Guid::new(EntityType::Player, 1, 101);
     let target = Guid::new(EntityType::Player, 2, 202);
@@ -145,7 +196,7 @@ async fn test_e2e_cross_partition_targeted_ability() {
     }
 
     // Wait for gRPC execution to complete on Node 2
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_health(&node2_sim, target, 60.0).await;
 
     // Verify target health on Node 2 was decremented
     {
@@ -165,8 +216,6 @@ async fn test_e2e_cross_partition_boundary_aoe() {
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
     )
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let caster = Guid::new(EntityType::Player, 1, 301);
     let local_enemy = Guid::new(EntityType::Npc, 1, 302);
@@ -249,7 +298,7 @@ async fn test_e2e_cross_partition_boundary_aoe() {
     }
 
     // Wait for remote gRPC batch to commit on Node 2
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_health(&node2_sim, remote_enemy, 65.0).await;
 
     // Verify remote enemy took damage on Node 2
     {
@@ -269,8 +318,6 @@ async fn test_e2e_migration_lease_veto_and_compensation() {
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
     )
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let caster = Guid::new(EntityType::Player, 1, 501);
     let target = Guid::new(EntityType::Player, 2, 601);
@@ -339,7 +386,7 @@ async fn test_e2e_migration_lease_veto_and_compensation() {
     }
 
     // Wait for RPC rejection to arrive and push compensation
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_compensation(&node1_sim).await;
 
     // Run simulation tick on Node 1 to drain compensation
     {
@@ -376,8 +423,6 @@ async fn test_e2e_out_of_range_revalidation_veto_and_compensation() {
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
     )
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let caster = Guid::new(EntityType::Player, 1, 701);
     let target = Guid::new(EntityType::Player, 2, 801);
@@ -442,7 +487,7 @@ async fn test_e2e_out_of_range_revalidation_veto_and_compensation() {
     }
 
     // Wait for target node to reject due to out-of-range authoritative re-validation
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_compensation(&node1_sim).await;
 
     // Node 1 drains compensation
     {
