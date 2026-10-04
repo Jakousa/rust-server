@@ -1045,4 +1045,77 @@ mod tests {
             Err(StorageError::ReservationExpiredOrAborted(_))
         ));
     }
+
+    #[tokio::test]
+    async fn test_2pc_error_branches_and_reserve_slot() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c1, c2) = setup_test_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        // 1. ContainerNotFound
+        let err_c = coord
+            .prepare_transfer("tx_err_1", 99999, 0, c2, 1, 5000)
+            .await;
+        assert!(matches!(err_c, Err(StorageError::ContainerNotFound(99999))));
+
+        // 2. Capacity exceeded / out of bounds
+        let err_cap = coord
+            .prepare_transfer("tx_err_2", c1, 0, c2, 100, 5000)
+            .await;
+        assert!(matches!(err_cap, Err(StorageError::SlotOccupied(100, _))));
+
+        // 3. Source item not found
+        let err_item = coord.prepare_transfer("tx_err_3", c1, 0, c2, 1, 5000).await;
+        assert!(matches!(err_item, Err(StorageError::ItemNotFound(..))));
+
+        // Add items to c1 slot 0 and c2 slot 1
+        let item1 = ItemRecord {
+            item_instance_id: "edge_item_1".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 10,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        let item2 = ItemRecord {
+            item_instance_id: "edge_item_2".to_string(),
+            character_guid: 1001,
+            container_id: c2,
+            item_def_id: 11,
+            slot: 1,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item1).await.unwrap();
+        char_repo.add_item(&item2).await.unwrap();
+
+        // 4. Destination slot occupied
+        let err_occ = coord.prepare_transfer("tx_err_4", c1, 0, c2, 1, 5000).await;
+        assert!(matches!(err_occ, Err(StorageError::SlotOccupied(1, _))));
+
+        // 5. Test reserve_slot directly
+        let res1 = coord
+            .reserve_slot("tx_res_1", c1, 0, Some("edge_item_1"), "transfer", 5000)
+            .await
+            .unwrap();
+        assert_eq!(res1.slot, 0);
+
+        // Duplicate reservation rejected
+        let res_dup = coord
+            .reserve_slot("tx_res_2", c1, 0, Some("edge_item_1"), "transfer", 5000)
+            .await;
+        assert!(matches!(res_dup, Err(StorageError::SlotReserved(0, _))));
+
+        // Non-existent abort returns false
+        let aborted = coord.abort_transfer("non_existent_tx").await.unwrap();
+        assert!(!aborted);
+    }
 }

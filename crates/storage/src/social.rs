@@ -256,4 +256,32 @@ mod tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received, SocialEnvelope::Chat(whisper));
     }
+
+    #[tokio::test]
+    async fn test_social_envelopes_and_redis_bus() {
+        let party_env = SocialEnvelope::Party(PartyAction::Invite {
+            party_id: 1,
+            inviter_guid: 10,
+            invitee_guid: 20,
+        });
+        let guild_env = SocialEnvelope::Guild(GuildSyncAction::MemberJoined {
+            guild_id: 5,
+            member_guid: 10,
+            rank: 1,
+        });
+        let cont_env = SocialEnvelope::Container(ContainerSyncAction::Transferred {
+            tx_id: "tx_1".into(),
+            src_container_id: 1,
+            dst_container_id: 2,
+            item_instance_id: "i1".into(),
+        });
+
+        for env in [&party_env, &guild_env, &cont_env] {
+            let json = serde_json::to_string(env).unwrap();
+            let dec: SocialEnvelope = serde_json::from_str(&json).unwrap();
+            assert_eq!(*env, dec);
+        }
+
+        assert!(RedisSocialBus::new("invalid_url").is_err());
+    }
 }

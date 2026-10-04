@@ -219,4 +219,49 @@ mod tests {
         // Atomic claim should remove entry
         assert!(cache.claim_handover(999).await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn test_memory_cache_expiration_and_not_found() {
+        let cache = MemoryCache::new();
+
+        // 1. Non-existent removal
+        assert!(!cache.remove_session(9999).await.unwrap());
+        assert!(cache.get_session(9999).await.unwrap().is_none());
+
+        // 2. Session expiration (0s TTL)
+        let session = SessionData {
+            session_id: 888,
+            guid: 777,
+            node_address: "127.0.0.1:50053".to_string(),
+            expires_at: 1000,
+        };
+        cache.set_session(&session, 0).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        assert!(cache.get_session(888).await.unwrap().is_none());
+
+        // 3. Handover expiration (0s TTL)
+        let handover = HandoverData {
+            guid: 555,
+            source_node: 1,
+            target_node: 2,
+            snapshot: EntitySnapshot {
+                guid: 555,
+                position: (0.0, 0.0, 0.0),
+                rotation: 0.0,
+                attributes: serde_json::json!({}),
+                version: 1,
+                timestamp: 1000,
+            },
+            staged_at: 1000,
+        };
+        cache.stage_handover(&handover, 0).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        assert!(cache.claim_handover(555).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_redis_cache_invalid_url() {
+        let res = RedisCache::new("not_a_valid_redis_url");
+        assert!(res.is_err());
+    }
 }

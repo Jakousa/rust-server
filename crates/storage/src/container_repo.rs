@@ -340,6 +340,18 @@ mod tests {
             .unwrap();
         assert_eq!(slot_item.item_instance_id, "vault_item_1");
 
+        let fetched_item = container_repo
+            .get_item("vault_item_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_item.item_instance_id, "vault_item_1");
+        assert!(container_repo
+            .get_item("non_existent")
+            .await
+            .unwrap()
+            .is_none());
+
         let empty_slot = container_repo.get_item_at_slot(5001, 1).await.unwrap();
         assert!(empty_slot.is_none());
 
@@ -355,5 +367,8 @@ mod tests {
         let deleted = container_repo.delete_container(5001).await.unwrap();
         assert!(deleted);
         assert!(container_repo.get_container(5001).await.unwrap().is_none());
+
+        // Deleting non-existent container returns false
+        assert!(!container_repo.delete_container(9999).await.unwrap());
     }
 }

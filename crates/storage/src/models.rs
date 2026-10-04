@@ -181,3 +181,207 @@ pub struct ContainerTransactionRecord {
     pub status: String,
     pub timestamp_epoch_ms: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_trade_status_display_and_from_str() {
+        assert_eq!(TradeStatus::Pending.to_string(), "pending");
+        assert_eq!(TradeStatus::Committed.to_string(), "committed");
+        assert_eq!(TradeStatus::RolledBack.to_string(), "rolled_back");
+
+        assert_eq!(
+            TradeStatus::from_str("pending").unwrap(),
+            TradeStatus::Pending
+        );
+        assert_eq!(
+            TradeStatus::from_str("committed").unwrap(),
+            TradeStatus::Committed
+        );
+        assert_eq!(
+            TradeStatus::from_str("rolled_back").unwrap(),
+            TradeStatus::RolledBack
+        );
+        assert!(TradeStatus::from_str("invalid").is_err());
+
+        let json = serde_json::to_string(&TradeStatus::Pending).unwrap();
+        let decoded: TradeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, TradeStatus::Pending);
+    }
+
+    #[test]
+    fn test_escrow_status_display_and_from_str() {
+        assert_eq!(EscrowStatus::Held.to_string(), "held");
+        assert_eq!(EscrowStatus::Settled.to_string(), "settled");
+        assert_eq!(EscrowStatus::Refunded.to_string(), "refunded");
+
+        assert_eq!(EscrowStatus::from_str("held").unwrap(), EscrowStatus::Held);
+        assert_eq!(
+            EscrowStatus::from_str("settled").unwrap(),
+            EscrowStatus::Settled
+        );
+        assert_eq!(
+            EscrowStatus::from_str("refunded").unwrap(),
+            EscrowStatus::Refunded
+        );
+        assert!(EscrowStatus::from_str("unknown").is_err());
+
+        let json = serde_json::to_string(&EscrowStatus::Held).unwrap();
+        let decoded: EscrowStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, EscrowStatus::Held);
+    }
+
+    #[test]
+    fn test_records_serialization_and_equality() {
+        let account = AccountRecord {
+            account_id: "acc_1".to_string(),
+            username: "tester".to_string(),
+            created_at: 1000,
+        };
+        let acc_json = serde_json::to_string(&account).unwrap();
+        let acc_dec: AccountRecord = serde_json::from_str(&acc_json).unwrap();
+        assert_eq!(account, acc_dec);
+        assert_eq!(account.clone(), acc_dec);
+        assert!(!format!("{:?}", account).is_empty());
+
+        let character = CharacterRecord {
+            guid: 10,
+            account_id: "acc_1".to_string(),
+            name: "Warrior".to_string(),
+            level: 1,
+            position: (1.0, 2.0, 3.0),
+            rotation: 1.5,
+            attributes: serde_json::json!({"hp": 100}),
+            updated_at: 1000,
+        };
+        let char_json = serde_json::to_string(&character).unwrap();
+        let char_dec: CharacterRecord = serde_json::from_str(&char_json).unwrap();
+        assert_eq!(character, char_dec);
+        assert_eq!(character.clone(), char_dec);
+        assert!(!format!("{:?}", character).is_empty());
+
+        let snapshot = EntitySnapshot {
+            guid: 10,
+            position: (1.0, 2.0, 3.0),
+            rotation: 1.5,
+            attributes: serde_json::json!({}),
+            version: 2,
+            timestamp: 2000,
+        };
+        let snap_json = serde_json::to_string(&snapshot).unwrap();
+        let snap_dec: EntitySnapshot = serde_json::from_str(&snap_json).unwrap();
+        assert_eq!(snapshot, snap_dec);
+        assert_eq!(snapshot.clone(), snap_dec);
+        assert!(!format!("{:?}", snapshot).is_empty());
+
+        let inv = InventoryRecord {
+            character_guid: 10,
+            capacity: 20,
+            updated_at: 1000,
+        };
+        let inv_json = serde_json::to_string(&inv).unwrap();
+        let inv_dec: InventoryRecord = serde_json::from_str(&inv_json).unwrap();
+        assert_eq!(inv, inv_dec);
+        assert_eq!(inv.clone(), inv_dec);
+        assert!(!format!("{:?}", inv).is_empty());
+
+        let item = ItemRecord {
+            item_instance_id: "item_1".to_string(),
+            character_guid: 10,
+            container_id: 100,
+            item_def_id: 5,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        let item_json = serde_json::to_string(&item).unwrap();
+        let item_dec: ItemRecord = serde_json::from_str(&item_json).unwrap();
+        assert_eq!(item, item_dec);
+        assert_eq!(item.clone(), item_dec);
+        assert!(!format!("{:?}", item).is_empty());
+
+        let trade = TradeRecord {
+            trade_id: "tx_1".to_string(),
+            sender_guid: 10,
+            recipient_guid: 20,
+            items_json: "[]".to_string(),
+            status: TradeStatus::Committed,
+            created_at: 1000,
+        };
+        let trade_json = serde_json::to_string(&trade).unwrap();
+        let trade_dec: TradeRecord = serde_json::from_str(&trade_json).unwrap();
+        assert_eq!(trade, trade_dec);
+        assert_eq!(trade.clone(), trade_dec);
+        assert!(!format!("{:?}", trade).is_empty());
+
+        let container = ContainerRecord {
+            container_id: 100,
+            owner_type: "character".to_string(),
+            owner_id: "10".to_string(),
+            name: "Bags".to_string(),
+            capacity: 20,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        let cont_json = serde_json::to_string(&container).unwrap();
+        let cont_dec: ContainerRecord = serde_json::from_str(&cont_json).unwrap();
+        assert_eq!(container, cont_dec);
+        assert_eq!(container.clone(), cont_dec);
+        assert!(!format!("{:?}", container).is_empty());
+
+        let res = ReservationRecord {
+            reservation_id: "res_1".to_string(),
+            tx_id: "tx_1".to_string(),
+            container_id: 100,
+            slot: 0,
+            item_instance_id: Some("item_1".to_string()),
+            reservation_type: "transfer".to_string(),
+            expires_at_epoch_ms: 2000,
+            created_at_epoch_ms: 1000,
+        };
+        let res_json = serde_json::to_string(&res).unwrap();
+        let res_dec: ReservationRecord = serde_json::from_str(&res_json).unwrap();
+        assert_eq!(res, res_dec);
+        assert_eq!(res.clone(), res_dec);
+        assert!(!format!("{:?}", res).is_empty());
+
+        let escrow = EscrowRecord {
+            escrow_id: "esc_1".to_string(),
+            depositor_container_id: 100,
+            beneficiary_container_id: 200,
+            escrow_container_id: 300,
+            status: EscrowStatus::Held,
+            secret_hash: "hash".to_string(),
+            expires_at_epoch_ms: 5000,
+            created_at_epoch_ms: 1000,
+            updated_at_epoch_ms: 1000,
+        };
+        let esc_json = serde_json::to_string(&escrow).unwrap();
+        let esc_dec: EscrowRecord = serde_json::from_str(&esc_json).unwrap();
+        assert_eq!(escrow, esc_dec);
+        assert_eq!(escrow.clone(), esc_dec);
+        assert!(!format!("{:?}", escrow).is_empty());
+
+        let tx = ContainerTransactionRecord {
+            tx_id: "tx_1".to_string(),
+            src_container_id: 100,
+            dst_container_id: 200,
+            item_instance_id: "item_1".to_string(),
+            status: "committed".to_string(),
+            timestamp_epoch_ms: 1000,
+        };
+        let tx_json = serde_json::to_string(&tx).unwrap();
+        let tx_dec: ContainerTransactionRecord = serde_json::from_str(&tx_json).unwrap();
+        assert_eq!(tx, tx_dec);
+        assert_eq!(tx.clone(), tx_dec);
+        assert!(!format!("{:?}", tx).is_empty());
+    }
+}
