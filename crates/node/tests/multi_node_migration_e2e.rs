@@ -4,97 +4,40 @@
 //! Verifies seamless entity transfer across spatial boundaries, Edge Gateway route update,
 //! and subsequent client packet routing without transport interruption or entity duplication.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::TestClusterBuilder;
 use mmo_core::guid::{EntityType, Guid};
 use mmo_core::BoundingBox3D;
-use mmo_gateway::{GatewayServer, GatewayServiceImpl, SessionRouter};
-use mmo_node::network::{execute_entity_migration, NodeServiceImpl};
-use mmo_node::TickSimulation;
+use mmo_node::network::execute_entity_migration;
 use mmo_schema::client::{ClientPacket, MovementPacket};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
-
-async fn wait_for_ready(addr: std::net::SocketAddr) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("Server at {} did not become ready", addr);
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
 
 #[tokio::test]
 async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     // -------------------------------------------------------------------------
-    // 1. Start Edge Gateway with gRPC GatewayService
-    // -------------------------------------------------------------------------
-    let router = Arc::new(SessionRouter::new());
-    let gateway_server = Arc::new(GatewayServer::new(Arc::clone(&router)));
-    let gateway_grpc = GatewayServiceImpl::new(Arc::clone(&router));
-
-    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gw_grpc_addr = gw_listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(gateway_grpc.into_server())
-            .serve_with_incoming(TcpListenerStream::new(gw_listener))
-            .await
-            .unwrap();
-    });
-
-    // -------------------------------------------------------------------------
-    // 2. Start Recipient Node (Node 2: [50.0..100.0, 0.0..100.0, 0.0..100.0])
-    // -------------------------------------------------------------------------
-    let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
-    let recipient_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
-        2,
-        recipient_bounds,
-    )));
-    let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
-
-    let recipient_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let recipient_addr = recipient_listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(recipient_service.into_server())
-            .serve_with_incoming(TcpListenerStream::new(recipient_listener))
-            .await
-            .unwrap();
-    });
-
-    // -------------------------------------------------------------------------
-    // 3. Start Donor Node (Node 1: [0.0..50.0, 0.0..100.0, 0.0..100.0])
+    // 1. Build and start Cluster with Gateway gRPC and 2 simulation nodes
     // -------------------------------------------------------------------------
     let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
-    let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
-        1,
-        donor_bounds,
-    )));
-    let donor_service = NodeServiceImpl::new(Arc::clone(&donor_sim));
+    let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
 
-    let donor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let donor_addr = donor_listener.local_addr().unwrap();
+    let cluster = TestClusterBuilder::new()
+        .with_gateway_grpc(true)
+        .with_spawn_grpc(true)
+        .with_node(1, donor_bounds)
+        .with_node(2, recipient_bounds)
+        .build()
+        .await;
 
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(donor_service.into_server())
-            .serve_with_incoming(TcpListenerStream::new(donor_listener))
-            .await
-            .unwrap();
-    });
-
-    // Synchronize until all gRPC servers are ready to accept connections
-    wait_for_ready(gw_grpc_addr).await;
-    wait_for_ready(recipient_addr).await;
-    wait_for_ready(donor_addr).await;
+    let router = cluster.router.clone();
+    let gateway_server = cluster.gateway_server.clone();
+    let gw_grpc_addr = cluster.gateway_grpc_addr();
+    let donor_sim = cluster.node_sim(1);
+    let recipient_sim = cluster.node_sim(2);
+    let donor_addr = cluster.node_addr(1).to_string();
+    let recipient_addr = cluster.node_addr(2).to_string();
     // -------------------------------------------------------------------------
     // 4. Register client session on Gateway routed to Node 1
     // -------------------------------------------------------------------------

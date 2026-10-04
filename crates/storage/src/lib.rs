@@ -9,6 +9,7 @@ pub mod escrow_coord;
 pub mod models;
 pub mod repository;
 pub mod social;
+pub mod test_helpers;
 pub mod transaction_coord;
 
 pub use cache::{MemoryCache, RedisCache, SessionCacheBackend, SessionData};
@@ -25,4 +26,5 @@ pub use social::{
     ChatChannel, ChatMessage, ContainerSyncAction, GuildSyncAction, MemorySocialBus, PartyAction,
     RedisSocialBus, SocialBus, SocialBusError, SocialEnvelope,
 };
+pub use test_helpers::{ContainerRecordBuilder, ItemRecordBuilder};
 pub use transaction_coord::TransactionCoordinator;

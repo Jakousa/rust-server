@@ -12,58 +12,50 @@
 //! - Boundary transition and dynamic gateway route handover from Node 1 to Node 2
 //! - Post-handover authoritative movement and interaction on Node 2
 
+mod common;
+
 use bytes::BytesMut;
-use std::sync::Arc;
+use common::TestClusterBuilder;
 
 use mmo_core::guid::{EntityType, Guid};
 use mmo_core::BoundingBox3D;
-use mmo_director::NodeRegistry;
-use mmo_gateway::router::SessionRouter;
-use mmo_gateway::server::PacketDispatcher;
-use mmo_node::network::{EntityVelocity, GhostBroadcaster, GhostStore};
-use mmo_node::sim::TickSimulation;
+use mmo_node::network::{EntityVelocity, GhostBroadcaster};
 use mmo_schema::client::{ClientPacket, InteractionPacket, InteractionType, MovementPacket, Vec3};
 use mmo_schema::cluster::GhostSyncRequest;
 
 #[tokio::test]
 async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     // ------------------------------------------------------------------------
-    // Step 1: Initialize Director Control Plane
+    // Step 1: Initialize Cluster Topology using TestClusterBuilder
     // ------------------------------------------------------------------------
-    let mut registry = NodeRegistry::new();
-
     let node1_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
     let node2_bounds = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
 
-    let node1_addr = "127.0.0.1:50052".to_string();
-    let node2_addr = "127.0.0.1:50053".to_string();
+    let cluster = TestClusterBuilder::new()
+        .with_spawn_grpc(false)
+        .with_node_and_addr(1, node1_bounds, "127.0.0.1:50052")
+        .with_node_and_addr(2, node2_bounds, "127.0.0.1:50053")
+        .build()
+        .await;
 
-    let node1_id = registry.register_node(node1_addr.clone(), vec![node1_bounds]);
-    let node2_id = registry.register_node(node2_addr.clone(), vec![node2_bounds]);
+    assert_eq!(cluster.registry.len(), 2);
+    let node1_addr = cluster.node_addr(1).to_string();
+    let node2_addr = cluster.node_addr(2).to_string();
+    let router = cluster.router.clone();
+    let dispatcher = cluster.dispatcher();
 
-    assert_eq!(node1_id, 1);
-    assert_eq!(node2_id, 2);
-    assert_eq!(registry.len(), 2);
-
-    // ------------------------------------------------------------------------
-    // Step 2: Initialize 2 Simulation Nodes
-    // ------------------------------------------------------------------------
-    let mut node1_sim = TickSimulation::new(1, node1_bounds);
-    let mut node2_sim = TickSimulation::new(2, node2_bounds);
-
-    let mut node2_ghost_store = GhostStore::new();
-
-    // ------------------------------------------------------------------------
-    // Step 3: Initialize Edge Gateway
-    // ------------------------------------------------------------------------
-    let router = Arc::new(SessionRouter::new());
-    let dispatcher = PacketDispatcher::new(router.clone());
+    let node1_sim_arc = cluster.node_sim(1);
+    let node2_sim_arc = cluster.node_sim(2);
+    let mut node1_sim = node1_sim_arc.write().await;
+    let mut node2_sim = node2_sim_arc.write().await;
+    let node2_ghost_store_arc = cluster.node_ghost_store(2);
+    let mut node2_ghost_store = node2_ghost_store_arc.write().await;
 
     let session_id = 9001u64;
     let player_guid = Guid::new(EntityType::Player, 1, 42);
 
     // Register initial player session routed to Node 1
-    router.register_session(session_id, player_guid, node1_addr.clone());
+    cluster.register_session(session_id, player_guid, 1);
 
     // Spawn player authoritatively on Node 1 at (-3.0, 0.0, 0.0)
     let spawned = node1_sim.spawn_entity(player_guid, (-3.0, 0.0, 0.0));

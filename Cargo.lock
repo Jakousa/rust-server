@@ -1736,6 +1736,7 @@ dependencies = [
  "criterion",
  "metrics",
  "mmo-core",
+ "mmo-director",
  "mmo-gameplay",
  "mmo-gateway",
  "mmo-schema",
