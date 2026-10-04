@@ -19,9 +19,10 @@ use mmo_node::ability_dispatcher::{
 };
 use mmo_node::network::{GhostRecord, NodeServiceImpl};
 use mmo_node::TickSimulation;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-fn create_node(
+async fn create_node(
     node_id: u16,
     bounds: BoundingBox3D,
 ) -> (
@@ -33,14 +34,13 @@ fn create_node(
     )));
     let service = NodeServiceImpl::new(Arc::clone(&sim));
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     tokio::spawn(async move {
         Server::builder()
             .add_service(service.into_server())
-            .serve(addr)
+            .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
     });
@@ -52,12 +52,13 @@ fn create_node(
 async fn test_e2e_cross_partition_targeted_ability() {
     // Node 1: [0..50, 0..100, 0..100]
     let (node1_sim, _node1_addr) =
-        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0)));
+        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0))).await;
     // Node 2: [50..100, 0..100, 0..100]
     let (node2_sim, node2_addr) = create_node(
         2,
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
-    );
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -158,11 +159,12 @@ async fn test_e2e_cross_partition_targeted_ability() {
 #[tokio::test]
 async fn test_e2e_cross_partition_boundary_aoe() {
     let (node1_sim, _node1_addr) =
-        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0)));
+        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0))).await;
     let (node2_sim, node2_addr) = create_node(
         2,
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
-    );
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -261,11 +263,12 @@ async fn test_e2e_cross_partition_boundary_aoe() {
 #[tokio::test]
 async fn test_e2e_migration_lease_veto_and_compensation() {
     let (node1_sim, _node1_addr) =
-        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0)));
+        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0))).await;
     let (node2_sim, node2_addr) = create_node(
         2,
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
-    );
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -367,11 +370,12 @@ async fn test_e2e_migration_lease_veto_and_compensation() {
 #[tokio::test]
 async fn test_e2e_out_of_range_revalidation_veto_and_compensation() {
     let (node1_sim, _node1_addr) =
-        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0)));
+        create_node(1, BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0))).await;
     let (node2_sim, node2_addr) = create_node(
         2,
         BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
-    );
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
