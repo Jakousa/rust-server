@@ -13,6 +13,7 @@ use mmo_gateway::{GatewayServer, GatewayServiceImpl, SessionRouter};
 use mmo_node::network::{execute_entity_migration, NodeServiceImpl};
 use mmo_node::TickSimulation;
 use mmo_schema::client::{ClientPacket, MovementPacket};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 #[tokio::test]
@@ -24,14 +25,13 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     let gateway_server = Arc::new(GatewayServer::new(Arc::clone(&router)));
     let gateway_grpc = GatewayServiceImpl::new(Arc::clone(&router));
 
-    let gw_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_grpc_addr = gw_listener.local_addr().unwrap();
-    drop(gw_listener);
 
     tokio::spawn(async move {
         Server::builder()
             .add_service(gateway_grpc.into_server())
-            .serve(gw_grpc_addr)
+            .serve_with_incoming(TcpListenerStream::new(gw_listener))
             .await
             .unwrap();
     });
@@ -46,14 +46,13 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     )));
     let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
 
-    let recipient_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let recipient_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let recipient_addr = recipient_listener.local_addr().unwrap();
-    drop(recipient_listener);
 
     tokio::spawn(async move {
         Server::builder()
             .add_service(recipient_service.into_server())
-            .serve(recipient_addr)
+            .serve_with_incoming(TcpListenerStream::new(recipient_listener))
             .await
             .unwrap();
     });
@@ -68,20 +67,16 @@ async fn test_end_to_end_multi_node_live_migration_and_gateway_invalidation() {
     )));
     let donor_service = NodeServiceImpl::new(Arc::clone(&donor_sim));
 
-    let donor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let donor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let donor_addr = donor_listener.local_addr().unwrap();
-    drop(donor_listener);
 
     tokio::spawn(async move {
         Server::builder()
             .add_service(donor_service.into_server())
-            .serve(donor_addr)
+            .serve_with_incoming(TcpListenerStream::new(donor_listener))
             .await
             .unwrap();
     });
-
-    // Allow gRPC servers to bind
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // -------------------------------------------------------------------------
     // 4. Register client session on Gateway routed to Node 1

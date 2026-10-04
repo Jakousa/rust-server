@@ -1510,6 +1510,7 @@ mod tests {
     use mmo_core::guid::EntityType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     fn test_bounds() -> BoundingBox3D {
         BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0))
@@ -1898,14 +1899,13 @@ mod tests {
         }
 
         let service = NodeServiceImpl::new(sim.clone());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service.into_server())
-                .serve(addr)
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
@@ -2019,14 +2019,13 @@ mod tests {
         )));
         let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
-        drop(listener);
 
         tokio::spawn(async move {
             Server::builder()
                 .add_service(recipient_service.into_server())
-                .serve(recipient_addr)
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
@@ -2123,14 +2122,13 @@ mod tests {
         )));
         let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
-        drop(listener);
 
         tokio::spawn(async move {
             Server::builder()
                 .add_service(recipient_service.into_server())
-                .serve(recipient_addr)
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
@@ -2138,9 +2136,8 @@ mod tests {
         // 2. Gateway Service
         let gw_router = Arc::new(mmo_gateway::router::SessionRouter::new());
         let gw_service = mmo_gateway::server::GatewayServiceImpl::new(Arc::clone(&gw_router));
-        let gw_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gw_addr = gw_listener.local_addr().unwrap();
-        drop(gw_listener);
 
         tokio::spawn(async move {
             Server::builder()
@@ -2149,7 +2146,7 @@ mod tests {
                         gw_service,
                     ),
                 )
-                .serve(gw_addr)
+                .serve_with_incoming(TcpListenerStream::new(gw_listener))
                 .await
                 .unwrap();
         });
@@ -2280,14 +2277,13 @@ mod tests {
         )));
         let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
-        drop(listener);
 
         tokio::spawn(async move {
             Server::builder()
                 .add_service(recipient_service.into_server())
-                .serve(recipient_addr)
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
