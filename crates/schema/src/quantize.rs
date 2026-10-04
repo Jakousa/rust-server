@@ -203,6 +203,20 @@ mod tests {
         assert!(is_teleport_delta(0.0, -300.0, 0.0));
         assert!(is_teleport_delta(0.0, 0.0, 1000.0));
 
+        // Exact boundary checks for teleport threshold
+        assert!(!is_teleport_delta(255.0, 0.0, 0.0));
+        assert!(!is_teleport_delta(0.0, 255.0, 0.0));
+        assert!(!is_teleport_delta(0.0, 0.0, 255.0));
+        assert!(!is_teleport_delta(-255.0, 0.0, 0.0));
+        assert!(!is_teleport_delta(0.0, -255.0, 0.0));
+        assert!(!is_teleport_delta(0.0, 0.0, -255.0));
+        assert!(is_teleport_delta(255.01, 0.0, 0.0));
+        assert!(is_teleport_delta(0.0, 255.01, 0.0));
+        assert!(is_teleport_delta(0.0, 0.0, 255.01));
+        assert!(is_teleport_delta(-255.01, 0.0, 0.0));
+        assert!(is_teleport_delta(0.0, -255.01, 0.0));
+        assert!(is_teleport_delta(0.0, 0.0, -255.01));
+
         // Clamping bounds
         let q_max = quantize_delta_i16(1000.0);
         assert_eq!(q_max, i16::MAX);
@@ -214,5 +228,29 @@ mod tests {
         assert_eq!(quantize_yaw_u8(f32::NAN), 0);
         assert_eq!(quantize_pitch_i8(f32::NAN), 0);
         assert_eq!(quantize_velocity_i16(f32::NAN), 0);
+    }
+
+    #[test]
+    fn test_delta_vec3_quantization_precision() {
+        let (qx, qy, qz) = quantize_delta_vec3(12.5, -45.25, 100.125);
+        assert_eq!(qx, quantize_delta_i16(12.5));
+        assert_eq!(qy, quantize_delta_i16(-45.25));
+        assert_eq!(qz, quantize_delta_i16(100.125));
+        assert_ne!((qx, qy, qz), (0, 0, 0));
+
+        let (rx, ry, rz) = dequantize_delta_vec3(qx, qy, qz);
+        assert!((rx - 12.5).abs() <= 0.008);
+        assert!((ry - -45.25).abs() <= 0.008);
+        assert!((rz - 100.125).abs() <= 0.008);
+
+        // Ensure negative and diverse combinations are verified
+        let (nx, ny, nz) = quantize_delta_vec3(-1.0, 1.0, -0.5);
+        assert_eq!(nx, quantize_delta_i16(-1.0));
+        assert_eq!(ny, quantize_delta_i16(1.0));
+        assert_eq!(nz, quantize_delta_i16(-0.5));
+        let (dx, dy, dz) = dequantize_delta_vec3(nx, ny, nz);
+        assert!((dx - -1.0).abs() <= 0.008);
+        assert!((dy - 1.0).abs() <= 0.008);
+        assert!((dz - -0.5).abs() <= 0.008);
     }
 }
