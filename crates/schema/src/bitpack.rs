@@ -93,6 +93,12 @@ impl BitWriter {
         }
     }
 
+    /// Returns the capacity of the underlying byte buffer in bytes.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
     /// Writes a single boolean as 1 bit.
     #[inline]
     pub fn write_bool(&mut self, val: bool) {
@@ -101,6 +107,9 @@ impl BitWriter {
 
     /// Writes `num_bits` (0..=64) from `val` into the bitstream (least significant bits first).
     pub fn write_bits(&mut self, mut val: u64, mut num_bits: usize) {
+        if num_bits == 0 {
+            return;
+        }
         if num_bits > 64 {
             num_bits = 64;
         }
@@ -189,6 +198,9 @@ impl<'a> BitReader<'a> {
 
     /// Reads `num_bits` (0..=64) from the bitstream.
     pub fn read_bits(&mut self, mut num_bits: usize) -> Result<u64, ClientCodecError> {
+        if num_bits == 0 {
+            return Ok(0);
+        }
         if num_bits > 64 {
             return Err(ClientCodecError::InvalidData(
                 "Cannot read more than 64 bits in a single read_bits call".to_string(),
@@ -326,11 +338,44 @@ mod tests {
 
     #[test]
     fn test_varint_buffer_too_short() {
-        let mut buf = BytesMut::from(&[0x80u8][..]); // Needs next byte
-        assert!(matches!(
+        // 1. Buffer ending after 1st byte with MSB set (requires 2nd byte) -> expected: 2, got: 1
+        let mut buf = BytesMut::from(&[0x80u8][..]);
+        assert_eq!(
             get_varint_u64(&mut buf),
-            Err(ClientCodecError::BufferTooShort { .. })
-        ));
+            Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: 1,
+            })
+        );
+
+        // 2. Empty buffer -> expected: 1, got: 0
+        let mut empty = BytesMut::new();
+        assert_eq!(
+            get_varint_u64(&mut empty),
+            Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0,
+            })
+        );
+
+        // 3. get_varint_u32 with buffer too short
+        let mut buf_u32 = BytesMut::from(&[0x80u8][..]);
+        assert_eq!(
+            get_varint_u32(&mut buf_u32),
+            Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: 1,
+            })
+        );
+
+        let mut empty_u32 = BytesMut::new();
+        assert_eq!(
+            get_varint_u32(&mut empty_u32),
+            Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0,
+            })
+        );
     }
 
     #[test]
@@ -387,5 +432,166 @@ mod tests {
         let bytes = [0b00000001];
         let mut reader = BitReader::new(&bytes);
         assert!(reader.read_bits(9).is_err());
+    }
+
+    #[test]
+    fn test_bitwriter_capacity() {
+        let writer = BitWriter::with_capacity(64);
+        assert!(writer.capacity() >= 64);
+    }
+
+    #[test]
+    fn test_bitwriter_write_bits_edge_cases() {
+        // num_bits == 0: nothing written, byte_len remains 0
+        let mut writer0 = BitWriter::with_capacity(8);
+        writer0.write_bits(0xFFFF_FFFF_FFFF_FFFF, 0);
+        assert_eq!(writer0.byte_len(), 0);
+        assert_eq!(writer0.finish().len(), 0);
+
+        // num_bits == 64: all 64 bits written
+        let mut writer64 = BitWriter::with_capacity(8);
+        let val64 = 0x0123_4567_89AB_CDEF_u64;
+        writer64.write_bits(val64, 64);
+        assert_eq!(writer64.byte_len(), 8);
+        let bytes64 = writer64.finish();
+        assert_eq!(bytes64.len(), 8);
+        let mut reader64 = BitReader::new(&bytes64);
+        assert_eq!(reader64.read_bits(64).unwrap(), val64);
+
+        // num_bits > 64 (e.g. 70): clamped to 64 bits written
+        let mut writer70 = BitWriter::with_capacity(16);
+        writer70.write_bits(val64, 70);
+        assert_eq!(writer70.byte_len(), 8);
+        let bytes70 = writer70.finish();
+        assert_eq!(bytes70.len(), 8);
+        let mut reader70 = BitReader::new(&bytes70);
+        assert_eq!(reader70.read_bits(64).unwrap(), val64);
+        assert_eq!(reader70.remaining_bits(), 0);
+    }
+
+    #[test]
+    fn test_bitwriter_flush_byte_align_zero_offset() {
+        // Calling flush_byte_align when bit_offset == 0 must NOT append an extra zero byte
+        let mut writer = BitWriter::with_capacity(8);
+        writer.flush_byte_align();
+        assert_eq!(writer.byte_len(), 0);
+        assert_eq!(writer.finish().len(), 0);
+
+        // Calling flush_byte_align when aligned after writing a full byte (8 bits)
+        let mut writer2 = BitWriter::with_capacity(8);
+        writer2.write_bits(0xAA, 8);
+        assert_eq!(writer2.byte_len(), 1);
+        writer2.flush_byte_align();
+        assert_eq!(writer2.byte_len(), 1);
+        let bytes2 = writer2.finish();
+        assert_eq!(bytes2.len(), 1);
+        assert_eq!(bytes2[0], 0xAA);
+    }
+
+    #[test]
+    fn test_bitwriter_byte_len_boundaries() {
+        let mut writer = BitWriter::with_capacity(8);
+        assert_eq!(writer.byte_len(), 0); // 0 bits -> 0 bytes
+
+        writer.write_bits(1, 1);
+        assert_eq!(writer.byte_len(), 1); // 1 bit -> 1 byte
+
+        writer.write_bits(0, 6);
+        assert_eq!(writer.byte_len(), 1); // 7 bits total -> 1 byte
+
+        writer.write_bits(1, 1);
+        assert_eq!(writer.byte_len(), 1); // 8 bits total -> 1 byte
+
+        writer.write_bits(1, 1);
+        assert_eq!(writer.byte_len(), 2); // 9 bits total -> 2 bytes
+
+        writer.write_bits(0, 7);
+        assert_eq!(writer.byte_len(), 2); // 16 bits total -> 2 bytes
+
+        writer.write_bits(1, 1);
+        assert_eq!(writer.byte_len(), 3); // 17 bits total -> 3 bytes
+    }
+
+    #[test]
+    fn test_bitreader_read_bits_boundary_and_limits() {
+        let bytes = [0x55; 9];
+        let mut reader = BitReader::new(&bytes);
+
+        // num_bits == 0 succeeds immediately returning 0
+        assert_eq!(reader.read_bits(0), Ok(0));
+
+        // num_bits == 64 succeeds (kills > replaced with >= or ==)
+        assert!(reader.read_bits(64).is_ok());
+
+        // num_bits == 65 fails with InvalidData
+        let mut reader2 = BitReader::new(&bytes);
+        assert!(matches!(
+            reader2.read_bits(65),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // Exact remaining bits (remaining_bits() == num_bits) succeeds (kills < replaced with <=)
+        let bytes1 = [0xAA];
+        let mut reader3 = BitReader::new(&bytes1);
+        assert_eq!(reader3.remaining_bits(), 8);
+        assert_eq!(reader3.read_bits(8), Ok(0xAA));
+        assert_eq!(reader3.remaining_bits(), 0);
+    }
+
+    #[test]
+    fn test_bitreader_align_byte_when_already_aligned() {
+        let bytes = [0x11, 0x22, 0x33];
+        let mut reader = BitReader::new(&bytes);
+
+        // Initially aligned at byte 0, bit_offset 0
+        reader.align_byte();
+        assert_eq!(reader.byte_pos, 0);
+        assert_eq!(reader.remaining_bits(), 24);
+
+        // Read 8 bits -> byte_pos becomes 1, bit_offset is 0
+        assert_eq!(reader.read_bits(8).unwrap(), 0x11);
+        assert_eq!(reader.byte_pos, 1);
+        assert_eq!(reader.bit_offset, 0);
+
+        // Calling align_byte() when bit_offset == 0 must NOT advance byte_pos (kills > replaced with >=)
+        reader.align_byte();
+        assert_eq!(reader.byte_pos, 1);
+        assert_eq!(reader.remaining_bits(), 16);
+
+        // Read next byte to verify stream position and data integrity
+        assert_eq!(reader.read_bits(8).unwrap(), 0x22);
+    }
+
+    #[test]
+    fn test_bitreader_read_bytes_boundaries() {
+        let bytes = [1, 2, 3, 4, 5];
+        let mut reader = BitReader::new(&bytes);
+
+        // len < remaining
+        let slice1 = reader.read_bytes(2).unwrap();
+        assert_eq!(slice1, &[1, 2]);
+
+        // len == remaining (kills < replaced with <=)
+        let slice2 = reader.read_bytes(3).unwrap();
+        assert_eq!(slice2, &[3, 4, 5]);
+
+        // len > remaining (expected: 1, got: 0)
+        assert_eq!(
+            reader.read_bytes(1),
+            Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0,
+            })
+        );
+
+        // Fresh reader: len > remaining (expected: 6, got: 5)
+        let mut reader2 = BitReader::new(&bytes);
+        assert_eq!(
+            reader2.read_bytes(6),
+            Err(ClientCodecError::BufferTooShort {
+                expected: 6,
+                got: 5,
+            })
+        );
     }
 }
