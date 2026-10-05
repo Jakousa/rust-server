@@ -18,7 +18,8 @@ use mmo_schema::cluster::{
     GhostEntity, GhostSyncRequest, GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse,
     RemoteAbilityErrorCode, RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest,
     RemoteCommandResponse, ReserveContainerSlotRequest, ReserveContainerSlotResponse,
-    RouteUpdateRequest, SerializedComponent, Vector3,
+    RouteUpdateRequest, SerializedComponent, TakeoverSessionRouteRequest,
+    TakeoverSessionRouteResponse, Vector3,
 };
 
 use crate::sim::{ContainerTransferNotification, TickSimulation};
@@ -782,6 +783,56 @@ impl NodeService for NodeServiceImpl {
                 error_message: e.to_string(),
             })),
         }
+    }
+
+    /// Takes over an entity's downstream session route to a new edge gateway.
+    ///
+    /// Validates monotonic session epoch to prevent stale/replayed takeovers,
+    /// advances the local authoritative epoch, and registers the new session ID for AoI observation.
+    async fn takeover_session_route(
+        &self,
+        request: tonic::Request<TakeoverSessionRouteRequest>,
+    ) -> Result<tonic::Response<TakeoverSessionRouteResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let guid = Guid::from_raw(req.guid);
+        let mut sim = self.sim.write().await;
+
+        if !sim.entity_store.contains_guid(guid) {
+            return Ok(tonic::Response::new(TakeoverSessionRouteResponse {
+                success: false,
+                error_message: format!("Entity {} not found on node {}", guid, sim.node_id),
+                authoritative_epoch: 0,
+            }));
+        }
+
+        let current_epoch = *sim.session_epochs.get(&guid).unwrap_or(&0);
+        if req.session_epoch <= current_epoch {
+            return Ok(tonic::Response::new(TakeoverSessionRouteResponse {
+                success: false,
+                error_message: format!(
+                    "Stale session epoch {} <= authoritative epoch {}",
+                    req.session_epoch, current_epoch
+                ),
+                authoritative_epoch: current_epoch,
+            }));
+        }
+
+        // Update authoritative epoch
+        sim.session_epochs.insert(guid, req.session_epoch);
+
+        // Register new observer session if provided
+        if req.new_session_id != 0 {
+            let config = crate::aoi::ObserverConfig::default();
+            sim.aoi.register_observer(req.new_session_id, guid, config);
+        }
+
+        metrics::counter!("mmo_node_session_takeovers_total").increment(1);
+
+        Ok(tonic::Response::new(TakeoverSessionRouteResponse {
+            success: true,
+            error_message: String::new(),
+            authoritative_epoch: req.session_epoch,
+        }))
     }
 }
 

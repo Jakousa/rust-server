@@ -258,11 +258,79 @@ message AbortContainerTransferResponse {
   string error_message = 2;
 }
 
+// Geo-Distributed Gateway Messages
+message RegisterGatewayRequest {
+  string gateway_id = 1;
+  string region = 2;
+  string listen_addr = 3;
+  string grpc_addr = 4;
+  string probe_addr = 5;
+  uint32 capacity = 6;
+}
+
+message RegisterGatewayResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 heartbeat_interval_ms = 3;
+}
+
+message GatewayHeartbeatRequest {
+  string gateway_id = 1;
+  uint32 active_sessions = 2;
+  float cpu_percent = 3;
+  float memory_percent = 4;
+  uint64 timestamp_ms = 5;
+}
+
+message GatewayHeartbeatResponse {
+  bool acknowledged = 1;
+  bool should_drain = 2;
+}
+
+message TakeoverSessionRouteRequest {
+  uint64 guid = 1;
+  uint64 new_session_id = 2;
+  string new_gateway_id = 3;
+  string new_gateway_grpc_addr = 4;
+  uint64 session_epoch = 5;
+  bytes handover_signature = 6;
+}
+
+message TakeoverSessionRouteResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 authoritative_epoch = 3;
+}
+
+message RevokeGatewaySessionRequest {
+  uint64 guid = 1;
+  uint64 session_id = 2;
+  uint64 superseded_by_epoch = 3;
+}
+
+message RevokeGatewaySessionResponse {
+  bool success = 1;
+}
+
+message MultiGatewayRouteBroadcastRequest {
+  uint64 guid = 1;
+  uint64 session_id = 2;
+  string new_node_address = 3;
+  uint64 session_epoch = 4;
+}
+
+message MultiGatewayRouteBroadcastResponse {
+  bool success = 1;
+  uint32 acknowledged_gateways = 2;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportSplit (SplitReportRequest) returns (SplitReportResponse);
+  rpc RegisterGateway (RegisterGatewayRequest) returns (RegisterGatewayResponse);
+  rpc GatewayHeartbeat (GatewayHeartbeatRequest) returns (GatewayHeartbeatResponse);
 }
 
 service NodeService {
@@ -275,11 +343,15 @@ service NodeService {
   rpc ReserveContainerSlot (ReserveContainerSlotRequest) returns (ReserveContainerSlotResponse);
   rpc CommitContainerTransfer (CommitContainerTransferRequest) returns (CommitContainerTransferResponse);
   rpc AbortContainerTransfer (AbortContainerTransferRequest) returns (AbortContainerTransferResponse);
+  rpc TakeoverSessionRoute (TakeoverSessionRouteRequest) returns (TakeoverSessionRouteResponse);
 }
 
 service GatewayService {
   rpc UpdateRoute (RouteUpdateRequest) returns (RouteUpdateResponse);
   rpc UpdateBatchRoutes (BatchRouteUpdateRequest) returns (BatchRouteUpdateResponse);
   rpc ReassignNodeRoutes (ReassignNodeRoutesRequest) returns (ReassignNodeRoutesResponse);
+  rpc RevokeGatewaySession (RevokeGatewaySessionRequest) returns (RevokeGatewaySessionResponse);
+  rpc BroadcastRoute (MultiGatewayRouteBroadcastRequest) returns (MultiGatewayRouteBroadcastResponse);
 }
+
 
