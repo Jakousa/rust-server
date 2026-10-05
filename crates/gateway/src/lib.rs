@@ -3,6 +3,7 @@
 //! Provides client transport termination, binary packet framing via FlatBuffers,
 //! dynamic session routing tables, and seamless simulation node handovers.
 
+pub mod auth;
 pub mod backhaul;
 pub mod handover;
 pub mod probe;
@@ -11,6 +12,7 @@ pub mod router;
 pub mod server;
 pub mod webtransport;
 
+pub use auth::{AuthError, AuthResult, EdgeAuthenticator, JwtClaims, TokenValidator};
 pub use backhaul::{BackhaulChannel, BackhaulError, BackhaulPool, BackhaulState};
 pub use handover::{HandoverError, HandoverRateLimiter, HandoverTicket};
 

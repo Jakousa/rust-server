@@ -59,6 +59,8 @@ pub enum Opcode {
     WorldObjectResync = 0x000E,
     PlaceObject = 0x000F,
     InteractObject = 0x0010,
+    AuthRequest = 0x0011,
+    AuthResponse = 0x0012,
 }
 
 impl Opcode {
@@ -80,6 +82,8 @@ impl Opcode {
             0x000E => Ok(Opcode::WorldObjectResync),
             0x000F => Ok(Opcode::PlaceObject),
             0x0010 => Ok(Opcode::InteractObject),
+            0x0011 => Ok(Opcode::AuthRequest),
+            0x0012 => Ok(Opcode::AuthResponse),
             other => Err(ClientCodecError::UnknownOpcode(other)),
         }
     }
@@ -102,6 +106,8 @@ impl Opcode {
             Opcode::WorldObjectResync => "WorldObjectResync",
             Opcode::PlaceObject => "PlaceObject",
             Opcode::InteractObject => "InteractObject",
+            Opcode::AuthRequest => "AuthRequest",
+            Opcode::AuthResponse => "AuthResponse",
         }
     }
 }
@@ -1196,6 +1202,138 @@ impl InteractObjectPacket {
     }
 }
 
+/// Standard authentication error codes returned in `AuthResponsePacket`.
+pub mod auth_error_codes {
+    pub const SUCCESS: u32 = 0;
+    pub const INVALID_TOKEN: u32 = 1;
+    pub const EXPIRED_TOKEN: u32 = 2;
+    pub const INVALID_SIGNATURE: u32 = 3;
+    pub const INVALID_CLAIMS: u32 = 4;
+    pub const VERSION_MISMATCH: u32 = 5;
+    pub const TIMEOUT: u32 = 6;
+    pub const RATE_LIMITED: u32 = 7;
+    pub const CLUSTER_UNAVAILABLE: u32 = 8;
+    pub const IDENTITY_MISMATCH: u32 = 9;
+}
+
+/// Client-originated authentication request containing a cryptographic token (e.g. JWT or HandoverTicket).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRequestPacket {
+    pub token: String,
+    pub client_version: u32,
+}
+
+impl AuthRequestPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let token_bytes = self.token.as_bytes();
+        dst.put_u16_le(token_bytes.len() as u16);
+        dst.put_slice(token_bytes);
+        dst.put_u32_le(self.client_version);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let token_len = src.get_u16_le() as usize;
+        if src.remaining() < token_len + 4 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: token_len + 4,
+                got: src.remaining(),
+            });
+        }
+        let token_bytes = src.copy_to_bytes(token_len);
+        let token = String::from_utf8(token_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let client_version = src.get_u32_le();
+        Ok(Self {
+            token,
+            client_version,
+        })
+    }
+}
+
+/// Server-originated authentication response granting or denying session admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthResponsePacket {
+    pub success: bool,
+    pub error_code: u32,
+    pub session_id: u64,
+    pub player_guid: u64,
+    pub assigned_node: String,
+    pub error_message: String,
+}
+
+impl AuthResponsePacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(if self.success { 1 } else { 0 });
+        dst.put_u32_le(self.error_code);
+        dst.put_u64_le(self.session_id);
+        dst.put_u64_le(self.player_guid);
+        let node_bytes = self.assigned_node.as_bytes();
+        dst.put_u16_le(node_bytes.len() as u16);
+        dst.put_slice(node_bytes);
+        let msg_bytes = self.error_message.as_bytes();
+        dst.put_u16_le(msg_bytes.len() as u16);
+        dst.put_slice(msg_bytes);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        // 1 (success) + 4 (error_code) + 8 (session_id) + 8 (player_guid) + 2 (node_len) + 2 (msg_len) = 25 bytes min
+        const MIN_SIZE: usize = 25;
+        if src.remaining() < MIN_SIZE {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: MIN_SIZE,
+                got: src.remaining(),
+            });
+        }
+        let success = src.get_u8() != 0;
+        let error_code = src.get_u32_le();
+        let session_id = src.get_u64_le();
+        let player_guid = src.get_u64_le();
+
+        let node_len = src.get_u16_le() as usize;
+        if src.remaining() < node_len {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: node_len,
+                got: src.remaining(),
+            });
+        }
+        let node_bytes = src.copy_to_bytes(node_len);
+        let assigned_node = String::from_utf8(node_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let msg_len = src.get_u16_le() as usize;
+        if src.remaining() < msg_len {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: msg_len,
+                got: src.remaining(),
+            });
+        }
+        let msg_bytes = src.copy_to_bytes(msg_len);
+        let error_message = String::from_utf8(msg_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+
+        Ok(Self {
+            success,
+            error_code,
+            session_id,
+            player_guid,
+            assigned_node,
+            error_message,
+        })
+    }
+}
+
 /// Top-level client packet enum encompassing all protocol messages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientPacket {
@@ -1215,6 +1353,8 @@ pub enum ClientPacket {
     WorldObjectResync(WorldObjectResyncPacket),
     PlaceObject(PlaceObjectPacket),
     InteractObject(InteractObjectPacket),
+    AuthRequest(AuthRequestPacket),
+    AuthResponse(AuthResponsePacket),
 }
 
 impl ClientPacket {
@@ -1236,6 +1376,8 @@ impl ClientPacket {
             ClientPacket::WorldObjectResync(_) => Opcode::WorldObjectResync,
             ClientPacket::PlaceObject(_) => Opcode::PlaceObject,
             ClientPacket::InteractObject(_) => Opcode::InteractObject,
+            ClientPacket::AuthRequest(_) => Opcode::AuthRequest,
+            ClientPacket::AuthResponse(_) => Opcode::AuthResponse,
         }
     }
 
@@ -1260,6 +1402,8 @@ impl ClientPacket {
             ClientPacket::WorldObjectResync(p) => p.encode(&mut payload_buf),
             ClientPacket::PlaceObject(p) => p.encode(&mut payload_buf),
             ClientPacket::InteractObject(p) => p.encode(&mut payload_buf),
+            ClientPacket::AuthRequest(p) => p.encode(&mut payload_buf),
+            ClientPacket::AuthResponse(p) => p.encode(&mut payload_buf),
         }
 
         let payload_len = payload_buf.len() as u32;
@@ -1346,6 +1490,12 @@ impl ClientPacket {
             Opcode::InteractObject => Ok(ClientPacket::InteractObject(
                 InteractObjectPacket::decode(&mut payload)?,
             )),
+            Opcode::AuthRequest => Ok(ClientPacket::AuthRequest(AuthRequestPacket::decode(
+                &mut payload,
+            )?)),
+            Opcode::AuthResponse => Ok(ClientPacket::AuthResponse(AuthResponsePacket::decode(
+                &mut payload,
+            )?)),
         }
     }
 
@@ -2486,6 +2636,24 @@ mod tests {
                 }),
                 Opcode::InteractObject,
             ),
+            (
+                ClientPacket::AuthRequest(AuthRequestPacket {
+                    token: "jwt.token.here".to_string(),
+                    client_version: 1,
+                }),
+                Opcode::AuthRequest,
+            ),
+            (
+                ClientPacket::AuthResponse(AuthResponsePacket {
+                    success: true,
+                    error_code: 0,
+                    session_id: 1234,
+                    player_guid: 5678,
+                    assigned_node: "127.0.0.1:50051".to_string(),
+                    error_message: String::new(),
+                }),
+                Opcode::AuthResponse,
+            ),
         ];
 
         for (pkt, expected_opcode) in packets {
@@ -2629,5 +2797,58 @@ mod tests {
         put_varint_u32(&mut buf, 1);
         // Truncate before position
         assert!(PlaceObjectPacket::decode(&mut buf.freeze()).is_err());
+    }
+
+    #[test]
+    fn test_auth_packets_roundtrip() {
+        let auth_req = AuthRequestPacket {
+            token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-IDcSemACt8x4iTMCda8Yhe3iZaWbvV5XKSTbuAn0M".to_string(),
+            client_version: 42,
+        };
+        let packet_req = ClientPacket::AuthRequest(auth_req.clone());
+        let encoded_req = packet_req.encode();
+        let decoded_req = ClientPacket::decode(&encoded_req).expect("decode auth req");
+        assert_eq!(decoded_req, packet_req);
+
+        let auth_res_success = AuthResponsePacket {
+            success: true,
+            error_code: auth_error_codes::SUCCESS,
+            session_id: 1001,
+            player_guid: 2002,
+            assigned_node: "127.0.0.1:50051".to_string(),
+            error_message: String::new(),
+        };
+        let packet_res = ClientPacket::AuthResponse(auth_res_success.clone());
+        let encoded_res = packet_res.encode();
+        let decoded_res = ClientPacket::decode(&encoded_res).expect("decode auth res");
+        assert_eq!(decoded_res, packet_res);
+
+        let auth_res_fail = AuthResponsePacket {
+            success: false,
+            error_code: auth_error_codes::EXPIRED_TOKEN,
+            session_id: 0,
+            player_guid: 0,
+            assigned_node: String::new(),
+            error_message: "Token has expired".to_string(),
+        };
+        let packet_fail = ClientPacket::AuthResponse(auth_res_fail.clone());
+        let encoded_fail = packet_fail.encode();
+        let decoded_fail = ClientPacket::decode(&encoded_fail).expect("decode auth fail");
+        assert_eq!(decoded_fail, packet_fail);
+    }
+
+    #[test]
+    fn test_auth_packets_truncated_buffer_rejection() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(10); // claims 10 bytes of token
+        buf.put_slice(b"short"); // only 5 bytes
+        assert!(AuthRequestPacket::decode(&mut buf.freeze()).is_err());
+
+        let mut buf2 = BytesMut::new();
+        buf2.put_u8(1); // success
+        buf2.put_u32_le(0); // error code
+        buf2.put_u64_le(1); // session_id
+                            // Truncated before player_guid
+        assert!(AuthResponsePacket::decode(&mut buf2.freeze()).is_err());
     }
 }

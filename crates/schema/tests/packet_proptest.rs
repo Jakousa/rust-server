@@ -1,5 +1,8 @@
 use bytes::{Bytes, BytesMut};
-use mmo_schema::client::{ClientPacket, InteractionPacket, InteractionType, MovementPacket, Vec3};
+use mmo_schema::client::{
+    AuthRequestPacket, AuthResponsePacket, ClientPacket, InteractionPacket, InteractionType,
+    MovementPacket, Vec3,
+};
 use proptest::prelude::*;
 
 prop_compose! {
@@ -58,6 +61,38 @@ prop_compose! {
     }
 }
 
+prop_compose! {
+    fn arb_auth_request_packet()(
+        token in "[a-zA-Z0-9_.-]{10,200}",
+        client_version in any::<u32>(),
+    ) -> AuthRequestPacket {
+        AuthRequestPacket {
+            token,
+            client_version,
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_auth_response_packet()(
+        success in any::<bool>(),
+        error_code in 0u32..10,
+        session_id in any::<u64>(),
+        player_guid in any::<u64>(),
+        assigned_node in "[a-z0-9.:]{5,30}",
+        error_message in "[a-zA-Z0-9 ]{0,50}",
+    ) -> AuthResponsePacket {
+        AuthResponsePacket {
+            success,
+            error_code,
+            session_id,
+            player_guid,
+            assigned_node,
+            error_message,
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -104,6 +139,48 @@ proptest! {
                 prop_assert_eq!(decoded_interaction.payload, packet.payload);
             }
             other => panic!("Expected Interaction packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prop_test_auth_request_roundtrip(packet in arb_auth_request_packet()) {
+        let client_packet = ClientPacket::AuthRequest(packet.clone());
+        let encoded = client_packet.encode();
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        let decoded = ClientPacket::decode_frame(&mut buf)
+            .expect("Valid frame must decode without error")
+            .expect("Complete frame must yield Some packet");
+
+        match decoded {
+            ClientPacket::AuthRequest(decoded_auth) => {
+                prop_assert_eq!(decoded_auth.token, packet.token);
+                prop_assert_eq!(decoded_auth.client_version, packet.client_version);
+            }
+            other => panic!("Expected AuthRequest packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prop_test_auth_response_roundtrip(packet in arb_auth_response_packet()) {
+        let client_packet = ClientPacket::AuthResponse(packet.clone());
+        let encoded = client_packet.encode();
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        let decoded = ClientPacket::decode_frame(&mut buf)
+            .expect("Valid frame must decode without error")
+            .expect("Complete frame must yield Some packet");
+
+        match decoded {
+            ClientPacket::AuthResponse(decoded_auth) => {
+                prop_assert_eq!(decoded_auth.success, packet.success);
+                prop_assert_eq!(decoded_auth.error_code, packet.error_code);
+                prop_assert_eq!(decoded_auth.session_id, packet.session_id);
+                prop_assert_eq!(decoded_auth.player_guid, packet.player_guid);
+                prop_assert_eq!(decoded_auth.assigned_node, packet.assigned_node);
+                prop_assert_eq!(decoded_auth.error_message, packet.error_message);
+            }
+            other => panic!("Expected AuthResponse packet, got {:?}", other),
         }
     }
 

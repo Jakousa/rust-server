@@ -60,6 +60,16 @@ pub enum GatewayError {
 
     #[error("Router lock poisoned")]
     LockPoisoned,
+
+    #[error("Identity mismatch: packet acting GUID {actual:?} does not match session {session_id} authenticated GUID {expected:?}")]
+    IdentityMismatch {
+        session_id: u64,
+        expected: Guid,
+        actual: Guid,
+    },
+
+    #[error("Authentication error: {0}")]
+    Auth(#[from] crate::auth::AuthError),
 }
 
 /// Represents a client packet that has been resolved and routed to an authoritative simulation node.
@@ -103,7 +113,9 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
         | ClientPacket::WorldObjectDespawn(_)
         | ClientPacket::WorldObjectResync(_)
         | ClientPacket::PlaceObject(_)
-        | ClientPacket::InteractObject(_) => None,
+        | ClientPacket::InteractObject(_)
+        | ClientPacket::AuthRequest(_)
+        | ClientPacket::AuthResponse(_) => None,
     }
 }
 
@@ -143,6 +155,21 @@ impl PacketDispatcher {
         packet: ClientPacket,
     ) -> Result<RoutedPacket, GatewayError> {
         let guid = extract_acting_guid(&packet);
+
+        // Anti-Spoofing: If the packet contains an acting GUID, it must strictly match
+        // the session's authenticated GUID in the routing table (if bound).
+        if let Some(acting) = guid {
+            if let Some(session_guid) = router.get_guid_by_session(session_id) {
+                if acting != session_guid {
+                    metrics::counter!("mmo_gateway_spoofed_packets_dropped_total").increment(1);
+                    return Err(GatewayError::IdentityMismatch {
+                        session_id,
+                        expected: session_guid,
+                        actual: acting,
+                    });
+                }
+            }
+        }
 
         let node_address = guid
             .and_then(|g| router.get_route_by_guid(g))
@@ -372,6 +399,8 @@ pub struct GatewayServer {
     social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
     session_sinks: Arc<DashMap<u64, SessionSink>>,
     backhaul_pool: Arc<BackhaulPool>,
+    authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
+    default_node_address: Option<String>,
 }
 
 impl GatewayServer {
@@ -388,6 +417,8 @@ impl GatewayServer {
             social_bus: None,
             session_sinks: Arc::new(DashMap::new()),
             backhaul_pool: Arc::new(BackhaulPool::new(10000)),
+            authenticator: None,
+            default_node_address: None,
         }
     }
 
@@ -407,7 +438,56 @@ impl GatewayServer {
             social_bus: None,
             session_sinks: Arc::new(DashMap::new()),
             backhaul_pool: Arc::new(BackhaulPool::new(10000)),
+            authenticator: None,
+            default_node_address: None,
         }
+    }
+
+    /// Configures an edge authenticator for admission control and identity verification.
+    pub fn with_authenticator(
+        mut self,
+        authenticator: Arc<crate::auth::EdgeAuthenticator>,
+    ) -> Self {
+        self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// Sets a default simulation node address for initial session assignment when no director is available.
+    pub fn with_default_node_address(mut self, node_address: impl Into<String>) -> Self {
+        self.default_node_address = Some(node_address.into());
+        self
+    }
+
+    /// Accesses the edge authenticator, if configured.
+    pub fn authenticator(&self) -> Option<&Arc<crate::auth::EdgeAuthenticator>> {
+        self.authenticator.as_ref()
+    }
+
+    /// Accesses the default simulation node address, if configured.
+    pub fn default_node_address(&self) -> Option<&str> {
+        self.default_node_address.as_deref()
+    }
+
+    /// Resolves the destination simulation node address for a player during initial authentication or handover.
+    pub async fn resolve_initial_node(&self, guid: Guid) -> Result<String, GatewayError> {
+        if let Some(route) = self.router.get_route_by_guid(guid) {
+            return Ok(route);
+        }
+
+        if let Some(session_id) = self.router.get_session_by_guid(guid) {
+            if let Some(route) = self.resolve_route_or_cache(session_id).await? {
+                return Ok(route);
+            }
+        }
+
+        if let Some(ref default_node) = self.default_node_address {
+            return Ok(default_node.clone());
+        }
+
+        Err(GatewayError::NoRouteFound {
+            session_id: 0,
+            guid: Some(guid),
+        })
     }
 
     /// Accesses the persistent backhaul connection pool.
@@ -822,6 +902,98 @@ impl GatewayServer {
 
         let mut buf = BytesMut::with_capacity(8192);
 
+        // Enforce edge authentication handshake if authenticator is configured
+        if let Some(ref auth) = self.authenticator {
+            let timeout_duration = auth.auth_timeout();
+            let auth_fut = async {
+                loop {
+                    if let Some(packet) =
+                        ClientPacket::decode_frame(&mut buf).map_err(GatewayError::Codec)?
+                    {
+                        return Ok::<ClientPacket, GatewayError>(packet);
+                    }
+                    let bytes_read = read_half
+                        .read_buf(&mut buf)
+                        .await
+                        .map_err(GatewayError::Io)?;
+                    if bytes_read == 0 {
+                        return Err(GatewayError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Client disconnected before authentication",
+                        )));
+                    }
+                    metrics::counter!("mmo_gateway_bytes_received_total")
+                        .increment(bytes_read as u64);
+                }
+            };
+
+            let first_pkt = match tokio::time::timeout(timeout_duration, auth_fut).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout")
+                        .increment(1);
+                    return Err(GatewayError::Auth(crate::auth::AuthError::Timeout));
+                }
+            };
+
+            match first_pkt {
+                ClientPacket::AuthRequest(auth_req) => match auth.authenticate(&auth_req.token) {
+                    Ok(auth_res) => {
+                        let initial_node = match self.resolve_initial_node(auth_res.guid).await {
+                            Ok(node) => node,
+                            Err(_) => {
+                                let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                        success: false,
+                                        error_code: mmo_schema::client::auth_error_codes::CLUSTER_UNAVAILABLE,
+                                        session_id: 0,
+                                        player_guid: 0,
+                                        assigned_node: String::new(),
+                                        error_message: "Cluster unavailable".to_string(),
+                                    });
+                                let _ = self.send_packet_to_session(session_id, &resp).await;
+                                return Err(GatewayError::NoRouteFound {
+                                    session_id,
+                                    guid: Some(auth_res.guid),
+                                });
+                            }
+                        };
+
+                        self.register_session(session_id, auth_res.guid, initial_node.clone())?;
+
+                        let resp =
+                            ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                success: true,
+                                error_code: mmo_schema::client::auth_error_codes::SUCCESS,
+                                session_id,
+                                player_guid: auth_res.guid.raw(),
+                                assigned_node: initial_node,
+                                error_message: String::new(),
+                            });
+                        let _ = self.send_packet_to_session(session_id, &resp).await;
+                    }
+                    Err(e) => {
+                        let resp =
+                            ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                success: false,
+                                error_code: e.to_error_code(),
+                                session_id: 0,
+                                player_guid: 0,
+                                assigned_node: String::new(),
+                                error_message: e.to_string(),
+                            });
+                        let _ = self.send_packet_to_session(session_id, &resp).await;
+                        return Err(GatewayError::Auth(e));
+                    }
+                },
+                _ => {
+                    metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
+                    return Err(GatewayError::Auth(crate::auth::AuthError::InvalidToken(
+                        "Expected AuthRequest packet".to_string(),
+                    )));
+                }
+            }
+        }
+
         loop {
             let bytes_read = read_half
                 .read_buf(&mut buf)
@@ -885,14 +1057,23 @@ impl GatewayServer {
         addr: SocketAddr,
     ) -> Result<crate::webtransport::WebTransportServer, crate::webtransport::WebTransportError>
     {
-        crate::webtransport::WebTransportServer::bind(
+        let mut server = crate::webtransport::WebTransportServer::bind(
             addr,
             self.router.clone(),
             self.session_sinks.clone(),
             self.session_counter.clone(),
             self.packet_tx.clone(),
         )
-        .await
+        .await?;
+
+        if let Some(ref auth) = self.authenticator {
+            server = server.with_authenticator(auth.clone());
+        }
+        if let Some(ref node) = self.default_node_address {
+            server = server.with_default_node_address(node.clone());
+        }
+
+        Ok(server)
     }
 
     /// Handles an active client QUIC connection:
@@ -903,6 +1084,9 @@ impl GatewayServer {
         connection: quinn::Connection,
         session_id: u64,
     ) -> Result<(), GatewayError> {
+        let is_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(
+            self.authenticator.is_none(),
+        ));
         let active_send_stream: Arc<tokio::sync::Mutex<Option<quinn::SendStream>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
@@ -949,6 +1133,12 @@ impl GatewayServer {
                 dgram_res = connection.read_datagram() => {
                     match dgram_res {
                         Ok(dg) => {
+                            // Zero-cost atomic packet filter: drop unauthenticated datagrams instantly
+                            if !is_authenticated.load(Ordering::Acquire) {
+                                metrics::counter!("mmo_gateway_unauthenticated_packets_dropped_total").increment(1);
+                                continue;
+                            }
+
                             metrics::counter!("mmo_gateway_bytes_received_total").increment(dg.len() as u64);
                             let mut dgram_buf = BytesMut::from(dg.as_ref());
                             while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut dgram_buf) {
@@ -989,9 +1179,133 @@ impl GatewayServer {
                             let active_stream = active_send_stream.clone();
                             let dispatcher = self.dispatcher.clone();
                             let packet_tx = self.packet_tx.clone();
+                            let authenticator = self.authenticator.clone();
+                            let is_auth = is_authenticated.clone();
+                            let router = self.router.clone();
+                            let cache = self.cache.clone();
+                            let default_node = self.default_node_address.clone();
                             tokio::spawn(async move {
                                 let mut buf = BytesMut::with_capacity(8192);
                                 let mut chunk = [0u8; 4096];
+
+                                // Enforce authentication handshake on stream if authenticator is configured
+                                if !is_auth.load(Ordering::Acquire) {
+                                    if let Some(ref auth) = authenticator {
+                                        let timeout = auth.auth_timeout();
+                                        let auth_fut = async {
+                                            loop {
+                                                if let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
+                                                    return Ok::<ClientPacket, GatewayError>(pkt);
+                                                }
+                                                match recv.read(&mut chunk).await {
+                                                    Ok(Some(n)) if n > 0 => {
+                                                        metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
+                                                        buf.extend_from_slice(&chunk[..n]);
+                                                    }
+                                                    _ => return Err(GatewayError::Io(std::io::Error::new(
+                                                        std::io::ErrorKind::UnexpectedEof,
+                                                        "Connection closed before auth",
+                                                    ))),
+                                                }
+                                            }
+                                        };
+
+                                        let first_pkt = match tokio::time::timeout(timeout, auth_fut).await {
+                                            Ok(res) => match res {
+                                                Ok(p) => p,
+                                                Err(_) => return,
+                                            },
+                                            Err(_) => {
+                                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout").increment(1);
+                                                return;
+                                            }
+                                        };
+
+                                        match first_pkt {
+                                            ClientPacket::AuthRequest(auth_req) => {
+                                                match auth.authenticate(&auth_req.token) {
+                                                    Ok(auth_res) => {
+                                                        let initial_node = router.get_route_by_guid(auth_res.guid)
+                                                            .or_else(|| default_node.clone());
+
+                                                        let initial_node = match initial_node {
+                                                            Some(node) => node,
+                                                            None => {
+                                                                let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                                                    success: false,
+                                                                    error_code: mmo_schema::client::auth_error_codes::CLUSTER_UNAVAILABLE,
+                                                                    session_id: 0,
+                                                                    player_guid: 0,
+                                                                    assigned_node: String::new(),
+                                                                    error_message: "Cluster unavailable".to_string(),
+                                                                });
+                                                                let mut lock = active_stream.lock().await;
+                                                                if let Some(ref mut s) = *lock {
+                                                                    let _ = s.write_all(&resp.encode()).await;
+                                                                }
+                                                                return;
+                                                            }
+                                                        };
+
+                                                        router.register_session(session_id, auth_res.guid, initial_node.clone());
+                                                        if let Some(ref c) = cache {
+                                                            let cache_clone = c.clone();
+                                                            let node_clone = initial_node.clone();
+                                                            let session_data = mmo_storage::cache::SessionData {
+                                                                session_id,
+                                                                guid: auth_res.guid.raw(),
+                                                                node_address: node_clone,
+                                                                expires_at: std::time::SystemTime::now()
+                                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                                    .unwrap_or_default()
+                                                                    .as_secs() + 3600,
+                                                            };
+                                                            tokio::spawn(async move {
+                                                                let _ = cache_clone.set_session(&session_data, 3600).await;
+                                                            });
+                                                        }
+
+                                                        // Memory ordering: register route before releasing authenticated state
+                                                        is_auth.store(true, Ordering::Release);
+
+                                                        let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                                            success: true,
+                                                            error_code: mmo_schema::client::auth_error_codes::SUCCESS,
+                                                            session_id,
+                                                            player_guid: auth_res.guid.raw(),
+                                                            assigned_node: initial_node,
+                                                            error_message: String::new(),
+                                                        });
+                                                        let mut lock = active_stream.lock().await;
+                                                        if let Some(ref mut s) = *lock {
+                                                            let _ = s.write_all(&resp.encode()).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                                            success: false,
+                                                            error_code: e.to_error_code(),
+                                                            session_id: 0,
+                                                            player_guid: 0,
+                                                            assigned_node: String::new(),
+                                                            error_message: e.to_string(),
+                                                        });
+                                                        let mut lock = active_stream.lock().await;
+                                                        if let Some(ref mut s) = *lock {
+                                                            let _ = s.write_all(&resp.encode()).await;
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 loop {
                                     match recv.read(&mut chunk).await {
                                         Ok(Some(n)) if n > 0 => {
