@@ -147,17 +147,30 @@ pub fn process_damage_events(
     let mut died_events = Vec::new();
 
     for dmg in damage_events {
+        let bonus_damage = entities
+            .get_by_guid(dmg.source)
+            .and_then(|attacker| attacker.get_property_f64("bonus_damage"))
+            .unwrap_or(0.0) as f32;
+        let raw_damage = dmg.raw_damage + bonus_damage;
+
         let target_entity = match entities.get_mut_by_guid(dmg.target) {
             Some(e) => e,
             None => continue,
         };
 
-        let effective_damage = if let Some(stats) = target_entity.get_component::<StatsComponent>()
-        {
-            stats.mitigate_damage(dmg.raw_damage)
-        } else {
-            dmg.raw_damage
-        };
+        let mut effective_damage =
+            if let Some(stats) = target_entity.get_component::<StatsComponent>() {
+                stats.mitigate_damage(raw_damage)
+            } else {
+                raw_damage
+            };
+
+        if let Some(mult) = target_entity.get_property_f64("damage_taken_multiplier") {
+            effective_damage *= mult as f32;
+        }
+        if let Some(reduction) = target_entity.get_property_f64("damage_reduction") {
+            effective_damage = (effective_damage - reduction as f32).max(0.0);
+        }
 
         if let Some(health) = target_entity.get_component_mut::<HealthComponent>() {
             let died = health.take_damage(effective_damage);
@@ -352,5 +365,48 @@ mod tests {
             .get_current("health")
             .unwrap();
         assert_eq!(current_hp, 75.0);
+    }
+
+    #[test]
+    fn test_combat_with_dynamic_properties() {
+        let mut store = EntityStore::new();
+        let mut queue = EventQueue::new();
+
+        let attacker = Guid::new(EntityType::Player, 1, 100);
+        let defender = Guid::new(EntityType::Player, 1, 200);
+
+        let att_key = store.spawn(attacker, (0.0, 0.0, 0.0));
+        let def_key = store.spawn(defender, (0.0, 0.0, 0.0));
+
+        // Attacker has dynamic bonus_damage = 20.0
+        store
+            .get_mut(att_key)
+            .unwrap()
+            .set_property("bonus_damage", 20.0);
+
+        // Defender has health 100, damage_taken_multiplier = 0.5 (50% shield), damage_reduction = 5.0
+        let def = store.get_mut(def_key).unwrap();
+        def.add_component(HealthComponent::new(100.0, 0.0));
+        def.set_property("damage_taken_multiplier", 0.5);
+        def.set_property("damage_reduction", 5.0);
+
+        // Raw damage = 40.0. Attacker adds +20.0 -> 60.0.
+        // Mitigated by multiplier 0.5 -> 30.0.
+        // Mitigated by flat reduction 5.0 -> 25.0.
+        queue.push(DamageEvent {
+            source: attacker,
+            target: defender,
+            raw_damage: 40.0,
+        });
+
+        process_damage_events(&mut queue, &mut store);
+
+        let def_hp = store
+            .get(def_key)
+            .unwrap()
+            .get_component::<HealthComponent>()
+            .unwrap()
+            .current_hp;
+        assert_eq!(def_hp, 75.0); // 100.0 - 25.0 = 75.0
     }
 }

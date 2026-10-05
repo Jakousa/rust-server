@@ -26,15 +26,15 @@ async fn test_end_to_end_npc_ai_simulation_lifecycle() {
     let mut sim = TickSimulation::new(1, bounds);
 
     // 2. Configure Goblin template
-    let goblin_template = SpawnTemplate {
-        template_id: 101,
-        name: "Forest Goblin".to_string(),
-        max_health: 80.0,
-        speed: 8.0, // 8 units/second
-        attack_power: 15,
-        armor: 10,
-        leash_radius: 20.0, // 20m leash boundary
-    };
+    let goblin_template = SpawnTemplate::new(
+        101,
+        "Forest Goblin",
+        80.0,
+        8.0, // 8 units/second
+        15,
+        10,
+        20.0, // 20m leash boundary
+    );
 
     // 3. Register standalone gameplay & AI plugins
     sim.add_plugin(Box::new(CombatPlugin));
