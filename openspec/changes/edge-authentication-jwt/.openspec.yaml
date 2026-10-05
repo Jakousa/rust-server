@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: edge-authentication-jwt
+  title: Edge Authentication, JWT/OIDC & Secure Session Provisioning
+  status: proposed
+  created: 2026-10-05
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: gateway
+  specs:
+    - specs/gateway/edge-authentication/spec.md

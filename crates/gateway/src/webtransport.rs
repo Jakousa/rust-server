@@ -66,6 +66,8 @@ pub struct WebTransportServer {
     packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     cert_digest: String,
     cert_digest_bytes: [u8; 32],
+    authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
+    default_node_address: Option<String>,
 }
 
 impl WebTransportServer {
@@ -99,7 +101,24 @@ impl WebTransportServer {
             packet_tx,
             cert_digest,
             cert_digest_bytes,
+            authenticator: None,
+            default_node_address: None,
         })
+    }
+
+    /// Configures an edge authenticator for admission control.
+    pub fn with_authenticator(
+        mut self,
+        authenticator: Arc<crate::auth::EdgeAuthenticator>,
+    ) -> Self {
+        self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// Sets a default simulation node address for initial session assignment.
+    pub fn with_default_node_address(mut self, node_address: impl Into<String>) -> Self {
+        self.default_node_address = Some(node_address.into());
+        self
     }
 
     /// Returns the local bound socket address.
@@ -139,6 +158,8 @@ impl WebTransportServer {
                     let dispatcher = self.dispatcher.clone();
                     let session_sinks = self.session_sinks.clone();
                     let packet_tx = self.packet_tx.clone();
+                    let authenticator = self.authenticator.clone();
+                    let default_node = self.default_node_address.clone();
 
                     tokio::spawn(async move {
                         Self::handle_session(
@@ -148,6 +169,8 @@ impl WebTransportServer {
                             dispatcher,
                             session_sinks,
                             packet_tx,
+                            authenticator,
+                            default_node,
                         ).await;
                     });
                 }
@@ -172,6 +195,7 @@ impl WebTransportServer {
         (handle, tx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_session(
         connection: wtransport::Connection,
         session_id: u64,
@@ -179,6 +203,8 @@ impl WebTransportServer {
         dispatcher: PacketDispatcher,
         session_sinks: Arc<DashMap<u64, SessionSink>>,
         packet_tx: Option<mpsc::Sender<RoutedPacket>>,
+        authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
+        default_node_address: Option<String>,
     ) {
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
@@ -236,12 +262,23 @@ impl WebTransportServer {
             }
         });
 
+        let is_authenticated =
+            Arc::new(std::sync::atomic::AtomicBool::new(authenticator.is_none()));
+
         // Task 3: Datagram Ingress (unreliable client movement / ACKs)
         let conn_datagram_in = connection.clone();
         let disp_datagram = dispatcher.clone();
         let ptx_datagram = packet_tx.clone();
+        let is_auth_dgram = is_authenticated.clone();
         let datagram_ingress_task = tokio::spawn(async move {
             while let Ok(datagram) = conn_datagram_in.receive_datagram().await {
+                // Zero-cost atomic packet filter: drop unauthenticated datagrams instantly
+                if !is_auth_dgram.load(Ordering::Acquire) {
+                    metrics::counter!("mmo_gateway_unauthenticated_packets_dropped_total")
+                        .increment(1);
+                    continue;
+                }
+
                 let mut buf = BytesMut::from(&datagram[..]);
                 if let Ok(routed) = disp_datagram.process_frames(session_id, &mut buf) {
                     if let Some(ref tx) = ptx_datagram {
@@ -253,14 +290,116 @@ impl WebTransportServer {
             }
         });
 
-        // Task 4: Stream Ingress (reliable client actions / interactions)
+        // Task 4: Stream Ingress (reliable client actions / interactions / auth)
         let conn_stream_in = connection.clone();
         let disp_stream = dispatcher.clone();
         let ptx_stream = packet_tx.clone();
+        let is_auth_stream = is_authenticated.clone();
+        let auth_opt = authenticator.clone();
+        let default_node_opt = default_node_address.clone();
+        let router_stream = router.clone();
         let stream_ingress_task = tokio::spawn(async move {
-            while let Ok((_, mut recv_stream)) = conn_stream_in.accept_bi().await {
+            while let Ok((mut send_stream, mut recv_stream)) = conn_stream_in.accept_bi().await {
                 let mut buf = BytesMut::with_capacity(4096);
                 let mut temp = [0u8; 1024];
+
+                // If not authenticated and authenticator is configured, enforce handshake
+                if !is_auth_stream.load(Ordering::Acquire) {
+                    if let Some(ref auth) = auth_opt {
+                        let timeout = auth.auth_timeout();
+                        let auth_fut = async {
+                            loop {
+                                if let Ok(Some(pkt)) =
+                                    mmo_schema::client::ClientPacket::decode_frame(&mut buf)
+                                {
+                                    return Ok::<mmo_schema::client::ClientPacket, ()>(pkt);
+                                }
+                                match recv_stream.read(&mut temp).await {
+                                    Ok(Some(n)) if n > 0 => {
+                                        buf.extend_from_slice(&temp[..n]);
+                                    }
+                                    _ => return Err(()),
+                                }
+                            }
+                        };
+
+                        let first_pkt = match tokio::time::timeout(timeout, auth_fut).await {
+                            Ok(Ok(pkt)) => pkt,
+                            _ => {
+                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout").increment(1);
+                                return;
+                            }
+                        };
+
+                        match first_pkt {
+                            mmo_schema::client::ClientPacket::AuthRequest(auth_req) => {
+                                match auth.authenticate(&auth_req.token) {
+                                    Ok(auth_res) => {
+                                        let initial_node = router_stream
+                                            .get_route_by_guid(auth_res.guid)
+                                            .or_else(|| default_node_opt.clone());
+
+                                        let initial_node = match initial_node {
+                                            Some(node) => node,
+                                            None => {
+                                                let resp = mmo_schema::client::ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
+                                                    success: false,
+                                                    error_code: mmo_schema::client::auth_error_codes::CLUSTER_UNAVAILABLE,
+                                                    session_id: 0,
+                                                    player_guid: 0,
+                                                    assigned_node: String::new(),
+                                                    error_message: "Cluster unavailable".to_string(),
+                                                });
+                                                let _ = send_stream.write_all(&resp.encode()).await;
+                                                return;
+                                            }
+                                        };
+
+                                        router_stream.register_session(
+                                            session_id,
+                                            auth_res.guid,
+                                            initial_node.clone(),
+                                        );
+                                        // Memory ordering: register route before releasing authenticated state
+                                        is_auth_stream.store(true, Ordering::Release);
+
+                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
+                                            mmo_schema::client::AuthResponsePacket {
+                                                success: true,
+                                                error_code:
+                                                    mmo_schema::client::auth_error_codes::SUCCESS,
+                                                session_id,
+                                                player_guid: auth_res.guid.raw(),
+                                                assigned_node: initial_node,
+                                                error_message: String::new(),
+                                            },
+                                        );
+                                        let _ = send_stream.write_all(&resp.encode()).await;
+                                    }
+                                    Err(e) => {
+                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
+                                            mmo_schema::client::AuthResponsePacket {
+                                                success: false,
+                                                error_code: e.to_error_code(),
+                                                session_id: 0,
+                                                player_guid: 0,
+                                                assigned_node: String::new(),
+                                                error_message: e.to_string(),
+                                            },
+                                        );
+                                        let _ = send_stream.write_all(&resp.encode()).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            _ => {
+                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 loop {
                     match recv_stream.read(&mut temp).await {
                         Ok(Some(n)) if n > 0 => {
