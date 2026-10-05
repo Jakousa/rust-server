@@ -38,9 +38,10 @@ All object placements (construction, deployment, dropped interactables) SHALL be
 - **THEN** the node SHALL verify:
   1. Target placement coordinates reside within the node's authoritative spatial partition.
   2. Interaction distance $|P_{\text{player}} - P_{\text{target}}| \le 6.0\text{m}$ evaluated strictly against the server's authoritative player entity position from `EntityStore`.
-  3. Line-of-sight raycast from the player's authoritative position to target placement coordinates does not intersect occluding solid geometry (preventing placement through walls or inside closed rooms).
-  4. Client session does not exceed a token-bucket rate limit (maximum 10 placement/interaction operations per second).
-  5. The object's calculated bounding box does not penetrate existing immovable world obstacles or player kinematic capsules.
+  3. Transform floats are strictly finite (`f32::is_finite()`), orientation quaternion is normalized, and scale dimensions are clamped within valid bounds ($0.01 \le s_i \le 100.0$) to prevent spatial index DOS attacks.
+  4. Line-of-sight raycast from the player's authoritative position to target placement coordinates does not intersect occluding solid geometry (preventing placement through walls or inside closed rooms).
+  5. Client session does not exceed a token-bucket rate limit (maximum 10 placement/interaction operations per second).
+  6. The object's calculated bounding box does not penetrate existing immovable world obstacles or player kinematic capsules.
 - **AND** upon successful verification, the object SHALL be inserted into the active sector and staged for replication and persistence.
 
 ### Requirement: Authoritative Interaction & State Transition
@@ -80,6 +81,7 @@ All incremental state modifications (health changes, state flag flips, destructi
 - **WHEN** broadcasting to nearby observers
 - **THEN** updates SHALL be sent via `WorldObjectDeltaPacket` carrying monotonic `dirty_revision` numbers over reliable stream sinks
 - **AND** if a client detects a revision sequence gap, it SHALL transmit `WorldObjectResyncRequest` to fetch the authoritative current state.
+- **AND** `WorldObjectResyncRequest` SHALL be rate-limited by the session token-bucket to prevent state-serialization DOS attacks.
 
 ---
 
@@ -92,7 +94,8 @@ Modified world objects SHALL be persisted asynchronously without stalling the 20
 - **WHEN** staging objects into `WorldObjectWriteBehindSnapshotter`
 - **THEN** staging SHALL only acquire an in-memory lock ($< 1\,\mu\text{s}$) to clone the object record
 - **AND** multiple modifications to the same object within the flush interval SHALL coalesce into the same queued record
-- **AND** a dedicated background worker SHALL execute SQL batch upserts (`INSERT ... ON CONFLICT DO UPDATE`).
+- **AND** a dedicated background worker SHALL execute SQL batch upserts with monotonic revision protection: `ON CONFLICT (world_id, object_id) DO UPDATE SET ... WHERE world_objects.dirty_revision < EXCLUDED.dirty_revision`.
+- **AND** if a database flush fails, unpersisted dirty records SHALL be preserved and merged back into the retry queue to guarantee zero data loss without overwriting newer in-memory revisions.
 
 ### Requirement: Dual-Engine Schema Migration
 The storage tier SHALL provide migration `V4__world_objects.sql` supporting PostgreSQL and SQLite.

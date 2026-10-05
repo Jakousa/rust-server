@@ -228,6 +228,19 @@ impl WorldObjectWriteBehindSnapshotter {
                         chunk.len(),
                         e
                     );
+                    // Pro Review mitigation: Merge failed records back into dirty_map so they are retried on the next flush cycle
+                    let mut map = self.dirty_map.lock().unwrap();
+                    for record in chunk {
+                        let guid = Guid(record.object_id);
+                        if let Some(existing) = map.get_mut(&guid) {
+                            if record.dirty_revision > existing.dirty_revision {
+                                *existing = record.clone();
+                            }
+                        } else if map.len() < self.max_dirty_capacity {
+                            map.insert(guid, record.clone());
+                        }
+                    }
+                    metrics::gauge!("mmo_node_world_snapshot_dirty_queue").set(map.len() as f64);
                 }
             }
         }
@@ -301,5 +314,28 @@ mod tests {
 
         let fetched2 = repo.get_world_object(1, 102).await.unwrap().unwrap();
         assert_eq!(fetched2.dirty_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn test_world_snapshotter_retry_on_flush_failure() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = WorldObjectRepository::new(db.clone());
+        let snapshotter = Arc::new(WorldObjectWriteBehindSnapshotter::new(repo.clone()));
+
+        let obj = make_test_object(999, (1.0, 2.0, 3.0), 1);
+        snapshotter.mark_object_dirty(1, &obj);
+        assert_eq!(snapshotter.dirty_count(), 1);
+
+        // Close the database pool to simulate database blackout / failure
+        db.sqlite_pool().unwrap().close().await;
+
+        // Flush batch should fail and merge failed records back into dirty_map
+        let saved = snapshotter.flush_batch().await;
+        assert_eq!(saved, 0);
+        assert_eq!(
+            snapshotter.dirty_count(),
+            1,
+            "Failed records must be retained in dirty_map for retry"
+        );
     }
 }

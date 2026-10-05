@@ -10,6 +10,7 @@ import { UIController } from "./ui.js";
 class ClientWorldBridge {
   constructor() {
     this.entities = new Map();
+    this.worldObjects = new Map();
     this.latestServerTick = 0;
     this.latestBaselineTick = 0;
     this.receivedPackets = 0;
@@ -93,6 +94,31 @@ class ClientWorldBridge {
       );
     }
 
+    return new Float32Array(buffer);
+  }
+
+  getWorldObjectsRenderBuffer() {
+    const buffer = [];
+    for (const obj of this.worldObjects.values()) {
+      buffer.push(
+        obj.id,
+        obj.prefabId,
+        obj.x,
+        obj.y,
+        obj.z,
+        obj.qx,
+        obj.qy,
+        obj.qz,
+        obj.qw,
+        obj.sx,
+        obj.sy,
+        obj.sz,
+        obj.stateFlags,
+        obj.hpPct,
+        obj.revision,
+        0.0
+      );
+    }
     return new Float32Array(buffer);
   }
 
@@ -224,6 +250,7 @@ window.addEventListener("DOMContentLoaded", () => {
     // 3. Render synchronized 3D scene
     const renderBuffer = world.getRenderBuffer(controls.position, controls.yaw);
     renderer.syncEntities(renderBuffer, world.localPlayerGuid);
+    renderer.updateWorldObjects(world.getWorldObjectsRenderBuffer());
     renderer.updateCamera(controls.position);
     renderer.render();
 

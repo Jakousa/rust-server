@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { WorldObjectRenderer } from "./world.js";
 
 /**
  * Three.js 3D Viewport Renderer for OpenSpec MMO.
@@ -31,6 +32,9 @@ export class WorldRenderer {
 
     // Entities Map: guid -> THREE.Group
     this.entities = new Map();
+
+    // World Object Renderer
+    this.worldObjects = new WorldObjectRenderer(this.scene);
 
     // Lighting
     this.initLighting();
@@ -153,6 +157,13 @@ export class WorldRenderer {
         this.entities.delete(guid);
       }
     }
+  }
+
+  /**
+   * Updates world objects from flat WASM render buffer (16 floats per object).
+   */
+  updateWorldObjects(buffer) {
+    this.worldObjects.updateFromBuffer(buffer);
   }
 
   /**
