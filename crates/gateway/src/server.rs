@@ -92,7 +92,13 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
         | ClientPacket::Ping(_)
         | ClientPacket::Pong(_)
         | ClientPacket::EntityDeltaBatch(_)
-        | ClientPacket::ClientAck(_) => None,
+        | ClientPacket::ClientAck(_)
+        | ClientPacket::WorldObjectSpawn(_)
+        | ClientPacket::WorldObjectDelta(_)
+        | ClientPacket::WorldObjectDespawn(_)
+        | ClientPacket::WorldObjectResync(_)
+        | ClientPacket::PlaceObject(_)
+        | ClientPacket::InteractObject(_) => None,
     }
 }
 

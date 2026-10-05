@@ -99,14 +99,16 @@ flowchart LR
 
 ---
 
-### Milestone: Real-Time World Persistence & Streaming Voxel / Heightmap Terrain
+### Milestone: Persistent World Objects, Dynamic Prefabs & Spatial Sector Streaming
 
-**Problem**: Dynamic virtual worlds require authoritative terrain deformation, constructible fortifications, and persistent environmental state streamed on-demand within each player's Area of Interest.
+**Problem**: Dynamic virtual worlds require authoritative persistent world objects (resource nodes, chests, doors, interactive mechanisms), constructible player structures and fortifications, and persistent environmental state streamed on-demand within each player's Area of Interest (AoI). Core engine primitives must remain genre-agnostic, with specialized mechanics (such as volumetric voxel sandboxes) isolated as decoupled plugins.
 
 **Technical Scope**:
-1. **Sparse Voxel Octree Terrain Representation**: Efficient 3D chunked volumetric terrain storage supporting point digging, building, and destruction.
-2. **Delta Chunk Streaming via AoI**: Integrate terrain chunk boundaries into `SpatialOctree` AoI queries, streaming compressed voxel deltas over WebTransport / QUIC datagrams.
-3. **Asynchronous Chunk Write-Behind**: Persist modified terrain chunks to PostgreSQL using LZ4-compressed binary blobs with coalesced dirty-chunk queues.
+1. **Generic Spatial Sector & Heightmap Paging**: Efficient 3D chunked sector storage and heightmap representation supporting spatial queries and LOD bounds.
+2. **Authoritative World Objects & Prefab Construction**: Generalized interactive world entities and player-placed prefabs with spatial transforms, AABB collision boundaries, health, and access control policies.
+3. **Delta Sector Streaming via AoI**: Integrate sector chunk boundaries into `SpatialOctree` AoI queries, streaming sector entities, state deltas, and heightmap data over WebTransport / QUIC.
+4. **Asynchronous Coalesced World Persistence**: Persist modified world entities, structure health, and sector state to PostgreSQL / SQLite using write-behind coalescing snapshotters.
+5. **Decoupled Plugin Architecture for Specialized Terrains**: Provide clean extension hooks so genre-specific mechanics (like volumetric voxel digging or deformable terrain) plug in as optional `GameplayPlugin` modules without polluting the core engine.
 
 ---
 

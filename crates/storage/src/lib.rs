@@ -11,6 +11,7 @@ pub mod repository;
 pub mod social;
 pub mod test_helpers;
 pub mod transaction_coord;
+pub mod world_repo;
 
 pub use cache::{MemoryCache, RedisCache, SessionCacheBackend, SessionData};
 pub use container_repo::ContainerRepository;
@@ -19,7 +20,7 @@ pub use escrow_coord::{hash_secret, EscrowCoordinator};
 pub use models::{
     AccountRecord, CharacterRecord, ContainerRecord, ContainerTransactionRecord, EntitySnapshot,
     EscrowRecord, EscrowStatus, InventoryRecord, ItemRecord, ReservationRecord, TradeRecord,
-    TradeStatus,
+    TradeStatus, WorldObjectRecord,
 };
 pub use repository::CharacterRepository;
 pub use social::{
@@ -28,3 +29,4 @@ pub use social::{
 };
 pub use test_helpers::{ContainerRecordBuilder, ItemRecordBuilder};
 pub use transaction_coord::TransactionCoordinator;
+pub use world_repo::WorldObjectRepository;

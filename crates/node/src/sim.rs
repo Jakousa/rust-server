@@ -34,6 +34,8 @@ pub struct TickSimulation {
     pub tick_systems: Vec<Box<dyn TickSystem>>,
     pub plugin_manager: PluginManager,
     pub aoi: AoiManager,
+    pub sectors: crate::sector::SectorManager,
+    pub next_world_object_seq: u32,
     pub pending_broadcast_jobs: Vec<AoiBroadcastJob>,
     pub kinematic_states: HashMap<Guid, EntityKinematicState>,
     pub migrating_leases: HashMap<Guid, Instant>,
@@ -120,6 +122,8 @@ impl TickSimulation {
             tick_systems,
             plugin_manager: PluginManager::new(),
             aoi: AoiManager::new(),
+            sectors: crate::sector::SectorManager::new(),
+            next_world_object_seq: 1,
             pending_broadcast_jobs: Vec::new(),
             kinematic_states: HashMap::new(),
             migrating_leases: HashMap::new(),
@@ -288,6 +292,78 @@ impl TickSimulation {
             position,
         });
         true
+    }
+
+    /// Authoritatively handles a client `PlaceObject` request: validates rate limit, range,
+    /// line of sight and non-penetration, then spawns the object into the sector index.
+    ///
+    /// Returns the new object's GUID on success.
+    pub fn handle_place_object(
+        &mut self,
+        player: Guid,
+        packet: &mmo_schema::client::PlaceObjectPacket,
+    ) -> Result<Guid, crate::sector::PlacementError> {
+        use mmo_core::container::ContainerOwner;
+        use mmo_core::world::{Transform3D, WorldObject};
+
+        let player_pos = self
+            .entity_store
+            .get_by_guid(player)
+            .map(|e| e.position)
+            .unwrap_or((0.0, 0.0, 0.0));
+        let pos = (packet.pos.x, packet.pos.y, packet.pos.z);
+        // Prefab footprint is plugin-defined; core uses the scaled unit cube centered on pos.
+        let half = (
+            0.5 * packet.scale.x.abs(),
+            0.5 * packet.scale.y.abs(),
+            0.5 * packet.scale.z.abs(),
+        );
+        let bounds = BoundingBox3D::new(
+            (pos.0 - half.0, pos.1 - half.1, pos.2 - half.2),
+            (pos.0 + half.0, pos.1 + half.1, pos.2 + half.2),
+        );
+        self.sectors
+            .validate_placement(player, player_pos, pos, &bounds)?;
+
+        let seq = self.next_world_object_seq;
+        self.next_world_object_seq = self.next_world_object_seq.wrapping_add(1);
+        let object_id = Guid::new(mmo_core::EntityType::DynamicObject, self.node_id, seq);
+        let mut obj = WorldObject::new(
+            object_id,
+            packet.prefab_id,
+            Transform3D::new(
+                pos,
+                packet.rot,
+                (packet.scale.x, packet.scale.y, packet.scale.z),
+            ),
+            bounds,
+            ContainerOwner::Character(player.raw()),
+        );
+        obj.properties = packet.properties.clone();
+        self.sectors.insert_object(obj);
+        Ok(object_id)
+    }
+
+    /// Handles a client `InteractObject` request, validating range and interactivity.
+    /// Returns `true` if the interaction is permitted; plugins react via hooks/events.
+    pub fn handle_interact_object(
+        &self,
+        player: Guid,
+        packet: &mmo_schema::client::InteractObjectPacket,
+    ) -> bool {
+        use mmo_core::world::world_object_flags;
+        let Some(ent) = self.entity_store.get_by_guid(player) else {
+            return false;
+        };
+        let Some(obj) = self.sectors.get_object(Guid::from_raw(packet.object_id)) else {
+            return false;
+        };
+        if !obj.has_flag(world_object_flags::INTERACTIVE)
+            || obj.has_flag(world_object_flags::LOCKED)
+        {
+            return false;
+        }
+        obj.bounds.distance_to_point(ent.position) <= crate::sector::MAX_INTERACTION_DISTANCE
     }
 
     /// Despawns an entity by GUID from both `EntityStore` and `Octree`, dispatching `OnDespawn`.
