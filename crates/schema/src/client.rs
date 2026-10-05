@@ -5,6 +5,7 @@
 //! and interaction actions).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::bitpack::{get_varint_u32, get_varint_u64, put_varint_u32, put_varint_u64};
@@ -52,6 +53,12 @@ pub enum Opcode {
     Pong = 0x0008,
     EntityDeltaBatch = 0x0009,
     ClientAck = 0x000A,
+    WorldObjectSpawn = 0x000B,
+    WorldObjectDelta = 0x000C,
+    WorldObjectDespawn = 0x000D,
+    WorldObjectResync = 0x000E,
+    PlaceObject = 0x000F,
+    InteractObject = 0x0010,
 }
 
 impl Opcode {
@@ -67,6 +74,12 @@ impl Opcode {
             0x0008 => Ok(Opcode::Pong),
             0x0009 => Ok(Opcode::EntityDeltaBatch),
             0x000A => Ok(Opcode::ClientAck),
+            0x000B => Ok(Opcode::WorldObjectSpawn),
+            0x000C => Ok(Opcode::WorldObjectDelta),
+            0x000D => Ok(Opcode::WorldObjectDespawn),
+            0x000E => Ok(Opcode::WorldObjectResync),
+            0x000F => Ok(Opcode::PlaceObject),
+            0x0010 => Ok(Opcode::InteractObject),
             other => Err(ClientCodecError::UnknownOpcode(other)),
         }
     }
@@ -83,6 +96,12 @@ impl Opcode {
             Opcode::Pong => "Pong",
             Opcode::EntityDeltaBatch => "EntityDeltaBatch",
             Opcode::ClientAck => "ClientAck",
+            Opcode::WorldObjectSpawn => "WorldObjectSpawn",
+            Opcode::WorldObjectDelta => "WorldObjectDelta",
+            Opcode::WorldObjectDespawn => "WorldObjectDespawn",
+            Opcode::WorldObjectResync => "WorldObjectResync",
+            Opcode::PlaceObject => "PlaceObject",
+            Opcode::InteractObject => "InteractObject",
         }
     }
 }
@@ -819,6 +838,364 @@ impl ClientAckPacket {
     }
 }
 
+fn put_string(dst: &mut BytesMut, s: &str) {
+    put_varint_u32(dst, s.len() as u32);
+    dst.extend_from_slice(s.as_bytes());
+}
+
+fn get_string(src: &mut impl Buf) -> Result<String, ClientCodecError> {
+    let len = get_varint_u32(src)? as usize;
+    if src.remaining() < len {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: len,
+            got: src.remaining(),
+        });
+    }
+    let mut bytes = vec![0u8; len];
+    src.copy_to_slice(&mut bytes);
+    String::from_utf8(bytes).map_err(|e| ClientCodecError::InvalidData(e.to_string()))
+}
+
+fn put_property_map(dst: &mut BytesMut, map: &HashMap<String, String>) {
+    put_varint_u32(dst, map.len() as u32);
+    for (k, v) in map {
+        put_string(dst, k);
+        put_string(dst, v);
+    }
+}
+
+fn get_property_map(src: &mut impl Buf) -> Result<HashMap<String, String>, ClientCodecError> {
+    let count = get_varint_u32(src)? as usize;
+    let mut map = HashMap::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let k = get_string(src)?;
+        let v = get_string(src)?;
+        map.insert(k, v);
+    }
+    Ok(map)
+}
+
+/// Server broadcast replicating a spawned world object or constructed prefab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldObjectSpawnPacket {
+    pub object_id: u64,
+    pub prefab_id: u32,
+    pub pos: Vec3,
+    pub rot: (f32, f32, f32, f32),
+    pub scale: Vec3,
+    pub bounds_min: Vec3,
+    pub bounds_max: Vec3,
+    pub state_flags: u32,
+    pub owner_type: u8,
+    pub owner_id: String,
+    pub health: Option<(u32, u32)>,
+    pub properties: HashMap<String, String>,
+    pub revision: u64,
+}
+
+impl WorldObjectSpawnPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.object_id);
+        put_varint_u32(dst, self.prefab_id);
+        dst.put_f32_le(self.pos.x);
+        dst.put_f32_le(self.pos.y);
+        dst.put_f32_le(self.pos.z);
+        dst.put_f32_le(self.rot.0);
+        dst.put_f32_le(self.rot.1);
+        dst.put_f32_le(self.rot.2);
+        dst.put_f32_le(self.rot.3);
+        dst.put_f32_le(self.scale.x);
+        dst.put_f32_le(self.scale.y);
+        dst.put_f32_le(self.scale.z);
+        dst.put_f32_le(self.bounds_min.x);
+        dst.put_f32_le(self.bounds_min.y);
+        dst.put_f32_le(self.bounds_min.z);
+        dst.put_f32_le(self.bounds_max.x);
+        dst.put_f32_le(self.bounds_max.y);
+        dst.put_f32_le(self.bounds_max.z);
+        put_varint_u32(dst, self.state_flags);
+        dst.put_u8(self.owner_type);
+        put_string(dst, &self.owner_id);
+        if let Some((cur, max)) = self.health {
+            dst.put_u8(1);
+            put_varint_u32(dst, cur);
+            put_varint_u32(dst, max);
+        } else {
+            dst.put_u8(0);
+        }
+        put_property_map(dst, &self.properties);
+        put_varint_u64(dst, self.revision);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let object_id = get_varint_u64(src)?;
+        let prefab_id = get_varint_u32(src)?;
+        if src.remaining() < 16 * 4 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 16 * 4,
+                got: src.remaining(),
+            });
+        }
+        let pos = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let rot = (
+            src.get_f32_le(),
+            src.get_f32_le(),
+            src.get_f32_le(),
+            src.get_f32_le(),
+        );
+        let scale = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let bounds_min = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let bounds_max = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let state_flags = get_varint_u32(src)?;
+        if src.remaining() < 1 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: src.remaining(),
+            });
+        }
+        let owner_type = src.get_u8();
+        let owner_id = get_string(src)?;
+        if src.remaining() < 1 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: src.remaining(),
+            });
+        }
+        let has_health = src.get_u8();
+        let health = if has_health != 0 {
+            let cur = get_varint_u32(src)?;
+            let max = get_varint_u32(src)?;
+            Some((cur, max))
+        } else {
+            None
+        };
+        let properties = get_property_map(src)?;
+        let revision = get_varint_u64(src)?;
+
+        Ok(Self {
+            object_id,
+            prefab_id,
+            pos,
+            rot,
+            scale,
+            bounds_min,
+            bounds_max,
+            state_flags,
+            owner_type,
+            owner_id,
+            health,
+            properties,
+            revision,
+        })
+    }
+}
+
+/// Server broadcast communicating delta state changes for a world object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldObjectDeltaPacket {
+    pub object_id: u64,
+    pub revision: u64,
+    pub state_flags: Option<u32>,
+    pub health: Option<(u32, u32)>,
+    pub properties: HashMap<String, String>,
+}
+
+impl WorldObjectDeltaPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.object_id);
+        put_varint_u64(dst, self.revision);
+        if let Some(flags) = self.state_flags {
+            dst.put_u8(1);
+            put_varint_u32(dst, flags);
+        } else {
+            dst.put_u8(0);
+        }
+        if let Some((cur, max)) = self.health {
+            dst.put_u8(1);
+            put_varint_u32(dst, cur);
+            put_varint_u32(dst, max);
+        } else {
+            dst.put_u8(0);
+        }
+        put_property_map(dst, &self.properties);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let object_id = get_varint_u64(src)?;
+        let revision = get_varint_u64(src)?;
+        if src.remaining() < 1 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: src.remaining(),
+            });
+        }
+        let has_flags = src.get_u8();
+        let state_flags = if has_flags != 0 {
+            Some(get_varint_u32(src)?)
+        } else {
+            None
+        };
+        if src.remaining() < 1 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: src.remaining(),
+            });
+        }
+        let has_health = src.get_u8();
+        let health = if has_health != 0 {
+            let cur = get_varint_u32(src)?;
+            let max = get_varint_u32(src)?;
+            Some((cur, max))
+        } else {
+            None
+        };
+        let properties = get_property_map(src)?;
+
+        Ok(Self {
+            object_id,
+            revision,
+            state_flags,
+            health,
+            properties,
+        })
+    }
+}
+
+/// Server broadcast communicating despawn or destruction of a world object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldObjectDespawnPacket {
+    pub object_id: u64,
+}
+
+impl WorldObjectDespawnPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.object_id);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let object_id = get_varint_u64(src)?;
+        Ok(Self { object_id })
+    }
+}
+
+/// Client request to fetch the complete current state of a world object after detected revision gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldObjectResyncPacket {
+    pub object_id: u64,
+}
+
+impl WorldObjectResyncPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.object_id);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let object_id = get_varint_u64(src)?;
+        Ok(Self { object_id })
+    }
+}
+
+/// Client request to authoritatively place a world object or constructible prefab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaceObjectPacket {
+    pub prefab_id: u32,
+    pub pos: Vec3,
+    pub rot: (f32, f32, f32, f32),
+    pub scale: Vec3,
+    pub properties: HashMap<String, String>,
+}
+
+impl PlaceObjectPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u32(dst, self.prefab_id);
+        dst.put_f32_le(self.pos.x);
+        dst.put_f32_le(self.pos.y);
+        dst.put_f32_le(self.pos.z);
+        dst.put_f32_le(self.rot.0);
+        dst.put_f32_le(self.rot.1);
+        dst.put_f32_le(self.rot.2);
+        dst.put_f32_le(self.rot.3);
+        dst.put_f32_le(self.scale.x);
+        dst.put_f32_le(self.scale.y);
+        dst.put_f32_le(self.scale.z);
+        put_property_map(dst, &self.properties);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let prefab_id = get_varint_u32(src)?;
+        if src.remaining() < 10 * 4 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 10 * 4,
+                got: src.remaining(),
+            });
+        }
+        let pos = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let rot = (
+            src.get_f32_le(),
+            src.get_f32_le(),
+            src.get_f32_le(),
+            src.get_f32_le(),
+        );
+        let scale = Vec3 {
+            x: src.get_f32_le(),
+            y: src.get_f32_le(),
+            z: src.get_f32_le(),
+        };
+        let properties = get_property_map(src)?;
+
+        Ok(Self {
+            prefab_id,
+            pos,
+            rot,
+            scale,
+            properties,
+        })
+    }
+}
+
+/// Client request to interact with an active world object (e.g. open door, mine node, loot chest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractObjectPacket {
+    pub object_id: u64,
+    pub action_type: u32,
+}
+
+impl InteractObjectPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        put_varint_u64(dst, self.object_id);
+        put_varint_u32(dst, self.action_type);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        let object_id = get_varint_u64(src)?;
+        let action_type = get_varint_u32(src)?;
+        Ok(Self {
+            object_id,
+            action_type,
+        })
+    }
+}
+
 /// Top-level client packet enum encompassing all protocol messages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientPacket {
@@ -832,6 +1209,12 @@ pub enum ClientPacket {
     Pong(PongPacket),
     EntityDeltaBatch(EntityDeltaBatchPacket),
     ClientAck(ClientAckPacket),
+    WorldObjectSpawn(WorldObjectSpawnPacket),
+    WorldObjectDelta(WorldObjectDeltaPacket),
+    WorldObjectDespawn(WorldObjectDespawnPacket),
+    WorldObjectResync(WorldObjectResyncPacket),
+    PlaceObject(PlaceObjectPacket),
+    InteractObject(InteractObjectPacket),
 }
 
 impl ClientPacket {
@@ -847,6 +1230,12 @@ impl ClientPacket {
             ClientPacket::Pong(_) => Opcode::Pong,
             ClientPacket::EntityDeltaBatch(_) => Opcode::EntityDeltaBatch,
             ClientPacket::ClientAck(_) => Opcode::ClientAck,
+            ClientPacket::WorldObjectSpawn(_) => Opcode::WorldObjectSpawn,
+            ClientPacket::WorldObjectDelta(_) => Opcode::WorldObjectDelta,
+            ClientPacket::WorldObjectDespawn(_) => Opcode::WorldObjectDespawn,
+            ClientPacket::WorldObjectResync(_) => Opcode::WorldObjectResync,
+            ClientPacket::PlaceObject(_) => Opcode::PlaceObject,
+            ClientPacket::InteractObject(_) => Opcode::InteractObject,
         }
     }
 
@@ -865,6 +1254,12 @@ impl ClientPacket {
             ClientPacket::Pong(p) => p.encode(&mut payload_buf),
             ClientPacket::EntityDeltaBatch(p) => p.encode(&mut payload_buf),
             ClientPacket::ClientAck(p) => p.encode(&mut payload_buf),
+            ClientPacket::WorldObjectSpawn(p) => p.encode(&mut payload_buf),
+            ClientPacket::WorldObjectDelta(p) => p.encode(&mut payload_buf),
+            ClientPacket::WorldObjectDespawn(p) => p.encode(&mut payload_buf),
+            ClientPacket::WorldObjectResync(p) => p.encode(&mut payload_buf),
+            ClientPacket::PlaceObject(p) => p.encode(&mut payload_buf),
+            ClientPacket::InteractObject(p) => p.encode(&mut payload_buf),
         }
 
         let payload_len = payload_buf.len() as u32;
@@ -933,6 +1328,24 @@ impl ClientPacket {
             Opcode::ClientAck => Ok(ClientPacket::ClientAck(ClientAckPacket::decode(
                 &mut payload,
             )?)),
+            Opcode::WorldObjectSpawn => Ok(ClientPacket::WorldObjectSpawn(
+                WorldObjectSpawnPacket::decode(&mut payload)?,
+            )),
+            Opcode::WorldObjectDelta => Ok(ClientPacket::WorldObjectDelta(
+                WorldObjectDeltaPacket::decode(&mut payload)?,
+            )),
+            Opcode::WorldObjectDespawn => Ok(ClientPacket::WorldObjectDespawn(
+                WorldObjectDespawnPacket::decode(&mut payload)?,
+            )),
+            Opcode::WorldObjectResync => Ok(ClientPacket::WorldObjectResync(
+                WorldObjectResyncPacket::decode(&mut payload)?,
+            )),
+            Opcode::PlaceObject => Ok(ClientPacket::PlaceObject(PlaceObjectPacket::decode(
+                &mut payload,
+            )?)),
+            Opcode::InteractObject => Ok(ClientPacket::InteractObject(
+                InteractObjectPacket::decode(&mut payload)?,
+            )),
         }
     }
 
@@ -2012,10 +2425,209 @@ mod tests {
                 }),
                 Opcode::ClientAck,
             ),
+            (
+                ClientPacket::WorldObjectSpawn(WorldObjectSpawnPacket {
+                    object_id: 100,
+                    prefab_id: 1,
+                    pos: Vec3::ZERO,
+                    rot: (0.0, 0.0, 0.0, 1.0),
+                    scale: Vec3 {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    },
+                    bounds_min: Vec3::ZERO,
+                    bounds_max: Vec3::ZERO,
+                    state_flags: 1,
+                    owner_type: 0,
+                    owner_id: "owner".into(),
+                    health: Some((100, 100)),
+                    properties: HashMap::new(),
+                    revision: 1,
+                }),
+                Opcode::WorldObjectSpawn,
+            ),
+            (
+                ClientPacket::WorldObjectDelta(WorldObjectDeltaPacket {
+                    object_id: 100,
+                    revision: 2,
+                    state_flags: Some(2),
+                    health: None,
+                    properties: HashMap::new(),
+                }),
+                Opcode::WorldObjectDelta,
+            ),
+            (
+                ClientPacket::WorldObjectDespawn(WorldObjectDespawnPacket { object_id: 100 }),
+                Opcode::WorldObjectDespawn,
+            ),
+            (
+                ClientPacket::WorldObjectResync(WorldObjectResyncPacket { object_id: 100 }),
+                Opcode::WorldObjectResync,
+            ),
+            (
+                ClientPacket::PlaceObject(PlaceObjectPacket {
+                    prefab_id: 1,
+                    pos: Vec3::ZERO,
+                    rot: (0.0, 0.0, 0.0, 1.0),
+                    scale: Vec3 {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    },
+                    properties: HashMap::new(),
+                }),
+                Opcode::PlaceObject,
+            ),
+            (
+                ClientPacket::InteractObject(InteractObjectPacket {
+                    object_id: 100,
+                    action_type: 1,
+                }),
+                Opcode::InteractObject,
+            ),
         ];
 
         for (pkt, expected_opcode) in packets {
             assert_eq!(pkt.opcode(), expected_opcode);
         }
+    }
+
+    #[test]
+    fn test_world_object_spawn_roundtrip() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), "Iron Door".to_string());
+        props.insert("tier".to_string(), "2".to_string());
+
+        let pkt = WorldObjectSpawnPacket {
+            object_id: 9999,
+            prefab_id: 42,
+            pos: Vec3 {
+                x: 12.5,
+                y: 0.0,
+                z: -34.5,
+            },
+            rot: (0.0, 0.5, 0.0, 0.5),
+            scale: Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 1.0,
+            },
+            bounds_min: Vec3 {
+                x: 11.5,
+                y: 0.0,
+                z: -35.5,
+            },
+            bounds_max: Vec3 {
+                x: 13.5,
+                y: 2.0,
+                z: -33.5,
+            },
+            state_flags: 3,
+            owner_type: 1,
+            owner_id: "guild_123".to_string(),
+            health: Some((250, 500)),
+            properties: props,
+            revision: 7,
+        };
+
+        let client_pkt = ClientPacket::WorldObjectSpawn(pkt.clone());
+        let encoded = client_pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode failed");
+
+        if let ClientPacket::WorldObjectSpawn(decoded_pkt) = decoded {
+            assert_eq!(decoded_pkt, pkt);
+        } else {
+            panic!("Decoded into wrong packet variant");
+        }
+    }
+
+    #[test]
+    fn test_world_object_delta_roundtrip() {
+        let mut props = HashMap::new();
+        props.insert("durability".to_string(), "85".to_string());
+
+        let pkt = WorldObjectDeltaPacket {
+            object_id: 54321,
+            revision: 12,
+            state_flags: Some(7),
+            health: Some((85, 100)),
+            properties: props,
+        };
+
+        let client_pkt = ClientPacket::WorldObjectDelta(pkt.clone());
+        let encoded = client_pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode failed");
+
+        if let ClientPacket::WorldObjectDelta(decoded_pkt) = decoded {
+            assert_eq!(decoded_pkt, pkt);
+        } else {
+            panic!("Decoded into wrong packet variant");
+        }
+    }
+
+    #[test]
+    fn test_world_object_despawn_and_resync_roundtrip() {
+        let despawn = WorldObjectDespawnPacket { object_id: 777 };
+        let encoded_despawn = ClientPacket::WorldObjectDespawn(despawn).encode();
+        let decoded = ClientPacket::decode(&encoded_despawn).expect("decode failed");
+        assert_eq!(decoded, ClientPacket::WorldObjectDespawn(despawn));
+
+        let resync = WorldObjectResyncPacket { object_id: 888 };
+        let encoded_resync = ClientPacket::WorldObjectResync(resync).encode();
+        let decoded = ClientPacket::decode(&encoded_resync).expect("decode failed");
+        assert_eq!(decoded, ClientPacket::WorldObjectResync(resync));
+    }
+
+    #[test]
+    fn test_place_and_interact_object_roundtrip() {
+        let mut props = HashMap::new();
+        props.insert("material".to_string(), "stone".to_string());
+
+        let place = PlaceObjectPacket {
+            prefab_id: 5,
+            pos: Vec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3 {
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+            properties: props,
+        };
+        let encoded_place = ClientPacket::PlaceObject(place.clone()).encode();
+        let decoded_place = ClientPacket::decode(&encoded_place).expect("decode failed");
+        assert_eq!(decoded_place, ClientPacket::PlaceObject(place));
+
+        let interact = InteractObjectPacket {
+            object_id: 999,
+            action_type: 2,
+        };
+        let encoded_interact = ClientPacket::InteractObject(interact).encode();
+        let decoded_interact = ClientPacket::decode(&encoded_interact).expect("decode failed");
+        assert_eq!(decoded_interact, ClientPacket::InteractObject(interact));
+    }
+
+    #[test]
+    fn test_world_object_packets_truncated_buffer_rejection() {
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 100);
+        put_varint_u32(&mut buf, 1);
+        // Truncate before floats
+        assert!(WorldObjectSpawnPacket::decode(&mut buf.freeze()).is_err());
+
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 100);
+        // Truncate before revision
+        assert!(WorldObjectDeltaPacket::decode(&mut buf.freeze()).is_err());
+
+        let mut buf = BytesMut::new();
+        put_varint_u32(&mut buf, 1);
+        // Truncate before position
+        assert!(PlaceObjectPacket::decode(&mut buf.freeze()).is_err());
     }
 }

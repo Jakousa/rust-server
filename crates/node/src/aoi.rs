@@ -8,13 +8,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use mmo_core::guid::Guid;
 use mmo_core::octree::calculate_throttled_aoi;
+use mmo_core::world::SectorCoord3D;
 use mmo_core::{EntityStore, Octree};
 use mmo_gameplay::combat::HealthComponent;
 use mmo_schema::client::{
     delta_flags, ClientPacket, EntityDeltaBatchPacket, EntityDeltaState, EntityDespawnPacket,
-    EntityStatePacket, Vec3,
+    EntityStatePacket, Vec3, WorldObjectDeltaPacket, WorldObjectDespawnPacket,
+    WorldObjectSpawnPacket,
 };
 use mmo_schema::quantize::is_teleport_delta;
+
+use crate::sector::SectorManager;
 
 /// Configuration parameters for an Area-of-Interest observer.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +134,55 @@ impl BaselineTracker {
     }
 }
 
+/// Maps a container owner to its compact wire discriminant.
+fn owner_type_code(owner: &mmo_core::container::ContainerOwner) -> u8 {
+    use mmo_core::container::ContainerOwner;
+    match owner {
+        ContainerOwner::Character(_) => 0,
+        ContainerOwner::Guild(_) => 1,
+        ContainerOwner::WorldEntity(_) => 2,
+        ContainerOwner::System(_) => 3,
+    }
+}
+
+/// Builds a full-state spawn packet for a world object.
+fn build_spawn_packet(obj: &mmo_core::world::WorldObject) -> WorldObjectSpawnPacket {
+    WorldObjectSpawnPacket {
+        object_id: obj.object_id.0,
+        prefab_id: obj.prefab_id,
+        pos: Vec3 {
+            x: obj.transform.position.0,
+            y: obj.transform.position.1,
+            z: obj.transform.position.2,
+        },
+        rot: obj.transform.rotation,
+        scale: Vec3 {
+            x: obj.transform.scale.0,
+            y: obj.transform.scale.1,
+            z: obj.transform.scale.2,
+        },
+        bounds_min: Vec3 {
+            x: obj.bounds.min.0,
+            y: obj.bounds.min.1,
+            z: obj.bounds.min.2,
+        },
+        bounds_max: Vec3 {
+            x: obj.bounds.max.0,
+            y: obj.bounds.max.1,
+            z: obj.bounds.max.2,
+        },
+        state_flags: obj.state_flags,
+        owner_type: owner_type_code(&obj.owner),
+        owner_id: obj.owner.owner_id(),
+        health: obj.health.map(|h| (h.current, h.max)),
+        properties: obj.properties.clone(),
+        revision: obj.dirty_revision,
+    }
+}
+
+/// Maximum number of queued world objects streamed to an observer per simulation tick.
+pub const MAX_PACED_WORLD_OBJECTS_PER_TICK: usize = 10;
+
 /// State tracking for an active player session observer.
 #[derive(Debug, Clone)]
 pub struct ObserverState {
@@ -139,6 +192,9 @@ pub struct ObserverState {
     pub effective_radius: f32,
     pub observed_entities: HashMap<Guid, CachedEntityState>,
     pub baseline_tracker: BaselineTracker,
+    pub observed_sectors: HashSet<SectorCoord3D>,
+    pub known_world_objects: HashMap<Guid, u64>,
+    pub pending_world_objects_egress: VecDeque<(Guid, SectorCoord3D, f32)>,
 }
 
 impl ObserverState {
@@ -153,8 +209,42 @@ impl ObserverState {
             effective_radius: base_radius,
             observed_entities: HashMap::new(),
             baseline_tracker: BaselineTracker::new(depth),
+            observed_sectors: HashSet::new(),
+            known_world_objects: HashMap::new(),
+            pending_world_objects_egress: VecDeque::new(),
         }
     }
+
+    /// Prunes all pending egress world objects associated with the given sector.
+    pub fn prune_sector_from_egress(&mut self, sector: SectorCoord3D) {
+        self.pending_world_objects_egress
+            .retain(|(_, s, _)| *s != sector);
+    }
+}
+
+/// Computes all discrete 3D spatial sectors whose bounding boxes intersect the observer's sphere.
+pub fn compute_visible_sectors(center: (f32, f32, f32), radius: f32) -> HashSet<SectorCoord3D> {
+    if radius <= 0.0 {
+        return HashSet::new();
+    }
+    let min_pos = (center.0 - radius, center.1 - radius, center.2 - radius);
+    let max_pos = (center.0 + radius, center.1 + radius, center.2 + radius);
+
+    let min_sec = SectorCoord3D::from_world_pos(min_pos);
+    let max_sec = SectorCoord3D::from_world_pos(max_pos);
+
+    let mut visible = HashSet::new();
+    for sx in min_sec.x..=max_sec.x {
+        for sy in min_sec.y..=max_sec.y {
+            for sz in min_sec.z..=max_sec.z {
+                let sector = SectorCoord3D::new(sx, sy, sz);
+                if sector.bounds().intersects_sphere(center, radius) {
+                    visible.insert(sector);
+                }
+            }
+        }
+    }
+    visible
 }
 
 /// Encapsulates a batch of outgoing client packets for a specific player session.
@@ -638,6 +728,158 @@ impl AoiManager {
 
         jobs
     }
+
+    /// Evaluates spatial sector discovery, egress queue pruning, paced object streaming,
+    /// and delta updates for all observers.
+    pub fn update_world_object_observers(
+        &mut self,
+        entity_store: &EntityStore,
+        sector_manager: &SectorManager,
+    ) -> Vec<AoiBroadcastJob> {
+        let mut jobs = Vec::new();
+
+        self.scratch_session_ids.clear();
+        self.scratch_session_ids
+            .extend(self.observers.keys().copied());
+
+        for session_id in &self.scratch_session_ids {
+            let observer = match self.observers.get_mut(session_id) {
+                Some(obs) => obs,
+                None => continue,
+            };
+
+            let observer_pos = match entity_store.get_by_guid(observer.player_guid) {
+                Some(ent) => ent.position,
+                None => continue,
+            };
+
+            let current_visible_sectors =
+                compute_visible_sectors(observer_pos, observer.effective_radius);
+            let mut packets = Vec::new();
+
+            // 1. Sector exits: prune egress queue and despawn objects
+            let mut exited_sectors = Vec::new();
+            for sector in &observer.observed_sectors {
+                if !current_visible_sectors.contains(sector) {
+                    exited_sectors.push(*sector);
+                }
+            }
+
+            for exited_sector in exited_sectors {
+                // Prune any unstreamed objects from this exited sector
+                observer.prune_sector_from_egress(exited_sector);
+                if let Some(sector_map) = sector_manager.query_sector(exited_sector) {
+                    for &obj_guid in sector_map.keys() {
+                        if observer.known_world_objects.remove(&obj_guid).is_some() {
+                            packets.push(ClientPacket::WorldObjectDespawn(
+                                WorldObjectDespawnPacket {
+                                    object_id: obj_guid.0,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 2. Sector entries: discover new sectors and enqueue resident objects
+            for sector in &current_visible_sectors {
+                if !observer.observed_sectors.contains(sector) {
+                    if let Some(sector_map) = sector_manager.query_sector(*sector) {
+                        for obj in sector_map.values() {
+                            if !observer.known_world_objects.contains_key(&obj.object_id)
+                                && !observer
+                                    .pending_world_objects_egress
+                                    .iter()
+                                    .any(|(g, _, _)| *g == obj.object_id)
+                            {
+                                let dx = obj.transform.position.0 - observer_pos.0;
+                                let dy = obj.transform.position.1 - observer_pos.1;
+                                let dz = obj.transform.position.2 - observer_pos.2;
+                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                                observer.pending_world_objects_egress.push_back((
+                                    obj.object_id,
+                                    *sector,
+                                    dist,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            observer.observed_sectors = current_visible_sectors;
+
+            // 3. Sort pending egress queue by distance ascending
+            let mut egress_vec: Vec<(Guid, SectorCoord3D, f32)> =
+                observer.pending_world_objects_egress.drain(..).collect();
+            egress_vec.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+            // 4. Paced streaming: deliver up to MAX_PACED_WORLD_OBJECTS_PER_TICK
+            let to_stream = egress_vec.len().min(MAX_PACED_WORLD_OBJECTS_PER_TICK);
+            for (obj_id, _, _) in egress_vec.drain(..to_stream) {
+                if let Some(obj) = sector_manager.get_object(obj_id) {
+                    packets.push(ClientPacket::WorldObjectSpawn(build_spawn_packet(obj)));
+                    observer
+                        .known_world_objects
+                        .insert(obj_id, obj.dirty_revision);
+                }
+            }
+            observer.pending_world_objects_egress = egress_vec.into();
+
+            // 5. Delta updates for active known objects
+            let mut despawned_guids = Vec::new();
+            for (&obj_id, last_rev) in observer.known_world_objects.iter_mut() {
+                if let Some(obj) = sector_manager.get_object(obj_id) {
+                    if obj.dirty_revision > *last_rev {
+                        *last_rev = obj.dirty_revision;
+                        packets.push(ClientPacket::WorldObjectDelta(WorldObjectDeltaPacket {
+                            object_id: obj.object_id.0,
+                            revision: obj.dirty_revision,
+                            state_flags: Some(obj.state_flags),
+                            health: obj.health.map(|h| (h.current, h.max)),
+                            properties: obj.properties.clone(),
+                        }));
+                    }
+                } else {
+                    despawned_guids.push(obj_id);
+                }
+            }
+
+            for despawned in despawned_guids {
+                observer.known_world_objects.remove(&despawned);
+                packets.push(ClientPacket::WorldObjectDespawn(WorldObjectDespawnPacket {
+                    object_id: despawned.0,
+                }));
+            }
+
+            if !packets.is_empty() {
+                jobs.push(AoiBroadcastJob {
+                    session_id: *session_id,
+                    player_guid: observer.player_guid,
+                    packets,
+                });
+            }
+        }
+
+        jobs
+    }
+
+    /// Handles a resync request for a specific world object, emitting a full spawn packet if found.
+    pub fn handle_resync_request(
+        &mut self,
+        session_id: u64,
+        object_id: u64,
+        sector_manager: &SectorManager,
+    ) -> Option<ClientPacket> {
+        let observer = self.observers.get_mut(&session_id)?;
+        let obj_guid = Guid(object_id);
+        let obj = sector_manager.get_object(obj_guid)?;
+
+        observer
+            .known_world_objects
+            .insert(obj_guid, obj.dirty_revision);
+        Some(ClientPacket::WorldObjectSpawn(build_spawn_packet(obj)))
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1215,114 @@ mod tests {
                 assert_eq!(d.position, (405.5, 100.0, 100.0));
             }
             other => panic!("Expected EntityDeltaBatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_world_object_aoi_discovery_paced_streaming_and_pruning() {
+        use mmo_core::container::ContainerOwner;
+        use mmo_core::world::{Transform3D, WorldObject};
+
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut sector_mgr = SectorManager::new();
+
+        let player = make_guid(1);
+        store.spawn(player, (0.0, 0.0, 0.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            ..Default::default()
+        };
+        aoi.register_observer(100, player, config);
+
+        // Place 15 objects in sector (0, 0, 0)
+        for i in 1..=15 {
+            let obj = WorldObject::new(
+                Guid(i),
+                100,
+                Transform3D::new(
+                    (i as f32 * 2.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                    (1.0, 1.0, 1.0),
+                ),
+                BoundingBox3D::new(
+                    (i as f32 * 2.0 - 0.5, -0.5, -0.5),
+                    (i as f32 * 2.0 + 0.5, 0.5, 0.5),
+                ),
+                ContainerOwner::Character(1),
+            );
+            sector_mgr.insert_object(obj);
+        }
+
+        // Tick 1: Paced streaming should stream only first 10 objects (closest first)
+        let jobs = aoi.update_world_object_observers(&store, &sector_mgr);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].packets.len(), 10);
+        for (idx, pkt) in jobs[0].packets.iter().enumerate() {
+            match pkt {
+                ClientPacket::WorldObjectSpawn(spawn) => {
+                    assert_eq!(spawn.object_id, (idx + 1) as u64);
+                }
+                other => panic!("Expected WorldObjectSpawn, got {:?}", other),
+            }
+        }
+
+        // Tick 2: Streams remaining 5 objects
+        let jobs2 = aoi.update_world_object_observers(&store, &sector_mgr);
+        assert_eq!(jobs2.len(), 1);
+        assert_eq!(jobs2[0].packets.len(), 5);
+        for (idx, pkt) in jobs2[0].packets.iter().enumerate() {
+            match pkt {
+                ClientPacket::WorldObjectSpawn(spawn) => {
+                    assert_eq!(spawn.object_id, (idx + 11) as u64);
+                }
+                other => panic!("Expected WorldObjectSpawn, got {:?}", other),
+            }
+        }
+
+        // Tick 3: No new objects or changes -> 0 packets
+        let jobs3 = aoi.update_world_object_observers(&store, &sector_mgr);
+        assert_eq!(jobs3.len(), 0);
+
+        // Mutate object 1 -> increments revision
+        if let Some(obj1) = sector_mgr.get_object_mut(Guid(1)) {
+            obj1.set_flag(mmo_core::world::world_object_flags::DAMAGED, true);
+        }
+
+        // Tick 4: Receives delta update for object 1
+        let jobs4 = aoi.update_world_object_observers(&store, &sector_mgr);
+        assert_eq!(jobs4.len(), 1);
+        assert_eq!(jobs4[0].packets.len(), 1);
+        match &jobs4[0].packets[0] {
+            ClientPacket::WorldObjectDelta(delta) => {
+                assert_eq!(delta.object_id, 1);
+                assert_eq!(delta.revision, 2);
+            }
+            other => panic!("Expected WorldObjectDelta, got {:?}", other),
+        }
+
+        // Resync test
+        let resync_pkt = aoi
+            .handle_resync_request(100, 1, &sector_mgr)
+            .expect("resync packet generated");
+        match resync_pkt {
+            ClientPacket::WorldObjectSpawn(spawn) => {
+                assert_eq!(spawn.object_id, 1);
+                assert_eq!(spawn.revision, 2);
+            }
+            other => panic!("Expected WorldObjectSpawn on resync, got {:?}", other),
+        }
+
+        // Player moves far away to (500, 500, 500) -> sector (0,0,0) exits AoI
+        store.get_mut_by_guid(player).unwrap().position = (500.0, 500.0, 500.0);
+
+        // Tick 5: Receives despawn packets for all 15 previously known objects
+        let jobs5 = aoi.update_world_object_observers(&store, &sector_mgr);
+        assert_eq!(jobs5.len(), 1);
+        assert_eq!(jobs5[0].packets.len(), 15);
+        for pkt in &jobs5[0].packets {
+            assert!(matches!(pkt, ClientPacket::WorldObjectDespawn(_)));
         }
     }
 }

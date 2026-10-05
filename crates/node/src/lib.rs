@@ -7,8 +7,10 @@ pub mod ability_dispatcher;
 pub mod aoi;
 pub mod kinematics;
 pub mod network;
+pub mod sector;
 pub mod sim;
 pub mod snapshotter;
+pub mod world_snapshotter;
 
 pub use ability_dispatcher::{
     cast_boundary_sphere_aoe, cast_cross_partition_ability, BoundaryAoeOutcome, CastOutcome,
@@ -24,5 +26,7 @@ pub use network::{
     GhostBroadcaster, GhostRecord, GhostStore, MigrationError, NetworkError, NodeServiceImpl,
     RemoteCommandErrorCode,
 };
+pub use sector::{PlacementError, SectorManager, MAX_INTERACTION_DISTANCE};
 pub use sim::{AbilityCompensation, ContainerTransferNotification, TickSimulation};
 pub use snapshotter::WriteBehindSnapshotter;
+pub use world_snapshotter::WorldObjectWriteBehindSnapshotter;

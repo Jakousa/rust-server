@@ -8,6 +8,7 @@ pub mod octree;
 pub mod plugin;
 pub mod spatial;
 pub mod telemetry;
+pub mod world;
 
 pub use action::{
     ActionCompletedEvent, ActionInterruptFlags, ActionInterruptedEvent, ActionProgressEvent,
@@ -34,3 +35,7 @@ pub use spatial::{
     SpatialQueryError, Vec3,
 };
 pub use telemetry::{TelemetryError, TelemetryServer};
+pub use world::{
+    world_object_flags, ObjectHealth, SectorCoord3D, SectorSpatialIndex, Transform3D, WorldObject,
+    SECTOR_SIZE,
+};

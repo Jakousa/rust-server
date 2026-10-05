@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: world-persistence-prefab-streaming
+  title: Persistent World Objects, Dynamic Prefabs & Spatial Sector Streaming
+  status: proposed
+  created: 2026-10-05
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: world
+  specs:
+    - specs/world/persistence-and-streaming/spec.md

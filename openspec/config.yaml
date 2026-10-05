@@ -1,23 +1,22 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  ARCHITECTURAL FOUNDATION & GENRE-AGNOSTIC DESIGN PRINCIPLE:
+  1. This repository is an unopinionated, genre-agnostic distributed MMO virtual world server platform.
+  2. The engine core (`crates/core`, `crates/node`, `crates/schema`, `crates/storage`, `crates/gateway`, `crates/director`) MUST NOT contain genre-specific, game-specific, or design-specific hardcoded mechanics (e.g. specific RPG classes, magic systems, voxel sandbox blocks, specific auction house fees, crafting trees).
+  3. All genre-, game-, or design-specific features MUST be decoupled and implemented either as pluggable `GameplayPlugin` modules (in `crates/gameplay`) or as optional extension crates.
+  4. Core primitives must always remain generalized: spatial queries, timed cancellable actions, generic containers with access policies, generic entity stores, and transport codecs.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  LOCAL SUBAGENT INTEGRATION:
+  1. To conserve cloud tokens and accelerate iteration, agents should utilize available local models and specialized subagents when configured in the environment.
+  2. Prioritize delegating self-contained tasks such as boilerplate structs, codecs, SQL queries, and unit tests to local subagents.
+
+rules:
+  proposal:
+    - Verify that proposed capabilities are generic and unopinionated for any virtual world or MMO genre
+    - Require any game-specific, genre-specific, or sandbox mechanics to be structured as decoupled plugins or optional modules
+  tasks:
+    - Structure tasks to allow delegating self-contained implementations and test writing to local subagents where appropriate
 
 # Per-operation guidance (optional)
 # Add advisory guidance for how apply and archive work should be conducted.

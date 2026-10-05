@@ -1,6 +1,8 @@
 //! Sparse Octree spatial partitioning module with dynamic subdivision,
 //! neighbor discovery, and Area of Interest (AoI) throttling.
 
+use serde::{Deserialize, Serialize};
+
 use crate::guid::Guid;
 
 /// Default maximum entities in a leaf node before subdividing into 8 child octants.
@@ -14,7 +16,7 @@ pub const DEFAULT_MIN_ENTITIES_TO_MERGE: usize = 4;
 const MIN_BOUNDS_SIZE: f32 = 1e-4;
 
 /// Axis-Aligned 3D Bounding Box.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BoundingBox3D {
     pub min: (f32, f32, f32),
     pub max: (f32, f32, f32),
@@ -76,6 +78,77 @@ impl BoundingBox3D {
             (self.min.1 + self.max.1) * 0.5,
             (self.min.2 + self.max.2) * 0.5,
         )
+    }
+
+    /// Tests ray intersection against this AABB using the slab method.
+    /// Returns `Some(t)` where `t >= 0.0 && t <= max_dist` is the distance along the ray to the first hit.
+    pub fn intersects_ray(
+        &self,
+        origin: (f32, f32, f32),
+        dir: (f32, f32, f32),
+        max_dist: f32,
+    ) -> Option<f32> {
+        let mut tmin = 0.0f32;
+        let mut tmax = max_dist;
+
+        // X slab
+        if dir.0.abs() < 1e-8 {
+            if origin.0 < self.min.0 || origin.0 > self.max.0 {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / dir.0;
+            let mut t1 = (self.min.0 - origin.0) * inv_d;
+            let mut t2 = (self.max.0 - origin.0) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+
+        // Y slab
+        if dir.1.abs() < 1e-8 {
+            if origin.1 < self.min.1 || origin.1 > self.max.1 {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / dir.1;
+            let mut t1 = (self.min.1 - origin.1) * inv_d;
+            let mut t2 = (self.max.1 - origin.1) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+
+        // Z slab
+        if dir.2.abs() < 1e-8 {
+            if origin.2 < self.min.2 || origin.2 > self.max.2 {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / dir.2;
+            let mut t1 = (self.min.2 - origin.2) * inv_d;
+            let mut t2 = (self.max.2 - origin.2) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+
+        Some(tmin)
     }
 
     /// Clamps an arbitrary point to lie on or within the bounding box volume.

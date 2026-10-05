@@ -196,6 +196,41 @@ pub struct ContainerTransactionRecord {
     pub timestamp_epoch_ms: i64,
 }
 
+/// Persistent record representing a dynamic, interactive, or static world object in a sector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldObjectRecord {
+    pub world_id: u64,
+    pub object_id: u64,
+    pub sector_x: i32,
+    pub sector_y: i32,
+    pub sector_z: i32,
+    pub prefab_id: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub rot_x: f32,
+    pub rot_y: f32,
+    pub rot_z: f32,
+    pub rot_w: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub scale_z: f32,
+    pub bounds_min_x: f32,
+    pub bounds_min_y: f32,
+    pub bounds_min_z: f32,
+    pub bounds_max_x: f32,
+    pub bounds_max_y: f32,
+    pub bounds_max_z: f32,
+    pub state_flags: u32,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub health: Option<i32>,
+    pub max_health: Option<i32>,
+    pub properties_json: String,
+    pub dirty_revision: u64,
+    pub updated_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +432,43 @@ mod tests {
         assert_eq!(tx, tx_dec);
         assert_eq!(tx.clone(), tx_dec);
         assert!(!format!("{:?}", tx).is_empty());
+
+        let wo = WorldObjectRecord {
+            world_id: 1,
+            object_id: 42,
+            sector_x: 2,
+            sector_y: -1,
+            sector_z: 3,
+            prefab_id: 101,
+            pos_x: 128.5,
+            pos_y: -60.0,
+            pos_z: 195.0,
+            rot_x: 0.0,
+            rot_y: 0.0,
+            rot_z: 0.0,
+            rot_w: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
+            bounds_min_x: 127.0,
+            bounds_min_y: -61.0,
+            bounds_min_z: 194.0,
+            bounds_max_x: 130.0,
+            bounds_max_y: -59.0,
+            bounds_max_z: 196.0,
+            state_flags: 3,
+            owner_type: "character".to_string(),
+            owner_id: "1001".to_string(),
+            health: Some(100),
+            max_health: Some(100),
+            properties_json: "{\"mat\":\"stone\"}".to_string(),
+            dirty_revision: 5,
+            updated_at: 1700000000,
+        };
+        let wo_json = serde_json::to_string(&wo).unwrap();
+        let wo_dec: WorldObjectRecord = serde_json::from_str(&wo_json).unwrap();
+        assert_eq!(wo, wo_dec);
+        assert_eq!(wo.clone(), wo_dec);
+        assert!(!format!("{:?}", wo).is_empty());
     }
 }
