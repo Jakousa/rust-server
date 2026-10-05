@@ -18,14 +18,19 @@ use tokio::sync::mpsc;
 
 use mmo_core::guid::Guid;
 use mmo_schema::client::{ClientCodecError, ClientPacket};
+use mmo_schema::cluster::director_service_client::DirectorServiceClient;
 use mmo_schema::cluster::gateway_service_server::{GatewayService, GatewayServiceServer};
 use mmo_schema::cluster::{
-    BatchRouteUpdateRequest, BatchRouteUpdateResponse, ReassignNodeRoutesRequest,
-    ReassignNodeRoutesResponse, RouteUpdateRequest, RouteUpdateResponse,
+    BatchRouteUpdateRequest, BatchRouteUpdateResponse, GatewayHeartbeatRequest,
+    MultiGatewayRouteBroadcastRequest, MultiGatewayRouteBroadcastResponse,
+    ReassignNodeRoutesRequest, ReassignNodeRoutesResponse, RegisterGatewayRequest,
+    RevokeGatewaySessionRequest, RevokeGatewaySessionResponse, RouteUpdateRequest,
+    RouteUpdateResponse,
 };
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
+use crate::backhaul::BackhaulPool;
 use crate::quic::{create_quic_server, generate_self_signed_cert, QuicTransportError};
 use crate::router::SessionRouter;
 
@@ -241,12 +246,27 @@ impl Drop for SessionDropGuard {
 #[derive(Clone)]
 pub struct GatewayServiceImpl {
     router: Arc<SessionRouter>,
+    session_sinks: Option<Arc<DashMap<u64, SessionSink>>>,
 }
 
 impl GatewayServiceImpl {
     /// Creates a new `GatewayServiceImpl` backed by the given `SessionRouter`.
     pub fn new(router: Arc<SessionRouter>) -> Self {
-        Self { router }
+        Self {
+            router,
+            session_sinks: None,
+        }
+    }
+
+    /// Creates a new `GatewayServiceImpl` with router and session sinks.
+    pub fn with_sinks(
+        router: Arc<SessionRouter>,
+        session_sinks: Arc<DashMap<u64, SessionSink>>,
+    ) -> Self {
+        Self {
+            router,
+            session_sinks: Some(session_sinks),
+        }
     }
 
     /// Wraps this implementation in a Tonic gRPC `GatewayServiceServer`.
@@ -307,6 +327,38 @@ impl GatewayService for GatewayServiceImpl {
             reassigned_count: count as u32,
         }))
     }
+
+    async fn revoke_gateway_session(
+        &self,
+        request: tonic::Request<RevokeGatewaySessionRequest>,
+    ) -> Result<tonic::Response<RevokeGatewaySessionResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let session_id = req.session_id;
+        let _ = self.router.remove_session(session_id);
+        if let Some(ref sinks) = self.session_sinks {
+            sinks.remove(&session_id);
+            metrics::gauge!("mmo_gateway_active_sessions").set(sinks.len() as f64);
+        }
+        metrics::counter!("mmo_gateway_revoked_sessions_total").increment(1);
+        Ok(tonic::Response::new(RevokeGatewaySessionResponse {
+            success: true,
+        }))
+    }
+
+    async fn broadcast_route(
+        &self,
+        request: tonic::Request<MultiGatewayRouteBroadcastRequest>,
+    ) -> Result<tonic::Response<MultiGatewayRouteBroadcastResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let guid = Guid::from_raw(req.guid);
+        self.router
+            .update_route_with_session(guid, req.session_id, req.new_node_address);
+        metrics::counter!("mmo_gateway_broadcast_routes_received_total").increment(1);
+        Ok(tonic::Response::new(MultiGatewayRouteBroadcastResponse {
+            success: true,
+            acknowledged_gateways: 1,
+        }))
+    }
 }
 
 /// Gateway server managing connection lifecycles, streaming packet framing,
@@ -319,6 +371,7 @@ pub struct GatewayServer {
     cache: Option<Arc<dyn SessionCacheBackend>>,
     social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
     session_sinks: Arc<DashMap<u64, SessionSink>>,
+    backhaul_pool: Arc<BackhaulPool>,
 }
 
 impl GatewayServer {
@@ -334,6 +387,7 @@ impl GatewayServer {
             cache: None,
             social_bus: None,
             session_sinks: Arc::new(DashMap::new()),
+            backhaul_pool: Arc::new(BackhaulPool::new(10000)),
         }
     }
 
@@ -352,7 +406,13 @@ impl GatewayServer {
             cache: None,
             social_bus: None,
             session_sinks: Arc::new(DashMap::new()),
+            backhaul_pool: Arc::new(BackhaulPool::new(10000)),
         }
+    }
+
+    /// Accesses the persistent backhaul connection pool.
+    pub fn backhaul_pool(&self) -> &Arc<BackhaulPool> {
+        &self.backhaul_pool
     }
 
     /// Sets an optional distributed session cache backend.
@@ -402,9 +462,84 @@ impl GatewayServer {
         &self.router
     }
 
-    /// Creates a [`GatewayServiceImpl`] backed by this server's routing table.
+    /// Creates a [`GatewayServiceImpl`] backed by this server's routing table and session sinks.
     pub fn create_service(&self) -> GatewayServiceImpl {
-        GatewayServiceImpl::new(Arc::clone(&self.router))
+        GatewayServiceImpl::with_sinks(Arc::clone(&self.router), Arc::clone(&self.session_sinks))
+    }
+
+    /// Spawns a background task registering this gateway with the Director and emitting periodic heartbeats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_heartbeat_loop(
+        director_addr: String,
+        gateway_id: String,
+        region: String,
+        listen_addr: String,
+        grpc_addr: String,
+        probe_addr: String,
+        capacity: u32,
+        session_sinks: Arc<DashMap<u64, SessionSink>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut client = None;
+            let mut attempts = 0;
+            while client.is_none() && attempts < 10 {
+                match DirectorServiceClient::connect(director_addr.clone()).await {
+                    Ok(c) => client = Some(c),
+                    Err(_) => {
+                        attempts += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+
+            let mut client = match client {
+                Some(c) => c,
+                None => {
+                    eprintln!("[Gateway] Failed to connect to Director at {director_addr}");
+                    return;
+                }
+            };
+
+            let reg_req = RegisterGatewayRequest {
+                gateway_id: gateway_id.clone(),
+                region,
+                listen_addr,
+                grpc_addr,
+                probe_addr,
+                capacity,
+            };
+
+            let mut interval_ms = 1000;
+            if let Ok(res) = client.register_gateway(reg_req).await {
+                interval_ms = res.into_inner().heartbeat_interval_ms.max(200);
+            }
+
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                let active = session_sinks.len() as u32;
+                let hb = GatewayHeartbeatRequest {
+                    gateway_id: gateway_id.clone(),
+                    active_sessions: active,
+                    cpu_percent: 0.0,
+                    memory_percent: 0.0,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                };
+                if client.gateway_heartbeat(hb).await.is_err() {
+                    // Try reconnecting next loop
+                    if let Ok(c) = DirectorServiceClient::connect(director_addr.clone()).await {
+                        client = c;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Accesses the session sinks map.
+    pub fn session_sinks(&self) -> Arc<DashMap<u64, SessionSink>> {
+        Arc::clone(&self.session_sinks)
     }
 
     /// Accesses the packet dispatcher.
@@ -1666,5 +1801,57 @@ mod tests {
             router.get_route_by_session(s2).as_deref(),
             Some("127.0.0.1:50052")
         );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_service_revoke_and_broadcast() {
+        let router = Arc::new(SessionRouter::new());
+        let sinks = Arc::new(DashMap::new());
+        let (dtx, _drx) = mpsc::channel(10);
+        let (stx, _srx) = mpsc::unbounded_channel();
+        sinks.insert(99, SessionSink::new(dtx, stx));
+
+        let service = GatewayServiceImpl::with_sinks(Arc::clone(&router), Arc::clone(&sinks));
+        let guid = Guid::new(mmo_core::guid::EntityType::Player, 1, 999);
+        router.register_session(99, guid, "127.0.0.1:50051".to_string());
+
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50051")
+        );
+        assert!(sinks.contains_key(&99));
+
+        // 1. Test broadcast route
+        let bcast_req = tonic::Request::new(MultiGatewayRouteBroadcastRequest {
+            guid: guid.raw(),
+            session_id: 99,
+            new_node_address: "127.0.0.1:50053".to_string(),
+            session_epoch: 2,
+        });
+        let bcast_resp = service
+            .broadcast_route(bcast_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(bcast_resp.success);
+        assert_eq!(
+            router.get_route_by_guid(guid).as_deref(),
+            Some("127.0.0.1:50053")
+        );
+
+        // 2. Test revoke session
+        let revoke_req = tonic::Request::new(RevokeGatewaySessionRequest {
+            guid: guid.raw(),
+            session_id: 99,
+            superseded_by_epoch: 3,
+        });
+        let revoke_resp = service
+            .revoke_gateway_session(revoke_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(revoke_resp.success);
+        assert_eq!(router.get_route_by_guid(guid), None);
+        assert!(!sinks.contains_key(&99));
     }
 }

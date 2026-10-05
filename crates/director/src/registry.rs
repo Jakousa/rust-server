@@ -431,3 +431,253 @@ mod tests {
         assert_eq!(node.assigned_bounds[0], bbox2);
     }
 }
+
+/// Status of an edge gateway in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayStatus {
+    Healthy,
+    Degraded,
+    Draining,
+    Offline,
+}
+
+/// Metadata and state for a registered edge gateway.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayDescriptor {
+    pub gateway_id: String,
+    pub region: String,
+    pub listen_addr: String,
+    pub grpc_addr: String,
+    pub probe_addr: String,
+    pub capacity: u32,
+    pub active_sessions: u32,
+    pub cpu_percent: f32,
+    pub memory_percent: f32,
+    pub last_heartbeat: Instant,
+    pub status: GatewayStatus,
+}
+
+impl GatewayDescriptor {
+    pub fn new(
+        gateway_id: String,
+        region: String,
+        listen_addr: String,
+        grpc_addr: String,
+        probe_addr: String,
+        capacity: u32,
+    ) -> Self {
+        Self {
+            gateway_id,
+            region,
+            listen_addr,
+            grpc_addr,
+            probe_addr,
+            capacity,
+            active_sessions: 0,
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+            last_heartbeat: Instant::now(),
+            status: GatewayStatus::Healthy,
+        }
+    }
+}
+
+/// Registry of active edge gateways in the cluster.
+#[derive(Debug, Default)]
+pub struct GatewayRegistry {
+    gateways: HashMap<String, GatewayDescriptor>,
+}
+
+impl GatewayRegistry {
+    /// Creates a new, empty `GatewayRegistry`.
+    pub fn new() -> Self {
+        Self {
+            gateways: HashMap::new(),
+        }
+    }
+
+    /// Registers or updates a gateway in the registry.
+    pub fn register_gateway(&mut self, descriptor: GatewayDescriptor) {
+        self.gateways
+            .insert(descriptor.gateway_id.clone(), descriptor);
+    }
+
+    /// Updates heartbeat metrics for an active gateway.
+    pub fn update_heartbeat(
+        &mut self,
+        gateway_id: &str,
+        active_sessions: u32,
+        cpu_percent: f32,
+        memory_percent: f32,
+    ) -> bool {
+        if let Some(gateway) = self.gateways.get_mut(gateway_id) {
+            gateway.active_sessions = active_sessions;
+            gateway.cpu_percent = cpu_percent;
+            gateway.memory_percent = memory_percent;
+            gateway.last_heartbeat = Instant::now();
+            gateway.status = if cpu_percent > 80.0 || memory_percent > 80.0 {
+                GatewayStatus::Degraded
+            } else {
+                GatewayStatus::Healthy
+            };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Gets a reference to a registered gateway by its ID.
+    pub fn get_gateway(&self, gateway_id: &str) -> Option<&GatewayDescriptor> {
+        self.gateways.get(gateway_id)
+    }
+
+    /// Returns all active, non-offline gateways.
+    pub fn get_active_gateways(&self) -> Vec<GatewayDescriptor> {
+        self.gateways
+            .values()
+            .filter(|g| g.status != GatewayStatus::Offline)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns all gateways in a specific geographical region.
+    pub fn get_gateways_by_region(&self, region: &str) -> Vec<GatewayDescriptor> {
+        self.gateways
+            .values()
+            .filter(|g| g.region == region && g.status != GatewayStatus::Offline)
+            .cloned()
+            .collect()
+    }
+
+    /// Manually sets the last heartbeat timestamp (for testing).
+    #[cfg(test)]
+    pub fn set_last_heartbeat(&mut self, gateway_id: &str, time: Instant) {
+        if let Some(g) = self.gateways.get_mut(gateway_id) {
+            g.last_heartbeat = time;
+        }
+    }
+
+    /// Scans for stale gateways exceeding `timeout`, marks them `Offline`, and returns their IDs.
+    pub fn remove_stale_gateways(&mut self, timeout: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let stale_gateways: Vec<String> = self
+            .gateways
+            .iter()
+            .filter(|(_, g)| {
+                g.status != GatewayStatus::Offline && now.duration_since(g.last_heartbeat) > timeout
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &stale_gateways {
+            if let Some(gateway) = self.gateways.get_mut(id) {
+                gateway.status = GatewayStatus::Offline;
+            }
+        }
+
+        stale_gateways
+    }
+
+    /// Returns the total number of registered gateways.
+    pub fn gateway_count(&self) -> usize {
+        self.gateways.len()
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+
+    #[test]
+    fn test_gateway_registration_and_retrieval() {
+        let mut registry = GatewayRegistry::new();
+        let gw = GatewayDescriptor::new(
+            "gw-us-1".to_string(),
+            "us-east".to_string(),
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1:50050".to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+        );
+        registry.register_gateway(gw.clone());
+
+        assert_eq!(registry.gateway_count(), 1);
+        assert_eq!(registry.get_gateway("gw-us-1"), Some(&gw));
+        assert_eq!(registry.get_active_gateways().len(), 1);
+    }
+
+    #[test]
+    fn test_gateway_heartbeat_and_degradation() {
+        let mut registry = GatewayRegistry::new();
+        let gw = GatewayDescriptor::new(
+            "gw-eu-1".to_string(),
+            "eu-central".to_string(),
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1:50050".to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+        );
+        registry.register_gateway(gw);
+
+        assert!(registry.update_heartbeat("gw-eu-1", 450, 85.0, 40.0));
+        let updated = registry.get_gateway("gw-eu-1").unwrap();
+        assert_eq!(updated.active_sessions, 450);
+        assert_eq!(updated.status, GatewayStatus::Degraded);
+    }
+
+    #[test]
+    fn test_gateway_regional_filtering() {
+        let mut registry = GatewayRegistry::new();
+        let gw1 = GatewayDescriptor::new(
+            "gw-us-1".to_string(),
+            "us-east".to_string(),
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1:50050".to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+        );
+        let gw2 = GatewayDescriptor::new(
+            "gw-eu-1".to_string(),
+            "eu-central".to_string(),
+            "127.0.0.1:8082".to_string(),
+            "127.0.0.1:50052".to_string(),
+            "127.0.0.1:8083".to_string(),
+            1000,
+        );
+        registry.register_gateway(gw1.clone());
+        registry.register_gateway(gw2.clone());
+
+        let us = registry.get_gateways_by_region("us-east");
+        assert_eq!(us.len(), 1);
+        assert_eq!(us[0].gateway_id, "gw-us-1");
+
+        let eu = registry.get_gateways_by_region("eu-central");
+        assert_eq!(eu.len(), 1);
+        assert_eq!(eu[0].gateway_id, "gw-eu-1");
+    }
+
+    #[test]
+    fn test_gateway_stale_detection_and_offline() {
+        let mut registry = GatewayRegistry::new();
+        let gw = GatewayDescriptor::new(
+            "gw-stale-1".to_string(),
+            "ap-southeast".to_string(),
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1:50050".to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+        );
+        registry.register_gateway(gw);
+
+        // Fast-forward last heartbeat using virtual time
+        let stale_time = Instant::now() - Duration::from_secs(10);
+        registry.set_last_heartbeat("gw-stale-1", stale_time);
+
+        let stale = registry.remove_stale_gateways(Duration::from_secs(3));
+        assert_eq!(stale, vec!["gw-stale-1"]);
+
+        let g = registry.get_gateway("gw-stale-1").unwrap();
+        assert_eq!(g.status, GatewayStatus::Offline);
+        assert!(registry.get_active_gateways().is_empty());
+    }
+}

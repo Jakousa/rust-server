@@ -40,6 +40,7 @@ pub struct TickSimulation {
     pub kinematic_states: HashMap<Guid, EntityKinematicState>,
     pub migrating_leases: HashMap<Guid, Instant>,
     pub last_migration_ticks: HashMap<Guid, u64>,
+    pub session_epochs: HashMap<Guid, u64>,
     pub current_time: Instant,
     pub last_tick_duration: Duration,
     pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
@@ -128,6 +129,7 @@ impl TickSimulation {
             kinematic_states: HashMap::new(),
             migrating_leases: HashMap::new(),
             last_migration_ticks: HashMap::new(),
+            session_epochs: HashMap::new(),
             current_time: Instant::now(),
             last_tick_duration: Duration::from_millis(0),
             ack_sender,
@@ -137,6 +139,12 @@ impl TickSimulation {
             container_transfer_sender,
             container_transfer_receiver,
         }
+    }
+
+    /// Validates whether an incoming upstream packet from a gateway carries a valid (non-stale) session epoch.
+    pub fn is_valid_upstream_epoch(&self, guid: Guid, packet_epoch: u64) -> bool {
+        let current_epoch = *self.session_epochs.get(&guid).unwrap_or(&0);
+        packet_epoch >= current_epoch
     }
 
     /// Returns a cloned sender for pushing client ACKs into the non-blocking channel.

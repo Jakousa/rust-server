@@ -6,6 +6,7 @@ mod container_transfer;
 mod content_loop;
 mod cross_partition_ability;
 mod delta_compression;
+mod geo_gateway_handover;
 mod hysteresis_proptest;
 mod multi_node_migration;
 mod npc_ai;

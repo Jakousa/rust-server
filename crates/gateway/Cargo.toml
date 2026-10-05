@@ -20,6 +20,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 dashmap = "6.1"
 metrics = "0.24"
 wtransport = "0.7.2"
+ring = "0.17"
 
 [dev-dependencies]
 mmo-node = { path = "../node" }

@@ -10,12 +10,13 @@ use tonic::{Request, Response, Status};
 use mmo_core::BoundingBox3D;
 use mmo_schema::cluster::director_service_server::DirectorService;
 use mmo_schema::cluster::{
-    BoundingBox, HeartbeatRequest, HeartbeatResponse, RegisterNodeRequest, RegisterNodeResponse,
-    SplitReportRequest, SplitReportResponse, Vector3,
+    BoundingBox, GatewayHeartbeatRequest, GatewayHeartbeatResponse, HeartbeatRequest,
+    HeartbeatResponse, RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest,
+    RegisterNodeResponse, SplitReportRequest, SplitReportResponse, Vector3,
 };
 
 use crate::coordinator::GlobalOctreeCoordinator;
-use crate::registry::NodeRegistry;
+use crate::registry::{GatewayDescriptor, GatewayRegistry, NodeRegistry};
 
 /// Converts a protobuf `BoundingBox` into a core `BoundingBox3D`.
 pub fn proto_bbox_to_bounding_box_3d(bbox: &BoundingBox) -> Option<BoundingBox3D> {
@@ -48,10 +49,11 @@ pub fn bounding_box_3d_to_proto(bbox: &BoundingBox3D) -> BoundingBox {
 pub struct DirectorServiceImpl {
     pub registry: Arc<RwLock<NodeRegistry>>,
     pub coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
+    pub gateway_registry: Arc<RwLock<GatewayRegistry>>,
 }
 
 impl DirectorServiceImpl {
-    /// Creates a new `DirectorServiceImpl` with shared registry and coordinator.
+    /// Creates a new `DirectorServiceImpl` with shared registry, coordinator, and an empty gateway registry.
     pub fn new(
         registry: Arc<RwLock<NodeRegistry>>,
         coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
@@ -59,15 +61,30 @@ impl DirectorServiceImpl {
         Self {
             registry,
             coordinator,
+            gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
         }
     }
 
-    /// Creates a `DirectorServiceImpl` with default empty registry and world coordinator.
+    /// Creates a new `DirectorServiceImpl` with explicit gateway registry.
+    pub fn with_gateway_registry(
+        registry: Arc<RwLock<NodeRegistry>>,
+        coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
+        gateway_registry: Arc<RwLock<GatewayRegistry>>,
+    ) -> Self {
+        Self {
+            registry,
+            coordinator,
+            gateway_registry,
+        }
+    }
+
+    /// Creates a `DirectorServiceImpl` with default empty registry, world coordinator, and gateway registry.
     pub fn default_service() -> Self {
-        Self::new(
-            Arc::new(RwLock::new(NodeRegistry::new())),
-            Arc::new(RwLock::new(GlobalOctreeCoordinator::default())),
-        )
+        Self {
+            registry: Arc::new(RwLock::new(NodeRegistry::new())),
+            coordinator: Arc::new(RwLock::new(GlobalOctreeCoordinator::default())),
+            gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
+        }
     }
 
     /// Checks for dead/unresponsive simulation nodes after `timeout`, evicting them from the registry
@@ -97,6 +114,17 @@ impl DirectorServiceImpl {
         }
         metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
         events
+    }
+
+    /// Checks for stale/unresponsive edge gateways after `timeout`, marking them `Offline`.
+    pub async fn check_and_recover_stale_gateways(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<String> {
+        let mut reg = self.gateway_registry.write().await;
+        let stale = reg.remove_stale_gateways(timeout);
+        metrics::gauge!("mmo_director_active_gateways").set(reg.get_active_gateways().len() as f64);
+        stale
     }
 }
 
@@ -198,6 +226,55 @@ impl DirectorService for DirectorServiceImpl {
             acknowledged: true,
             assigned_node_ids,
             topology_epoch,
+        }))
+    }
+
+    async fn register_gateway(
+        &self,
+        request: Request<RegisterGatewayRequest>,
+    ) -> Result<Response<RegisterGatewayResponse>, Status> {
+        let req = request.into_inner();
+        if req.gateway_id.is_empty() {
+            return Err(Status::invalid_argument("gateway_id cannot be empty"));
+        }
+
+        let desc = GatewayDescriptor::new(
+            req.gateway_id.clone(),
+            req.region,
+            req.listen_addr,
+            req.grpc_addr,
+            req.probe_addr,
+            req.capacity,
+        );
+
+        let mut reg = self.gateway_registry.write().await;
+        reg.register_gateway(desc);
+        metrics::gauge!("mmo_director_active_gateways").set(reg.get_active_gateways().len() as f64);
+
+        Ok(Response::new(RegisterGatewayResponse {
+            success: true,
+            error_message: String::new(),
+            heartbeat_interval_ms: 1000,
+        }))
+    }
+
+    async fn gateway_heartbeat(
+        &self,
+        request: Request<GatewayHeartbeatRequest>,
+    ) -> Result<Response<GatewayHeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let mut reg = self.gateway_registry.write().await;
+        let acknowledged = reg.update_heartbeat(
+            &req.gateway_id,
+            req.active_sessions,
+            req.cpu_percent,
+            req.memory_percent,
+        );
+        metrics::gauge!("mmo_director_active_gateways").set(reg.get_active_gateways().len() as f64);
+
+        Ok(Response::new(GatewayHeartbeatResponse {
+            acknowledged,
+            should_drain: false,
         }))
     }
 }
@@ -505,5 +582,78 @@ mod tests {
 
         let render_recovery = telemetry.render_metrics();
         assert!(render_recovery.contains("mmo_director_partition_recoveries_total"));
+    }
+
+    #[tokio::test]
+    async fn test_gateway_registration_and_heartbeat_service() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. Register gateway
+        let reg_res = service
+            .register_gateway(Request::new(RegisterGatewayRequest {
+                gateway_id: "gw-test-1".to_string(),
+                region: "eu-central".to_string(),
+                listen_addr: "127.0.0.1:8080".to_string(),
+                grpc_addr: "127.0.0.1:50050".to_string(),
+                probe_addr: "127.0.0.1:8081".to_string(),
+                capacity: 500,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(reg_res.success);
+        assert_eq!(reg_res.heartbeat_interval_ms, 1000);
+
+        // Verify in registry
+        {
+            let reg = service.gateway_registry.read().await;
+            assert_eq!(reg.gateway_count(), 1);
+            let gw = reg.get_gateway("gw-test-1").unwrap();
+            assert_eq!(gw.region, "eu-central");
+            assert_eq!(gw.capacity, 500);
+        }
+
+        // 2. Send heartbeat
+        let hb_res = service
+            .gateway_heartbeat(Request::new(GatewayHeartbeatRequest {
+                gateway_id: "gw-test-1".to_string(),
+                active_sessions: 120,
+                cpu_percent: 25.0,
+                memory_percent: 30.0,
+                timestamp_ms: 1234567,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(hb_res.acknowledged);
+
+        {
+            let reg = service.gateway_registry.read().await;
+            let gw = reg.get_gateway("gw-test-1").unwrap();
+            assert_eq!(gw.active_sessions, 120);
+            assert_eq!(gw.status, crate::registry::GatewayStatus::Healthy);
+        }
+
+        // 3. Mark stale and recover
+        {
+            let mut reg = service.gateway_registry.write().await;
+            reg.set_last_heartbeat(
+                "gw-test-1",
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            );
+        }
+
+        let stale = service
+            .check_and_recover_stale_gateways(std::time::Duration::from_secs(3))
+            .await;
+        assert_eq!(stale, vec!["gw-test-1"]);
+
+        {
+            let reg = service.gateway_registry.read().await;
+            let gw = reg.get_gateway("gw-test-1").unwrap();
+            assert_eq!(gw.status, crate::registry::GatewayStatus::Offline);
+        }
     }
 }

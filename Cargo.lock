@@ -1706,6 +1706,7 @@ dependencies = [
  "mmo-storage",
  "quinn",
  "rcgen 0.13.2",
+ "ring",
  "rustls",
  "thiserror 2.0.20",
  "tokio",
@@ -1734,6 +1735,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
+ "dashmap",
  "metrics",
  "mmo-core",
  "mmo-director",

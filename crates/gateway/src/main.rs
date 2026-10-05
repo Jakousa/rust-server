@@ -21,12 +21,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_addr =
         std::env::var("DIRECTOR_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
+    let gateway_id = std::env::var("GATEWAY_ID").unwrap_or_else(|_| "gw-local-1".to_string());
+    let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+    let probe_addr = std::env::var("PROBE_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    let capacity: u32 = std::env::var("CAPACITY")
+        .unwrap_or_else(|_| "10000".to_string())
+        .parse()
+        .unwrap_or(10000);
+
     let redis_url = std::env::var("REDIS_URL").ok();
 
     println!("============================================================");
     println!("          MMO Edge Gateway Daemon Initialized               ");
     println!("============================================================");
+    println!("Gateway ID          : {gateway_id}");
+    println!("Region              : {region}");
     println!("Listen Address      : {listen_addr}");
+    println!("Probe Address       : {probe_addr}");
+    println!("Capacity            : {capacity}");
     println!("Admin Address       : {admin_addr}");
     println!("gRPC Address        : {grpc_addr}");
     println!("Default Node Route  : {default_node_addr}");
@@ -83,6 +95,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[Gateway] gRPC Server failed: {e}");
         }
     });
+
+    // Spawn UDP Anycast Probe Responder
+    match tokio::net::UdpSocket::bind(&probe_addr).await {
+        Ok(probe_sock) => {
+            let sinks = server.session_sinks();
+            let active_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let s_counter = Arc::clone(&active_counter);
+            let s_region = region.clone();
+            tokio::spawn(async move {
+                mmo_gateway::probe::run_probe_server(probe_sock, s_region, capacity, s_counter)
+                    .await;
+            });
+
+            // Keep active session counter synchronized for lock-free probing
+            let s_counter_sync = Arc::clone(&active_counter);
+            let sinks_sync = Arc::clone(&sinks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    s_counter_sync.store(
+                        sinks_sync.len() as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            });
+            println!("Anycast Latency & Health Probe active on UDP {probe_addr}");
+        }
+        Err(e) => {
+            eprintln!("[Gateway] Failed to bind probe socket on {probe_addr}: {e}");
+        }
+    }
+
+    // Spawn Director Gateway Heartbeat Loop
+    GatewayServer::spawn_heartbeat_loop(
+        director_addr,
+        gateway_id,
+        region,
+        listen_addr.clone(),
+        grpc_addr.to_string(),
+        probe_addr,
+        capacity,
+        server.session_sinks(),
+    );
 
     let listener = server.bind(&listen_addr).await?;
     telemetry.mark_ready();

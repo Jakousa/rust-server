@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: geo-distributed-gateways-anycast
+  title: Geo-Distributed Edge Gateways & Anycast Routing
+  status: proposed
+  created: 2026-10-05
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: gateway
+  specs:
+    - specs/gateway/geo-distributed-routing/spec.md
