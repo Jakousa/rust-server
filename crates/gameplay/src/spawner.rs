@@ -25,6 +25,45 @@ pub struct SpawnTemplate {
     pub attack_power: u32,
     pub armor: u32,
     pub leash_radius: f32,
+    #[serde(default)]
+    pub properties: mmo_core::DynamicProperties,
+}
+
+impl SpawnTemplate {
+    pub fn new(
+        template_id: u32,
+        name: impl Into<String>,
+        max_health: f32,
+        speed: f32,
+        attack_power: u32,
+        armor: u32,
+        leash_radius: f32,
+    ) -> Self {
+        Self {
+            template_id,
+            name: name.into(),
+            max_health,
+            speed,
+            attack_power,
+            armor,
+            leash_radius,
+            properties: mmo_core::DynamicProperties::new(),
+        }
+    }
+
+    /// Creates a `SpawnTemplate` populated from a schemaless `DynamicProperties` container.
+    pub fn from_properties(template_id: u32, props: &mmo_core::DynamicProperties) -> Self {
+        Self {
+            template_id,
+            name: props.get_str("name").unwrap_or("NPC").to_string(),
+            max_health: props.get_f64("max_health").unwrap_or(100.0) as f32,
+            speed: props.get_f64("speed").unwrap_or(5.0) as f32,
+            attack_power: props.get_i64("attack_power").unwrap_or(10) as u32,
+            armor: props.get_i64("armor").unwrap_or(0) as u32,
+            leash_radius: props.get_f64("leash_radius").unwrap_or(15.0) as f32,
+            properties: props.clone(),
+        }
+    }
 }
 
 /// Dynamic component attached to spawner entities.
@@ -68,6 +107,7 @@ pub struct SpawnEntityCommand {
     pub max_health: f32,
     pub attack_power: u32,
     pub armor: u32,
+    pub properties: mmo_core::DynamicProperties,
 }
 
 impl DomainEvent for SpawnEntityCommand {}
@@ -156,6 +196,7 @@ impl SpawnerSystem {
                 ent.add_component(StatsComponent::new(cmd.attack_power, cmd.armor));
                 ent.add_component(NavAgentComponent::new(cmd.speed, 0.5));
                 ent.add_component(LeashComponent::new(cmd.leash_origin, cmd.leash_radius));
+                ent.properties.merge(&cmd.properties);
             }
 
             // Track spawned entity in the parent spawner
@@ -250,6 +291,7 @@ impl TickSystem for SpawnerSystem {
                     max_health: tmpl.max_health,
                     attack_power: tmpl.attack_power,
                     armor: tmpl.armor,
+                    properties: tmpl.properties.clone(),
                 });
             }
         }
@@ -315,15 +357,15 @@ mod tests {
 
         let mut spawner_system = SpawnerSystem::new();
         spawner_system.auto_flush = false;
-        spawner_system.register_template(SpawnTemplate {
-            template_id: 1,
-            name: "Goblin Raider".to_string(),
-            max_health: 50.0,
-            speed: 6.0,
-            attack_power: 12,
-            armor: 5,
-            leash_radius: 20.0,
-        });
+        spawner_system.register_template(SpawnTemplate::new(
+            1,
+            "Goblin Raider",
+            50.0,
+            6.0,
+            12,
+            5,
+            20.0,
+        ));
 
         // Spawn a spawner entity
         let spawner_guid = Guid::new(EntityType::Npc, 1, 999);
@@ -420,5 +462,70 @@ mod tests {
             .unwrap()
             .spawned_entities
             .is_empty());
+    }
+
+    #[test]
+    fn test_spawner_from_schemaless_properties() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+
+        let mut dyn_props = mmo_core::DynamicProperties::new();
+        dyn_props.set("name", "Elder Dragon");
+        dyn_props.set("max_health", 5000.0);
+        dyn_props.set("speed", 12.0);
+        dyn_props.set("attack_power", 250);
+        dyn_props.set("armor", 80);
+        dyn_props.set("leash_radius", 50.0);
+        dyn_props.set("element", "fire");
+        dyn_props.set("loot_tier", "legendary");
+
+        let tmpl = SpawnTemplate::from_properties(42, &dyn_props);
+        assert_eq!(tmpl.name, "Elder Dragon");
+        assert_eq!(tmpl.max_health, 5000.0);
+        assert_eq!(tmpl.attack_power, 250);
+        assert_eq!(tmpl.armor, 80);
+
+        let mut spawner_system = SpawnerSystem::new();
+        spawner_system.register_template(tmpl);
+
+        let spawner_guid = Guid::new(EntityType::Npc, 1, 10);
+        let spawner_key = store.spawn(spawner_guid, (0.0, 0.0, 0.0));
+        store
+            .get_mut(spawner_key)
+            .unwrap()
+            .add_component(SpawnerComponent::new(42, 1, 10.0, 5.0));
+
+        let mut ctx = TickContext {
+            entities: &mut store,
+            octree: &mut octree,
+            events: &mut events,
+            dt_sec: 0.1,
+            tick: 1,
+        };
+        spawner_system.update(&mut ctx);
+
+        // Find spawned entity
+        let spawned = store
+            .iter()
+            .find(|(k, _)| *k != spawner_key)
+            .map(|(_, e)| e)
+            .unwrap();
+        assert_eq!(
+            spawned.get_component::<HealthComponent>().unwrap().max_hp,
+            5000.0
+        );
+        assert_eq!(
+            spawned
+                .get_component::<StatsComponent>()
+                .unwrap()
+                .attack_power,
+            250
+        );
+        assert_eq!(spawned.get_property_str("element"), Some("fire"));
+        assert_eq!(spawned.get_property_str("loot_tier"), Some("legendary"));
     }
 }

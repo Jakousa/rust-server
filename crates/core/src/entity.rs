@@ -7,6 +7,7 @@ use std::fmt;
 use slotmap::{new_key_type, SlotMap};
 
 use crate::guid::Guid;
+use crate::property::{DynamicProperties, PropertyValue};
 
 new_key_type! {
     /// SlotMap generational key for uniquely addressing entities in the entity store.
@@ -99,16 +100,18 @@ pub struct Entity {
     pub guid: Guid,
     pub position: (f32, f32, f32),
     pub rotation: f32,
+    pub properties: DynamicProperties,
     pub components: ComponentStore,
 }
 
 impl Entity {
-    /// Creates a new entity with the given GUID and position, default rotation (0.0), and an empty component store.
+    /// Creates a new entity with the given GUID and position, default rotation (0.0), empty properties, and an empty component store.
     pub fn new(guid: Guid, position: (f32, f32, f32)) -> Self {
         Self {
             guid,
             position,
             rotation: 0.0,
+            properties: DynamicProperties::new(),
             components: ComponentStore::new(),
         }
     }
@@ -142,6 +145,36 @@ impl Entity {
     /// Returns `true` if the entity has a component of type `T`.
     pub fn has_component<T: 'static>(&self) -> bool {
         self.components.has_component::<T>()
+    }
+
+    /// Returns an immutable reference to the property value associated with the specified key.
+    pub fn get_property(&self, key: &str) -> Option<&PropertyValue> {
+        self.properties.get(key)
+    }
+
+    /// Sets a dynamic property value by key.
+    pub fn set_property(&mut self, key: impl Into<String>, value: impl Into<PropertyValue>) {
+        self.properties.set(key, value);
+    }
+
+    /// Returns a string property slice if present and of string type.
+    pub fn get_property_str(&self, key: &str) -> Option<&str> {
+        self.properties.get_str(key)
+    }
+
+    /// Returns an integer property value if present.
+    pub fn get_property_i64(&self, key: &str) -> Option<i64> {
+        self.properties.get_i64(key)
+    }
+
+    /// Returns a float property value (with integer auto-coercion) if present.
+    pub fn get_property_f64(&self, key: &str) -> Option<f64> {
+        self.properties.get_f64(key)
+    }
+
+    /// Returns a boolean property value if present.
+    pub fn get_property_bool(&self, key: &str) -> Option<bool> {
+        self.properties.get_bool(key)
     }
 }
 
@@ -563,5 +596,22 @@ mod tests {
         // Non-existent GUID should return None
         let g_missing = Guid::new(EntityType::Player, 1, 999);
         assert!(store.get_two_mut(g1, g_missing).is_none());
+    }
+
+    #[test]
+    fn test_entity_dynamic_properties() {
+        let mut entity = Entity::new(Guid::new(EntityType::Npc, 1, 800), (1.0, 2.0, 3.0));
+        assert!(entity.properties.is_empty());
+
+        entity.set_property("rank", "elite");
+        entity.set_property("power", 75);
+        entity.set_property("scale", 1.5);
+        entity.set_property("is_boss", true);
+
+        assert_eq!(entity.get_property_str("rank"), Some("elite"));
+        assert_eq!(entity.get_property_i64("power"), Some(75));
+        assert_eq!(entity.get_property_f64("scale"), Some(1.5));
+        assert_eq!(entity.get_property_bool("is_boss"), Some(true));
+        assert_eq!(entity.get_property("missing"), None);
     }
 }

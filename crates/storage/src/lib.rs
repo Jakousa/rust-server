@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod container_repo;
+pub mod datastore;
 pub mod db;
 pub mod escrow_coord;
 pub mod models;
@@ -15,6 +16,7 @@ pub mod world_repo;
 
 pub use cache::{MemoryCache, RedisCache, SessionCacheBackend, SessionData};
 pub use container_repo::ContainerRepository;
+pub use datastore::{DataDocument, DataStore, DataStoreError, LoadReport};
 pub use db::{sql_for_dialect, Database, DbBackend, StorageError};
 pub use escrow_coord::{hash_secret, EscrowCoordinator};
 pub use models::{

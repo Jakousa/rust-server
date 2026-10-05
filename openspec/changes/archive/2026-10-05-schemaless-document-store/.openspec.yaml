@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: schemaless-document-store
+  title: Schemaless Document Store for Data-Driven Assets
+  status: proposed
+  created: 2026-10-05
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: storage
+  specs:
+    - specs/storage/schemaless-document-store/spec.md
