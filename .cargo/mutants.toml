@@ -7,6 +7,22 @@ exclude_re = [
     # Equivalent mutant: in `(val as u32 % 256) as u8`, `(val as u32 + 256) as u8`
     # produces the exact same low 8 bits for all inputs in [0, 256] due to byte truncation.
     'replace % with \+ in quantize_yaw_u8',
+
+    # Equivalent mutants: in LEB128 varint encoding, `(val & 0x7F) as u8` has bit 7 (0x80) always 0.
+    # Therefore, `((val & 0x7F) as u8) | 0x80` is bitwise identical to `^ 0x80` for all inputs.
+    'replace \| with \^ in put_varint_u64',
+    'replace \| with \^ in put_varint_u32',
+
+    # Equivalent mutant: in `if num_bits > 64 { num_bits = 64; }`, replacing `>` with `>=`
+    # assigns 64 when `num_bits == 64`, which is a no-op across all usize inputs.
+    'replace > with >= in BitWriter::write_bits',
+
+    # Infinite loop mutants (loops where the counter is never decremented or condition is a tautology for usize):
+    'replace >= with < in put_varint_u64',
+    'replace >= with < in put_varint_u32',
+    'replace -= with \+= in BitWriter::write_bits',
+    'replace -= with /= in BitWriter::write_bits',
+    'replace > with >= in BitReader.*::read_bits',
 ]
 
 # Test timeout multiplier relative to baseline cargo test
