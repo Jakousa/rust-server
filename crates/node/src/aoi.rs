@@ -146,7 +146,7 @@ fn owner_type_code(owner: &mmo_core::container::ContainerOwner) -> u8 {
 }
 
 /// Builds a full-state spawn packet for a world object.
-fn build_spawn_packet(obj: &mmo_core::world::WorldObject) -> WorldObjectSpawnPacket {
+pub(crate) fn build_spawn_packet(obj: &mmo_core::world::WorldObject) -> WorldObjectSpawnPacket {
     WorldObjectSpawnPacket {
         object_id: obj.object_id.0,
         prefab_id: obj.prefab_id,

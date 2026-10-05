@@ -312,12 +312,40 @@ impl TickSimulation {
             .map(|e| e.position)
             .unwrap_or((0.0, 0.0, 0.0));
         let pos = (packet.pos.x, packet.pos.y, packet.pos.z);
-        // Prefab footprint is plugin-defined; core uses the scaled unit cube centered on pos.
-        let half = (
-            0.5 * packet.scale.x.abs(),
-            0.5 * packet.scale.y.abs(),
-            0.5 * packet.scale.z.abs(),
+        if !pos.0.is_finite() || !pos.1.is_finite() || !pos.2.is_finite() {
+            return Err(crate::sector::PlacementError::InvalidTransform(
+                "Position coordinates must be finite".to_string(),
+            ));
+        }
+
+        let rot = packet.rot;
+        if !rot.0.is_finite() || !rot.1.is_finite() || !rot.2.is_finite() || !rot.3.is_finite() {
+            return Err(crate::sector::PlacementError::InvalidTransform(
+                "Rotation quaternion components must be finite".to_string(),
+            ));
+        }
+        let rot_len_sq = rot.0 * rot.0 + rot.1 * rot.1 + rot.2 * rot.2 + rot.3 * rot.3;
+        if (rot_len_sq - 1.0).abs() > 0.05 {
+            return Err(crate::sector::PlacementError::InvalidTransform(
+                "Rotation quaternion must be normalized".to_string(),
+            ));
+        }
+
+        let scale_raw = (packet.scale.x, packet.scale.y, packet.scale.z);
+        if !scale_raw.0.is_finite() || !scale_raw.1.is_finite() || !scale_raw.2.is_finite() {
+            return Err(crate::sector::PlacementError::InvalidTransform(
+                "Scale dimensions must be finite".to_string(),
+            ));
+        }
+        // Clamp scale dimensions to safe bounds [0.01, 100.0] to prevent spatial index poisoning
+        let scale = (
+            scale_raw.0.abs().clamp(0.01, 100.0),
+            scale_raw.1.abs().clamp(0.01, 100.0),
+            scale_raw.2.abs().clamp(0.01, 100.0),
         );
+
+        // Prefab footprint is plugin-defined; core uses the scaled unit cube centered on pos.
+        let half = (0.5 * scale.0, 0.5 * scale.1, 0.5 * scale.2);
         let bounds = BoundingBox3D::new(
             (pos.0 - half.0, pos.1 - half.1, pos.2 - half.2),
             (pos.0 + half.0, pos.1 + half.1, pos.2 + half.2),
@@ -331,11 +359,7 @@ impl TickSimulation {
         let mut obj = WorldObject::new(
             object_id,
             packet.prefab_id,
-            Transform3D::new(
-                pos,
-                packet.rot,
-                (packet.scale.x, packet.scale.y, packet.scale.z),
-            ),
+            Transform3D::new(pos, rot, scale),
             bounds,
             ContainerOwner::Character(player.raw()),
         );
@@ -364,6 +388,20 @@ impl TickSimulation {
             return false;
         }
         obj.bounds.distance_to_point(ent.position) <= crate::sector::MAX_INTERACTION_DISTANCE
+    }
+
+    /// Authoritatively handles a client `WorldObjectResync` request with token-bucket rate limiting,
+    /// protecting the server against state-serialization DOS attacks.
+    pub fn handle_world_object_resync(
+        &mut self,
+        player: Guid,
+        packet: &mmo_schema::client::WorldObjectResyncPacket,
+    ) -> Option<mmo_schema::client::WorldObjectSpawnPacket> {
+        if !self.sectors.check_rate_limit(player) {
+            return None;
+        }
+        let obj = self.sectors.get_object(Guid::from_raw(packet.object_id))?;
+        Some(crate::aoi::build_spawn_packet(obj))
     }
 
     /// Despawns an entity by GUID from both `EntityStore` and `Octree`, dispatching `OnDespawn`.
@@ -1337,5 +1375,96 @@ mod tests {
         // Step updates last_tick_duration
         sim.step(0.05);
         assert!(sim.last_tick_duration_ms() >= 0.0);
+    }
+
+    #[test]
+    fn test_place_object_anti_cheat_float_and_quaternion_validation() {
+        use mmo_schema::client::{PlaceObjectPacket, Vec3};
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let player = Guid::new(EntityType::Player, 1, 777);
+        sim.spawn_entity(player, (10.0, 10.0, 10.0));
+        let sector = mmo_core::world::SectorCoord3D::from_world_pos((10.0, 10.0, 10.0));
+        sim.sectors.mark_sector_loaded(sector);
+
+        // 1. NaN position rejected
+        let nan_packet = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(f32::NAN, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: std::collections::HashMap::new(),
+        };
+        assert!(matches!(
+            sim.handle_place_object(player, &nan_packet),
+            Err(crate::sector::PlacementError::InvalidTransform(_))
+        ));
+
+        // 2. Unnormalized quaternion rejected
+        let bad_quat_packet = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (5.0, 5.0, 5.0, 5.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: std::collections::HashMap::new(),
+        };
+        assert!(matches!(
+            sim.handle_place_object(player, &bad_quat_packet),
+            Err(crate::sector::PlacementError::InvalidTransform(_))
+        ));
+
+        // 3. Valid placement succeeds and clamps massive scale
+        let valid_packet = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(500.0, 0.0001, 1.0),
+            properties: std::collections::HashMap::new(),
+        };
+        let obj_id = sim.handle_place_object(player, &valid_packet).unwrap();
+        let obj = sim.sectors.get_object(obj_id).unwrap();
+        assert_eq!(obj.transform.scale.0, 100.0); // clamped to MAX_SCALE
+        assert_eq!(obj.transform.scale.1, 0.01); // clamped to MIN_SCALE
+    }
+
+    #[test]
+    fn test_world_object_resync_rate_limiting() {
+        use mmo_schema::client::{PlaceObjectPacket, Vec3, WorldObjectResyncPacket};
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let player = Guid::new(EntityType::Player, 1, 555);
+        sim.spawn_entity(player, (10.0, 10.0, 10.0));
+        let sector = mmo_core::world::SectorCoord3D::from_world_pos((10.0, 10.0, 10.0));
+        sim.sectors.mark_sector_loaded(sector);
+
+        let place_pkt = PlaceObjectPacket {
+            prefab_id: 10,
+            pos: Vec3::new(11.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: std::collections::HashMap::new(),
+        };
+        let obj_id = sim.handle_place_object(player, &place_pkt).unwrap();
+
+        let resync_pkt = WorldObjectResyncPacket {
+            object_id: obj_id.raw(),
+        };
+
+        // First resync succeeds
+        let res1 = sim.handle_world_object_resync(player, &resync_pkt);
+        assert!(res1.is_some());
+        assert_eq!(res1.unwrap().object_id, obj_id.raw());
+
+        // Exhaust token bucket
+        for _ in 0..15 {
+            sim.handle_world_object_resync(player, &resync_pkt);
+        }
+
+        // Subsequent resync is rate-limited and rejected
+        let res_exhausted = sim.handle_world_object_resync(player, &resync_pkt);
+        assert!(
+            res_exhausted.is_none(),
+            "Resync should be rejected when token bucket exhausted"
+        );
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod interp;
 pub mod state;
+pub mod world;
 
 use std::collections::HashMap;
 
@@ -18,6 +19,7 @@ use mmo_schema::client::{
 
 use crate::interp::InterpolationBuffer;
 use crate::state::ClientEntityReplica;
+use crate::world::WorldObjectStore;
 
 /// Telemetry structure serialized to JSON for developer HUD overlays.
 #[derive(Debug, Serialize)]
@@ -35,6 +37,7 @@ pub struct ClientTelemetry {
 pub struct WasmClientWorld {
     entities: HashMap<u64, ClientEntityReplica>,
     interp_buffer: InterpolationBuffer,
+    world_objects: WorldObjectStore,
     local_player_id: Option<u64>,
     session_id: u64,
     latest_server_tick: u64,
@@ -58,6 +61,7 @@ impl WasmClientWorld {
         Self {
             entities: HashMap::new(),
             interp_buffer: InterpolationBuffer::new(0.10),
+            world_objects: WorldObjectStore::new(),
             local_player_id: None,
             session_id: 0,
             latest_server_tick: 0,
@@ -181,6 +185,15 @@ impl WasmClientWorld {
             ClientPacket::InteractionResult(_res) => {
                 // Action result acknowledged
             }
+            ClientPacket::WorldObjectSpawn(spawn) => {
+                self.world_objects.insert_or_update(&spawn);
+            }
+            ClientPacket::WorldObjectDelta(delta) => {
+                self.world_objects.apply_delta(&delta);
+            }
+            ClientPacket::WorldObjectDespawn(despawn) => {
+                self.world_objects.remove(&despawn);
+            }
             _ => {}
         }
     }
@@ -279,6 +292,62 @@ impl WasmClientWorld {
         }
 
         buffer
+    }
+
+    /// Returns the number of currently active world objects in client memory.
+    pub fn world_objects_count(&self) -> usize {
+        self.world_objects.len()
+    }
+
+    /// Returns a flat Float32Array render buffer for all active world objects (16 floats per object).
+    ///
+    /// Memory layout per world object (16 floats):
+    /// `[object_id_f32, prefab_id_f32, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, scale_x, scale_y, scale_z, state_flags_f32, hp_pct, revision_f32, 0.0]`
+    pub fn get_world_objects_render_buffer(&self) -> Vec<f32> {
+        self.world_objects.get_render_buffer()
+    }
+
+    /// Encodes a client `PlaceObjectPacket` ready for transmission over reliable stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_place_object(
+        &self,
+        prefab_id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        qw: f32,
+        sx: f32,
+        sy: f32,
+        sz: f32,
+    ) -> Vec<u8> {
+        let pkt = ClientPacket::PlaceObject(mmo_schema::client::PlaceObjectPacket {
+            prefab_id,
+            pos: Vec3::new(x, y, z),
+            rot: (qx, qy, qz, qw),
+            scale: Vec3::new(sx, sy, sz),
+            properties: HashMap::new(),
+        });
+        pkt.encode()
+    }
+
+    /// Encodes a client `InteractObjectPacket` for transmission over reliable stream.
+    pub fn encode_interact_object(&self, object_id: u64, action_type: u32) -> Vec<u8> {
+        let pkt = ClientPacket::InteractObject(mmo_schema::client::InteractObjectPacket {
+            object_id,
+            action_type,
+        });
+        pkt.encode()
+    }
+
+    /// Encodes a client `WorldObjectResyncPacket` requesting full object state resynchronization.
+    pub fn encode_world_object_resync(&self, object_id: u64) -> Vec<u8> {
+        let pkt = ClientPacket::WorldObjectResync(mmo_schema::client::WorldObjectResyncPacket {
+            object_id,
+        });
+        pkt.encode()
     }
 
     /// Returns telemetry metrics formatted as a JSON string for the HUD.
@@ -393,5 +462,80 @@ mod tests {
             .process_packet(&despawn.encode())
             .expect("should process despawn");
         assert_eq!(world.get_render_buffer().len(), 0);
+    }
+
+    #[test]
+    fn test_wasm_client_world_world_objects_lifecycle() {
+        use mmo_schema::client::{
+            WorldObjectDeltaPacket, WorldObjectDespawnPacket, WorldObjectSpawnPacket,
+        };
+
+        let mut world = WasmClientWorld::new();
+        assert_eq!(world.world_objects_count(), 0);
+
+        // 1. Process WorldObjectSpawn
+        let spawn = ClientPacket::WorldObjectSpawn(WorldObjectSpawnPacket {
+            object_id: 5001,
+            prefab_id: 10,
+            pos: Vec3::new(25.0, 0.0, 30.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(2.0, 2.0, 2.0),
+            bounds_min: Vec3::new(24.0, 0.0, 29.0),
+            bounds_max: Vec3::new(26.0, 4.0, 31.0),
+            state_flags: 1,
+            owner_type: 0,
+            owner_id: "hero".to_string(),
+            health: Some((100, 100)),
+            properties: HashMap::new(),
+            revision: 1,
+        });
+
+        world
+            .process_packet(&spawn.encode())
+            .expect("should process spawn");
+        assert_eq!(world.world_objects_count(), 1);
+
+        let buf = world.get_world_objects_render_buffer();
+        assert_eq!(buf.len(), 16);
+        assert_eq!(buf[0], 5001.0);
+        assert_eq!(buf[1], 10.0);
+        assert_eq!(buf[2], 25.0);
+        assert_eq!(buf[13], 1.0); // 100 / 100 HP
+
+        // 2. Process WorldObjectDelta
+        let delta = ClientPacket::WorldObjectDelta(WorldObjectDeltaPacket {
+            object_id: 5001,
+            revision: 2,
+            state_flags: Some(3),
+            health: Some((50, 100)),
+            properties: HashMap::new(),
+        });
+        world
+            .process_packet(&delta.encode())
+            .expect("should process delta");
+        let buf_v2 = world.get_world_objects_render_buffer();
+        assert_eq!(buf_v2[12], 3.0); // state_flags
+        assert_eq!(buf_v2[13], 0.5); // 50 / 100 HP
+        assert_eq!(buf_v2[14], 2.0); // revision
+
+        // 3. Encode place, interact, and resync packets
+        let place_bytes =
+            world.encode_place_object(10, 25.0, 0.0, 30.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0);
+        assert!(!place_bytes.is_empty());
+
+        let interact_bytes = world.encode_interact_object(5001, 1);
+        assert!(!interact_bytes.is_empty());
+
+        let resync_bytes = world.encode_world_object_resync(5001);
+        assert!(!resync_bytes.is_empty());
+
+        // 4. Process WorldObjectDespawn
+        let despawn =
+            ClientPacket::WorldObjectDespawn(WorldObjectDespawnPacket { object_id: 5001 });
+        world
+            .process_packet(&despawn.encode())
+            .expect("should process despawn");
+        assert_eq!(world.world_objects_count(), 0);
+        assert_eq!(world.get_world_objects_render_buffer().len(), 0);
     }
 }

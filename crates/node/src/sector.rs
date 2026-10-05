@@ -42,6 +42,9 @@ pub enum PlacementError {
 
     #[error("Target sector is not loaded on this simulation node")]
     SectorNotLoaded(SectorCoord3D),
+
+    #[error("Invalid transform or dimension parameters: {0}")]
+    InvalidTransform(String),
 }
 
 /// Token bucket entry for tracking client action rates.

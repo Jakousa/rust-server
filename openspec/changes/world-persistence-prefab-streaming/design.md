@@ -87,13 +87,14 @@ pub struct WorldObject {
 - Each client connection maintains a token bucket in `mmo-node`:
   - Bucket capacity: 10 tokens.
   - Refill rate: 5 tokens/second.
-- Any request exceeding available tokens is rejected immediately before triggering raycasting or spatial searches.
+- Any request exceeding available tokens—including `PlaceObjectRequest`, `InteractObjectRequest`, and `WorldObjectResyncRequest`—is rejected immediately before triggering raycasting or spatial searches, mitigating state-serialization DOS attacks.
 
 ### 3.2 Server-Authoritative Position, Line-of-Sight & Range Check
 - `PlaceObjectRequest` and `InteractObjectRequest` contain no authoritative player position from the client.
 - The simulation node queries `EntityStore` for the player's true server-side position $P_{\text{player}}$.
 - The distance $|P_{\text{player}} - P_{\text{target}}| \le 6.0\text{m}$ is strictly enforced.
 - **Placement Line-of-Sight**: A raycast from the player's eye position to the target placement coordinate is evaluated against world geometry. If occluded, the placement is rejected to prevent placing structures through walls or inside closed structures.
+- **Strict Float & Scale Validation**: All coordinates, rotations, and scales in incoming `Transform3D` payloads are checked with `f32::is_finite()`. Rotations must be unit-length quaternions within $\pm 0.001$, and scale dimensions are clamped to $0.01 \le s_i \le 100.0$ to prevent malformed or infinite bounds from poisoning octree spatial indices.
 
 ### 3.3 Bounding Box Collision Verification
 - Prospective placement bounding box $B_{\text{target}}$ is checked against:
@@ -135,6 +136,8 @@ pub struct WorldObject {
 - **Lock-Free Flushing via Buffer Swap**:
   - The background worker acquires the mutex, invokes `std::mem::take(&mut *guard)` to immediately swap out the dirty map, and releases the mutex within nanoseconds.
   - The worker then serializes records to JSON and executes SQL batch upserts completely detached from the simulation tick mutex.
+  - **Monotonic Revision Upsert Guard**: SQL batch upserts use `ON CONFLICT (world_id, object_id) DO UPDATE SET ... WHERE world_objects.dirty_revision < EXCLUDED.dirty_revision`. This prevents delayed flushes from donor nodes during spatial partition transfers from overwriting newer recipient node revisions.
+  - **Flush Failure Retry Mechanism**: If the database transaction fails (e.g. transient network or database error), the worker re-acquires the mutex and merges the failed batch back into the active dirty map (`entry.or_insert(...)` or updating if `failed.dirty_revision > active.dirty_revision`), guaranteeing zero data loss across flush failures.
 
 ### 5.2 Relational Schema (`V4__world_objects.sql`)
 ```sql
