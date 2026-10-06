@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: dynamic-instancing-director
+  title: Dynamic Instancing, Transient Dungeons & Cross-Cluster Realm Federation
+  status: proposed
+  created: 2026-10-06
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: director
+  specs:
+    - specs/director/dynamic-instancing/spec.md

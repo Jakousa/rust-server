@@ -10,12 +10,17 @@ use tonic::{Request, Response, Status};
 use mmo_core::BoundingBox3D;
 use mmo_schema::cluster::director_service_server::DirectorService;
 use mmo_schema::cluster::{
-    BoundingBox, GatewayHeartbeatRequest, GatewayHeartbeatResponse, HeartbeatRequest,
-    HeartbeatResponse, RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest,
-    RegisterNodeResponse, SplitReportRequest, SplitReportResponse, Vector3,
+    BoundingBox, CreateInstanceRequest, CreateInstanceResponse, GatewayHeartbeatRequest,
+    GatewayHeartbeatResponse, HeartbeatRequest, HeartbeatResponse, InstanceHeartbeatRequest,
+    InstanceHeartbeatResponse, IssueRealmTransferClaimRequest, IssueRealmTransferClaimResponse,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse,
+    SplitReportRequest, SplitReportResponse, TerminateInstanceRequest, TerminateInstanceResponse,
+    Vector3, VerifyRealmTransferClaimRequest, VerifyRealmTransferClaimResponse,
 };
 
 use crate::coordinator::GlobalOctreeCoordinator;
+use crate::federation::{RealmFederationAuthority, RealmTransferClaim};
+use crate::instance::InstanceRegistry;
 use crate::registry::{GatewayDescriptor, GatewayRegistry, NodeRegistry};
 
 /// Converts a protobuf `BoundingBox` into a core `BoundingBox3D`.
@@ -50,18 +55,27 @@ pub struct DirectorServiceImpl {
     pub registry: Arc<RwLock<NodeRegistry>>,
     pub coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
     pub gateway_registry: Arc<RwLock<GatewayRegistry>>,
+    pub instance_registry: Arc<RwLock<InstanceRegistry>>,
+    pub federation_authority: Arc<RwLock<RealmFederationAuthority>>,
 }
 
 impl DirectorServiceImpl {
-    /// Creates a new `DirectorServiceImpl` with shared registry, coordinator, and an empty gateway registry.
+    /// Creates a new `DirectorServiceImpl` with shared registry, coordinator, and default registries.
     pub fn new(
         registry: Arc<RwLock<NodeRegistry>>,
         coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
     ) -> Self {
+        let auth = RealmFederationAuthority::new(
+            "realm-default",
+            b"cluster-realm-federation-default-secret-key".to_vec(),
+        )
+        .expect("valid default auth");
         Self {
             registry,
             coordinator,
             gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
+            instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
+            federation_authority: Arc::new(RwLock::new(auth)),
         }
     }
 
@@ -71,39 +85,88 @@ impl DirectorServiceImpl {
         coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
         gateway_registry: Arc<RwLock<GatewayRegistry>>,
     ) -> Self {
+        let auth = RealmFederationAuthority::new(
+            "realm-default",
+            b"cluster-realm-federation-default-secret-key".to_vec(),
+        )
+        .expect("valid default auth");
         Self {
             registry,
             coordinator,
             gateway_registry,
+            instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
+            federation_authority: Arc::new(RwLock::new(auth)),
+        }
+    }
+
+    /// Creates a `DirectorServiceImpl` with all explicit components.
+    pub fn with_all_components(
+        registry: Arc<RwLock<NodeRegistry>>,
+        coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
+        gateway_registry: Arc<RwLock<GatewayRegistry>>,
+        instance_registry: Arc<RwLock<InstanceRegistry>>,
+        federation_authority: Arc<RwLock<RealmFederationAuthority>>,
+    ) -> Self {
+        Self {
+            registry,
+            coordinator,
+            gateway_registry,
+            instance_registry,
+            federation_authority,
         }
     }
 
     /// Creates a `DirectorServiceImpl` with default empty registry, world coordinator, and gateway registry.
     pub fn default_service() -> Self {
+        let auth = RealmFederationAuthority::new(
+            "realm-default",
+            b"cluster-realm-federation-default-secret-key".to_vec(),
+        )
+        .expect("valid default auth");
         Self {
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             coordinator: Arc::new(RwLock::new(GlobalOctreeCoordinator::default())),
             gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
+            instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
+            federation_authority: Arc::new(RwLock::new(auth)),
         }
     }
 
-    /// Checks for dead/unresponsive simulation nodes after `timeout`, evicting them from the registry
-    /// and immediately reassigning their orphaned spatial partitions to surviving nodes.
+    /// Checks for dead/unresponsive simulation nodes after `timeout`, evicting them from the registry,
+    /// evicting all instances allocated on them, and immediately reassigning their orphaned spatial partitions to surviving nodes.
     ///
-    /// Maintains strict lock acquisition ordering (`registry` then `coordinator`) to prevent deadlocks.
+    /// Maintains strict lock acquisition hierarchy (`instance_registry` -> `registry` -> `coordinator`) to prevent deadlocks.
     pub async fn check_and_recover_dead_nodes(
         &self,
         timeout: std::time::Duration,
     ) -> Vec<crate::coordinator::PartitionRecoveryEvent> {
+        // Enforce strict global lock order: instance_registry -> registry -> coordinator
+        let mut inst_reg = self.instance_registry.write().await;
         let mut reg = self.registry.write().await;
         let dead_nodes = reg.check_dead_nodes(timeout);
 
         if dead_nodes.is_empty() {
             metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+            metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
             return Vec::new();
         }
 
         eprintln!("[Director] Dead node(s) detected: {:?}", dead_nodes);
+
+        // Evict instances on dead nodes to prevent routing to dead instances
+        let evicted_instances = inst_reg.evict_instances_on_nodes(&dead_nodes);
+        if !evicted_instances.is_empty() {
+            eprintln!(
+                "[Director] Evicted {} orphaned instances on dead nodes: {:?}",
+                evicted_instances.len(),
+                evicted_instances
+                    .iter()
+                    .map(|i| i.instance_id)
+                    .collect::<Vec<_>>()
+            );
+            metrics::counter!("mmo_director_orphaned_instances_evicted_total")
+                .increment(evicted_instances.len() as u64);
+        }
 
         let mut coord = self.coordinator.write().await;
         let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
@@ -113,7 +176,20 @@ impl DirectorServiceImpl {
             metrics::gauge!("mmo_director_topology_epoch").set(coord.topology_epoch() as f64);
         }
         metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+        metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
         events
+    }
+
+    /// Scans for and reaps idle instances across all simulation nodes.
+    pub async fn reap_idle_instances(&self) -> usize {
+        let mut inst_reg = self.instance_registry.write().await;
+        let reaped = inst_reg.reap_idle_instances();
+        let count = reaped.len();
+        if count > 0 {
+            metrics::counter!("mmo_director_idle_instances_reaped_total").increment(count as u64);
+        }
+        metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
+        count
     }
 
     /// Checks for stale/unresponsive edge gateways after `timeout`, marking them `Offline`.
@@ -276,6 +352,164 @@ impl DirectorService for DirectorServiceImpl {
             acknowledged,
             should_drain: false,
         }))
+    }
+
+    async fn create_instance(
+        &self,
+        request: Request<CreateInstanceRequest>,
+    ) -> Result<Response<CreateInstanceResponse>, Status> {
+        let req = request.into_inner();
+        let bounds = match req.bounds.as_ref().and_then(proto_bbox_to_bounding_box_3d) {
+            Some(b) => b,
+            None => {
+                return Ok(Response::new(CreateInstanceResponse {
+                    success: false,
+                    error_message: "Missing or invalid bounding box".to_string(),
+                    instance_id: req.instance_id,
+                    assigned_node_id: 0,
+                    node_address: String::new(),
+                }));
+            }
+        };
+
+        // Enforce lock order: instance_registry -> registry
+        let mut inst_reg = self.instance_registry.write().await;
+        let reg = self.registry.read().await;
+
+        match inst_reg.allocate_instance(
+            req.instance_id,
+            req.template_id,
+            bounds,
+            req.idle_timeout_seconds,
+            req.preferred_node_id,
+            &reg,
+        ) {
+            Ok(desc) => {
+                let node_addr = reg
+                    .get_node(desc.assigned_node_id)
+                    .map(|n| n.listen_addr.clone())
+                    .unwrap_or_default();
+                metrics::counter!("mmo_director_instances_created_total").increment(1);
+                metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
+
+                Ok(Response::new(CreateInstanceResponse {
+                    success: true,
+                    error_message: String::new(),
+                    instance_id: desc.instance_id,
+                    assigned_node_id: desc.assigned_node_id,
+                    node_address: node_addr,
+                }))
+            }
+            Err(e) => Ok(Response::new(CreateInstanceResponse {
+                success: false,
+                error_message: e.to_string(),
+                instance_id: req.instance_id,
+                assigned_node_id: 0,
+                node_address: String::new(),
+            })),
+        }
+    }
+
+    async fn terminate_instance(
+        &self,
+        request: Request<TerminateInstanceRequest>,
+    ) -> Result<Response<TerminateInstanceResponse>, Status> {
+        let req = request.into_inner();
+        let mut inst_reg = self.instance_registry.write().await;
+        let terminated = inst_reg.terminate_instance(req.instance_id);
+        metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
+
+        if terminated.is_some() {
+            metrics::counter!("mmo_director_instances_terminated_total").increment(1);
+            Ok(Response::new(TerminateInstanceResponse {
+                success: true,
+                error_message: String::new(),
+            }))
+        } else {
+            Ok(Response::new(TerminateInstanceResponse {
+                success: false,
+                error_message: format!("Instance {} not found", req.instance_id),
+            }))
+        }
+    }
+
+    async fn instance_heartbeat(
+        &self,
+        request: Request<InstanceHeartbeatRequest>,
+    ) -> Result<Response<InstanceHeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let mut inst_reg = self.instance_registry.write().await;
+
+        match inst_reg.record_heartbeat(
+            req.instance_id,
+            req.player_count,
+            req.total_entity_count,
+            req.is_idle,
+        ) {
+            Ok(should_terminate) => Ok(Response::new(InstanceHeartbeatResponse {
+                acknowledged: true,
+                should_terminate,
+            })),
+            Err(_) => Ok(Response::new(InstanceHeartbeatResponse {
+                acknowledged: false,
+                should_terminate: false,
+            })),
+        }
+    }
+
+    async fn issue_realm_transfer_claim(
+        &self,
+        request: Request<IssueRealmTransferClaimRequest>,
+    ) -> Result<Response<IssueRealmTransferClaimResponse>, Status> {
+        let req = request.into_inner();
+        let ttl =
+            std::time::Duration::from_millis(if req.ttl_ms == 0 { 60_000 } else { req.ttl_ms });
+
+        let mut auth = self.federation_authority.write().await;
+        let claim = auth.issue_claim(req.guid, &req.target_realm_id, req.session_epoch, ttl);
+        metrics::counter!("mmo_director_realm_transfer_claims_issued_total").increment(1);
+
+        Ok(Response::new(IssueRealmTransferClaimResponse {
+            success: true,
+            error_message: String::new(),
+            nonce: claim.nonce,
+            expires_at_epoch_ms: claim.expires_at_epoch_ms,
+            signature: claim.signature,
+        }))
+    }
+
+    async fn verify_realm_transfer_claim(
+        &self,
+        request: Request<VerifyRealmTransferClaimRequest>,
+    ) -> Result<Response<VerifyRealmTransferClaimResponse>, Status> {
+        let req = request.into_inner();
+        let claim = RealmTransferClaim {
+            guid: req.guid,
+            source_realm_id: req.source_realm_id,
+            target_realm_id: req.target_realm_id,
+            session_epoch: req.session_epoch,
+            nonce: req.nonce,
+            expires_at_epoch_ms: req.expires_at_epoch_ms,
+            signature: req.signature,
+        };
+
+        let mut auth = self.federation_authority.write().await;
+        match auth.verify_and_redeem_claim(&claim) {
+            Ok(()) => {
+                metrics::counter!("mmo_director_realm_transfer_claims_verified_total").increment(1);
+                Ok(Response::new(VerifyRealmTransferClaimResponse {
+                    valid: true,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => {
+                metrics::counter!("mmo_director_realm_transfer_claims_rejected_total").increment(1);
+                Ok(Response::new(VerifyRealmTransferClaimResponse {
+                    valid: false,
+                    error_message: e.to_string(),
+                }))
+            }
+        }
     }
 }
 
@@ -655,5 +889,131 @@ mod tests {
             let gw = reg.get_gateway("gw-test-1").unwrap();
             assert_eq!(gw.status, crate::registry::GatewayStatus::Offline);
         }
+    }
+
+    #[tokio::test]
+    async fn test_service_instance_lifecycle_and_dead_node_eviction() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. Register a simulation node
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let reg_resp = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 1,
+                listen_addr: "127.0.0.1:50051".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reg_resp.success);
+
+        // 2. Create dynamic instance
+        let inst_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 50.0, 50.0));
+        let create_resp = service
+            .create_instance(Request::new(CreateInstanceRequest {
+                instance_id: 9999,
+                template_id: 101,
+                bounds: Some(bounding_box_3d_to_proto(&inst_bounds)),
+                idle_timeout_seconds: 60,
+                preferred_node_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(create_resp.success);
+        assert_eq!(create_resp.instance_id, 9999);
+        assert_eq!(create_resp.assigned_node_id, 1);
+        assert_eq!(create_resp.node_address, "127.0.0.1:50051");
+
+        // 3. Instance Heartbeat
+        let hb_resp = service
+            .instance_heartbeat(Request::new(InstanceHeartbeatRequest {
+                instance_id: 9999,
+                node_id: 1,
+                player_count: 5,
+                total_entity_count: 20,
+                is_idle: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hb_resp.acknowledged);
+        assert!(!hb_resp.should_terminate);
+
+        // 4. Dead node eviction cleans up hosted instances
+        {
+            let mut reg = service.registry.write().await;
+            if let Some(node) = reg.get_node_mut(1) {
+                node.last_heartbeat =
+                    std::time::Instant::now() - std::time::Duration::from_secs(10);
+            }
+        }
+
+        let _recovery = service
+            .check_and_recover_dead_nodes(std::time::Duration::from_secs(2))
+            .await;
+        // Node 1 was evicted, so instance 9999 must also be removed
+        let inst_reg = service.instance_registry.read().await;
+        assert!(inst_reg.get_instance(9999).is_none());
+        assert_eq!(inst_reg.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_service_realm_transfer_claim_rpc() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. Issue claim
+        let issue_resp = service
+            .issue_realm_transfer_claim(Request::new(IssueRealmTransferClaimRequest {
+                guid: 12345,
+                source_realm_id: "realm-default".to_string(),
+                target_realm_id: "realm-default".to_string(),
+                session_epoch: 1,
+                ttl_ms: 10_000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(issue_resp.success);
+        assert!(issue_resp.nonce > 0);
+        assert!(!issue_resp.signature.is_empty());
+
+        // 2. Verify claim
+        let verify_resp = service
+            .verify_realm_transfer_claim(Request::new(VerifyRealmTransferClaimRequest {
+                guid: 12345,
+                source_realm_id: "realm-default".to_string(),
+                target_realm_id: "realm-default".to_string(),
+                session_epoch: 1,
+                nonce: issue_resp.nonce,
+                expires_at_epoch_ms: issue_resp.expires_at_epoch_ms,
+                signature: issue_resp.signature.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(verify_resp.valid);
+
+        // 3. Replay claim must be rejected
+        let replay_resp = service
+            .verify_realm_transfer_claim(Request::new(VerifyRealmTransferClaimRequest {
+                guid: 12345,
+                source_realm_id: "realm-default".to_string(),
+                target_realm_id: "realm-default".to_string(),
+                session_epoch: 1,
+                nonce: issue_resp.nonce,
+                expires_at_epoch_ms: issue_resp.expires_at_epoch_ms,
+                signature: issue_resp.signature,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!replay_resp.valid);
+        assert!(replay_resp.error_message.contains("Replay"));
     }
 }

@@ -324,6 +324,78 @@ message MultiGatewayRouteBroadcastResponse {
   uint32 acknowledged_gateways = 2;
 }
 
+// Dynamic Instance Messages
+message CreateInstanceRequest {
+  uint64 instance_id = 1;
+  uint32 template_id = 2;
+  BoundingBox bounds = 3;
+  uint32 idle_timeout_seconds = 4;
+  uint32 preferred_node_id = 5; // 0 for automatic least-loaded selection
+}
+
+message CreateInstanceResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 instance_id = 3;
+  uint32 assigned_node_id = 4;
+  string node_address = 5;
+}
+
+message TerminateInstanceRequest {
+  uint64 instance_id = 1;
+  string reason = 2;
+}
+
+message TerminateInstanceResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message InstanceHeartbeatRequest {
+  uint64 instance_id = 1;
+  uint32 node_id = 2;
+  uint32 player_count = 3;
+  uint32 total_entity_count = 4;
+  bool is_idle = 5;
+}
+
+message InstanceHeartbeatResponse {
+  bool acknowledged = 1;
+  bool should_terminate = 2;
+}
+
+// Cross-Cluster Realm Federation Messages
+message IssueRealmTransferClaimRequest {
+  uint64 guid = 1;
+  string source_realm_id = 2;
+  string target_realm_id = 3;
+  uint64 session_epoch = 4;
+  uint64 ttl_ms = 5;
+}
+
+message IssueRealmTransferClaimResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 nonce = 3;
+  uint64 expires_at_epoch_ms = 4;
+  bytes signature = 5;
+}
+
+message VerifyRealmTransferClaimRequest {
+  uint64 guid = 1;
+  string source_realm_id = 2;
+  string target_realm_id = 3;
+  uint64 session_epoch = 4;
+  uint64 nonce = 5;
+  uint64 expires_at_epoch_ms = 6;
+  bytes signature = 7;
+}
+
+message VerifyRealmTransferClaimResponse {
+  bool valid = 1;
+  string error_message = 2;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -331,6 +403,11 @@ service DirectorService {
   rpc ReportSplit (SplitReportRequest) returns (SplitReportResponse);
   rpc RegisterGateway (RegisterGatewayRequest) returns (RegisterGatewayResponse);
   rpc GatewayHeartbeat (GatewayHeartbeatRequest) returns (GatewayHeartbeatResponse);
+  rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse);
+  rpc TerminateInstance (TerminateInstanceRequest) returns (TerminateInstanceResponse);
+  rpc InstanceHeartbeat (InstanceHeartbeatRequest) returns (InstanceHeartbeatResponse);
+  rpc IssueRealmTransferClaim (IssueRealmTransferClaimRequest) returns (IssueRealmTransferClaimResponse);
+  rpc VerifyRealmTransferClaim (VerifyRealmTransferClaimRequest) returns (VerifyRealmTransferClaimResponse);
 }
 
 service NodeService {
