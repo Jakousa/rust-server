@@ -233,6 +233,57 @@ pub struct WorldObjectRecord {
     pub updated_at: i64,
 }
 
+/// Status of an asynchronous market listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListingStatus {
+    Active,
+    Sold,
+    Cancelled,
+    Expired,
+}
+
+impl std::fmt::Display for ListingStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListingStatus::Active => write!(f, "Active"),
+            ListingStatus::Sold => write!(f, "Sold"),
+            ListingStatus::Cancelled => write!(f, "Cancelled"),
+            ListingStatus::Expired => write!(f, "Expired"),
+        }
+    }
+}
+
+impl std::str::FromStr for ListingStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Active" => Ok(ListingStatus::Active),
+            "Sold" => Ok(ListingStatus::Sold),
+            "Cancelled" => Ok(ListingStatus::Cancelled),
+            "Expired" => Ok(ListingStatus::Expired),
+            other => Err(format!("Unknown listing status: {}", other)),
+        }
+    }
+}
+
+/// Persistent record representing an item listed on the asynchronous global marketplace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketListingRecord {
+    pub listing_id: String,
+    pub seller_guid: u64,
+    pub seller_container_id: u64,
+    pub item_instance_id: String,
+    pub item_def_id: u32,
+    pub price: u64,
+    pub escrow_container_id: u64,
+    pub escrow_slot: u32,
+    pub status: ListingStatus,
+    pub created_at_epoch_ms: i64,
+    pub expires_at_epoch_ms: i64,
+    pub updated_at_epoch_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

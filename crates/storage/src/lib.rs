@@ -7,6 +7,7 @@ pub mod container_repo;
 pub mod datastore;
 pub mod db;
 pub mod escrow_coord;
+pub mod marketplace;
 pub mod models;
 pub mod repository;
 pub mod social;
@@ -19,10 +20,11 @@ pub use container_repo::ContainerRepository;
 pub use datastore::{DataDocument, DataStore, DataStoreError, LoadReport};
 pub use db::{sql_for_dialect, Database, DbBackend, StorageError};
 pub use escrow_coord::{hash_secret, EscrowCoordinator};
+pub use marketplace::MarketplaceRepository;
 pub use models::{
     AccountRecord, CharacterRecord, ContainerRecord, ContainerTransactionRecord, EntitySnapshot,
-    EscrowRecord, EscrowStatus, InventoryRecord, ItemRecord, ReservationRecord, TradeRecord,
-    TradeStatus, WorldObjectRecord,
+    EscrowRecord, EscrowStatus, InventoryRecord, ItemRecord, ListingStatus, MarketListingRecord,
+    ReservationRecord, TradeRecord, TradeStatus, WorldObjectRecord,
 };
 pub use repository::CharacterRepository;
 pub use social::{

@@ -7,6 +7,7 @@ pub mod hook;
 pub mod octree;
 pub mod plugin;
 pub mod property;
+pub mod social;
 pub mod spatial;
 pub mod telemetry;
 pub mod world;
@@ -32,6 +33,7 @@ pub use plugin::{
     PluginContext, PluginManager, TickContext, TickSystem, TypedComponentCodec,
 };
 pub use property::{DynamicProperties, PropertyValue};
+pub use social::{SocialChannel, SocialEvent};
 pub use spatial::{
     query_sphere_targets, ray_intersects_aabb, validate_cone_target, validate_point_range,
     SpatialQueryError, Vec3,

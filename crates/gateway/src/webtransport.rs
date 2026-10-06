@@ -68,6 +68,7 @@ pub struct WebTransportServer {
     cert_digest_bytes: [u8; 32],
     authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
     default_node_address: Option<String>,
+    intercept_handler: Option<crate::server::GatewayInterceptHandler>,
 }
 
 impl WebTransportServer {
@@ -103,6 +104,7 @@ impl WebTransportServer {
             cert_digest_bytes,
             authenticator: None,
             default_node_address: None,
+            intercept_handler: None,
         })
     }
 
@@ -118,6 +120,15 @@ impl WebTransportServer {
     /// Sets a default simulation node address for initial session assignment.
     pub fn with_default_node_address(mut self, node_address: impl Into<String>) -> Self {
         self.default_node_address = Some(node_address.into());
+        self
+    }
+
+    /// Configures a gateway packet intercept handler for social and marketplace events.
+    pub fn with_intercept_handler(
+        mut self,
+        intercept_handler: crate::server::GatewayInterceptHandler,
+    ) -> Self {
+        self.intercept_handler = Some(intercept_handler);
         self
     }
 
@@ -160,6 +171,7 @@ impl WebTransportServer {
                     let packet_tx = self.packet_tx.clone();
                     let authenticator = self.authenticator.clone();
                     let default_node = self.default_node_address.clone();
+                    let intercept_handler = self.intercept_handler.clone();
 
                     tokio::spawn(async move {
                         Self::handle_session(
@@ -171,6 +183,7 @@ impl WebTransportServer {
                             packet_tx,
                             authenticator,
                             default_node,
+                            intercept_handler,
                         ).await;
                     });
                 }
@@ -205,6 +218,7 @@ impl WebTransportServer {
         packet_tx: Option<mpsc::Sender<RoutedPacket>>,
         authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
         default_node_address: Option<String>,
+        intercept_handler: Option<crate::server::GatewayInterceptHandler>,
     ) {
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
@@ -216,11 +230,15 @@ impl WebTransportServer {
             session_id: u64,
             router: Arc<SessionRouter>,
             session_sinks: Arc<DashMap<u64, SessionSink>>,
+            intercept_handler: Option<crate::server::GatewayInterceptHandler>,
         }
         impl Drop for WtSessionGuard {
             fn drop(&mut self) {
                 let _ = self.router.remove_session(self.session_id);
                 self.session_sinks.remove(&self.session_id);
+                if let Some(ref handler) = self.intercept_handler {
+                    handler.remove_session(self.session_id);
+                }
                 metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
             }
         }
@@ -228,6 +246,7 @@ impl WebTransportServer {
             session_id,
             router: router.clone(),
             session_sinks: session_sinks.clone(),
+            intercept_handler: intercept_handler.clone(),
         };
 
         // Task 1: Datagram Egress (unreliable stream: movement, deltas)
@@ -298,6 +317,7 @@ impl WebTransportServer {
         let auth_opt = authenticator.clone();
         let default_node_opt = default_node_address.clone();
         let router_stream = router.clone();
+        let intercept_stream = intercept_handler.clone();
         let stream_ingress_task = tokio::spawn(async move {
             while let Ok((mut send_stream, mut recv_stream)) = conn_stream_in.accept_bi().await {
                 let mut buf = BytesMut::with_capacity(4096);
@@ -360,6 +380,20 @@ impl WebTransportServer {
                                             auth_res.guid,
                                             initial_node.clone(),
                                         );
+                                        if let Some(ref handler) = intercept_stream {
+                                            handler
+                                                .subscribe_session_topic(
+                                                    session_id,
+                                                    "chat:global".to_string(),
+                                                )
+                                                .await;
+                                            handler
+                                                .subscribe_session_topic(
+                                                    session_id,
+                                                    format!("whisper:{}", auth_res.guid.raw()),
+                                                )
+                                                .await;
+                                        }
                                         // Memory ordering: register route before releasing authenticated state
                                         is_auth_stream.store(true, Ordering::Release);
 
@@ -404,10 +438,19 @@ impl WebTransportServer {
                     match recv_stream.read(&mut temp).await {
                         Ok(Some(n)) if n > 0 => {
                             buf.extend_from_slice(&temp[..n]);
-                            if let Ok(routed) = disp_stream.process_frames(session_id, &mut buf) {
-                                if let Some(ref tx) = ptx_stream {
-                                    for pkt in routed {
-                                        let _ = tx.send(pkt).await;
+                            while let Ok(Some(pkt)) =
+                                mmo_schema::client::ClientPacket::decode_frame(&mut buf)
+                            {
+                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                                    .increment(1);
+                                if let Some(ref handler) = intercept_stream {
+                                    if handler.handle_packet(session_id, &pkt).await {
+                                        continue;
+                                    }
+                                }
+                                if let Ok(routed) = disp_stream.dispatch_packet(session_id, pkt) {
+                                    if let Some(ref tx) = ptx_stream {
+                                        let _ = tx.send(routed).await;
                                     }
                                 }
                             }

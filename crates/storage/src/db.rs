@@ -71,6 +71,15 @@ pub enum StorageError {
 
     #[error("Unauthorized access to container {0}")]
     UnauthorizedContainerAccess(u64),
+
+    #[error("Listing not found: {0}")]
+    ListingNotFound(String),
+
+    #[error("Listing {0} is not active (status: {1})")]
+    ListingNotActive(String, String),
+
+    #[error("Unauthorized marketplace action on listing {0}")]
+    UnauthorizedMarketAction(String),
 }
 
 /// Database backend variant.
@@ -412,6 +421,31 @@ impl Database {
             "#,
             r#"
             CREATE INDEX IF NOT EXISTS idx_world_objects_updated ON world_objects (world_id, updated_at);
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS market_listings (
+                listing_id TEXT PRIMARY KEY,
+                seller_guid BIGINT NOT NULL,
+                seller_container_id BIGINT NOT NULL,
+                item_instance_id TEXT NOT NULL,
+                item_def_id INTEGER NOT NULL,
+                price BIGINT NOT NULL,
+                escrow_container_id BIGINT NOT NULL,
+                escrow_slot INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at_epoch_ms BIGINT NOT NULL,
+                expires_at_epoch_ms BIGINT NOT NULL,
+                updated_at_epoch_ms BIGINT NOT NULL
+            );
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_market_status_expiry ON market_listings (status, expires_at_epoch_ms);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_market_item_def ON market_listings (item_def_id, status);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_market_seller ON market_listings (seller_guid, status);
             "#,
         ];
 

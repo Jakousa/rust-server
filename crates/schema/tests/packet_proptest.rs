@@ -93,6 +93,42 @@ prop_compose! {
     }
 }
 
+prop_compose! {
+    fn arb_social_message_packet()(
+        channel_type in 0u8..=5,
+        target_id in any::<u64>(),
+        sender_guid in any::<u64>(),
+        sender_name in "[a-zA-Z0-9]{1,24}",
+        content in "[a-zA-Z0-9 ]{0,100}",
+        timestamp in any::<u64>(),
+    ) -> mmo_schema::client::SocialMessagePacket {
+        mmo_schema::client::SocialMessagePacket {
+            channel_type,
+            target_id,
+            sender_guid,
+            sender_name,
+            content,
+            timestamp,
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_market_buy_packet()(
+        listing_id in "[a-zA-Z0-9-]{1,24}",
+        buyer_container_id in any::<u64>(),
+        payment_container_id in any::<u64>(),
+        price in any::<u64>(),
+    ) -> mmo_schema::client::MarketBuyRequestPacket {
+        mmo_schema::client::MarketBuyRequestPacket {
+            listing_id,
+            buyer_container_id,
+            payment_container_id,
+            price,
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -181,6 +217,50 @@ proptest! {
                 prop_assert_eq!(decoded_auth.error_message, packet.error_message);
             }
             other => panic!("Expected AuthResponse packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prop_test_social_message_roundtrip(packet in arb_social_message_packet()) {
+        let client_packet = ClientPacket::SocialMessage(packet.clone());
+        let encoded = client_packet.encode();
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        let decoded = ClientPacket::decode_frame(&mut buf)
+            .expect("Valid frame must decode without error")
+            .expect("Complete frame must yield Some packet");
+
+        match decoded {
+            ClientPacket::SocialMessage(dec) => {
+                prop_assert_eq!(dec.channel_type, packet.channel_type);
+                prop_assert_eq!(dec.target_id, packet.target_id);
+                prop_assert_eq!(dec.sender_guid, packet.sender_guid);
+                prop_assert_eq!(dec.sender_name, packet.sender_name);
+                prop_assert_eq!(dec.content, packet.content);
+                prop_assert_eq!(dec.timestamp, packet.timestamp);
+            }
+            other => panic!("Expected SocialMessage packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prop_test_market_buy_roundtrip(packet in arb_market_buy_packet()) {
+        let client_packet = ClientPacket::MarketBuyRequest(packet.clone());
+        let encoded = client_packet.encode();
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        let decoded = ClientPacket::decode_frame(&mut buf)
+            .expect("Valid frame must decode without error")
+            .expect("Complete frame must yield Some packet");
+
+        match decoded {
+            ClientPacket::MarketBuyRequest(dec) => {
+                prop_assert_eq!(dec.listing_id, packet.listing_id);
+                prop_assert_eq!(dec.buyer_container_id, packet.buyer_container_id);
+                prop_assert_eq!(dec.payment_container_id, packet.payment_container_id);
+                prop_assert_eq!(dec.price, packet.price);
+            }
+            other => panic!("Expected MarketBuyRequest packet, got {:?}", other),
         }
     }
 
