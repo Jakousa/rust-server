@@ -305,14 +305,15 @@ impl CharacterRepository {
             DbBackend::Sqlite(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(guid) DO UPDATE SET
                         pos_x = excluded.pos_x,
                         pos_y = excluded.pos_y,
                         pos_z = excluded.pos_z,
                         rotation = excluded.rotation,
                         attributes_json = excluded.attributes_json,
+                        state_blob = excluded.state_blob,
                         version = excluded.version,
                         timestamp = excluded.timestamp
                     WHERE excluded.version >= entity_snapshots.version
@@ -324,6 +325,7 @@ impl CharacterRepository {
                 .bind(snapshot.position.2)
                 .bind(snapshot.rotation)
                 .bind(&attrs_str)
+                .bind(snapshot.state_blob.as_deref())
                 .bind(snapshot.version as i64)
                 .bind(snapshot.timestamp as i64)
                 .execute(pool)
@@ -348,14 +350,15 @@ impl CharacterRepository {
             DbBackend::Postgres(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT(guid) DO UPDATE SET
                         pos_x = excluded.pos_x,
                         pos_y = excluded.pos_y,
                         pos_z = excluded.pos_z,
                         rotation = excluded.rotation,
                         attributes_json = excluded.attributes_json,
+                        state_blob = excluded.state_blob,
                         version = excluded.version,
                         timestamp = excluded.timestamp
                     WHERE excluded.version >= entity_snapshots.version
@@ -367,6 +370,7 @@ impl CharacterRepository {
                 .bind(snapshot.position.2)
                 .bind(snapshot.rotation)
                 .bind(&attrs_str)
+                .bind(snapshot.state_blob.as_deref())
                 .bind(snapshot.version as i64)
                 .bind(snapshot.timestamp as i64)
                 .execute(pool)
@@ -410,14 +414,15 @@ impl CharacterRepository {
                         let attrs_str = serde_json::to_string(&snap.attributes)?;
                         sqlx::query(
                             r#"
-                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(guid) DO UPDATE SET
                                 pos_x = excluded.pos_x,
                                 pos_y = excluded.pos_y,
                                 pos_z = excluded.pos_z,
                                 rotation = excluded.rotation,
                                 attributes_json = excluded.attributes_json,
+                                state_blob = excluded.state_blob,
                                 version = excluded.version,
                                 timestamp = excluded.timestamp
                             WHERE excluded.version >= entity_snapshots.version
@@ -429,6 +434,7 @@ impl CharacterRepository {
                         .bind(snap.position.2)
                         .bind(snap.rotation)
                         .bind(&attrs_str)
+                        .bind(snap.state_blob.as_deref())
                         .bind(snap.version as i64)
                         .bind(snap.timestamp as i64)
                         .execute(&mut *tx)
@@ -460,14 +466,15 @@ impl CharacterRepository {
                         let attrs_str = serde_json::to_string(&snap.attributes)?;
                         sqlx::query(
                             r#"
-                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                             ON CONFLICT(guid) DO UPDATE SET
                                 pos_x = excluded.pos_x,
                                 pos_y = excluded.pos_y,
                                 pos_z = excluded.pos_z,
                                 rotation = excluded.rotation,
                                 attributes_json = excluded.attributes_json,
+                                state_blob = excluded.state_blob,
                                 version = excluded.version,
                                 timestamp = excluded.timestamp
                             WHERE excluded.version >= entity_snapshots.version
@@ -479,6 +486,7 @@ impl CharacterRepository {
                         .bind(snap.position.2)
                         .bind(snap.rotation)
                         .bind(&attrs_str)
+                        .bind(snap.state_blob.as_deref())
                         .bind(snap.version as i64)
                         .bind(snap.timestamp as i64)
                         .execute(&mut *tx)
@@ -510,10 +518,11 @@ impl CharacterRepository {
 
     /// Retrieves an entity snapshot by GUID.
     pub async fn get_snapshot(&self, guid: u64) -> Result<Option<EntitySnapshot>, StorageError> {
-        let (x, y, z, rotation, attrs_str, version, timestamp) = match self.db.backend() {
+        let (x, y, z, rotation, attrs_str, state_blob, version, timestamp) = match self.db.backend()
+        {
             DbBackend::Sqlite(pool) => {
                 let row = sqlx::query(
-                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp FROM entity_snapshots WHERE guid = ?",
+                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = ?",
                 )
                 .bind(guid as i64)
                 .fetch_optional(pool)
@@ -526,6 +535,7 @@ impl CharacterRepository {
                         r.try_get::<f32, _>("pos_z")?,
                         r.try_get::<f32, _>("rotation")?,
                         r.try_get::<String, _>("attributes_json")?,
+                        r.try_get::<Option<Vec<u8>>, _>("state_blob")?,
                         r.try_get::<i64, _>("version")?,
                         r.try_get::<i64, _>("timestamp")?,
                     )
@@ -535,7 +545,7 @@ impl CharacterRepository {
             }
             DbBackend::Postgres(pool) => {
                 let row = sqlx::query(
-                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, version, timestamp FROM entity_snapshots WHERE guid = $1",
+                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = $1",
                 )
                 .bind(guid as i64)
                 .fetch_optional(pool)
@@ -548,6 +558,7 @@ impl CharacterRepository {
                         r.try_get::<f32, _>("pos_z")?,
                         r.try_get::<f32, _>("rotation")?,
                         r.try_get::<String, _>("attributes_json")?,
+                        r.try_get::<Option<Vec<u8>>, _>("state_blob")?,
                         r.try_get::<i64, _>("version")?,
                         r.try_get::<i64, _>("timestamp")?,
                     )
@@ -564,6 +575,7 @@ impl CharacterRepository {
             position: (x, y, z),
             rotation,
             attributes,
+            state_blob,
             version: version as u64,
             timestamp: timestamp as u64,
         }))
@@ -1143,6 +1155,7 @@ mod tests {
             position: (1.0, 2.0, 3.0),
             rotation: 0.0,
             attributes: serde_json::json!({"health": 100}),
+            state_blob: Some(vec![1, 2, 3]),
             version: 1,
             timestamp: 1000,
         };
@@ -1152,6 +1165,7 @@ mod tests {
             position: (4.0, 5.0, 6.0),
             rotation: std::f32::consts::PI,
             attributes: serde_json::json!({"mana": 50}),
+            state_blob: None,
             version: 1,
             timestamp: 1000,
         };
@@ -1165,6 +1179,7 @@ mod tests {
         let loaded = repo.get_snapshot(5001).await.unwrap().unwrap();
         assert_eq!(loaded.position, (1.0, 2.0, 3.0));
         assert_eq!(loaded.attributes["health"], 100);
+        assert_eq!(loaded.state_blob, Some(vec![1, 2, 3]));
 
         // Update with higher version
         let snap1_v2 = EntitySnapshot {
@@ -1172,6 +1187,7 @@ mod tests {
             position: (10.0, 20.0, 30.0),
             rotation: 1.0,
             attributes: serde_json::json!({"health": 85}),
+            state_blob: Some(vec![4, 5, 6]),
             version: 2,
             timestamp: 2000,
         };
@@ -1180,6 +1196,7 @@ mod tests {
         let loaded_v2 = repo.get_snapshot(5001).await.unwrap().unwrap();
         assert_eq!(loaded_v2.position, (10.0, 20.0, 30.0));
         assert_eq!(loaded_v2.version, 2);
+        assert_eq!(loaded_v2.state_blob, Some(vec![4, 5, 6]));
     }
 
     #[tokio::test]

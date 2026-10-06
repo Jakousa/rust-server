@@ -1679,6 +1679,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "proptest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "slotmap",
