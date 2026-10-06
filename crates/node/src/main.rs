@@ -49,12 +49,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry = mmo_core::TelemetryServer::init()?;
     telemetry.spawn(admin_addr);
 
+    // Default world bounds (-100.0 to 100.0)
+    let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+    let mut tick_sim = TickSimulation::new(node_id, bounds);
+
     let _snapshotter = if let Some(ref url) = db_url {
         match Database::connect(url).await {
             Ok(db) => {
                 println!("[Node {}] Connected to database at {}", node_id, url);
                 let repo = CharacterRepository::new(db);
-                Some(WriteBehindSnapshotter::new(repo))
+                let snapshotter = Arc::new(WriteBehindSnapshotter::new(repo));
+                tick_sim.set_snapshot_sender(snapshotter.sender());
+                let _handle = snapshotter.clone().start_worker();
+                println!(
+                    "[Node {}] Asynchronous write-behind snapshot worker active",
+                    node_id
+                );
+                Some(snapshotter)
             }
             Err(e) => {
                 eprintln!("[Node {}] Database connection failed: {}", node_id, e);
@@ -65,9 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Default world bounds (-100.0 to 100.0)
-    let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
-    let sim = Arc::new(RwLock::new(TickSimulation::new(node_id, bounds)));
+    let sim = Arc::new(RwLock::new(tick_sim));
 
     // 1. Start gRPC NodeService server
     let node_service = NodeServiceImpl::new(Arc::clone(&sim));

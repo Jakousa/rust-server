@@ -52,6 +52,8 @@ pub struct TickSimulation {
         tokio::sync::mpsc::UnboundedSender<ContainerTransferNotification>,
     pub container_transfer_receiver:
         tokio::sync::mpsc::UnboundedReceiver<ContainerTransferNotification>,
+    pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
+    pub snapshot_interval_ticks: u64,
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -140,6 +142,8 @@ impl TickSimulation {
             ability_compensation_receiver,
             container_transfer_sender,
             container_transfer_receiver,
+            snapshot_sender: None,
+            snapshot_interval_ticks: 20,
         }
     }
 
@@ -183,6 +187,19 @@ impl TickSimulation {
     /// Queues an ability compensation event into the simulation's non-blocking channel.
     pub fn queue_ability_compensation(&self, comp: AbilityCompensation) {
         let _ = self.ability_compensation_sender.send(comp);
+    }
+
+    /// Sets or attaches the asynchronous snapshot sender pipeline.
+    pub fn set_snapshot_sender(
+        &mut self,
+        sender: tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>,
+    ) {
+        self.snapshot_sender = Some(sender);
+    }
+
+    /// Sets the interval (in simulation ticks) between periodic entity state snapshots.
+    pub fn set_snapshot_interval_ticks(&mut self, ticks: u64) {
+        self.snapshot_interval_ticks = ticks.max(1);
     }
 
     /// Returns the current simulation monotonic timestamp.
@@ -538,6 +555,41 @@ impl TickSimulation {
             self.aoi
                 .update_observers(&self.entity_store, &self.octree, self.tick_counter, now_ms);
         self.pending_broadcast_jobs.append(&mut aoi_jobs);
+
+        // 3.5. Periodic asynchronous write-behind snapshot dispatch
+        if let Some(ref sender) = self.snapshot_sender {
+            if self.tick_counter.is_multiple_of(self.snapshot_interval_ticks) {
+                let now_sec = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                for (_key, entity) in self.entity_store.iter() {
+                    // Skip entities holding active migration leases
+                    if self.migrating_leases.contains_key(&entity.guid) {
+                        continue;
+                    }
+
+                    let attributes = self.codecs.serialize_all(&entity.components);
+                    let state_blob = self.codecs.serialize_all_binary(&entity.components).ok();
+                    let payload = crate::snapshotter::SnapshotPayload {
+                        guid: entity.guid,
+                        position: entity.position,
+                        rotation: entity.rotation,
+                        attributes,
+                        state_blob,
+                        version: self.tick_counter,
+                        timestamp: now_sec,
+                    };
+
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        sender.try_send(payload)
+                    {
+                        metrics::counter!("mmo_node_snapshot_dropped_channel_full").increment(1);
+                    }
+                }
+            }
+        }
 
         // 4. Record simulation loop metrics
         let duration = start.elapsed();

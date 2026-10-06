@@ -254,6 +254,7 @@ impl Database {
                 pos_z REAL NOT NULL,
                 rotation REAL NOT NULL DEFAULT 0.0,
                 attributes_json TEXT NOT NULL DEFAULT '{}',
+                state_blob BLOB,
                 version BIGINT NOT NULL DEFAULT 1,
                 timestamp BIGINT NOT NULL
             );
@@ -428,7 +429,38 @@ impl Database {
         }
 
         self.ensure_items_container_column().await?;
+        self.ensure_entity_snapshots_blob_column().await?;
 
+        Ok(())
+    }
+
+    /// Idempotently verifies and adds `state_blob` column on the `entity_snapshots` table.
+    async fn ensure_entity_snapshots_blob_column(&self) -> Result<(), StorageError> {
+        use sqlx::Row;
+        match &self.backend {
+            DbBackend::Postgres(pool) => {
+                sqlx::query(
+                    "ALTER TABLE entity_snapshots ADD COLUMN IF NOT EXISTS state_blob BYTEA",
+                )
+                .execute(pool)
+                .await?;
+            }
+            DbBackend::Sqlite(pool) => {
+                let cols = sqlx::query("PRAGMA table_info(entity_snapshots)")
+                    .fetch_all(pool)
+                    .await?;
+                let has_col = cols.iter().any(|r| {
+                    r.try_get::<String, _>("name")
+                        .map(|n| n == "state_blob")
+                        .unwrap_or(false)
+                });
+                if !has_col {
+                    sqlx::query("ALTER TABLE entity_snapshots ADD COLUMN state_blob BLOB")
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
 

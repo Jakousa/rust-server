@@ -36,6 +36,15 @@ pub enum CodecError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("Binary serialization failed: {0}")]
+    BinarySerialization(#[from] rmp_serde::encode::Error),
+
+    #[error("Binary deserialization failed: {0}")]
+    BinaryDeserialization(#[from] rmp_serde::decode::Error),
+
+    #[error("Binary payload exceeds maximum allowed size ({size} > {max})")]
+    PayloadTooLarge { size: usize, max: usize },
 }
 
 /// Errors that can occur during modular client packet dispatch.
@@ -173,6 +182,36 @@ impl ComponentCodecRegistry {
             }
         }
         Ok(restored)
+    }
+
+    /// Serializes all registered components from a `ComponentStore` into an opaque MessagePack binary byte vector.
+    pub fn serialize_all_binary(&self, store: &ComponentStore) -> Result<Vec<u8>, CodecError> {
+        let json_val = self.serialize_all(store);
+        let bytes = rmp_serde::to_vec_named(&json_val)?;
+        Ok(bytes)
+    }
+
+    /// Maximum allowed binary state blob size (16 MB) to prevent out-of-memory attacks on malformed input.
+    pub const MAX_STATE_BLOB_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Deserializes components from an opaque MessagePack binary slice into the specified `ComponentStore`.
+    /// Validates slice size against `MAX_STATE_BLOB_SIZE`.
+    pub fn deserialize_binary_into(
+        &self,
+        blob: &[u8],
+        store: &mut ComponentStore,
+    ) -> Result<usize, CodecError> {
+        if blob.len() > Self::MAX_STATE_BLOB_SIZE {
+            return Err(CodecError::PayloadTooLarge {
+                size: blob.len(),
+                max: Self::MAX_STATE_BLOB_SIZE,
+            });
+        }
+        if blob.is_empty() {
+            return Ok(0);
+        }
+        let val: serde_json::Value = rmp_serde::from_slice(blob)?;
+        self.deserialize_into(&val, store)
     }
 }
 

@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: async-write-behind-snapshots
+  title: Asynchronous Write-Behind Entity State Snapshots
+  status: proposed
+  created: 2026-10-06
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: storage
+  specs:
+    - specs/storage/persistence/spec.md

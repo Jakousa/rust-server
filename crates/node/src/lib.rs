@@ -31,5 +31,5 @@ pub use network::{
 };
 pub use sector::{PlacementError, SectorManager, MAX_INTERACTION_DISTANCE};
 pub use sim::{AbilityCompensation, ContainerTransferNotification, TickSimulation};
-pub use snapshotter::WriteBehindSnapshotter;
+pub use snapshotter::{SnapshotPayload, WriteBehindSnapshotter};
 pub use world_snapshotter::WorldObjectWriteBehindSnapshotter;

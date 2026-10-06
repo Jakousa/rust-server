@@ -80,6 +80,7 @@ async fn test_end_to_end_persistence_and_simulation_recovery() {
                 "health": 100 - tick,
                 "mana": 50 + tick
             }),
+            state_blob: Some(vec![1, 2, 3, tick as u8]),
             version: tick,
             timestamp: 1000 + tick,
         };
@@ -106,6 +107,7 @@ async fn test_end_to_end_persistence_and_simulation_recovery() {
     assert_eq!(persisted_snapshot.version, 5);
     assert_eq!(persisted_snapshot.attributes["level"], json!(15));
     assert_eq!(persisted_snapshot.attributes["health"], json!(95));
+    assert_eq!(persisted_snapshot.state_blob, Some(vec![1, 2, 3, 5]));
 
     // Also verify character table position coordinates were updated
     let loaded_character = repo

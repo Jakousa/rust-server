@@ -30,6 +30,8 @@ pub struct EntitySnapshot {
     pub position: (f32, f32, f32),
     pub rotation: f32,
     pub attributes: serde_json::Value,
+    #[serde(default)]
+    pub state_blob: Option<Vec<u8>>,
     pub version: u64,
     pub timestamp: u64,
 }
@@ -317,6 +319,7 @@ mod tests {
             position: (1.0, 2.0, 3.0),
             rotation: 1.5,
             attributes: serde_json::json!({}),
+            state_blob: Some(vec![1, 2, 3]),
             version: 2,
             timestamp: 2000,
         };
