@@ -5,6 +5,7 @@
 
 pub mod ability_dispatcher;
 pub mod aoi;
+pub mod instance;
 pub mod kinematics;
 pub mod network;
 pub mod sector;
@@ -17,9 +18,11 @@ pub use ability_dispatcher::{
     CrossNodeDispatcher, DEFAULT_DISPATCH_TIMEOUT,
 };
 pub use aoi::{AoiBroadcastJob, AoiManager, CachedEntityState, ObserverConfig, ObserverState};
+pub use instance::{InstanceDomainManager, LocalInstanceDomain, NodeInstanceError};
 pub use kinematics::{
     EntityKinematicState, KinematicValidator, KinematicViolation, KinematicViolationReason,
 };
+
 pub use network::{
     execute_batch_entity_migration, execute_entity_migration, execute_remote_ability,
     extract_initiator, make_remote_command, BatchMigrationReport, BroadcastJob, EntityVelocity,

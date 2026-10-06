@@ -1694,6 +1694,8 @@ dependencies = [
  "metrics",
  "mmo-core",
  "mmo-schema",
+ "ring",
+ "thiserror 2.0.20",
  "tokio",
  "tonic",
 ]

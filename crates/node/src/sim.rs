@@ -35,6 +35,7 @@ pub struct TickSimulation {
     pub plugin_manager: PluginManager,
     pub aoi: AoiManager,
     pub sectors: crate::sector::SectorManager,
+    pub instances: crate::instance::InstanceDomainManager,
     pub next_world_object_seq: u32,
     pub pending_broadcast_jobs: Vec<AoiBroadcastJob>,
     pub kinematic_states: HashMap<Guid, EntityKinematicState>,
@@ -124,6 +125,7 @@ impl TickSimulation {
             plugin_manager: PluginManager::new(),
             aoi: AoiManager::new(),
             sectors: crate::sector::SectorManager::new(),
+            instances: crate::instance::InstanceDomainManager::new(),
             next_world_object_seq: 1,
             pending_broadcast_jobs: Vec::new(),
             kinematic_states: HashMap::new(),
@@ -419,6 +421,7 @@ impl TickSimulation {
         self.kinematic_states.remove(&guid);
         self.migrating_leases.remove(&guid);
         self.last_migration_ticks.remove(&guid);
+        self.instances.remove_entity(guid);
         if let Some(entity) = self.entity_store.despawn_by_guid(guid) {
             if !self.octree.remove(guid, entity.position) {
                 self.octree.remove_by_guid(guid);
@@ -483,6 +486,19 @@ impl TickSimulation {
 
         // 0.2 Drain pending container transfer notifications
         while let Ok(_notif) = self.container_transfer_receiver.try_recv() {}
+
+        // 0.3 Reap idle instance domains and evict remaining non-player entities
+        let reaped_instances = self.instances.reap_idle_instances();
+        for (reaped_inst_id, evicted_guids) in reaped_instances {
+            metrics::counter!("mmo_node_idle_instances_reaped_total").increment(1);
+            for g in evicted_guids {
+                self.despawn_entity(g);
+            }
+            eprintln!(
+                "[Node {}] Reaped idle instance domain {}",
+                self.node_id, reaped_inst_id
+            );
+        }
 
         // 1. Run batch tick systems registered by plugins
         let mut tick_ctx = TickContext {
