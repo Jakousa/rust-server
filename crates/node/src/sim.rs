@@ -558,7 +558,10 @@ impl TickSimulation {
 
         // 3.5. Periodic asynchronous write-behind snapshot dispatch
         if let Some(ref sender) = self.snapshot_sender {
-            if self.tick_counter.is_multiple_of(self.snapshot_interval_ticks) {
+            if self
+                .tick_counter
+                .is_multiple_of(self.snapshot_interval_ticks)
+            {
                 let now_sec = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
