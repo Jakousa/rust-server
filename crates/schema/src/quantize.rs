@@ -20,6 +20,9 @@ pub const VELOCITY_SCALE: f32 = 100.0;
 /// indicating teleportation, respawn, or extreme knockback that requires a keyframe.
 #[inline]
 pub fn is_teleport_delta(dx: f32, dy: f32, dz: f32) -> bool {
+    if !dx.is_finite() || !dy.is_finite() || !dz.is_finite() {
+        return true;
+    }
     dx.abs() > MAX_DELTA_POS || dy.abs() > MAX_DELTA_POS || dz.abs() > MAX_DELTA_POS
 }
 
@@ -202,6 +205,13 @@ mod tests {
         assert!(is_teleport_delta(256.0, 0.0, 0.0));
         assert!(is_teleport_delta(0.0, -300.0, 0.0));
         assert!(is_teleport_delta(0.0, 0.0, 1000.0));
+
+        // Non-finite (NaN / Infinity) coordinates must force teleport / keyframe fallback
+        assert!(is_teleport_delta(f32::NAN, 0.0, 0.0));
+        assert!(is_teleport_delta(0.0, f32::NAN, 0.0));
+        assert!(is_teleport_delta(0.0, 0.0, f32::NAN));
+        assert!(is_teleport_delta(f32::INFINITY, 0.0, 0.0));
+        assert!(is_teleport_delta(0.0, f32::NEG_INFINITY, 0.0));
 
         // Exact boundary checks for teleport threshold
         assert!(!is_teleport_delta(255.0, 0.0, 0.0));

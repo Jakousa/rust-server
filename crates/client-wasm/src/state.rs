@@ -1,5 +1,7 @@
 //! Client-side entity replica and state tracking.
 
+use std::collections::HashMap;
+
 use mmo_schema::client::{delta_flags, EntityDeltaState, EntityStatePacket};
 
 /// Extracts the entity type from the upper 16 bits of a GUID.
@@ -21,6 +23,7 @@ pub struct ClientEntityReplica {
     pub state_flags: u32,
     pub action_id: u32,
     pub cast_progress: f32,
+    pub attributes: HashMap<u16, u32>,
 }
 
 impl ClientEntityReplica {
@@ -39,12 +42,17 @@ impl ClientEntityReplica {
             state_flags: 0,
             action_id: 0,
             cast_progress: 0.0,
+            attributes: HashMap::new(),
         }
     }
 
     /// Creates a replica initialized from an authoritative `EntityStatePacket`.
     pub fn from_entity_state(pkt: &EntityStatePacket) -> Self {
         let entity_type = extract_entity_type(pkt.entity_id);
+        let mut attributes = HashMap::new();
+        attributes.insert(0, pkt.health);
+        attributes.insert(1, pkt.max_health);
+
         Self {
             entity_id: pkt.entity_id,
             entity_type,
@@ -57,6 +65,7 @@ impl ClientEntityReplica {
             state_flags: pkt.state_flags,
             action_id: 0,
             cast_progress: 0.0,
+            attributes,
         }
     }
 
@@ -89,9 +98,11 @@ impl ClientEntityReplica {
         }
         if mask & delta_flags::MASK_HEALTH != 0 {
             self.health = delta.health;
+            self.attributes.insert(0, delta.health);
         }
         if mask & delta_flags::MASK_MAX_HEALTH != 0 {
             self.max_health = delta.max_health;
+            self.attributes.insert(1, delta.max_health);
         }
         if mask & delta_flags::MASK_STATE_FLAGS != 0 {
             self.state_flags = delta.state_flags;
@@ -99,6 +110,21 @@ impl ClientEntityReplica {
         if mask & delta_flags::MASK_ACTION_ID != 0 {
             self.action_id = delta.action_id;
         }
+        if mask & delta_flags::MASK_ATTRIBUTES != 0 {
+            for attr in &delta.attributes {
+                self.attributes.insert(attr.attribute_id, attr.value);
+                if attr.attribute_id == 0 {
+                    self.health = attr.value;
+                } else if attr.attribute_id == 1 {
+                    self.max_health = attr.value;
+                }
+            }
+        }
+    }
+
+    /// Returns the scalar attribute value for the given attribute ID if present.
+    pub fn get_attribute(&self, attribute_id: u16) -> Option<u32> {
+        self.attributes.get(&attribute_id).copied()
     }
 
     /// Returns health normalized to 0.0 - 1.0 range.
@@ -114,6 +140,7 @@ impl ClientEntityReplica {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mmo_schema::client::ScalarAttributeDelta;
 
     #[test]
     fn test_replica_delta_application() {
@@ -133,6 +160,7 @@ mod tests {
             max_health: 100,
             state_flags: 0,
             action_id: 0,
+            attributes: Vec::new(),
         };
 
         replica.apply_delta(&delta);
@@ -141,5 +169,41 @@ mod tests {
         assert!((replica.position.2 - 19.0).abs() < 1e-4);
         assert_eq!(replica.health, 80);
         assert_eq!(replica.hp_percent(), 0.8);
+        assert_eq!(replica.get_attribute(0), Some(80));
+    }
+
+    #[test]
+    fn test_replica_scalar_attributes_application() {
+        let mut replica = ClientEntityReplica::new(42);
+        assert_eq!(replica.get_attribute(0), None);
+
+        let delta = EntityDeltaState {
+            entity_id: 42,
+            field_mask: delta_flags::MASK_ATTRIBUTES,
+            position: (0.0, 0.0, 0.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 0,
+            max_health: 0,
+            state_flags: 0,
+            action_id: 0,
+            attributes: vec![
+                ScalarAttributeDelta {
+                    attribute_id: 0,
+                    value: 75,
+                },
+                ScalarAttributeDelta {
+                    attribute_id: 10,
+                    value: 999,
+                },
+            ],
+        };
+
+        replica.apply_delta(&delta);
+        assert_eq!(replica.health, 75);
+        assert_eq!(replica.get_attribute(0), Some(75));
+        assert_eq!(replica.get_attribute(10), Some(999));
+        assert_eq!(replica.get_attribute(99), None);
     }
 }

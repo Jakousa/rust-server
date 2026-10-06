@@ -559,6 +559,15 @@ pub mod delta_flags {
     pub const MASK_STATE_FLAGS: u16 = 1 << 9;
     /// Varint action/animation ID present.
     pub const MASK_ACTION_ID: u16 = 1 << 10;
+    /// Generic scalar attributes present (varint count followed by attribute ID and value pairs).
+    pub const MASK_ATTRIBUTES: u16 = 1 << 11;
+}
+
+/// Unopinionated generic scalar attribute delta identified by numeric attribute ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarAttributeDelta {
+    pub attribute_id: u16,
+    pub value: u32,
 }
 
 /// A single entity's compressed delta update within an `EntityDeltaBatchPacket`.
@@ -574,6 +583,7 @@ pub struct EntityDeltaState {
     pub max_health: u32,
     pub state_flags: u32,
     pub action_id: u32,
+    pub attributes: Vec<ScalarAttributeDelta>,
 }
 
 impl Default for EntityDeltaState {
@@ -589,6 +599,7 @@ impl Default for EntityDeltaState {
             max_health: 0,
             state_flags: 0,
             action_id: 0,
+            attributes: Vec::new(),
         }
     }
 }
@@ -642,6 +653,14 @@ impl EntityDeltaState {
 
         if self.field_mask & delta_flags::MASK_ACTION_ID != 0 {
             put_varint_u32(dst, self.action_id);
+        }
+
+        if self.field_mask & delta_flags::MASK_ATTRIBUTES != 0 {
+            put_varint_u32(dst, self.attributes.len() as u32);
+            for attr in &self.attributes {
+                put_varint_u32(dst, attr.attribute_id as u32);
+                put_varint_u32(dst, attr.value);
+            }
         }
     }
 
@@ -751,6 +770,31 @@ impl EntityDeltaState {
             action_id = get_varint_u32(src)?;
         }
 
+        let mut attributes = Vec::new();
+        if field_mask & delta_flags::MASK_ATTRIBUTES != 0 {
+            let attr_len = get_varint_u32(src)? as usize;
+            if attr_len > 256 {
+                return Err(ClientCodecError::InvalidData(format!(
+                    "Too many scalar attributes in delta: {}",
+                    attr_len
+                )));
+            }
+            attributes.reserve_exact(attr_len);
+            for _ in 0..attr_len {
+                let attr_id = get_varint_u32(src)?;
+                if attr_id > u16::MAX as u32 {
+                    return Err(ClientCodecError::InvalidData(
+                        "Attribute ID exceeds u16::MAX".to_string(),
+                    ));
+                }
+                let val = get_varint_u32(src)?;
+                attributes.push(ScalarAttributeDelta {
+                    attribute_id: attr_id as u16,
+                    value: val,
+                });
+            }
+        }
+
         Ok(Self {
             entity_id,
             field_mask,
@@ -762,6 +806,7 @@ impl EntityDeltaState {
             max_health,
             state_flags,
             action_id,
+            attributes,
         })
     }
 }
@@ -1746,6 +1791,7 @@ mod tests {
                     max_health: 100,
                     state_flags: 0,
                     action_id: 0,
+                    attributes: Vec::new(),
                 },
                 EntityDeltaState {
                     entity_id: 102,
@@ -1761,6 +1807,7 @@ mod tests {
                     max_health: 100,
                     state_flags: 0,
                     action_id: 0,
+                    attributes: Vec::new(),
                 },
             ],
         });
@@ -2245,6 +2292,33 @@ mod tests {
         assert_eq!(dec_act.entity_id, 10);
         assert_eq!(dec_act.field_mask, delta_flags::MASK_ACTION_ID);
         assert_eq!(dec_act.action_id, 7777);
+
+        // MASK_ATTRIBUTES
+        let s_attr = EntityDeltaState {
+            entity_id: 11,
+            field_mask: delta_flags::MASK_ATTRIBUTES,
+            attributes: vec![
+                ScalarAttributeDelta {
+                    attribute_id: 1,
+                    value: 100,
+                },
+                ScalarAttributeDelta {
+                    attribute_id: 5,
+                    value: 5000,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        s_attr.encode(&mut buf);
+        let dec_attr = EntityDeltaState::decode(&mut buf).unwrap();
+        assert_eq!(dec_attr.entity_id, 11);
+        assert_eq!(dec_attr.field_mask, delta_flags::MASK_ATTRIBUTES);
+        assert_eq!(dec_attr.attributes.len(), 2);
+        assert_eq!(dec_attr.attributes[0].attribute_id, 1);
+        assert_eq!(dec_attr.attributes[0].value, 100);
+        assert_eq!(dec_attr.attributes[1].attribute_id, 5);
+        assert_eq!(dec_attr.attributes[1].value, 5000);
     }
 
     #[test]
@@ -2258,7 +2332,8 @@ mod tests {
             | delta_flags::MASK_HEALTH
             | delta_flags::MASK_MAX_HEALTH
             | delta_flags::MASK_STATE_FLAGS
-            | delta_flags::MASK_ACTION_ID;
+            | delta_flags::MASK_ACTION_ID
+            | delta_flags::MASK_ATTRIBUTES;
 
         let state = EntityDeltaState {
             entity_id: 999,
@@ -2271,6 +2346,16 @@ mod tests {
             max_health: 120,
             state_flags: 0xF00F,
             action_id: 42,
+            attributes: vec![
+                ScalarAttributeDelta {
+                    attribute_id: 10,
+                    value: 420,
+                },
+                ScalarAttributeDelta {
+                    attribute_id: 20,
+                    value: 840,
+                },
+            ],
         };
 
         let mut buf = BytesMut::new();
@@ -2291,6 +2376,11 @@ mod tests {
         assert_eq!(decoded.max_health, 120);
         assert_eq!(decoded.state_flags, 0xF00F);
         assert_eq!(decoded.action_id, 42);
+        assert_eq!(decoded.attributes.len(), 2);
+        assert_eq!(decoded.attributes[0].attribute_id, 10);
+        assert_eq!(decoded.attributes[0].value, 420);
+        assert_eq!(decoded.attributes[1].attribute_id, 20);
+        assert_eq!(decoded.attributes[1].value, 840);
     }
 
     #[test]
@@ -2403,6 +2493,43 @@ mod tests {
                 got: 0,
             })
         );
+
+        // Attributes count exceeds 256
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1);
+        buf.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf, 257); // > 256
+        let mut slice = &buf[..];
+        assert!(matches!(
+            EntityDeltaState::decode(&mut slice),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // Attribute ID exceeds u16::MAX
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1);
+        buf.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf, 1);
+        put_varint_u32(&mut buf, 70000); // > u16::MAX
+        put_varint_u32(&mut buf, 100);
+        let mut slice = &buf[..];
+        assert!(matches!(
+            EntityDeltaState::decode(&mut slice),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // Attributes list truncated
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1);
+        buf.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf, 2); // claims 2 attributes
+        put_varint_u32(&mut buf, 1);
+        put_varint_u32(&mut buf, 100); // only 1 attribute provided
+        let mut slice = &buf[..];
+        assert!(matches!(
+            EntityDeltaState::decode(&mut slice),
+            Err(ClientCodecError::BufferTooShort { .. })
+        ));
     }
 
     #[test]

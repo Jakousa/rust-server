@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: aoi-culling-bitpacked-deltas
+  title: Aggressive AoI Culling & Bit-Packed Deltas
+  status: proposed
+  created: 2026-10-06
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: network
+  specs:
+    - specs/network/aoi-culling-bitpacked-deltas/spec.md

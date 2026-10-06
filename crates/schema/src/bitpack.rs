@@ -154,6 +154,18 @@ impl BitWriter {
         self.buffer.len() + if self.bit_offset > 0 { 1 } else { 0 }
     }
 
+    /// Writes an unsigned 64-bit varint, automatically ensuring byte alignment first.
+    pub fn put_varint_u64(&mut self, val: u64) {
+        self.flush_byte_align();
+        put_varint_u64(&mut self.buffer, val);
+    }
+
+    /// Writes an unsigned 32-bit varint, automatically ensuring byte alignment first.
+    pub fn put_varint_u32(&mut self, val: u32) {
+        self.flush_byte_align();
+        put_varint_u32(&mut self.buffer, val);
+    }
+
     /// Finalizes the bitstream by aligning to byte boundary and returning the underlying bytes.
     pub fn finish(mut self) -> BytesMut {
         self.flush_byte_align();
@@ -261,6 +273,169 @@ impl<'a> BitReader<'a> {
         self.byte_pos += len;
         Ok(slice)
     }
+
+    /// Reads an unsigned 64-bit integer using LEB128 varint encoding, automatically aligning to byte boundary first.
+    pub fn get_varint_u64(&mut self) -> Result<u64, ClientCodecError> {
+        self.align_byte();
+        let mut slice = &self.data[self.byte_pos..];
+        let original_len = slice.len();
+        let val = get_varint_u64(&mut slice)?;
+        let consumed = original_len - slice.len();
+        self.byte_pos += consumed;
+        Ok(val)
+    }
+
+    /// Reads an unsigned 32-bit integer using LEB128 varint encoding, automatically aligning to byte boundary first.
+    pub fn get_varint_u32(&mut self) -> Result<u32, ClientCodecError> {
+        self.align_byte();
+        let mut slice = &self.data[self.byte_pos..];
+        let original_len = slice.len();
+        let val = get_varint_u32(&mut slice)?;
+        let consumed = original_len - slice.len();
+        self.byte_pos += consumed;
+        Ok(val)
+    }
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! encode_bitpack_field {
+    ($writer:expr, $val:expr, bool) => {
+        $writer.write_bool(*$val);
+    };
+    ($writer:expr, $val:expr, bits($n:expr)) => {
+        $writer.write_bits(*$val as u64, $n);
+    };
+    ($writer:expr, $val:expr, varint) => {
+        $writer.put_varint_u32(*$val);
+    };
+    ($writer:expr, $val:expr, varint64) => {
+        $writer.put_varint_u64(*$val);
+    };
+    ($writer:expr, $val:expr, delta_pos) => {
+        $writer.write_bits(
+            $crate::quantize::quantize_delta_i16(*$val) as u16 as u64,
+            16,
+        );
+    };
+    ($writer:expr, $val:expr, yaw_u8) => {
+        $writer.write_bits($crate::quantize::quantize_yaw_u8(*$val) as u64, 8);
+    };
+    ($writer:expr, $val:expr, pitch_i8) => {
+        $writer.write_bits($crate::quantize::quantize_pitch_i8(*$val) as u8 as u64, 8);
+    };
+    ($writer:expr, $val:expr, vel_i16) => {
+        $writer.write_bits(
+            $crate::quantize::quantize_velocity_i16(*$val) as u16 as u64,
+            16,
+        );
+    };
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! decode_bitpack_field {
+    ($reader:expr, $type:ty, bool) => {
+        $reader.read_bool()?
+    };
+    ($reader:expr, $type:ty, bits($n:expr)) => {
+        $reader.read_bits($n)? as $type
+    };
+    ($reader:expr, $type:ty, varint) => {
+        $reader.get_varint_u32()?
+    };
+    ($reader:expr, $type:ty, varint64) => {
+        $reader.get_varint_u64()?
+    };
+    ($reader:expr, $type:ty, delta_pos) => {
+        $crate::quantize::dequantize_delta_i16($reader.read_bits(16)? as u16 as i16)
+    };
+    ($reader:expr, $type:ty, yaw_u8) => {
+        $crate::quantize::dequantize_yaw_u8($reader.read_bits(8)? as u8)
+    };
+    ($reader:expr, $type:ty, pitch_i8) => {
+        $crate::quantize::dequantize_pitch_i8($reader.read_bits(8)? as u8 as i8)
+    };
+    ($reader:expr, $type:ty, vel_i16) => {
+        $crate::quantize::dequantize_velocity_i16($reader.read_bits(16)? as u16 as i16)
+    };
+}
+
+/// Macro for defining compact bit-packed delta structures.
+///
+/// Automatically generates:
+/// - Associated field mask constants (`MASK_<FIELD> = 1 << bit_index`)
+/// - A struct where optional fields are wrapped in `Option<T>`
+/// - `compute_field_mask(&self) -> u16`
+/// - `encode(&self, writer: &mut BitWriter)`
+/// - `decode(reader: &mut BitReader) -> Result<Self, ClientCodecError>`
+#[macro_export]
+macro_rules! bitpack_delta {
+    (
+        $(#[$struct_meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field:ident $( ( $mask_const:ident ) )? : $type:ty => $directive:ident $( ( $opt:expr ) )? = $mask_bit:expr
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$struct_meta])*
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                pub $field: Option<$type>,
+            )+
+        }
+
+        impl $name {
+            $(
+                $(
+                    #[doc = concat!("Presence bitmask constant for `", stringify!($field), "`")]
+                    pub const $mask_const: u16 = 1u16 << ($mask_bit);
+                )?
+            )+
+
+            /// Computes the bitmask of all currently populated fields.
+            #[inline]
+            pub fn compute_field_mask(&self) -> u16 {
+                let mut mask = 0u16;
+                $(
+                    if self.$field.is_some() {
+                        mask |= 1u16 << ($mask_bit);
+                    }
+                )+
+                mask
+            }
+
+            /// Encodes this delta into a [`$crate::bitpack::BitWriter`].
+            pub fn encode(&self, writer: &mut $crate::bitpack::BitWriter) {
+                let mask = self.compute_field_mask();
+                writer.write_bits(mask as u64, 16);
+
+                $(
+                    if let Some(ref val) = self.$field {
+                        $crate::encode_bitpack_field!(writer, val, $directive $( ( $opt ) )?);
+                    }
+                )+
+            }
+
+            /// Decodes this delta from a [`$crate::bitpack::BitReader`].
+            pub fn decode(reader: &mut $crate::bitpack::BitReader<'_>) -> Result<Self, $crate::client::ClientCodecError> {
+                let mask = reader.read_bits(16)? as u16;
+
+                Ok(Self {
+                    $(
+                        $field: if mask & (1u16 << ($mask_bit)) != 0 {
+                            Some($crate::decode_bitpack_field!(reader, $type, $directive $( ( $opt ) )?))
+                        } else {
+                            None
+                        },
+                    )+
+                })
+            }
+        }
+    };
 }
 
 #[cfg(test)]
@@ -593,5 +768,108 @@ mod tests {
                 got: 5,
             })
         );
+    }
+
+    #[test]
+    fn test_bitwriter_and_reader_varints_roundtrip() {
+        let mut writer = BitWriter::with_capacity(32);
+        writer.write_bits(0b101, 3);
+        writer.put_varint_u32(123456);
+        writer.put_varint_u64(9876543210123);
+        writer.write_bool(true);
+
+        let bytes = writer.finish();
+        let mut reader = BitReader::new(&bytes);
+
+        assert_eq!(reader.read_bits(3).unwrap(), 0b101);
+        assert_eq!(reader.get_varint_u32().unwrap(), 123456);
+        assert_eq!(reader.get_varint_u64().unwrap(), 9876543210123);
+        assert!(reader.read_bool().unwrap());
+    }
+
+    bitpack_delta! {
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct TestKinematicDelta {
+            dx (MASK_DX): f32 => delta_pos = 0,
+            dy (MASK_DY): f32 => delta_pos = 1,
+            dz (MASK_DZ): f32 => delta_pos = 2,
+            yaw (MASK_YAW): f32 => yaw_u8 = 3,
+            pitch (MASK_PITCH): f32 => pitch_i8 = 4,
+            vel_x (MASK_VEL_X): f32 => vel_i16 = 5,
+            crouching (MASK_CROUCHING): bool => bool = 6,
+            action_id (MASK_ACTION): u32 => varint = 7,
+        }
+    }
+
+    #[test]
+    fn test_bitpack_delta_macro_roundtrip_full() {
+        assert_eq!(TestKinematicDelta::MASK_DX, 1 << 0);
+        assert_eq!(TestKinematicDelta::MASK_DY, 1 << 1);
+        assert_eq!(TestKinematicDelta::MASK_DZ, 1 << 2);
+        assert_eq!(TestKinematicDelta::MASK_YAW, 1 << 3);
+        assert_eq!(TestKinematicDelta::MASK_PITCH, 1 << 4);
+        assert_eq!(TestKinematicDelta::MASK_VEL_X, 1 << 5);
+        assert_eq!(TestKinematicDelta::MASK_CROUCHING, 1 << 6);
+        assert_eq!(TestKinematicDelta::MASK_ACTION, 1 << 7);
+
+        let delta = TestKinematicDelta {
+            dx: Some(1.25),
+            dy: Some(-0.5),
+            dz: Some(10.0),
+            yaw: Some(1.57),
+            pitch: Some(-0.25),
+            vel_x: Some(3.5),
+            crouching: Some(true),
+            action_id: Some(42),
+        };
+
+        let mut writer = BitWriter::with_capacity(32);
+        delta.encode(&mut writer);
+        let bytes = writer.finish();
+
+        let mut reader = BitReader::new(&bytes);
+        let decoded = TestKinematicDelta::decode(&mut reader).expect("decode failed");
+
+        assert!((decoded.dx.unwrap() - 1.25).abs() < 0.01);
+        assert!((decoded.dy.unwrap() - (-0.5)).abs() < 0.01);
+        assert!((decoded.dz.unwrap() - 10.0).abs() < 0.01);
+        assert!((decoded.yaw.unwrap() - 1.57).abs() < 0.03);
+        assert!((decoded.pitch.unwrap() - (-0.25)).abs() < 0.03);
+        assert!((decoded.vel_x.unwrap() - 3.5).abs() < 0.02);
+        assert_eq!(decoded.crouching, Some(true));
+        assert_eq!(decoded.action_id, Some(42));
+    }
+
+    #[test]
+    fn test_bitpack_delta_macro_roundtrip_sparse() {
+        let sparse = TestKinematicDelta {
+            dx: Some(0.125),
+            dy: None,
+            dz: None,
+            yaw: Some(std::f32::consts::PI),
+            pitch: None,
+            vel_x: None,
+            crouching: None,
+            action_id: None,
+        };
+
+        let mut writer = BitWriter::with_capacity(16);
+        sparse.encode(&mut writer);
+        let bytes = writer.finish();
+
+        // 16 bits mask (2 bytes) + 16 bits dx (2 bytes) + 8 bits yaw (1 byte) = 5 bytes total!
+        assert_eq!(bytes.len(), 5);
+
+        let mut reader = BitReader::new(&bytes);
+        let decoded = TestKinematicDelta::decode(&mut reader).expect("sparse decode failed");
+
+        assert!((decoded.dx.unwrap() - 0.125).abs() < 0.01);
+        assert!(decoded.dy.is_none());
+        assert!(decoded.dz.is_none());
+        assert!((decoded.yaw.unwrap() - std::f32::consts::PI).abs() < 0.03);
+        assert!(decoded.pitch.is_none());
+        assert!(decoded.vel_x.is_none());
+        assert!(decoded.crouching.is_none());
+        assert!(decoded.action_id.is_none());
     }
 }
