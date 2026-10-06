@@ -988,4 +988,142 @@ mod tests {
             .await;
         assert!(matches!(bad_item, Err(StorageError::ItemNotFound(..))));
     }
+
+    #[test]
+    fn test_time_helpers() {
+        let ms = current_time_ms();
+        let secs = current_time_secs();
+
+        // Timestamps should be positive and well past year 2023 (> 1_700_000_000)
+        assert!(secs > 1_700_000_000);
+        assert!(ms > 1_700_000_000_000);
+        assert!(ms > secs * 900);
+        assert!(ms >= secs * 1000);
+    }
+
+    #[tokio::test]
+    async fn test_get_escrow_status_parsing_and_transitions() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c_dep, c_ben, c_esc) = setup_escrow_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+
+        // Add items to depositor container
+        let item1 = ItemRecordBuilder::new("gem_status_1")
+            .container_id(c_dep)
+            .item_def_id(91)
+            .slot(0)
+            .build();
+        let item2 = ItemRecordBuilder::new("gem_status_2")
+            .container_id(c_dep)
+            .item_def_id(92)
+            .slot(1)
+            .build();
+        char_repo.add_item(&item1).await.unwrap();
+        char_repo.add_item(&item2).await.unwrap();
+
+        // 1. Create escrow -> status "held"
+        escrow_coord
+            .create_escrow(
+                "escrow_status_held",
+                c_dep,
+                c_ben,
+                c_esc,
+                &["gem_status_1".to_string()],
+                "secret_1",
+                60,
+            )
+            .await
+            .unwrap();
+
+        let held_record = escrow_coord
+            .get_escrow("escrow_status_held")
+            .await
+            .unwrap()
+            .expect("record exists");
+        assert_eq!(held_record.status, EscrowStatus::Held);
+
+        // Release escrow -> status "settled"
+        let released = escrow_coord
+            .release_escrow("escrow_status_held", "secret_1")
+            .await
+            .unwrap();
+        assert!(released);
+
+        let settled_record = escrow_coord
+            .get_escrow("escrow_status_held")
+            .await
+            .unwrap()
+            .expect("record exists");
+        assert_eq!(settled_record.status, EscrowStatus::Settled);
+
+        // Releasing already settled escrow returns EscrowAlreadySettled
+        let re_release = escrow_coord
+            .release_escrow("escrow_status_held", "secret_1")
+            .await;
+        assert!(matches!(
+            re_release,
+            Err(StorageError::EscrowAlreadySettled(_))
+        ));
+
+        // Refunding already settled escrow returns false
+        let re_refund = escrow_coord
+            .refund_escrow("escrow_status_held")
+            .await
+            .unwrap();
+        assert!(!re_refund);
+
+        // 2. Create second escrow -> refund -> status "refunded"
+        escrow_coord
+            .create_escrow(
+                "escrow_status_refund",
+                c_dep,
+                c_ben,
+                c_esc,
+                &["gem_status_2".to_string()],
+                "secret_2",
+                60,
+            )
+            .await
+            .unwrap();
+
+        let refunded = escrow_coord
+            .refund_escrow("escrow_status_refund")
+            .await
+            .unwrap();
+        assert!(refunded);
+
+        let refunded_record = escrow_coord
+            .get_escrow("escrow_status_refund")
+            .await
+            .unwrap()
+            .expect("record exists");
+        assert_eq!(refunded_record.status, EscrowStatus::Refunded);
+
+        // Releasing already refunded escrow returns EscrowAlreadySettled (status != "held")
+        let release_refunded = escrow_coord
+            .release_escrow("escrow_status_refund", "secret_2")
+            .await;
+        assert!(matches!(
+            release_refunded,
+            Err(StorageError::EscrowAlreadySettled(_))
+        ));
+
+        // Refunding already refunded escrow returns false
+        let refund_again = escrow_coord
+            .refund_escrow("escrow_status_refund")
+            .await
+            .unwrap();
+        assert!(!refund_again);
+
+        // 3. Test unknown status parsing error branch
+        if let DbBackend::Sqlite(pool) = db.backend() {
+            sqlx::query("UPDATE escrows SET status = 'corrupted_status' WHERE escrow_id = 'escrow_status_held'")
+                .execute(pool)
+                .await
+                .unwrap();
+            let err_parse = escrow_coord.get_escrow("escrow_status_held").await;
+            assert!(matches!(err_parse, Err(StorageError::TradeError(_))));
+        }
+    }
 }

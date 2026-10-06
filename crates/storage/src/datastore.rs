@@ -511,6 +511,69 @@ mod tests {
     }
 
     #[test]
+    fn test_data_document_get_bool() {
+        let mut props = DynamicProperties::new();
+        props.set("flag_true", true);
+        props.set("flag_false", false);
+        props.set("not_a_bool", "hello");
+
+        let doc = DataDocument::new("settings", "config_01", props);
+        assert_eq!(doc.get_bool("flag_true"), Some(true));
+        assert_eq!(doc.get_bool("flag_false"), Some(false));
+        assert_eq!(doc.get_bool("not_a_bool"), None);
+        assert_eq!(doc.get_bool("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_datastore_collections_and_clear() {
+        let store = DataStore::new();
+
+        // Initially empty
+        assert!(store.list_collections().is_empty());
+        assert_eq!(store.count(), 0);
+        assert!(store.get_collection("items").is_empty());
+
+        let mut p1 = DynamicProperties::new();
+        p1.set("val", 1);
+        let mut p2 = DynamicProperties::new();
+        p2.set("val", 2);
+        let mut p3 = DynamicProperties::new();
+        p3.set("val", 3);
+
+        store.insert_document(DataDocument::new("items", "item_a", p1));
+        store.insert_document(DataDocument::new("items", "item_b", p2));
+        store.insert_document(DataDocument::new("monsters", "boss_1", p3));
+
+        assert_eq!(store.count(), 3);
+        assert_eq!(store.collection_count("items"), 2);
+        assert_eq!(store.collection_count("monsters"), 1);
+        assert_eq!(store.collection_count("empty_col"), 0);
+
+        let mut cols = store.list_collections();
+        cols.sort();
+        assert_eq!(cols, vec!["items".to_string(), "monsters".to_string()]);
+
+        let items = store.get_collection("items");
+        assert_eq!(items.len(), 2);
+        let item_ids: std::collections::HashSet<String> =
+            items.iter().map(|d| d.id.clone()).collect();
+        assert!(item_ids.contains("item_a"));
+        assert!(item_ids.contains("item_b"));
+
+        let monsters = store.get_collection("monsters");
+        assert_eq!(monsters.len(), 1);
+        assert_eq!(monsters[0].id, "boss_1");
+
+        // Clear datastore
+        store.clear();
+        assert_eq!(store.count(), 0);
+        assert!(store.list_collections().is_empty());
+        assert!(store.get_collection("items").is_empty());
+        assert!(store.get_collection("monsters").is_empty());
+        assert_eq!(store.collection_count("items"), 0);
+    }
+
+    #[test]
     fn test_apply_to_entity() {
         let store = DataStore::new();
 
