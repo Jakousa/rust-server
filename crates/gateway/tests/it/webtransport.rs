@@ -121,6 +121,7 @@ async fn test_webtransport_gateway_e2e_full_lifecycle() {
             max_health: 100,
             state_flags: 0,
             action_id: 0,
+            attributes: Vec::new(),
         }],
     });
 

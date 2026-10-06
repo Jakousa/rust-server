@@ -7,7 +7,7 @@ pub mod interp;
 pub mod state;
 pub mod world;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::{Bytes, BytesMut};
 use serde::Serialize;
@@ -45,6 +45,7 @@ pub struct WasmClientWorld {
     received_packets: u64,
     client_time: f64,
     incoming_buffer: BytesMut,
+    pending_acks: VecDeque<u64>,
 }
 
 impl Default for WasmClientWorld {
@@ -69,6 +70,7 @@ impl WasmClientWorld {
             received_packets: 0,
             client_time: 0.0,
             incoming_buffer: BytesMut::with_capacity(16384),
+            pending_acks: VecDeque::new(),
         }
     }
 
@@ -113,6 +115,14 @@ impl WasmClientWorld {
             ClientPacket::EntityDeltaBatch(batch) => {
                 self.latest_server_tick = batch.server_tick;
                 self.latest_baseline_tick = batch.baseline_tick;
+
+                // Queue server tick receipt for delta baseline acknowledgment
+                if !self.pending_acks.contains(&batch.server_tick) {
+                    if self.pending_acks.len() >= 128 {
+                        self.pending_acks.pop_front();
+                    }
+                    self.pending_acks.push_back(batch.server_tick);
+                }
 
                 // Process despawns included in the batch
                 for despawn_id in batch.despawns {
@@ -258,6 +268,29 @@ impl WasmClientWorld {
         Some(pkt.encode())
     }
 
+    /// Drains the oldest pending ACK packet for WASM JS transmission.
+    pub fn drain_ack_packet(&mut self) -> Option<Vec<u8>> {
+        let tick = self.pending_acks.pop_front()?;
+        let pkt = ClientPacket::ClientAck(ClientAckPacket {
+            session_id: self.session_id,
+            observed_tick: tick,
+            ack_mask: 0,
+        });
+        Some(pkt.encode())
+    }
+
+    /// Returns the number of currently queued unacknowledged server ticks for JS/WASM.
+    pub fn pending_acks_len(&self) -> usize {
+        self.pending_acks.len()
+    }
+
+    /// Retrieves a scalar attribute value for a given entity, if present.
+    pub fn get_entity_attribute(&self, entity_id: u64, attribute_id: u16) -> Option<u32> {
+        self.entities
+            .get(&entity_id)
+            .and_then(|r| r.get_attribute(attribute_id))
+    }
+
     /// Encodes an action or ability cast interaction for reliable stream transmission.
     pub fn encode_interaction(&mut self, target_guid: u64, action_id: u32) -> Vec<u8> {
         let source_guid = self.local_player_id.unwrap_or(0);
@@ -365,6 +398,27 @@ impl WasmClientWorld {
     }
 }
 
+impl WasmClientWorld {
+    /// Drains all pending unacknowledged tick receipts and returns their serialized binary `ClientAckPacket`s.
+    pub fn drain_pending_acks(&mut self) -> Vec<Vec<u8>> {
+        let mut packets = Vec::with_capacity(self.pending_acks.len());
+        for tick in self.pending_acks.drain(..) {
+            let pkt = ClientPacket::ClientAck(ClientAckPacket {
+                session_id: self.session_id,
+                observed_tick: tick,
+                ack_mask: 0,
+            });
+            packets.push(pkt.encode());
+        }
+        packets
+    }
+
+    /// Returns the number of currently queued unacknowledged server ticks.
+    pub fn pending_acks_count(&self) -> usize {
+        self.pending_acks.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +477,7 @@ mod tests {
                 max_health: 100,
                 state_flags: 0,
                 action_id: 0,
+                attributes: Vec::new(),
             }],
         });
 
@@ -446,7 +501,12 @@ mod tests {
         let move_bytes = world.encode_movement(12.0, 0.0, 15.0, std::f32::consts::PI, 1);
         assert!(!move_bytes.is_empty());
 
-        // Check ACK encoding
+        // Check ACK queue and encoding
+        assert_eq!(world.pending_acks_count(), 1);
+        let drained_acks = world.drain_pending_acks();
+        assert_eq!(drained_acks.len(), 1);
+        assert_eq!(world.pending_acks_count(), 0);
+
         let ack_bytes = world.encode_ack().expect("should encode ack");
         assert!(!ack_bytes.is_empty());
 
@@ -537,5 +597,106 @@ mod tests {
             .expect("should process despawn");
         assert_eq!(world.world_objects_count(), 0);
         assert_eq!(world.get_world_objects_render_buffer().len(), 0);
+    }
+
+    #[test]
+    fn test_wasm_client_world_auto_ack_and_scalar_attributes() {
+        use mmo_schema::client::ScalarAttributeDelta;
+
+        let mut world = WasmClientWorld::new();
+        world.set_session_id(777);
+
+        assert_eq!(world.pending_acks_count(), 0);
+        assert_eq!(world.pending_acks_len(), 0);
+
+        // Receive batch 1 at tick 10
+        let batch1 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 10,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: 100,
+                field_mask: delta_flags::MASK_ATTRIBUTES,
+                position: (0.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 0,
+                max_health: 0,
+                state_flags: 0,
+                action_id: 0,
+                attributes: vec![
+                    ScalarAttributeDelta {
+                        attribute_id: 5,
+                        value: 42,
+                    },
+                    ScalarAttributeDelta {
+                        attribute_id: 0,
+                        value: 95,
+                    },
+                ],
+            }],
+        });
+        world
+            .process_packet(&batch1.encode())
+            .expect("process batch 1");
+
+        assert_eq!(world.pending_acks_count(), 1);
+        assert_eq!(world.get_entity_attribute(100, 5), Some(42));
+        assert_eq!(world.get_entity_attribute(100, 0), Some(95));
+        assert_eq!(world.get_entity_attribute(100, 99), None);
+
+        // Receive batch 2 at tick 11
+        let batch2 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 11,
+            baseline_tick: 10,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: 100,
+                field_mask: delta_flags::MASK_ATTRIBUTES,
+                position: (0.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 0,
+                max_health: 0,
+                state_flags: 0,
+                action_id: 0,
+                attributes: vec![ScalarAttributeDelta {
+                    attribute_id: 5,
+                    value: 84,
+                }],
+            }],
+        });
+        world
+            .process_packet(&batch2.encode())
+            .expect("process batch 2");
+
+        assert_eq!(world.pending_acks_count(), 2);
+        assert_eq!(world.get_entity_attribute(100, 5), Some(84));
+
+        // Drain first ack via drain_ack_packet
+        let ack1_bytes = world.drain_ack_packet().expect("must have ack 1");
+        assert_eq!(world.pending_acks_len(), 1);
+        let mut buf1 = bytes::BytesMut::from(&ack1_bytes[..]);
+        if let Ok(Some(ClientPacket::ClientAck(ack1))) = ClientPacket::decode_frame(&mut buf1) {
+            assert_eq!(ack1.session_id, 777);
+            assert_eq!(ack1.observed_tick, 10);
+        } else {
+            panic!("Expected ClientAckPacket for tick 10");
+        }
+
+        // Drain remaining acks via drain_pending_acks
+        let remaining_acks = world.drain_pending_acks();
+        assert_eq!(remaining_acks.len(), 1);
+        assert_eq!(world.pending_acks_count(), 0);
+
+        let mut buf2 = bytes::BytesMut::from(&remaining_acks[0][..]);
+        if let Ok(Some(ClientPacket::ClientAck(ack2))) = ClientPacket::decode_frame(&mut buf2) {
+            assert_eq!(ack2.session_id, 777);
+            assert_eq!(ack2.observed_tick, 11);
+        } else {
+            panic!("Expected ClientAckPacket for tick 11");
+        }
     }
 }

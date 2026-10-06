@@ -215,3 +215,59 @@ fn test_baseline_tracker_memory_bounding_under_latency() {
     );
     assert!(worst_case_mem_estimate_mb <= 400.0);
 }
+
+#[test]
+fn test_density_throttling_and_frustum_culling_egress_scaling() {
+    let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+    let mut store = EntityStore::new();
+    let mut octree = Octree::new(bounds);
+    let mut aoi = AoiManager::new();
+
+    let observer_guid = make_guid(1);
+    store.spawn(observer_guid, (0.0, 0.0, 0.0));
+    store.get_mut_by_guid(observer_guid).unwrap().rotation = 0.0; // Facing +Z
+    octree.insert(observer_guid, (0.0, 0.0, 0.0));
+
+    // Spawn 200 entities around observer (half in front +Z, half behind -Z)
+    for i in 2..=201 {
+        let guid = make_guid(i as u64);
+        let z = if i % 2 == 0 { 20.0 } else { -20.0 };
+        let x = ((i % 10) as f32 - 5.0) * 2.0;
+        store.spawn(guid, (x, 0.0, z));
+        octree.insert(guid, (x, 0.0, z));
+    }
+
+    // Config with density throttling (max_entities: 40) and frustum culling
+    let config = ObserverConfig {
+        base_radius: 100.0,
+        max_entities: 40,
+        enable_frustum_culling: true,
+        fov_degrees: 90.0,
+        near_clip_radius: 5.0,
+        enable_delta_compression: true,
+        ..Default::default()
+    };
+    aoi.register_observer(1, observer_guid, config);
+
+    let jobs = aoi.update_observers(&store, &octree, 1, 1000);
+    assert_eq!(jobs.len(), 1);
+
+    // Observer receives at most max_entities, and behind entities (outside 5m) are culled
+    let count = jobs[0].packets.len();
+    assert!(
+        count <= 40,
+        "Egress must be strictly clamped by max_entities (got {})",
+        count
+    );
+
+    // Verify all received entities at z=-20 are NOT included because they're behind and outside near_clip_radius
+    for pkt in &jobs[0].packets {
+        if let mmo_schema::client::ClientPacket::EntityState(s) = pkt {
+            assert!(
+                s.position.z >= -5.0,
+                "Entity at z={} should have been culled by view frustum!",
+                s.position.z
+            );
+        }
+    }
+}

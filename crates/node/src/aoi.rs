@@ -13,8 +13,8 @@ use mmo_core::{EntityStore, Octree};
 use mmo_gameplay::combat::HealthComponent;
 use mmo_schema::client::{
     delta_flags, ClientPacket, EntityDeltaBatchPacket, EntityDeltaState, EntityDespawnPacket,
-    EntityStatePacket, Vec3, WorldObjectDeltaPacket, WorldObjectDespawnPacket,
-    WorldObjectSpawnPacket,
+    EntityStatePacket, ScalarAttributeDelta, Vec3, WorldObjectDeltaPacket,
+    WorldObjectDespawnPacket, WorldObjectSpawnPacket,
 };
 use mmo_schema::quantize::is_teleport_delta;
 
@@ -37,6 +37,13 @@ pub struct ObserverConfig {
     pub enable_delta_compression: bool,
     /// Maximum number of historical tick snapshots retained for delta differencing. Default is 60 (3 seconds at 20 Hz).
     pub history_depth_ticks: usize,
+    /// Whether to enable directional view frustum culling. Default is false.
+    pub enable_frustum_culling: bool,
+    /// Horizontal field of view in degrees. Default is 90.0 degrees.
+    pub fov_degrees: f32,
+    /// Immediate awareness sphere radius in meters. Entities within this 3D radius
+    /// are always visible regardless of facing direction. Default is 5.0m.
+    pub near_clip_radius: f32,
 }
 
 impl Default for ObserverConfig {
@@ -49,8 +56,51 @@ impl Default for ObserverConfig {
             include_self: false,
             enable_delta_compression: false,
             history_depth_ticks: 60,
+            enable_frustum_culling: false,
+            fov_degrees: 90.0,
+            near_clip_radius: 5.0,
         }
     }
+}
+
+/// Evaluates whether `target_pos` lies within the observer's view frustum or 3D awareness sphere.
+///
+/// Returns `true` if:
+/// 1. The 3D distance between `observer_pos` and `target_pos` is <= `near_clip_radius` (awareness bubble).
+/// 2. OR the entity lies within `fov_degrees` of the observer's forward heading vector `(-sin(yaw), 0, cos(yaw))`.
+pub fn is_in_view_frustum(
+    observer_pos: (f32, f32, f32),
+    observer_yaw: f32,
+    target_pos: (f32, f32, f32),
+    fov_degrees: f32,
+    near_clip_radius: f32,
+) -> bool {
+    let dx = target_pos.0 - observer_pos.0;
+    let dy = target_pos.1 - observer_pos.1;
+    let dz = target_pos.2 - observer_pos.2;
+
+    let dist_3d_sq = dx * dx + dy * dy + dz * dz;
+    let near_clip_sq = near_clip_radius * near_clip_radius;
+    if dist_3d_sq <= near_clip_sq {
+        return true;
+    }
+
+    let dist_horiz_sq = dx * dx + dz * dz;
+    if dist_horiz_sq <= 1e-6 {
+        // Vertically above/below observer outside near clip radius -> culled
+        return false;
+    }
+
+    let dist_horiz = dist_horiz_sq.sqrt();
+    let fwd_x = -observer_yaw.sin();
+    let fwd_z = observer_yaw.cos();
+
+    // Dot product between normalized horizontal direction and forward vector
+    let cos_angle = (dx * fwd_x + dz * fwd_z) / dist_horiz;
+    let half_fov_rad = (fov_degrees * 0.5).to_radians();
+    let min_cos = half_fov_rad.cos();
+
+    cos_angle >= min_cos
 }
 
 /// Cached state of an entity observed by a player in a previous tick.
@@ -63,6 +113,7 @@ pub struct CachedEntityState {
     pub max_health: u32,
     pub state_flags: u32,
     pub last_sent_tick: u64,
+    pub attributes: Vec<ScalarAttributeDelta>,
 }
 
 /// Historical snapshot of all visible entity states sent to an observer at a specific tick.
@@ -247,6 +298,55 @@ pub fn compute_visible_sectors(center: (f32, f32, f32), radius: f32) -> HashSet<
     visible
 }
 
+/// Extracts generic scalar attributes and state flags for an entity.
+///
+/// Follows the engine's unopinionated prime directive: reads generic properties without hardcoding
+/// specific genre gameplay logic into spatial replication.
+fn extract_entity_attributes(ent: &mmo_core::Entity) -> (u32, u32, u32, Vec<ScalarAttributeDelta>) {
+    let mut attrs = Vec::new();
+
+    // Check generic dynamic properties first
+    let mut health = ent
+        .properties
+        .get("health")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as u32);
+    let mut max_health = ent
+        .properties
+        .get("max_health")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as u32);
+    let state_flags = ent
+        .properties
+        .get("state_flags")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as u32)
+        .unwrap_or(0);
+
+    // Fallback to combat HealthComponent if attached to entity
+    if health.is_none() || max_health.is_none() {
+        if let Some(h) = ent.components.get_component::<HealthComponent>() {
+            health = Some(h.current_hp as u32);
+            max_health = Some(h.max_hp as u32);
+        }
+    }
+
+    let h_val = health.unwrap_or(100);
+    let mh_val = max_health.unwrap_or(100);
+
+    // Generic scalar attribute mapping: 1 for health, 2 for max_health
+    attrs.push(ScalarAttributeDelta {
+        attribute_id: 1,
+        value: h_val,
+    });
+    attrs.push(ScalarAttributeDelta {
+        attribute_id: 2,
+        value: mh_val,
+    });
+
+    (h_val, mh_val, state_flags, attrs)
+}
+
 /// Encapsulates a batch of outgoing client packets for a specific player session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AoiBroadcastJob {
@@ -377,9 +477,10 @@ impl AoiManager {
                 None => continue,
             };
 
-            // 1. Get observer position
-            let observer_pos = match entity_store.get_by_guid(observer.player_guid) {
-                Some(ent) => ent.position,
+            // 1. Get observer position and orientation
+            let (observer_pos, observer_yaw) = match entity_store.get_by_guid(observer.player_guid)
+            {
+                Some(ent) => (ent.position, ent.rotation),
                 None => continue,
             };
 
@@ -395,6 +496,15 @@ impl AoiManager {
             if !observer.config.include_self {
                 self.scratch_query
                     .retain(|&(g, _, _)| g != observer.player_guid);
+            }
+
+            // 2.5 Frustum Culling (if enabled)
+            if observer.config.enable_frustum_culling {
+                let fov = observer.config.fov_degrees;
+                let near_r = observer.config.near_clip_radius;
+                self.scratch_query.retain(|&(_, pos, _)| {
+                    is_in_view_frustum(observer_pos, observer_yaw, pos, fov, near_r)
+                });
             }
 
             // 3. Dynamic density throttling
@@ -469,17 +579,7 @@ impl AoiManager {
                         None => continue,
                     };
 
-                    let (health, max_health, state_flags) = ent
-                        .components
-                        .get_component::<HealthComponent>()
-                        .map(|h| {
-                            (
-                                h.current_hp as u32,
-                                h.max_hp as u32,
-                                if h.is_dead { 1 } else { 0 },
-                            )
-                        })
-                        .unwrap_or((100, 100, 0));
+                    let (health, max_health, state_flags, attrs) = extract_entity_attributes(ent);
 
                     let yaw = ent.rotation;
                     let pitch = 0.0;
@@ -507,6 +607,9 @@ impl AoiManager {
                             field_mask |= delta_flags::MASK_HEALTH
                                 | delta_flags::MASK_MAX_HEALTH
                                 | delta_flags::MASK_STATE_FLAGS;
+                            if !attrs.is_empty() {
+                                field_mask |= delta_flags::MASK_ATTRIBUTES;
+                            }
 
                             delta_entry = Some(EntityDeltaState {
                                 entity_id: visible_guid.raw(),
@@ -519,6 +622,7 @@ impl AoiManager {
                                 max_health,
                                 state_flags,
                                 action_id: 0,
+                                attributes: attrs.clone(),
                             });
                         } else {
                             let mut field_mask = 0u16;
@@ -537,10 +641,10 @@ impl AoiManager {
                             if velocity != base_state.velocity {
                                 field_mask |= delta_flags::MASK_VELOCITY;
                             }
-                            let yaw_diff = (yaw.rem_euclid(2.0 * std::f32::consts::PI)
-                                - base_state.yaw.rem_euclid(2.0 * std::f32::consts::PI))
-                            .abs();
-                            if yaw_diff > 0.02 {
+                            let diff =
+                                (yaw - base_state.yaw).rem_euclid(2.0 * std::f32::consts::PI);
+                            let shortest_yaw_diff = diff.min(2.0 * std::f32::consts::PI - diff);
+                            if shortest_yaw_diff > 0.02 {
                                 field_mask |= delta_flags::MASK_YAW;
                             }
                             if health != base_state.health {
@@ -551,6 +655,9 @@ impl AoiManager {
                             }
                             if state_flags != base_state.state_flags {
                                 field_mask |= delta_flags::MASK_STATE_FLAGS;
+                            }
+                            if attrs != base_state.attributes {
+                                field_mask |= delta_flags::MASK_ATTRIBUTES;
                             }
 
                             if field_mask != 0 {
@@ -565,32 +672,63 @@ impl AoiManager {
                                     max_health,
                                     state_flags,
                                     action_id: 0,
+                                    attributes: if field_mask & delta_flags::MASK_ATTRIBUTES != 0 {
+                                        attrs.clone()
+                                    } else {
+                                        Vec::new()
+                                    },
                                 });
                             }
                         }
                     } else {
-                        // New entrant or unacknowledged baseline: full keyframe
-                        let mut field_mask = delta_flags::MASK_KEYFRAME;
-                        if velocity != (0.0, 0.0, 0.0) {
-                            field_mask |= delta_flags::MASK_VELOCITY;
-                        }
-                        field_mask |= delta_flags::MASK_YAW;
-                        field_mask |= delta_flags::MASK_HEALTH
-                            | delta_flags::MASK_MAX_HEALTH
-                            | delta_flags::MASK_STATE_FLAGS;
+                        // Unacknowledged baseline or new entrant. Rate-limit keyframe fallback to avoid network death spiral!
+                        let last_sent_opt = observer.observed_entities.get(&visible_guid);
+                        let is_new_entrant = last_sent_opt.is_none();
+                        let should_emit_keyframe = if is_new_entrant {
+                            true
+                        } else {
+                            let last_sent = last_sent_opt.unwrap();
+                            let dx = pos.0 - last_sent.position.0;
+                            let dy = pos.1 - last_sent.position.1;
+                            let dz = pos.2 - last_sent.position.2;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            let moved = dist_sq >= observer.config.position_epsilon_sq;
+                            let attr_changed = health != last_sent.health
+                                || max_health != last_sent.max_health
+                                || state_flags != last_sent.state_flags
+                                || attrs != last_sent.attributes;
+                            let refresh_due = current_tick.saturating_sub(last_sent.last_sent_tick)
+                                >= observer.config.full_refresh_interval_ticks;
+                            moved || attr_changed || refresh_due
+                        };
 
-                        delta_entry = Some(EntityDeltaState {
-                            entity_id: visible_guid.raw(),
-                            field_mask,
-                            position: pos,
-                            velocity,
-                            yaw,
-                            pitch,
-                            health,
-                            max_health,
-                            state_flags,
-                            action_id: 0,
-                        });
+                        if should_emit_keyframe {
+                            let mut field_mask = delta_flags::MASK_KEYFRAME;
+                            if velocity != (0.0, 0.0, 0.0) {
+                                field_mask |= delta_flags::MASK_VELOCITY;
+                            }
+                            field_mask |= delta_flags::MASK_YAW;
+                            field_mask |= delta_flags::MASK_HEALTH
+                                | delta_flags::MASK_MAX_HEALTH
+                                | delta_flags::MASK_STATE_FLAGS;
+                            if !attrs.is_empty() {
+                                field_mask |= delta_flags::MASK_ATTRIBUTES;
+                            }
+
+                            delta_entry = Some(EntityDeltaState {
+                                entity_id: visible_guid.raw(),
+                                field_mask,
+                                position: pos,
+                                velocity,
+                                yaw,
+                                pitch,
+                                health,
+                                max_health,
+                                state_flags,
+                                action_id: 0,
+                                attributes: attrs.clone(),
+                            });
+                        }
                     }
 
                     if let Some(entry) = delta_entry {
@@ -605,6 +743,7 @@ impl AoiManager {
                                 max_health,
                                 state_flags,
                                 last_sent_tick: current_tick,
+                                attributes: attrs,
                             },
                         );
                     }
@@ -638,17 +777,7 @@ impl AoiManager {
                         None => continue,
                     };
 
-                    let (health, max_health, state_flags) = ent
-                        .components
-                        .get_component::<HealthComponent>()
-                        .map(|h| {
-                            (
-                                h.current_hp as u32,
-                                h.max_hp as u32,
-                                if h.is_dead { 1 } else { 0 },
-                            )
-                        })
-                        .unwrap_or((100, 100, 0));
+                    let (health, max_health, state_flags, attrs) = extract_entity_attributes(ent);
 
                     let yaw = ent.rotation;
                     let pitch = 0.0;
@@ -664,10 +793,16 @@ impl AoiManager {
                         let health_changed =
                             cached.health != health || cached.max_health != max_health;
                         let flags_changed = cached.state_flags != state_flags;
+                        let attrs_changed = cached.attributes != attrs;
                         let periodic_refresh = current_tick.saturating_sub(cached.last_sent_tick)
                             >= observer.config.full_refresh_interval_ticks;
 
-                        if pos_changed || health_changed || flags_changed || periodic_refresh {
+                        if pos_changed
+                            || health_changed
+                            || flags_changed
+                            || attrs_changed
+                            || periodic_refresh
+                        {
                             cached.position = pos;
                             cached.velocity = velocity;
                             cached.yaw = yaw;
@@ -675,6 +810,7 @@ impl AoiManager {
                             cached.max_health = max_health;
                             cached.state_flags = state_flags;
                             cached.last_sent_tick = current_tick;
+                            cached.attributes = attrs;
 
                             packets.push(ClientPacket::EntityState(EntityStatePacket {
                                 entity_id: visible_guid.raw(),
@@ -699,6 +835,7 @@ impl AoiManager {
                                 max_health,
                                 state_flags,
                                 last_sent_tick: current_tick,
+                                attributes: attrs,
                             },
                         );
 
@@ -1094,6 +1231,7 @@ mod tests {
                 max_health: 100,
                 state_flags: 0,
                 last_sent_tick: 1,
+                attributes: Vec::new(),
             },
         );
 
@@ -1324,5 +1462,240 @@ mod tests {
         for pkt in &jobs5[0].packets {
             assert!(matches!(pkt, ClientPacket::WorldObjectDespawn(_)));
         }
+    }
+
+    #[test]
+    fn test_is_in_view_frustum_geometry() {
+        let obs_pos = (0.0, 0.0, 0.0);
+        let obs_yaw = 0.0; // facing +Z (fwd: (0, 0, 1))
+        let fov = 90.0;
+        let near_r = 5.0;
+
+        // Directly ahead (+Z, 20m) -> true
+        assert!(is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (0.0, 0.0, 20.0),
+            fov,
+            near_r
+        ));
+
+        // Directly behind (-Z, 20m, > near_r) -> false
+        assert!(!is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (0.0, 0.0, -20.0),
+            fov,
+            near_r
+        ));
+
+        // Directly behind (-Z, 3m, <= near_r awareness bubble) -> true
+        assert!(is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (0.0, 0.0, -3.0),
+            fov,
+            near_r
+        ));
+
+        // 100m straight up (Y=100m, > near_r 3D distance) -> false (prevents sky bypass)
+        assert!(!is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (0.0, 100.0, 0.0),
+            fov,
+            near_r
+        ));
+
+        // 3m straight up (Y=3m, <= near_r 3D distance) -> true
+        assert!(is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (0.0, 3.0, 0.0),
+            fov,
+            near_r
+        ));
+
+        // 30 degrees to the right (+X=10m, +Z=17.32m) -> true (within 45 deg half-FOV)
+        assert!(is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (10.0, 0.0, 17.32),
+            fov,
+            near_r
+        ));
+
+        // 60 degrees to the right (+X=17.32m, +Z=10m) -> false (outside 45 deg half-FOV)
+        assert!(!is_in_view_frustum(
+            obs_pos,
+            obs_yaw,
+            (17.32, 0.0, 10.0),
+            fov,
+            near_r
+        ));
+    }
+
+    #[test]
+    fn test_aoi_manager_frustum_culling_integration() {
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+
+        let observer_guid = make_guid(100);
+        store.spawn(observer_guid, (0.0, 0.0, 0.0));
+        store.get_mut_by_guid(observer_guid).unwrap().rotation = 0.0; // facing +Z
+        octree.insert(observer_guid, (0.0, 0.0, 0.0));
+
+        // Entity 1: in front (+Z=20m) -> should be visible
+        let ent_front = make_guid(1);
+        store.spawn(ent_front, (0.0, 0.0, 20.0));
+        octree.insert(ent_front, (0.0, 0.0, 20.0));
+
+        // Entity 2: behind (-Z=20m) -> should be culled
+        let ent_behind = make_guid(2);
+        store.spawn(ent_behind, (0.0, 0.0, -20.0));
+        octree.insert(ent_behind, (0.0, 0.0, -20.0));
+
+        // Entity 3: behind close (-Z=3m) -> in awareness bubble -> should be visible
+        let ent_near = make_guid(3);
+        store.spawn(ent_near, (0.0, 0.0, -3.0));
+        octree.insert(ent_near, (0.0, 0.0, -3.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_frustum_culling: true,
+            fov_degrees: 90.0,
+            near_clip_radius: 5.0,
+            ..Default::default()
+        };
+
+        aoi.register_observer(1, observer_guid, config);
+
+        let jobs = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs.len(), 1);
+
+        let observed_ids: Vec<u64> = jobs[0]
+            .packets
+            .iter()
+            .filter_map(|p| match p {
+                ClientPacket::EntityState(s) => Some(s.entity_id),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            observed_ids.contains(&ent_front.raw()),
+            "Front entity must be observed"
+        );
+        assert!(
+            !observed_ids.contains(&ent_behind.raw()),
+            "Distant entity behind must be culled"
+        );
+        assert!(
+            observed_ids.contains(&ent_near.raw()),
+            "Near entity behind must be observed via awareness bubble"
+        );
+    }
+
+    #[test]
+    fn test_yaw_wrap_around_delta_differencing() {
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+
+        let obs_guid = make_guid(100);
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+
+        let target_guid = make_guid(200);
+        store.spawn(target_guid, (0.0, 0.0, 10.0));
+        store.get_mut_by_guid(target_guid).unwrap().rotation = 0.01; // nearly 0 rads
+        octree.insert(target_guid, (0.0, 0.0, 10.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: true,
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        // Tick 1: keyframe
+        aoi.update_observers(&store, &octree, 1, 1000);
+        aoi.process_ack(1, 1, 0, 1);
+
+        // Tick 2: rotation changes from 0.01 to near TAU (diff is wrapping to 0.013 <= 0.02)
+        store.get_mut_by_guid(target_guid).unwrap().rotation = std::f32::consts::TAU - 0.003;
+        let jobs2 = aoi.update_observers(&store, &octree, 2, 1050);
+
+        // The angular difference across the 2PI boundary is only ~0.013 rads <= 0.02 threshold,
+        // so NO yaw delta should be emitted!
+        if !jobs2.is_empty() {
+            for pkt in &jobs2[0].packets {
+                if let ClientPacket::EntityDeltaBatch(batch) = pkt {
+                    for delta in &batch.deltas {
+                        if delta.entity_id == target_guid.raw() {
+                            assert_eq!(
+                                delta.field_mask & delta_flags::MASK_YAW,
+                                0,
+                                "Yaw wrap-around across 0 <-> 2PI boundary must not trigger false positive delta"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expired_baseline_rate_limited_keyframe_fallback() {
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+
+        let obs_guid = make_guid(100);
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+
+        let target_guid = make_guid(200);
+        store.spawn(target_guid, (0.0, 0.0, 10.0));
+        octree.insert(target_guid, (0.0, 0.0, 10.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: true,
+            full_refresh_interval_ticks: 20, // 1 sec at 20 Hz
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        // Tick 1: keyframe sent
+        let jobs1 = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs1.len(), 1);
+
+        // Tick 2: Client does NOT ack (baseline remains unconfirmed / expired).
+        // Since entity is stationary, server must NOT spam another keyframe!
+        let jobs2 = aoi.update_observers(&store, &octree, 2, 1050);
+        assert_eq!(
+            jobs2.len(),
+            0,
+            "Stationary entity must not be keyframed every tick during baseline loss"
+        );
+
+        // Tick 21: Full refresh interval (20 ticks) elapsed -> rate-limited refresh is emitted
+        let jobs21 = aoi.update_observers(&store, &octree, 21, 2000);
+        assert_eq!(
+            jobs21.len(),
+            1,
+            "Rate-limited refresh emitted after full_refresh_interval_ticks"
+        );
     }
 }
