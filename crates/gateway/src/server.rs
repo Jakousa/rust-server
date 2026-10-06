@@ -31,8 +31,10 @@ use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
 use crate::backhaul::BackhaulPool;
+use crate::marketplace::GatewayMarketplaceService;
 use crate::quic::{create_quic_server, generate_self_signed_cert, QuicTransportError};
 use crate::router::SessionRouter;
+use crate::social::GatewaySubscriptionManager;
 
 /// Errors that can occur within the Edge Gateway server or packet dispatcher.
 #[derive(Debug, Error)]
@@ -103,6 +105,7 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
         ClientPacket::Interaction(p) => Some(Guid::from_raw(p.source_guid)),
         ClientPacket::EntityState(p) => Some(Guid::from_raw(p.entity_id)),
         ClientPacket::EntityDespawn(p) => Some(Guid::from_raw(p.entity_id)),
+        ClientPacket::SocialMessage(p) => Some(Guid::from_raw(p.sender_guid)),
         ClientPacket::InteractionResult(_)
         | ClientPacket::Ping(_)
         | ClientPacket::Pong(_)
@@ -115,7 +118,14 @@ pub fn extract_acting_guid(packet: &ClientPacket) -> Option<Guid> {
         | ClientPacket::PlaceObject(_)
         | ClientPacket::InteractObject(_)
         | ClientPacket::AuthRequest(_)
-        | ClientPacket::AuthResponse(_) => None,
+        | ClientPacket::AuthResponse(_)
+        | ClientPacket::SocialSubscribe(_)
+        | ClientPacket::SocialUnsubscribe(_)
+        | ClientPacket::MarketListRequest(_)
+        | ClientPacket::MarketBuyRequest(_)
+        | ClientPacket::MarketCancelRequest(_)
+        | ClientPacket::MarketQueryRequest(_)
+        | ClientPacket::MarketResponse(_) => None,
     }
 }
 
@@ -248,6 +258,7 @@ pub struct SessionDropGuard {
     pub router: Arc<SessionRouter>,
     pub session_sinks: Arc<DashMap<u64, SessionSink>>,
     pub cache: Option<Arc<dyn SessionCacheBackend>>,
+    pub subscription_manager: Option<Arc<GatewaySubscriptionManager>>,
     pub writer_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -256,6 +267,9 @@ impl Drop for SessionDropGuard {
         let _ = self.router.remove_session(self.session_id);
         self.session_sinks.remove(&self.session_id);
         metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
+        if let Some(ref sub_mgr) = self.subscription_manager {
+            sub_mgr.remove_session(self.session_id);
+        }
         if let Some(ref handle) = self.writer_handle {
             handle.abort();
         }
@@ -265,6 +279,300 @@ impl Drop for SessionDropGuard {
             tokio::spawn(async move {
                 let _ = cache.remove_session(session_id).await;
             });
+        }
+    }
+}
+
+/// Intercept handler for social pub/sub messaging and asynchronous marketplace transactions.
+///
+/// Packets matching social channels (chat, whispers, topic subscriptions) or marketplace
+/// actions (listing, buying, cancelling, querying) are intercepted at the edge gateway layer
+/// and completely bypass downstream simulation nodes.
+#[derive(Clone)]
+pub struct GatewayInterceptHandler {
+    pub router: Arc<SessionRouter>,
+    pub subscription_manager: Arc<GatewaySubscriptionManager>,
+    pub marketplace_service: Option<Arc<GatewayMarketplaceService>>,
+    pub social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
+    pub session_sinks: Arc<DashMap<u64, SessionSink>>,
+    pub active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+}
+
+impl GatewayInterceptHandler {
+    /// Creates a new `GatewayInterceptHandler`.
+    pub fn new(
+        router: Arc<SessionRouter>,
+        subscription_manager: Arc<GatewaySubscriptionManager>,
+        marketplace_service: Option<Arc<GatewayMarketplaceService>>,
+        social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
+        session_sinks: Arc<DashMap<u64, SessionSink>>,
+        active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    ) -> Self {
+        Self {
+            router,
+            subscription_manager,
+            marketplace_service,
+            social_bus,
+            session_sinks,
+            active_bus_subscriptions,
+        }
+    }
+
+    /// Subscribes a session to a named topic and ensures a background bus listener is active if needed.
+    pub async fn subscribe_session_topic(&self, session_id: u64, topic: String) {
+        let is_new = self
+            .subscription_manager
+            .subscribe(session_id, topic.clone());
+        if is_new {
+            self.ensure_bus_listener(&topic).await;
+        }
+    }
+
+    /// Ensures a background listener task is subscribed to `topic` on `social_bus`.
+    pub async fn ensure_bus_listener(&self, topic: &str) {
+        if let Some(ref bus) = self.social_bus {
+            if self.active_bus_subscriptions.contains_key(topic) {
+                return;
+            }
+            if let Ok(mut rx) = bus.subscribe(topic).await {
+                let topic_name = topic.to_string();
+                let sub_mgr = self.subscription_manager.clone();
+                let sinks = self.session_sinks.clone();
+                let handle = tokio::spawn(async move {
+                    while let Ok(envelope) = rx.recv().await {
+                        if let mmo_storage::SocialEnvelope::Chat(chat) = envelope {
+                            let packet = ClientPacket::SocialMessage(
+                                mmo_schema::client::SocialMessagePacket {
+                                    channel_type: match chat.channel {
+                                        mmo_storage::ChatChannel::Global => 0,
+                                        mmo_storage::ChatChannel::Whisper => 1,
+                                        mmo_storage::ChatChannel::Party => 2,
+                                        mmo_storage::ChatChannel::Guild => 3,
+                                        mmo_storage::ChatChannel::Area => 4,
+                                    },
+                                    target_id: chat.target_guid.unwrap_or(0),
+                                    sender_guid: chat.sender_guid,
+                                    sender_name: chat.sender_name,
+                                    content: chat.content,
+                                    timestamp: chat.timestamp,
+                                },
+                            );
+                            let encoded = Bytes::from(packet.encode());
+                            let subscribers = sub_mgr.get_subscribers(&topic_name);
+                            for sid in subscribers {
+                                if let Some(sink) = sinks.get(&sid) {
+                                    let _ = sink.stream_tx.send(encoded.clone());
+                                }
+                            }
+                        }
+                    }
+                });
+                self.active_bus_subscriptions
+                    .insert(topic.to_string(), handle);
+            }
+        }
+    }
+
+    /// Cleanly deregisters all subscriptions for `session_id`, terminating idle whisper listeners.
+    pub fn remove_session(&self, session_id: u64) {
+        let removed = self.subscription_manager.remove_session(session_id);
+        for topic in removed {
+            if topic.starts_with("whisper:")
+                && self.subscription_manager.get_subscribers(&topic).is_empty()
+            {
+                if let Some((_, handle)) = self.active_bus_subscriptions.remove(&topic) {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    /// Sends a packet directly to a session's reliable stream sink.
+    pub fn send_packet_to_session(&self, session_id: u64, packet: &ClientPacket) {
+        if let Some(sink) = self.session_sinks.get(&session_id) {
+            let encoded = Bytes::from(packet.encode());
+            let _ = sink.stream_tx.send(encoded);
+        }
+    }
+
+    /// Attempts to intercept and process a packet if it belongs to social pub/sub or marketplace.
+    ///
+    /// Returns `true` if intercepted (do not route to simulation node), `false` otherwise.
+    pub async fn handle_packet(&self, session_id: u64, packet: &ClientPacket) -> bool {
+        match packet {
+            ClientPacket::SocialMessage(msg) => {
+                // Anti-Spoofing: If the session has an authenticated player GUID, sender_guid must match.
+                if let Some(bound_guid) = self.router.get_guid_by_session(session_id) {
+                    if msg.sender_guid != bound_guid.raw() {
+                        metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                            .increment(1);
+                        return true;
+                    }
+                }
+
+                let topic = match msg.channel_type {
+                    0 => "chat:global".to_string(),
+                    1 => format!("whisper:{}", msg.target_id),
+                    2 => format!("chat:party:{}", msg.target_id),
+                    3 => format!("chat:guild:{}", msg.target_id),
+                    4 => "chat:area".to_string(),
+                    _ => format!("custom:{}", msg.target_id),
+                };
+
+                let chat_channel = match msg.channel_type {
+                    0 => mmo_storage::ChatChannel::Global,
+                    1 => mmo_storage::ChatChannel::Whisper,
+                    2 => mmo_storage::ChatChannel::Party,
+                    3 => mmo_storage::ChatChannel::Guild,
+                    4 => mmo_storage::ChatChannel::Area,
+                    _ => mmo_storage::ChatChannel::Global,
+                };
+
+                let chat_msg = mmo_storage::ChatMessage {
+                    channel: chat_channel,
+                    sender_guid: msg.sender_guid,
+                    sender_name: msg.sender_name.clone(),
+                    target_guid: if msg.target_id > 0 {
+                        Some(msg.target_id)
+                    } else {
+                        None
+                    },
+                    content: msg.content.clone(),
+                    timestamp: msg.timestamp,
+                };
+
+                if let Some(ref bus) = self.social_bus {
+                    let _ = bus
+                        .publish(&topic, &mmo_storage::SocialEnvelope::Chat(chat_msg))
+                        .await;
+                } else {
+                    let encoded = Bytes::from(packet.encode());
+                    let subscribers = self.subscription_manager.get_subscribers(&topic);
+                    for sid in subscribers {
+                        if let Some(sink) = self.session_sinks.get(&sid) {
+                            let _ = sink.stream_tx.send(encoded.clone());
+                        }
+                    }
+                }
+                true
+            }
+            ClientPacket::SocialSubscribe(sub) => {
+                let topic = if !sub.channel_name.is_empty() {
+                    sub.channel_name.clone()
+                } else {
+                    match sub.channel_type {
+                        0 => "chat:global".to_string(),
+                        1 => format!("whisper:{}", sub.target_id),
+                        2 => format!("chat:party:{}", sub.target_id),
+                        3 => format!("chat:guild:{}", sub.target_id),
+                        4 => "chat:area".to_string(),
+                        _ => format!("custom:{}", sub.target_id),
+                    }
+                };
+                self.subscribe_session_topic(session_id, topic).await;
+                true
+            }
+            ClientPacket::SocialUnsubscribe(unsub) => {
+                let topic = if !unsub.channel_name.is_empty() {
+                    unsub.channel_name.clone()
+                } else {
+                    match unsub.channel_type {
+                        0 => "chat:global".to_string(),
+                        1 => format!("whisper:{}", unsub.target_id),
+                        2 => format!("chat:party:{}", unsub.target_id),
+                        3 => format!("chat:guild:{}", unsub.target_id),
+                        4 => "chat:area".to_string(),
+                        _ => format!("custom:{}", unsub.target_id),
+                    }
+                };
+                self.subscription_manager.unsubscribe(session_id, &topic);
+                true
+            }
+            ClientPacket::MarketListRequest(req) => {
+                let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
+                let resp = match (player_guid, &self.marketplace_service) {
+                    (Some(guid), Some(service)) => service.handle_list(guid, req.clone()).await,
+                    (None, _) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 1,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
+                        error_message: "Unauthenticated session".to_string(),
+                        listings: Vec::new(),
+                    },
+                    (_, None) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 1,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
+                        error_message: "Marketplace service unavailable".to_string(),
+                        listings: Vec::new(),
+                    },
+                };
+                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
+                true
+            }
+            ClientPacket::MarketBuyRequest(req) => {
+                let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
+                let resp = match (player_guid, &self.marketplace_service) {
+                    (Some(guid), Some(service)) => service.handle_buy(guid, req.clone()).await,
+                    (None, _) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 2,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
+                        error_message: "Unauthenticated session".to_string(),
+                        listings: Vec::new(),
+                    },
+                    (_, None) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 2,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
+                        error_message: "Marketplace service unavailable".to_string(),
+                        listings: Vec::new(),
+                    },
+                };
+                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
+                true
+            }
+            ClientPacket::MarketCancelRequest(req) => {
+                let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
+                let resp = match (player_guid, &self.marketplace_service) {
+                    (Some(guid), Some(service)) => service.handle_cancel(guid, req.clone()).await,
+                    (None, _) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 3,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
+                        error_message: "Unauthenticated session".to_string(),
+                        listings: Vec::new(),
+                    },
+                    (_, None) => mmo_schema::client::MarketResponsePacket {
+                        request_type: 3,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
+                        error_message: "Marketplace service unavailable".to_string(),
+                        listings: Vec::new(),
+                    },
+                };
+                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
+                true
+            }
+            ClientPacket::MarketQueryRequest(req) => {
+                let resp = match &self.marketplace_service {
+                    Some(service) => service.handle_query(req.clone()).await,
+                    None => mmo_schema::client::MarketResponsePacket {
+                        request_type: 4,
+                        success: false,
+                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
+                        error_message: "Marketplace service unavailable".to_string(),
+                        listings: Vec::new(),
+                    },
+                };
+                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
+                true
+            }
+            ClientPacket::MarketResponse(_) => {
+                // Intercept and drop any unsolicited MarketResponse from client
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -401,6 +709,9 @@ pub struct GatewayServer {
     backhaul_pool: Arc<BackhaulPool>,
     authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
     default_node_address: Option<String>,
+    subscription_manager: Arc<GatewaySubscriptionManager>,
+    marketplace_service: Option<Arc<GatewayMarketplaceService>>,
+    active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl GatewayServer {
@@ -419,6 +730,9 @@ impl GatewayServer {
             backhaul_pool: Arc::new(BackhaulPool::new(10000)),
             authenticator: None,
             default_node_address: None,
+            subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
+            marketplace_service: None,
+            active_bus_subscriptions: Arc::new(DashMap::new()),
         }
     }
 
@@ -440,6 +754,9 @@ impl GatewayServer {
             backhaul_pool: Arc::new(BackhaulPool::new(10000)),
             authenticator: None,
             default_node_address: None,
+            subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
+            marketplace_service: None,
+            active_bus_subscriptions: Arc::new(DashMap::new()),
         }
     }
 
@@ -540,6 +857,43 @@ impl GatewayServer {
     /// Accesses the underlying `SessionRouter`.
     pub fn router(&self) -> &Arc<SessionRouter> {
         &self.router
+    }
+
+    /// Configures a custom gateway subscription manager.
+    pub fn with_subscription_manager(
+        mut self,
+        subscription_manager: Arc<GatewaySubscriptionManager>,
+    ) -> Self {
+        self.subscription_manager = subscription_manager;
+        self
+    }
+
+    /// Configures an asynchronous marketplace service operating at the edge gateway.
+    pub fn with_marketplace(mut self, marketplace_service: Arc<GatewayMarketplaceService>) -> Self {
+        self.marketplace_service = Some(marketplace_service);
+        self
+    }
+
+    /// Accesses the gateway subscription manager.
+    pub fn subscription_manager(&self) -> &Arc<GatewaySubscriptionManager> {
+        &self.subscription_manager
+    }
+
+    /// Accesses the marketplace service, if configured.
+    pub fn marketplace_service(&self) -> Option<&Arc<GatewayMarketplaceService>> {
+        self.marketplace_service.as_ref()
+    }
+
+    /// Constructs a `GatewayInterceptHandler` capturing current routing, subscription, and marketplace services.
+    pub fn intercept_handler(&self) -> GatewayInterceptHandler {
+        GatewayInterceptHandler {
+            router: self.router.clone(),
+            subscription_manager: self.subscription_manager.clone(),
+            marketplace_service: self.marketplace_service.clone(),
+            social_bus: self.social_bus.clone(),
+            session_sinks: self.session_sinks.clone(),
+            active_bus_subscriptions: self.active_bus_subscriptions.clone(),
+        }
     }
 
     /// Creates a [`GatewayServiceImpl`] backed by this server's routing table and session sinks.
@@ -892,11 +1246,13 @@ impl GatewayServer {
             }
         });
 
+        let intercept_handler = self.intercept_handler();
         let _drop_guard = SessionDropGuard {
             session_id,
             router: self.router.clone(),
             session_sinks: self.session_sinks.clone(),
             cache: self.cache.clone(),
+            subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(writer_handle),
         };
 
@@ -959,6 +1315,15 @@ impl GatewayServer {
                         };
 
                         self.register_session(session_id, auth_res.guid, initial_node.clone())?;
+                        intercept_handler
+                            .subscribe_session_topic(session_id, "chat:global".to_string())
+                            .await;
+                        intercept_handler
+                            .subscribe_session_topic(
+                                session_id,
+                                format!("whisper:{}", auth_res.guid.raw()),
+                            )
+                            .await;
 
                         let resp =
                             ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
@@ -1005,11 +1370,12 @@ impl GatewayServer {
             }
             metrics::counter!("mmo_gateway_bytes_received_total").increment(bytes_read as u64);
 
-            let routed_packets = self.dispatcher.process_frames(session_id, &mut buf)?;
-            for pkt in &routed_packets {
-                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.packet.opcode().as_str())
+            while let Some(packet) =
+                ClientPacket::decode_frame(&mut buf).map_err(GatewayError::Codec)?
+            {
+                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
                     .increment(1);
-                if let ClientPacket::Ping(ping) = &pkt.packet {
+                if let ClientPacket::Ping(ping) = &packet {
                     let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
                         client_timestamp: ping.timestamp,
                         server_timestamp: std::time::SystemTime::now()
@@ -1018,12 +1384,16 @@ impl GatewayServer {
                             .as_millis() as u64,
                     });
                     let _ = self.send_packet_to_session(session_id, &pong).await;
+                    continue;
                 }
-            }
 
-            if let Some(ref tx) = self.packet_tx {
-                for pkt in routed_packets {
-                    let _ = tx.send(pkt).await;
+                if intercept_handler.handle_packet(session_id, &packet).await {
+                    continue;
+                }
+
+                let routed = self.dispatcher.dispatch_packet(session_id, packet)?;
+                if let Some(ref tx) = self.packet_tx {
+                    let _ = tx.send(routed).await;
                 }
             }
         }
@@ -1064,7 +1434,8 @@ impl GatewayServer {
             self.session_counter.clone(),
             self.packet_tx.clone(),
         )
-        .await?;
+        .await?
+        .with_intercept_handler(self.intercept_handler());
 
         if let Some(ref auth) = self.authenticator {
             server = server.with_authenticator(auth.clone());
@@ -1120,11 +1491,13 @@ impl GatewayServer {
             }
         });
 
+        let intercept_handler = self.intercept_handler();
         let _drop_guard = SessionDropGuard {
             session_id,
             router: self.router.clone(),
             session_sinks: self.session_sinks.clone(),
             cache: self.cache.clone(),
+            subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(downstream_handle),
         };
 
@@ -1184,6 +1557,7 @@ impl GatewayServer {
                             let router = self.router.clone();
                             let cache = self.cache.clone();
                             let default_node = self.default_node_address.clone();
+                            let intercept = intercept_handler.clone();
                             tokio::spawn(async move {
                                 let mut buf = BytesMut::with_capacity(8192);
                                 let mut chunk = [0u8; 4096];
@@ -1248,6 +1622,9 @@ impl GatewayServer {
                                                         };
 
                                                         router.register_session(session_id, auth_res.guid, initial_node.clone());
+                                                        intercept.subscribe_session_topic(session_id, "chat:global".to_string()).await;
+                                                        intercept.subscribe_session_topic(session_id, format!("whisper:{}", auth_res.guid.raw())).await;
+
                                                         if let Some(ref c) = cache {
                                                             let cache_clone = c.clone();
                                                             let node_clone = initial_node.clone();
@@ -1329,7 +1706,13 @@ impl GatewayServer {
                                                     if let Some(ref mut send) = *lock {
                                                         let _ = send.write_all(&pong_bytes).await;
                                                     }
+                                                    continue;
                                                 }
+
+                                                if intercept.handle_packet(session_id, &pkt).await {
+                                                    continue;
+                                                }
+
                                                 match dispatcher.dispatch_packet(session_id, pkt) {
                                                     Ok(routed) => {
                                                         if let Some(ref tx) = packet_tx {

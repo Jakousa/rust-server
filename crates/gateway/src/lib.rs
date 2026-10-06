@@ -6,15 +6,19 @@
 pub mod auth;
 pub mod backhaul;
 pub mod handover;
+pub mod marketplace;
 pub mod probe;
 pub mod quic;
 pub mod router;
 pub mod server;
+pub mod social;
 pub mod webtransport;
 
 pub use auth::{AuthError, AuthResult, EdgeAuthenticator, JwtClaims, TokenValidator};
 pub use backhaul::{BackhaulChannel, BackhaulError, BackhaulPool, BackhaulState};
 pub use handover::{HandoverError, HandoverRateLimiter, HandoverTicket};
+pub use marketplace::GatewayMarketplaceService;
+pub use social::GatewaySubscriptionManager;
 
 pub use probe::{
     encode_probe_response, parse_probe_request, parse_probe_response, run_probe_server,

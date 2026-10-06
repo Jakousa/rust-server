@@ -61,6 +61,14 @@ pub enum Opcode {
     InteractObject = 0x0010,
     AuthRequest = 0x0011,
     AuthResponse = 0x0012,
+    SocialMessage = 0x0013,
+    SocialSubscribe = 0x0014,
+    SocialUnsubscribe = 0x0015,
+    MarketListRequest = 0x0016,
+    MarketBuyRequest = 0x0017,
+    MarketCancelRequest = 0x0018,
+    MarketQueryRequest = 0x0019,
+    MarketResponse = 0x001A,
 }
 
 impl Opcode {
@@ -84,6 +92,14 @@ impl Opcode {
             0x0010 => Ok(Opcode::InteractObject),
             0x0011 => Ok(Opcode::AuthRequest),
             0x0012 => Ok(Opcode::AuthResponse),
+            0x0013 => Ok(Opcode::SocialMessage),
+            0x0014 => Ok(Opcode::SocialSubscribe),
+            0x0015 => Ok(Opcode::SocialUnsubscribe),
+            0x0016 => Ok(Opcode::MarketListRequest),
+            0x0017 => Ok(Opcode::MarketBuyRequest),
+            0x0018 => Ok(Opcode::MarketCancelRequest),
+            0x0019 => Ok(Opcode::MarketQueryRequest),
+            0x001A => Ok(Opcode::MarketResponse),
             other => Err(ClientCodecError::UnknownOpcode(other)),
         }
     }
@@ -108,6 +124,14 @@ impl Opcode {
             Opcode::InteractObject => "InteractObject",
             Opcode::AuthRequest => "AuthRequest",
             Opcode::AuthResponse => "AuthResponse",
+            Opcode::SocialMessage => "SocialMessage",
+            Opcode::SocialSubscribe => "SocialSubscribe",
+            Opcode::SocialUnsubscribe => "SocialUnsubscribe",
+            Opcode::MarketListRequest => "MarketListRequest",
+            Opcode::MarketBuyRequest => "MarketBuyRequest",
+            Opcode::MarketCancelRequest => "MarketCancelRequest",
+            Opcode::MarketQueryRequest => "MarketQueryRequest",
+            Opcode::MarketResponse => "MarketResponse",
         }
     }
 }
@@ -1379,6 +1403,501 @@ impl AuthResponsePacket {
     }
 }
 
+/// Social message packet for global chat, party chat, guild chat, and direct whispers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocialMessagePacket {
+    pub channel_type: u8,
+    pub target_id: u64,
+    pub sender_guid: u64,
+    pub sender_name: String,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+impl SocialMessagePacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.channel_type);
+        dst.put_u64_le(self.target_id);
+        dst.put_u64_le(self.sender_guid);
+        let name_bytes = self.sender_name.as_bytes();
+        dst.put_u16_le(name_bytes.len() as u16);
+        dst.put_slice(name_bytes);
+        let content_bytes = self.content.as_bytes();
+        dst.put_u16_le(content_bytes.len() as u16);
+        dst.put_slice(content_bytes);
+        dst.put_u64_le(self.timestamp);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        const MIN_SIZE: usize = 29;
+        if src.remaining() < MIN_SIZE {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: MIN_SIZE,
+                got: src.remaining(),
+            });
+        }
+        let channel_type = src.get_u8();
+        let target_id = src.get_u64_le();
+        let sender_guid = src.get_u64_le();
+        let name_len = src.get_u16_le() as usize;
+        if src.remaining() < name_len {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: name_len,
+                got: src.remaining(),
+            });
+        }
+        let name_bytes = src.copy_to_bytes(name_len);
+        let sender_name = String::from_utf8(name_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let content_len = src.get_u16_le() as usize;
+        if src.remaining() < content_len + 8 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: content_len + 8,
+                got: src.remaining(),
+            });
+        }
+        let content_bytes = src.copy_to_bytes(content_len);
+        let content = String::from_utf8(content_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let timestamp = src.get_u64_le();
+
+        Ok(Self {
+            channel_type,
+            target_id,
+            sender_guid,
+            sender_name,
+            content,
+            timestamp,
+        })
+    }
+}
+
+/// Request to subscribe to a social pub/sub topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocialSubscribePacket {
+    pub channel_type: u8,
+    pub target_id: u64,
+    pub channel_name: String,
+}
+
+impl SocialSubscribePacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.channel_type);
+        dst.put_u64_le(self.target_id);
+        let name_bytes = self.channel_name.as_bytes();
+        dst.put_u16_le(name_bytes.len() as u16);
+        dst.put_slice(name_bytes);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 11 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: src.remaining(),
+            });
+        }
+        let channel_type = src.get_u8();
+        let target_id = src.get_u64_le();
+        let name_len = src.get_u16_le() as usize;
+        if src.remaining() < name_len {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: name_len,
+                got: src.remaining(),
+            });
+        }
+        let name_bytes = src.copy_to_bytes(name_len);
+        let channel_name = String::from_utf8(name_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        Ok(Self {
+            channel_type,
+            target_id,
+            channel_name,
+        })
+    }
+}
+
+/// Request to unsubscribe from a social pub/sub topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocialUnsubscribePacket {
+    pub channel_type: u8,
+    pub target_id: u64,
+    pub channel_name: String,
+}
+
+impl SocialUnsubscribePacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.channel_type);
+        dst.put_u64_le(self.target_id);
+        let name_bytes = self.channel_name.as_bytes();
+        dst.put_u16_le(name_bytes.len() as u16);
+        dst.put_slice(name_bytes);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 11 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: src.remaining(),
+            });
+        }
+        let channel_type = src.get_u8();
+        let target_id = src.get_u64_le();
+        let name_len = src.get_u16_le() as usize;
+        if src.remaining() < name_len {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: name_len,
+                got: src.remaining(),
+            });
+        }
+        let name_bytes = src.copy_to_bytes(name_len);
+        let channel_name = String::from_utf8(name_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        Ok(Self {
+            channel_type,
+            target_id,
+            channel_name,
+        })
+    }
+}
+
+/// Standard marketplace error codes.
+pub mod market_error_codes {
+    pub const SUCCESS: u32 = 0;
+    pub const LISTING_NOT_FOUND: u32 = 1;
+    pub const UNAUTHORIZED: u32 = 2;
+    pub const INSUFFICIENT_FUNDS: u32 = 3;
+    pub const CONTAINER_FULL: u32 = 4;
+    pub const ITEM_NOT_FOUND: u32 = 5;
+    pub const ALREADY_SOLD_OR_CANCELLED: u32 = 6;
+    pub const INTERNAL_ERROR: u32 = 7;
+    pub const INVALID_PARAMETERS: u32 = 8;
+}
+
+/// Wire representation of a marketplace listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketListingWire {
+    pub listing_id: String,
+    pub seller_guid: u64,
+    pub item_instance_id: String,
+    pub item_def_id: u32,
+    pub price: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+impl MarketListingWire {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let lid_bytes = self.listing_id.as_bytes();
+        dst.put_u16_le(lid_bytes.len() as u16);
+        dst.put_slice(lid_bytes);
+        dst.put_u64_le(self.seller_guid);
+        let iid_bytes = self.item_instance_id.as_bytes();
+        dst.put_u16_le(iid_bytes.len() as u16);
+        dst.put_slice(iid_bytes);
+        dst.put_u32_le(self.item_def_id);
+        dst.put_u64_le(self.price);
+        dst.put_u64_le(self.created_at);
+        dst.put_u64_le(self.expires_at);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let lid_len = src.get_u16_le() as usize;
+        if src.remaining() < lid_len + 8 + 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: lid_len + 10,
+                got: src.remaining(),
+            });
+        }
+        let lid_bytes = src.copy_to_bytes(lid_len);
+        let listing_id = String::from_utf8(lid_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let seller_guid = src.get_u64_le();
+        let iid_len = src.get_u16_le() as usize;
+        if src.remaining() < iid_len + 4 + 8 + 8 + 8 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: iid_len + 28,
+                got: src.remaining(),
+            });
+        }
+        let iid_bytes = src.copy_to_bytes(iid_len);
+        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let item_def_id = src.get_u32_le();
+        let price = src.get_u64_le();
+        let created_at = src.get_u64_le();
+        let expires_at = src.get_u64_le();
+
+        Ok(Self {
+            listing_id,
+            seller_guid,
+            item_instance_id,
+            item_def_id,
+            price,
+            created_at,
+            expires_at,
+        })
+    }
+}
+
+/// Request to create a new market listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketListRequestPacket {
+    pub item_instance_id: String,
+    pub src_container_id: u64,
+    pub src_slot: u32,
+    pub price: u64,
+    pub duration_secs: u64,
+}
+
+impl MarketListRequestPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let iid_bytes = self.item_instance_id.as_bytes();
+        dst.put_u16_le(iid_bytes.len() as u16);
+        dst.put_slice(iid_bytes);
+        dst.put_u64_le(self.src_container_id);
+        dst.put_u32_le(self.src_slot);
+        dst.put_u64_le(self.price);
+        dst.put_u64_le(self.duration_secs);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let iid_len = src.get_u16_le() as usize;
+        if src.remaining() < iid_len + 28 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: iid_len + 28,
+                got: src.remaining(),
+            });
+        }
+        let iid_bytes = src.copy_to_bytes(iid_len);
+        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let src_container_id = src.get_u64_le();
+        let src_slot = src.get_u32_le();
+        let price = src.get_u64_le();
+        let duration_secs = src.get_u64_le();
+
+        Ok(Self {
+            item_instance_id,
+            src_container_id,
+            src_slot,
+            price,
+            duration_secs,
+        })
+    }
+}
+
+/// Request to purchase an active market listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketBuyRequestPacket {
+    pub listing_id: String,
+    pub buyer_container_id: u64,
+    pub payment_container_id: u64,
+    pub price: u64,
+}
+
+impl MarketBuyRequestPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let lid_bytes = self.listing_id.as_bytes();
+        dst.put_u16_le(lid_bytes.len() as u16);
+        dst.put_slice(lid_bytes);
+        dst.put_u64_le(self.buyer_container_id);
+        dst.put_u64_le(self.payment_container_id);
+        dst.put_u64_le(self.price);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let lid_len = src.get_u16_le() as usize;
+        if src.remaining() < lid_len + 24 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: lid_len + 24,
+                got: src.remaining(),
+            });
+        }
+        let lid_bytes = src.copy_to_bytes(lid_len);
+        let listing_id = String::from_utf8(lid_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let buyer_container_id = src.get_u64_le();
+        let payment_container_id = src.get_u64_le();
+        let price = src.get_u64_le();
+
+        Ok(Self {
+            listing_id,
+            buyer_container_id,
+            payment_container_id,
+            price,
+        })
+    }
+}
+
+/// Request to cancel a market listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketCancelRequestPacket {
+    pub listing_id: String,
+    pub dst_container_id: u64,
+}
+
+impl MarketCancelRequestPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let lid_bytes = self.listing_id.as_bytes();
+        dst.put_u16_le(lid_bytes.len() as u16);
+        dst.put_slice(lid_bytes);
+        dst.put_u64_le(self.dst_container_id);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: src.remaining(),
+            });
+        }
+        let lid_len = src.get_u16_le() as usize;
+        if src.remaining() < lid_len + 8 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: lid_len + 8,
+                got: src.remaining(),
+            });
+        }
+        let lid_bytes = src.copy_to_bytes(lid_len);
+        let listing_id = String::from_utf8(lid_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let dst_container_id = src.get_u64_le();
+
+        Ok(Self {
+            listing_id,
+            dst_container_id,
+        })
+    }
+}
+
+/// Request to query market listings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketQueryRequestPacket {
+    pub item_def_id: u32,
+    pub min_price: u64,
+    pub max_price: u64,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+impl MarketQueryRequestPacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32_le(self.item_def_id);
+        dst.put_u64_le(self.min_price);
+        dst.put_u64_le(self.max_price);
+        dst.put_u32_le(self.offset);
+        dst.put_u32_le(self.limit);
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 28 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 28,
+                got: src.remaining(),
+            });
+        }
+        let item_def_id = src.get_u32_le();
+        let min_price = src.get_u64_le();
+        let max_price = src.get_u64_le();
+        let offset = src.get_u32_le();
+        let limit = src.get_u32_le();
+
+        Ok(Self {
+            item_def_id,
+            min_price,
+            max_price,
+            offset,
+            limit,
+        })
+    }
+}
+
+/// Server response for marketplace actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketResponsePacket {
+    pub request_type: u8,
+    pub success: bool,
+    pub error_code: u32,
+    pub error_message: String,
+    pub listings: Vec<MarketListingWire>,
+}
+
+impl MarketResponsePacket {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.request_type);
+        dst.put_u8(if self.success { 1 } else { 0 });
+        dst.put_u32_le(self.error_code);
+        let msg_bytes = self.error_message.as_bytes();
+        dst.put_u16_le(msg_bytes.len() as u16);
+        dst.put_slice(msg_bytes);
+        dst.put_u16_le(self.listings.len() as u16);
+        for item in &self.listings {
+            item.encode(dst);
+        }
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < 10 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: 10,
+                got: src.remaining(),
+            });
+        }
+        let request_type = src.get_u8();
+        let success = src.get_u8() != 0;
+        let error_code = src.get_u32_le();
+        let msg_len = src.get_u16_le() as usize;
+        if src.remaining() < msg_len + 2 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: msg_len + 2,
+                got: src.remaining(),
+            });
+        }
+        let msg_bytes = src.copy_to_bytes(msg_len);
+        let error_message = String::from_utf8(msg_bytes.to_vec())
+            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+
+        let count = src.get_u16_le() as usize;
+        let mut listings = Vec::with_capacity(count);
+        for _ in 0..count {
+            listings.push(MarketListingWire::decode(src)?);
+        }
+
+        Ok(Self {
+            request_type,
+            success,
+            error_code,
+            error_message,
+            listings,
+        })
+    }
+}
+
 /// Top-level client packet enum encompassing all protocol messages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientPacket {
@@ -1400,6 +1919,14 @@ pub enum ClientPacket {
     InteractObject(InteractObjectPacket),
     AuthRequest(AuthRequestPacket),
     AuthResponse(AuthResponsePacket),
+    SocialMessage(SocialMessagePacket),
+    SocialSubscribe(SocialSubscribePacket),
+    SocialUnsubscribe(SocialUnsubscribePacket),
+    MarketListRequest(MarketListRequestPacket),
+    MarketBuyRequest(MarketBuyRequestPacket),
+    MarketCancelRequest(MarketCancelRequestPacket),
+    MarketQueryRequest(MarketQueryRequestPacket),
+    MarketResponse(MarketResponsePacket),
 }
 
 impl ClientPacket {
@@ -1423,6 +1950,14 @@ impl ClientPacket {
             ClientPacket::InteractObject(_) => Opcode::InteractObject,
             ClientPacket::AuthRequest(_) => Opcode::AuthRequest,
             ClientPacket::AuthResponse(_) => Opcode::AuthResponse,
+            ClientPacket::SocialMessage(_) => Opcode::SocialMessage,
+            ClientPacket::SocialSubscribe(_) => Opcode::SocialSubscribe,
+            ClientPacket::SocialUnsubscribe(_) => Opcode::SocialUnsubscribe,
+            ClientPacket::MarketListRequest(_) => Opcode::MarketListRequest,
+            ClientPacket::MarketBuyRequest(_) => Opcode::MarketBuyRequest,
+            ClientPacket::MarketCancelRequest(_) => Opcode::MarketCancelRequest,
+            ClientPacket::MarketQueryRequest(_) => Opcode::MarketQueryRequest,
+            ClientPacket::MarketResponse(_) => Opcode::MarketResponse,
         }
     }
 
@@ -1449,6 +1984,14 @@ impl ClientPacket {
             ClientPacket::InteractObject(p) => p.encode(&mut payload_buf),
             ClientPacket::AuthRequest(p) => p.encode(&mut payload_buf),
             ClientPacket::AuthResponse(p) => p.encode(&mut payload_buf),
+            ClientPacket::SocialMessage(p) => p.encode(&mut payload_buf),
+            ClientPacket::SocialSubscribe(p) => p.encode(&mut payload_buf),
+            ClientPacket::SocialUnsubscribe(p) => p.encode(&mut payload_buf),
+            ClientPacket::MarketListRequest(p) => p.encode(&mut payload_buf),
+            ClientPacket::MarketBuyRequest(p) => p.encode(&mut payload_buf),
+            ClientPacket::MarketCancelRequest(p) => p.encode(&mut payload_buf),
+            ClientPacket::MarketQueryRequest(p) => p.encode(&mut payload_buf),
+            ClientPacket::MarketResponse(p) => p.encode(&mut payload_buf),
         }
 
         let payload_len = payload_buf.len() as u32;
@@ -1541,6 +2084,30 @@ impl ClientPacket {
             Opcode::AuthResponse => Ok(ClientPacket::AuthResponse(AuthResponsePacket::decode(
                 &mut payload,
             )?)),
+            Opcode::SocialMessage => Ok(ClientPacket::SocialMessage(SocialMessagePacket::decode(
+                &mut payload,
+            )?)),
+            Opcode::SocialSubscribe => Ok(ClientPacket::SocialSubscribe(
+                SocialSubscribePacket::decode(&mut payload)?,
+            )),
+            Opcode::SocialUnsubscribe => Ok(ClientPacket::SocialUnsubscribe(
+                SocialUnsubscribePacket::decode(&mut payload)?,
+            )),
+            Opcode::MarketListRequest => Ok(ClientPacket::MarketListRequest(
+                MarketListRequestPacket::decode(&mut payload)?,
+            )),
+            Opcode::MarketBuyRequest => Ok(ClientPacket::MarketBuyRequest(
+                MarketBuyRequestPacket::decode(&mut payload)?,
+            )),
+            Opcode::MarketCancelRequest => Ok(ClientPacket::MarketCancelRequest(
+                MarketCancelRequestPacket::decode(&mut payload)?,
+            )),
+            Opcode::MarketQueryRequest => Ok(ClientPacket::MarketQueryRequest(
+                MarketQueryRequestPacket::decode(&mut payload)?,
+            )),
+            Opcode::MarketResponse => Ok(ClientPacket::MarketResponse(
+                MarketResponsePacket::decode(&mut payload)?,
+            )),
         }
     }
 
@@ -2781,6 +3348,79 @@ mod tests {
                 }),
                 Opcode::AuthResponse,
             ),
+            (
+                ClientPacket::SocialMessage(SocialMessagePacket {
+                    channel_type: 0,
+                    target_id: 0,
+                    sender_guid: 100,
+                    sender_name: "Player".into(),
+                    content: "Hello".into(),
+                    timestamp: 1000,
+                }),
+                Opcode::SocialMessage,
+            ),
+            (
+                ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 2,
+                    target_id: 123,
+                    channel_name: "chat:guild:123".into(),
+                }),
+                Opcode::SocialSubscribe,
+            ),
+            (
+                ClientPacket::SocialUnsubscribe(SocialUnsubscribePacket {
+                    channel_type: 2,
+                    target_id: 123,
+                    channel_name: "chat:guild:123".into(),
+                }),
+                Opcode::SocialUnsubscribe,
+            ),
+            (
+                ClientPacket::MarketListRequest(MarketListRequestPacket {
+                    item_instance_id: "item-1".into(),
+                    src_container_id: 10,
+                    src_slot: 1,
+                    price: 500,
+                    duration_secs: 3600,
+                }),
+                Opcode::MarketListRequest,
+            ),
+            (
+                ClientPacket::MarketBuyRequest(MarketBuyRequestPacket {
+                    listing_id: "list-1".into(),
+                    buyer_container_id: 20,
+                    payment_container_id: 21,
+                    price: 500,
+                }),
+                Opcode::MarketBuyRequest,
+            ),
+            (
+                ClientPacket::MarketCancelRequest(MarketCancelRequestPacket {
+                    listing_id: "list-1".into(),
+                    dst_container_id: 10,
+                }),
+                Opcode::MarketCancelRequest,
+            ),
+            (
+                ClientPacket::MarketQueryRequest(MarketQueryRequestPacket {
+                    item_def_id: 42,
+                    min_price: 100,
+                    max_price: 1000,
+                    offset: 0,
+                    limit: 20,
+                }),
+                Opcode::MarketQueryRequest,
+            ),
+            (
+                ClientPacket::MarketResponse(MarketResponsePacket {
+                    request_type: 1,
+                    success: true,
+                    error_code: 0,
+                    error_message: String::new(),
+                    listings: vec![],
+                }),
+                Opcode::MarketResponse,
+            ),
         ];
 
         for (pkt, expected_opcode) in packets {
@@ -2977,5 +3617,145 @@ mod tests {
         buf2.put_u64_le(1); // session_id
                             // Truncated before player_guid
         assert!(AuthResponsePacket::decode(&mut buf2.freeze()).is_err());
+    }
+
+    #[test]
+    fn test_social_packets_roundtrip() {
+        let msg = SocialMessagePacket {
+            channel_type: 4,
+            target_id: 200,
+            sender_guid: 100,
+            sender_name: "Alice".into(),
+            content: "Whisper text".into(),
+            timestamp: 12345,
+        };
+        let pkt = ClientPacket::SocialMessage(msg);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode SocialMessage");
+        assert_eq!(decoded, pkt);
+
+        let sub = SocialSubscribePacket {
+            channel_type: 2,
+            target_id: 50,
+            channel_name: "chat:guild:50".into(),
+        };
+        let pkt = ClientPacket::SocialSubscribe(sub);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode SocialSubscribe");
+        assert_eq!(decoded, pkt);
+
+        let unsub = SocialUnsubscribePacket {
+            channel_type: 2,
+            target_id: 50,
+            channel_name: "chat:guild:50".into(),
+        };
+        let pkt = ClientPacket::SocialUnsubscribe(unsub);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode SocialUnsubscribe");
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_social_packets_truncated_buffer_rejection() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0); // channel_type
+        buf.put_u64_le(0); // target_id
+        buf.put_u64_le(100); // sender_guid
+        buf.put_u16_le(10); // claims 10 bytes name
+        buf.put_slice(b"short"); // only 5 bytes
+        assert!(SocialMessagePacket::decode(&mut buf.freeze()).is_err());
+
+        let mut buf2 = BytesMut::new();
+        buf2.put_u8(0);
+        buf2.put_u64_le(1);
+        buf2.put_u16_le(8); // claims 8 bytes channel_name
+        buf2.put_slice(b"abc"); // only 3 bytes
+        assert!(SocialSubscribePacket::decode(&mut buf2.freeze()).is_err());
+    }
+
+    #[test]
+    fn test_market_packets_roundtrip() {
+        let list_req = MarketListRequestPacket {
+            item_instance_id: "item-xyz".into(),
+            src_container_id: 101,
+            src_slot: 3,
+            price: 750,
+            duration_secs: 7200,
+        };
+        let pkt = ClientPacket::MarketListRequest(list_req);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode MarketListRequest");
+        assert_eq!(decoded, pkt);
+
+        let buy_req = MarketBuyRequestPacket {
+            listing_id: "listing-42".into(),
+            buyer_container_id: 102,
+            payment_container_id: 103,
+            price: 750,
+        };
+        let pkt = ClientPacket::MarketBuyRequest(buy_req);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode MarketBuyRequest");
+        assert_eq!(decoded, pkt);
+
+        let cancel_req = MarketCancelRequestPacket {
+            listing_id: "listing-42".into(),
+            dst_container_id: 101,
+        };
+        let pkt = ClientPacket::MarketCancelRequest(cancel_req);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode MarketCancelRequest");
+        assert_eq!(decoded, pkt);
+
+        let query_req = MarketQueryRequestPacket {
+            item_def_id: 99,
+            min_price: 100,
+            max_price: 1000,
+            offset: 10,
+            limit: 25,
+        };
+        let pkt = ClientPacket::MarketQueryRequest(query_req);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode MarketQueryRequest");
+        assert_eq!(decoded, pkt);
+
+        let wire_listing = MarketListingWire {
+            listing_id: "listing-42".into(),
+            seller_guid: 1001,
+            item_instance_id: "item-xyz".into(),
+            item_def_id: 99,
+            price: 750,
+            created_at: 10000,
+            expires_at: 17200,
+        };
+        let resp = MarketResponsePacket {
+            request_type: 4,
+            success: true,
+            error_code: market_error_codes::SUCCESS,
+            error_message: "OK".into(),
+            listings: vec![wire_listing],
+        };
+        let pkt = ClientPacket::MarketResponse(resp);
+        let encoded = pkt.encode();
+        let decoded = ClientPacket::decode(&encoded).expect("decode MarketResponse");
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_market_packets_truncated_buffer_rejection() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(20); // claims 20 bytes listing_id
+        buf.put_slice(b"short");
+        assert!(MarketBuyRequestPacket::decode(&mut buf.freeze()).is_err());
+
+        let mut buf2 = BytesMut::new();
+        buf2.put_u8(1);
+        buf2.put_u8(1);
+        buf2.put_u32_le(0);
+        buf2.put_u16_le(2);
+        buf2.put_slice(b"OK");
+        buf2.put_u16_le(5); // claims 5 listings
+                            // No listing bytes follow
+        assert!(MarketResponsePacket::decode(&mut buf2.freeze()).is_err());
     }
 }

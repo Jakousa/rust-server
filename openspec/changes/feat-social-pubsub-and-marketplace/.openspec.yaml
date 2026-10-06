@@ -1,0 +1,17 @@
+schema_version: "1.0"
+change_name: "feat-social-pubsub-and-marketplace"
+title: "Decoupled Social Pub/Sub Event Bus and Asynchronous Global Marketplace Service"
+authors:
+  - "MMO Engineering Team"
+created_at: "2026-10-06"
+status: "in_progress"
+capabilities:
+  - "gateway/social-pubsub"
+  - "gateway/marketplace"
+  - "storage/marketplace"
+  - "core/social"
+  - "schema/social-wire"
+  - "schema/marketplace-wire"
+issues:
+  - 57
+  - 55
