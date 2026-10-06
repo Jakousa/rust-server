@@ -1437,4 +1437,76 @@ mod tests {
         assert_eq!(p2_items.len(), 1);
         assert_eq!(p2_items[0].item_instance_id, "p1_ring");
     }
+
+    #[tokio::test]
+    async fn test_update_character_position_coordinates() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+
+        repo.create_account("acc_pos", "pos_user").await.unwrap();
+        repo.create_character("acc_pos", 7001, "PosChar", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+
+        // Updating nonexistent character returns false
+        let not_found = repo
+            .update_character_position(99999, (1.0, 2.0, 3.0), 0.5)
+            .await
+            .unwrap();
+        assert!(!not_found);
+
+        // Test boundary values: negative coordinates, zero, large floats
+        let test_coords = [
+            ((-100.5, -200.25, -300.75), -std::f32::consts::PI),
+            ((0.0, 0.0, 0.0), 0.0),
+            ((12345.67, 98765.43, 54321.12), std::f32::consts::TAU),
+        ];
+
+        for (pos, rot) in test_coords {
+            let ok = repo
+                .update_character_position(7001, pos, rot)
+                .await
+                .unwrap();
+            assert!(ok);
+
+            let character = repo.get_character(7001).await.unwrap().unwrap();
+            assert_eq!(character.position, pos);
+            assert_eq!(character.rotation, rot);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_trade_validation_boundaries() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+
+        repo.create_account("acc_trade_val", "val_user")
+            .await
+            .unwrap();
+        repo.create_character("acc_trade_val", 8001, "TraderA", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        repo.create_character("acc_trade_val", 8002, "TraderB", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+
+        // 1. Same character ID trade (party_a == party_b) rejected with TradeError
+        let same_char_trade = repo
+            .execute_trade("trade_self", 8001, 8001, &["item_1".to_string()])
+            .await;
+        assert!(matches!(same_char_trade, Err(StorageError::TradeError(_))));
+        if let Err(StorageError::TradeError(msg)) = same_char_trade {
+            assert!(msg.contains("Sender and recipient must be distinct"));
+        }
+
+        // 2. Empty items list rejected with TradeError
+        let empty_items_trade = repo.execute_trade("trade_empty", 8001, 8002, &[]).await;
+        assert!(matches!(
+            empty_items_trade,
+            Err(StorageError::TradeError(_))
+        ));
+        if let Err(StorageError::TradeError(msg)) = empty_items_trade {
+            assert!(msg.contains("No items specified"));
+        }
+    }
 }

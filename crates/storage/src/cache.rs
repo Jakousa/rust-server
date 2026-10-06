@@ -264,4 +264,36 @@ mod tests {
         let res = RedisCache::new("not_a_valid_redis_url");
         assert!(res.is_err());
     }
+
+    #[tokio::test]
+    async fn test_redis_cache_backend_error_handling() {
+        let cache = RedisCache::new("redis://127.0.0.1:1").unwrap();
+
+        let session = SessionData {
+            session_id: 123,
+            guid: 456,
+            node_address: "127.0.0.1:50052".to_string(),
+            expires_at: 9999,
+        };
+        assert!(cache.set_session(&session, 60).await.is_err());
+        assert!(cache.get_session(123).await.is_err());
+        assert!(cache.remove_session(123).await.is_err());
+
+        let handover = HandoverData {
+            guid: 999,
+            source_node: 1,
+            target_node: 2,
+            snapshot: EntitySnapshot {
+                guid: 999,
+                position: (10.0, 20.0, 30.0),
+                rotation: 0.0,
+                attributes: serde_json::json!({}),
+                version: 1,
+                timestamp: 1000,
+            },
+            staged_at: 1000,
+        };
+        assert!(cache.stage_handover(&handover, 30).await.is_err());
+        assert!(cache.claim_handover(999).await.is_err());
+    }
 }

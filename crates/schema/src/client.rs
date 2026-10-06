@@ -2927,6 +2927,256 @@ mod tests {
     }
 
     #[test]
+    fn test_world_object_spawn_decoder_exact_boundaries() {
+        // 1. Buffer length check: src.remaining() < 16 * 4 (64 bytes)
+        // Header: object_id (1 byte varint), prefab_id (1 byte varint)
+        let mut base = BytesMut::new();
+        put_varint_u64(&mut base, 42);
+        put_varint_u32(&mut base, 7);
+
+        // Exactly 63 bytes remaining after header
+        let mut buf_63 = base.clone();
+        buf_63.put_slice(&[0u8; 63]);
+        let err_63 = WorldObjectSpawnPacket::decode(&mut buf_63.freeze())
+            .expect_err("should fail when remaining < 64");
+        assert_eq!(
+            err_63,
+            ClientCodecError::BufferTooShort {
+                expected: 64,
+                got: 63
+            }
+        );
+
+        // Exactly 64 bytes for pos/rot/scale/bounds, followed by state_flags
+        let mut base_64 = base.clone();
+        base_64.put_slice(&[0u8; 64]); // pos, rot, scale, bounds_min, bounds_max
+        put_varint_u32(&mut base_64, 0); // state_flags
+
+        // Test exact 0 bytes remaining before owner_type (< 1 check)
+        let buf_no_owner_type = base_64.clone();
+        let err_owner_type = WorldObjectSpawnPacket::decode(&mut buf_no_owner_type.freeze())
+            .expect_err("should fail with 0 bytes before owner_type");
+        assert_eq!(
+            err_owner_type,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0
+            }
+        );
+
+        // Provide owner_type and empty owner_id string
+        let mut base_with_owner = base_64.clone();
+        base_with_owner.put_u8(1); // owner_type
+        put_string(&mut base_with_owner, ""); // owner_id (empty string varint len 0)
+
+        // Test exact 0 bytes remaining before has_health (< 1 check)
+        let buf_no_health = base_with_owner.clone();
+        let err_health = WorldObjectSpawnPacket::decode(&mut buf_no_health.freeze())
+            .expect_err("should fail with 0 bytes before has_health");
+        assert_eq!(
+            err_health,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0
+            }
+        );
+
+        // Complete minimal valid packet: has_health = 0, empty properties, revision = 100
+        let mut valid_buf = base_with_owner.clone();
+        valid_buf.put_u8(0); // has_health = 0
+        put_property_map(&mut valid_buf, &HashMap::new()); // empty props (0 count)
+        put_varint_u64(&mut valid_buf, 100); // revision
+
+        let decoded = WorldObjectSpawnPacket::decode(&mut valid_buf.freeze())
+            .expect("should decode minimal valid packet");
+        assert_eq!(decoded.object_id, 42);
+        assert_eq!(decoded.prefab_id, 7);
+        assert_eq!(decoded.owner_type, 1);
+        assert_eq!(decoded.owner_id, "");
+        assert_eq!(decoded.health, None);
+        assert_eq!(decoded.revision, 100);
+    }
+
+    #[test]
+    fn test_world_object_delta_decoder_exact_boundaries() {
+        let mut base = BytesMut::new();
+        put_varint_u64(&mut base, 55); // object_id
+        put_varint_u64(&mut base, 12); // revision
+
+        // 0 bytes remaining before has_flags (< 1 check)
+        let buf_no_flags = base.clone();
+        let err_flags = WorldObjectDeltaPacket::decode(&mut buf_no_flags.freeze())
+            .expect_err("should fail with 0 bytes before has_flags");
+        assert_eq!(
+            err_flags,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0
+            }
+        );
+
+        // Provide has_flags = 0
+        let mut base_with_flags = base.clone();
+        base_with_flags.put_u8(0);
+
+        // 0 bytes remaining before has_health (< 1 check)
+        let buf_no_health = base_with_flags.clone();
+        let err_health = WorldObjectDeltaPacket::decode(&mut buf_no_health.freeze())
+            .expect_err("should fail with 0 bytes before has_health");
+        assert_eq!(
+            err_health,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0
+            }
+        );
+
+        // Provide has_health = 0 and empty properties map
+        let mut valid_buf = base_with_flags.clone();
+        valid_buf.put_u8(0); // has_health = 0
+        put_property_map(&mut valid_buf, &HashMap::new());
+
+        let decoded = WorldObjectDeltaPacket::decode(&mut valid_buf.freeze())
+            .expect("should decode valid delta");
+        assert_eq!(decoded.object_id, 55);
+        assert_eq!(decoded.revision, 12);
+        assert_eq!(decoded.state_flags, None);
+        assert_eq!(decoded.health, None);
+    }
+
+    #[test]
+    fn test_place_object_packet_decoder_boundary() {
+        let mut base = BytesMut::new();
+        put_varint_u32(&mut base, 10); // prefab_id
+
+        // Exactly 39 bytes remaining (< 40 bytes)
+        let mut buf_39 = base.clone();
+        buf_39.put_slice(&[0u8; 39]);
+        let err_39 =
+            PlaceObjectPacket::decode(&mut buf_39.freeze()).expect_err("should fail with 39 bytes");
+        assert_eq!(
+            err_39,
+            ClientCodecError::BufferTooShort {
+                expected: 40,
+                got: 39
+            }
+        );
+
+        // Exactly 40 bytes + empty properties map succeeds
+        let mut buf_40 = base.clone();
+        buf_40.put_slice(&[0u8; 40]);
+        put_property_map(&mut buf_40, &HashMap::new());
+
+        let decoded = PlaceObjectPacket::decode(&mut buf_40.freeze())
+            .expect("should decode with 40 bytes + props");
+        assert_eq!(decoded.prefab_id, 10);
+    }
+
+    #[test]
+    fn test_auth_request_packet_exact_boundaries() {
+        // Test token length 0 with 4 bytes client_version (2 bytes for token_len + 4 bytes version)
+        let mut zero_len_buf = BytesMut::new();
+        zero_len_buf.put_u16_le(0); // token_len = 0
+        zero_len_buf.put_u32_le(101); // client_version = 101
+        let decoded_zero = AuthRequestPacket::decode(&mut zero_len_buf.freeze())
+            .expect("token_len = 0 should succeed");
+        assert_eq!(decoded_zero.token, "");
+        assert_eq!(decoded_zero.client_version, 101);
+
+        // Test token length 5 ("hello"): token_len + 4 = 9 bytes total payload
+        // Exact payload length token_len + 4 succeeds
+        let mut exact_buf = BytesMut::new();
+        exact_buf.put_u16_le(5);
+        exact_buf.put_slice(b"hello");
+        exact_buf.put_u32_le(202);
+        let decoded_exact = AuthRequestPacket::decode(&mut exact_buf.freeze())
+            .expect("exact length should succeed");
+        assert_eq!(decoded_exact.token, "hello");
+        assert_eq!(decoded_exact.client_version, 202);
+
+        // token_len + 3 bytes (1 byte short of client_version) fails BufferTooShort
+        let mut short_buf = BytesMut::new();
+        short_buf.put_u16_le(5);
+        short_buf.put_slice(b"hello");
+        short_buf.put_slice(&[1, 2, 3]); // only 3 bytes for client_version instead of 4
+        let err_short = AuthRequestPacket::decode(&mut short_buf.freeze())
+            .expect_err("token_len + 3 should fail BufferTooShort");
+        assert_eq!(
+            err_short,
+            ClientCodecError::BufferTooShort {
+                expected: 5 + 4,
+                got: 5 + 3
+            }
+        );
+    }
+
+    #[test]
+    fn test_auth_response_packet_exact_boundaries() {
+        // MIN_SIZE is 25 bytes:
+        // 1 (success) + 4 (error_code) + 8 (session_id) + 8 (player_guid) + 2 (node_len) + 2 (msg_len)
+        let mut base_25 = BytesMut::new();
+        base_25.put_u8(1); // success
+        base_25.put_u32_le(0); // error_code
+        base_25.put_u64_le(100); // session_id
+        base_25.put_u64_le(200); // player_guid
+
+        // Test assigned_node boundary: node_len = 4 ("node")
+        let mut node_short = base_25.clone();
+        node_short.put_u16_le(4);
+        node_short.put_slice(b"nod"); // only 3 bytes
+        let err_node = AuthResponsePacket::decode(&mut node_short.freeze())
+            .expect_err("assigned_node length mismatch should fail");
+        assert_eq!(
+            err_node,
+            ClientCodecError::BufferTooShort {
+                expected: 4,
+                got: 3
+            }
+        );
+
+        // Test error_message boundary:
+        let mut with_node = base_25.clone();
+        with_node.put_u16_le(4);
+        with_node.put_slice(b"node");
+
+        // Exactly 1 byte remaining after node (needs 2 for msg_len u16)
+        let mut short_msg_len = with_node.clone();
+        short_msg_len.put_u8(0);
+        let err_msg_len = AuthResponsePacket::decode(&mut short_msg_len.freeze())
+            .expect_err("1 byte remaining for msg_len should fail");
+        assert_eq!(
+            err_msg_len,
+            ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: 1
+            }
+        );
+
+        // msg_len = 5 ("error"), but only 4 bytes remaining
+        let mut msg_short = with_node.clone();
+        msg_short.put_u16_le(5);
+        msg_short.put_slice(b"erro"); // only 4 bytes
+        let err_msg = AuthResponsePacket::decode(&mut msg_short.freeze())
+            .expect_err("error_message length mismatch should fail");
+        assert_eq!(
+            err_msg,
+            ClientCodecError::BufferTooShort {
+                expected: 5,
+                got: 4
+            }
+        );
+
+        // Exact match succeeds
+        let mut exact_res = with_node.clone();
+        exact_res.put_u16_le(5);
+        exact_res.put_slice(b"error");
+        let decoded_res = AuthResponsePacket::decode(&mut exact_res.freeze())
+            .expect("exact lengths should succeed");
+        assert_eq!(decoded_res.assigned_node, "node");
+        assert_eq!(decoded_res.error_message, "error");
+    }
+
+    #[test]
     fn test_auth_packets_roundtrip() {
         let auth_req = AuthRequestPacket {
             token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-IDcSemACt8x4iTMCda8Yhe3iZaWbvV5XKSTbuAn0M".to_string(),
