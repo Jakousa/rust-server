@@ -1776,6 +1776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmo-plugin-voxel"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "mmo-core",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "mmo-schema"
 version = "0.1.0"
 dependencies = [
