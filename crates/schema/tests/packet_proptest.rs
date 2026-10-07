@@ -1,7 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use mmo_schema::client::{
     AuthRequestPacket, AuthResponsePacket, ClientPacket, InteractionPacket, InteractionType,
-    MovementPacket, Vec3,
+    LagCompensationPayload, MovementCorrectionPacket, MovementCorrectionReason, MovementPacket,
+    Vec3,
 };
 use proptest::prelude::*;
 
@@ -57,6 +58,26 @@ prop_compose! {
             interaction_type,
             action_id,
             payload: Bytes::from(payload_vec),
+        }
+    }
+}
+
+prop_compose! {
+    fn arb_lag_compensation_payload()(
+        client_timestamp in any::<u64>(),
+        origin in arb_vec3(),
+        dx in 0.1f32..100.0f32,
+        dy in 0.1f32..100.0f32,
+        dz in 0.1f32..100.0f32,
+        max_distance in 0.01f32..1000.0f32,
+        sequence in any::<u32>(),
+    ) -> LagCompensationPayload {
+        LagCompensationPayload {
+            client_timestamp,
+            origin,
+            direction: Vec3::new(dx, dy, dz),
+            max_distance,
+            sequence,
         }
     }
 }
@@ -327,5 +348,104 @@ proptest! {
         mmo_schema::bitpack::put_varint_u64(&mut buf, val);
         let decoded = mmo_schema::bitpack::get_varint_u64(&mut buf).unwrap();
         prop_assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn prop_test_lag_compensation_payload_roundtrip(payload in arb_lag_compensation_payload()) {
+        let mut buf = bytes::BytesMut::new();
+        payload.encode(&mut buf);
+        let mut slice = &buf[..];
+        let decoded = LagCompensationPayload::decode(&mut slice).unwrap();
+        prop_assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn prop_test_normalized_direction(payload in arb_lag_compensation_payload()) {
+        let norm = payload.normalized_direction().unwrap();
+        let len = (norm.x * norm.x + norm.y * norm.y + norm.z * norm.z).sqrt();
+        prop_assert!((len - 1.0).abs() < 1e-4, "Normalized length was {}", len);
+    }
+}
+
+#[cfg(test)]
+mod lag_compensation_tests {
+    use super::*;
+
+    #[test]
+    fn test_lag_compensation_payload_buffer_too_short() {
+        let buf = [0u8; 39]; // 39 < 40 bytes
+        let mut slice = &buf[..];
+        let res = LagCompensationPayload::decode(&mut slice);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_lag_compensation_payload_nan_rejected() {
+        let payload = LagCompensationPayload {
+            client_timestamp: 1000,
+            origin: Vec3::new(f32::NAN, 0.0, 0.0),
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            max_distance: 10.0,
+            sequence: 1,
+        };
+        let mut buf = BytesMut::new();
+        payload.encode(&mut buf);
+        let mut slice = &buf[..];
+        assert!(LagCompensationPayload::decode(&mut slice).is_err());
+    }
+
+    #[test]
+    fn test_lag_compensation_payload_non_positive_max_distance() {
+        let payload = LagCompensationPayload {
+            client_timestamp: 1000,
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            max_distance: -5.0,
+            sequence: 1,
+        };
+        let mut buf = BytesMut::new();
+        payload.encode(&mut buf);
+        let mut slice = &buf[..];
+        assert!(LagCompensationPayload::decode(&mut slice).is_err());
+    }
+
+    #[test]
+    fn test_lag_compensation_payload_degenerate_direction() {
+        let payload = LagCompensationPayload {
+            client_timestamp: 1000,
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, 0.0),
+            max_distance: 10.0,
+            sequence: 1,
+        };
+        let mut buf = BytesMut::new();
+        payload.encode(&mut buf);
+        let mut slice = &buf[..];
+        assert!(LagCompensationPayload::decode(&mut slice).is_err());
+    }
+
+    #[test]
+    fn test_movement_correction_reason_roundtrip() {
+        let reasons = [
+            MovementCorrectionReason::KinematicViolation,
+            MovementCorrectionReason::Reconciliation,
+            MovementCorrectionReason::Veto,
+            MovementCorrectionReason::OutOfBounds,
+            MovementCorrectionReason::Custom(42),
+        ];
+        for reason in reasons {
+            let raw: u8 = reason.into();
+            assert_eq!(MovementCorrectionReason::from(raw), reason);
+
+            let pkt = MovementCorrectionPacket {
+                entity_id: 1,
+                corrected_position: Vec3::new(0.0, 0.0, 0.0),
+                corrected_velocity: Vec3::new(0.0, 0.0, 0.0),
+                sequence: 10,
+                reason: 0,
+            }
+            .with_reason(reason);
+            assert_eq!(pkt.reason_enum(), reason);
+        }
     }
 }

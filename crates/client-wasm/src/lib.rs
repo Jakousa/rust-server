@@ -4,6 +4,7 @@
 //! temporal entity smoothing (Hermite / LERP), and flat typed buffer generation for WebGL rendering.
 
 pub mod interp;
+pub mod prediction;
 pub mod state;
 pub mod world;
 
@@ -14,12 +15,14 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use mmo_schema::client::{
-    ClientAckPacket, ClientPacket, InteractionPacket, InteractionType, MovementPacket, Vec3,
+    delta_flags, ClientAckPacket, ClientPacket, InteractionPacket, InteractionType, MovementPacket,
+    Vec3,
 };
 
 use crate::interp::InterpolationBuffer;
 use crate::state::ClientEntityReplica;
 use crate::world::WorldObjectStore;
+pub use prediction::{ClientInput, PredictionBuffer};
 
 /// Telemetry structure serialized to JSON for developer HUD overlays.
 #[derive(Debug, Serialize)]
@@ -37,6 +40,7 @@ pub struct ClientTelemetry {
 pub struct WasmClientWorld {
     entities: HashMap<u64, ClientEntityReplica>,
     interp_buffer: InterpolationBuffer,
+    prediction_buffer: PredictionBuffer,
     world_objects: WorldObjectStore,
     local_player_id: Option<u64>,
     session_id: u64,
@@ -62,6 +66,7 @@ impl WasmClientWorld {
         Self {
             entities: HashMap::new(),
             interp_buffer: InterpolationBuffer::new(0.10),
+            prediction_buffer: PredictionBuffer::new(),
             world_objects: WorldObjectStore::new(),
             local_player_id: None,
             session_id: 0,
@@ -140,14 +145,23 @@ impl WasmClientWorld {
 
                     replica.apply_delta(&delta);
 
-                    self.interp_buffer.push_snapshot(
-                        entity_id,
-                        batch.server_tick,
-                        self.client_time,
-                        replica.position,
-                        replica.velocity,
-                        replica.yaw,
-                    );
+                    if Some(entity_id) == self.local_player_id {
+                        // Local player position is predicted, but if keyframe arrives, reconcile against it
+                        if delta.field_mask & delta_flags::MASK_KEYFRAME != 0 {
+                            let server_pos = replica.position;
+                            let reconciled = self.prediction_buffer.reconcile(0, server_pos);
+                            replica.position = self.prediction_buffer.visual_position(reconciled);
+                        }
+                    } else {
+                        self.interp_buffer.push_snapshot(
+                            entity_id,
+                            batch.server_tick,
+                            self.client_time,
+                            replica.position,
+                            replica.velocity,
+                            replica.yaw,
+                        );
+                    }
                 }
             }
             ClientPacket::EntityState(state) => {
@@ -174,12 +188,17 @@ impl WasmClientWorld {
             ClientPacket::MovementCorrection(correction) => {
                 if let Some(local_id) = self.local_player_id {
                     if correction.entity_id == local_id {
+                        let server_pos = (
+                            correction.corrected_position.x,
+                            correction.corrected_position.y,
+                            correction.corrected_position.z,
+                        );
+                        let reconciled_pos = self
+                            .prediction_buffer
+                            .reconcile(correction.sequence, server_pos);
                         if let Some(replica) = self.entities.get_mut(&local_id) {
-                            replica.position = (
-                                correction.corrected_position.x,
-                                correction.corrected_position.y,
-                                correction.corrected_position.z,
-                            );
+                            replica.position =
+                                self.prediction_buffer.visual_position(reconciled_pos);
                             replica.velocity = (
                                 correction.corrected_velocity.x,
                                 correction.corrected_velocity.y,
@@ -211,6 +230,16 @@ impl WasmClientWorld {
     /// Advances client time by `dt_sec` and smoothly updates entity positions via interpolation.
     pub fn update(&mut self, dt_sec: f32) {
         self.client_time += dt_sec as f64;
+        self.prediction_buffer.update(dt_sec);
+
+        // Update local player visual position with decayed error offset
+        if let Some(local_id) = self.local_player_id {
+            if let Some(replica) = self.entities.get_mut(&local_id) {
+                replica.position = self
+                    .prediction_buffer
+                    .visual_position(self.prediction_buffer.current_sim_pos);
+            }
+        }
 
         for (entity_id, replica) in self.entities.iter_mut() {
             // Local player is predicted immediately on input; other entities are interpolated
@@ -231,8 +260,18 @@ impl WasmClientWorld {
     pub fn encode_movement(&mut self, x: f32, y: f32, z: f32, yaw: f32, sequence: u32) -> Vec<u8> {
         let entity_id = self.local_player_id.unwrap_or(0);
 
+        let prev_sim = self.prediction_buffer.current_sim_pos;
+        let displacement = (x - prev_sim.0, y - prev_sim.1, z - prev_sim.2);
+        self.prediction_buffer.push_input(
+            sequence,
+            (x, y, z),
+            displacement,
+            0.05,
+            self.client_time,
+        );
+
         if let Some(replica) = self.entities.get_mut(&entity_id) {
-            replica.position = (x, y, z);
+            replica.position = self.prediction_buffer.visual_position((x, y, z));
             replica.yaw = yaw;
         }
 
@@ -416,6 +455,21 @@ impl WasmClientWorld {
     /// Returns the number of currently queued unacknowledged server ticks.
     pub fn pending_acks_count(&self) -> usize {
         self.pending_acks.len()
+    }
+
+    /// Returns a reference to the client prediction buffer.
+    pub fn prediction_buffer(&self) -> &PredictionBuffer {
+        &self.prediction_buffer
+    }
+
+    /// Returns a mutable reference to the client prediction buffer.
+    pub fn prediction_buffer_mut(&mut self) -> &mut PredictionBuffer {
+        &mut self.prediction_buffer
+    }
+
+    /// Returns the current (x, y, z) position of an entity, if tracked.
+    pub fn get_entity_position(&self, entity_id: u64) -> Option<(f32, f32, f32)> {
+        self.entities.get(&entity_id).map(|r| r.position)
     }
 }
 
@@ -698,5 +752,109 @@ mod tests {
         } else {
             panic!("Expected ClientAckPacket for tick 11");
         }
+    }
+
+    #[test]
+    fn test_client_movement_prediction_and_reconciliation() {
+        use mmo_schema::client::{MovementCorrectionPacket, MovementCorrectionReason};
+
+        let mut world = WasmClientWorld::new();
+        let local_id = 42;
+        world.set_local_player_id(local_id);
+
+        let state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: local_id,
+            position: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        world.process_packet(&state.encode()).unwrap();
+
+        // Client predicts steps 1, 2, 3
+        let _ = world.encode_movement(1.0, 0.0, 0.0, 0.0, 1);
+        let _ = world.encode_movement(2.0, 0.0, 0.0, 0.0, 2);
+        let _ = world.encode_movement(3.0, 0.0, 0.0, 0.0, 3);
+
+        assert_eq!(world.prediction_buffer.unacknowledged_inputs.len(), 3);
+        assert_eq!(world.get_entity_position(local_id), Some((3.0, 0.0, 0.0)));
+
+        // Server sends correction for sequence 1 at (0.5, 0.0, 0.0) -> soft divergence
+        let correction = ClientPacket::MovementCorrection(MovementCorrectionPacket {
+            entity_id: local_id,
+            corrected_position: Vec3::new(0.5, 0.0, 0.0),
+            corrected_velocity: Vec3::new(0.0, 0.0, 0.0),
+            sequence: 1,
+            reason: MovementCorrectionReason::Reconciliation.into(),
+        });
+
+        world
+            .process_packet(&correction.encode())
+            .expect("process correction");
+
+        // 1 acknowledged, 2 remaining in queue
+        assert_eq!(world.prediction_buffer.unacknowledged_inputs.len(), 2);
+        // Simulation position replayed: 0.5 + 1.0 + 1.0 = 2.5
+        assert!((world.prediction_buffer.current_sim_pos.0 - 2.5).abs() < 1e-4);
+
+        // Visual smoothing: previous visual was 3.0, new sim is 2.5 -> error offset +0.5
+        assert!((world.prediction_buffer.visual_error_offset.0 - 0.5).abs() < 1e-4);
+
+        // Update with dt to smoothly bleed out error offset
+        world.update(0.10);
+        assert!(world.prediction_buffer.visual_error_offset.0 < 0.5);
+        assert!(world.prediction_buffer.visual_error_offset.0 > 0.0);
+
+        // Fully decay error offset
+        world.update(1.0);
+        assert_eq!(world.prediction_buffer.visual_error_offset.0, 0.0);
+        assert_eq!(world.get_entity_position(local_id), Some((2.5, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_client_movement_correction_hard_snap() {
+        use mmo_schema::client::{MovementCorrectionPacket, MovementCorrectionReason};
+
+        let mut world = WasmClientWorld::new();
+        let local_id = 42;
+        world.set_local_player_id(local_id);
+
+        let state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: local_id,
+            position: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        world.process_packet(&state.encode()).unwrap();
+
+        let _ = world.encode_movement(1.0, 0.0, 0.0, 0.0, 1);
+        let _ = world.encode_movement(2.0, 0.0, 0.0, 0.0, 2);
+
+        // Severe teleport rollback: server reports (100.0, 0.0, 0.0)
+        let correction = ClientPacket::MovementCorrection(MovementCorrectionPacket {
+            entity_id: local_id,
+            corrected_position: Vec3::new(100.0, 0.0, 0.0),
+            corrected_velocity: Vec3::new(0.0, 0.0, 0.0),
+            sequence: 1,
+            reason: MovementCorrectionReason::KinematicViolation.into(),
+        });
+
+        world
+            .process_packet(&correction.encode())
+            .expect("process correction");
+
+        // Hard snap: unacknowledged inputs cleared, visual error offset zeroed
+        assert!(world.prediction_buffer.unacknowledged_inputs.is_empty());
+        assert_eq!(world.prediction_buffer.visual_error_offset, (0.0, 0.0, 0.0));
+        assert_eq!(world.get_entity_position(local_id), Some((100.0, 0.0, 0.0)));
     }
 }

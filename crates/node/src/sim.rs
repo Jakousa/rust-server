@@ -55,6 +55,7 @@ pub struct TickSimulation {
         tokio::sync::mpsc::UnboundedReceiver<ContainerTransferNotification>,
     pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
     pub snapshot_interval_ticks: u64,
+    pub history: crate::history::SpatialHistoryBuffer,
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -148,6 +149,7 @@ impl TickSimulation {
             container_transfer_receiver,
             snapshot_sender: None,
             snapshot_interval_ticks: 20,
+            history: crate::history::SpatialHistoryBuffer::default(),
         }
     }
 
@@ -635,6 +637,44 @@ impl TickSimulation {
             }
         }
 
+        // 3.6. Record historical spatial tick frame in zero-allocation ring buffer
+        let entity_records: Vec<_> = self
+            .entity_store
+            .iter()
+            .filter_map(|(_key, entity)| {
+                if self.migrating_leases.contains_key(&entity.guid) {
+                    return None;
+                }
+                let half = 0.5f32;
+                let bounds = BoundingBox3D::new(
+                    (
+                        entity.position.0 - half,
+                        entity.position.1 - half,
+                        entity.position.2 - half,
+                    ),
+                    (
+                        entity.position.0 + half,
+                        entity.position.1 + half,
+                        entity.position.2 + half,
+                    ),
+                );
+                Some(crate::history::HistoricalEntityRecord {
+                    guid: entity.guid,
+                    position: entity.position,
+                    bounds,
+                    velocity: (0.0, 0.0, 0.0),
+                    yaw: entity.rotation,
+                    pitch: 0.0,
+                })
+            })
+            .collect();
+        self.history.push_frame(
+            self.tick_counter,
+            self.current_time,
+            now_ms,
+            entity_records.into_iter(),
+        );
+
         // 4. Record simulation loop metrics
         let duration = start.elapsed();
         self.last_tick_duration = duration;
@@ -705,6 +745,62 @@ impl TickSimulation {
     /// Convenience helper executing a standard 20 Hz (50ms) simulation tick step.
     pub fn step_tick(&mut self) {
         self.step(Self::TICK_DT_SEC);
+    }
+
+    /// Performs an authoritative lag-compensated raycast against historical entity bounding boxes.
+    pub fn raycast_historical(
+        &self,
+        origin: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        max_distance: f32,
+        target_time: Instant,
+        exclude_guid: Option<Guid>,
+    ) -> Option<crate::history::HistoricalHitResult> {
+        self.history.raycast_historical(
+            origin,
+            direction,
+            max_distance,
+            target_time,
+            self.current_time,
+            exclude_guid,
+        )
+    }
+
+    /// Performs a lag-compensated raycast using millisecond timestamps.
+    pub fn raycast_historical_ms(
+        &self,
+        origin: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        max_distance: f32,
+        target_ms: u64,
+        current_ms: u64,
+        exclude_guid: Option<Guid>,
+    ) -> Option<crate::history::HistoricalHitResult> {
+        self.history.raycast_historical_ms(
+            origin,
+            direction,
+            max_distance,
+            target_ms,
+            current_ms,
+            exclude_guid,
+        )
+    }
+
+    /// Authoritatively validates whether a target entity was within range at historical timestamp `target_time`.
+    pub fn validate_historical_range(
+        &self,
+        attacker_pos: (f32, f32, f32),
+        target_guid: Guid,
+        target_time: Instant,
+        max_range: f32,
+    ) -> Result<f32, crate::history::HistoricalQueryError> {
+        self.history.validate_historical_range(
+            attacker_pos,
+            target_guid,
+            target_time,
+            self.current_time,
+            max_range,
+        )
     }
 
     /// Maximum number of consecutive catch-up ticks executed per cycle before yielding to Tokio.
@@ -1644,5 +1740,40 @@ mod tests {
         // Now unobstructed move succeeds
         let res2 = sim.process_client_move_deterministic(player, (6.0, 10.0, 10.0), 0.5);
         assert!(res2.is_ok());
+    }
+
+    #[test]
+    fn test_sim_tick_history_recording_and_raycast() {
+        let mut sim = TickSimulation::new(
+            1,
+            BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0)),
+        );
+        let target = Guid::new(EntityType::Player, 1, 10);
+        let shooter = Guid::new(EntityType::Player, 1, 20);
+        sim.spawn_entity(target, (10.0, 0.0, 0.0));
+        sim.spawn_entity(shooter, (0.0, 0.0, 0.0));
+
+        // Step 1
+        sim.step_tick();
+        assert_eq!(sim.history.len(), 1);
+        let t0 = sim.current_time();
+
+        // Move target to (20.0, 0.0, 0.0)
+        let _ = sim.process_client_move_deterministic(target, (20.0, 0.0, 0.0), 1.0);
+        sim.step_tick();
+        assert_eq!(sim.history.len(), 2);
+        let _t1 = sim.current_time();
+
+        // Historical raycast directed at target's position at t0 (10.0, 0.0, 0.0)
+        let hit = sim.raycast_historical((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 50.0, t0, Some(shooter));
+        assert!(hit.is_some());
+        let hit_res = hit.unwrap();
+        assert_eq!(hit_res.target_guid, target);
+        assert!((hit_res.distance - 9.5).abs() < 1e-3);
+
+        // Historical range validation
+        let range_res = sim.validate_historical_range((0.0, 0.0, 0.0), target, t0, 15.0);
+        assert!(range_res.is_ok());
+        assert!((range_res.unwrap() - 10.0).abs() < 1e-3);
     }
 }

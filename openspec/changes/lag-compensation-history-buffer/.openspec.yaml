@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: lag-compensation-history-buffer
+  title: Lag Compensation, Server-Authoritative History Buffers & Client Prediction Reconciliation
+  status: proposed
+  created: 2026-10-07
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: simulation
+  specs:
+    - specs/simulation/lag-compensation/spec.md

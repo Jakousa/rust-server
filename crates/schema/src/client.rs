@@ -166,6 +166,31 @@ impl Vec3 {
         self.distance_squared(other).sqrt()
     }
 
+    pub fn is_finite(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
+    pub fn length_squared(&self) -> f32 {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
+
+    pub fn length(&self) -> f32 {
+        self.length_squared().sqrt()
+    }
+
+    pub fn normalized(&self) -> Option<Self> {
+        let len = self.length();
+        if len > 1e-6 {
+            Some(Self {
+                x: self.x / len,
+                y: self.y / len,
+                z: self.z / len,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn encode(&self, dst: &mut BytesMut) {
         dst.put_f32_le(self.x);
         dst.put_f32_le(self.y);
@@ -277,7 +302,42 @@ impl MovementPacket {
     }
 }
 
-/// Server-originated movement snap-back correction (anti-cheat / kinematic violation).
+/// Specific reason category for a server-originated movement correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MovementCorrectionReason {
+    KinematicViolation = 0,
+    Reconciliation = 1,
+    Veto = 2,
+    OutOfBounds = 3,
+    Custom(u8),
+}
+
+impl From<u8> for MovementCorrectionReason {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => MovementCorrectionReason::KinematicViolation,
+            1 => MovementCorrectionReason::Reconciliation,
+            2 => MovementCorrectionReason::Veto,
+            3 => MovementCorrectionReason::OutOfBounds,
+            custom => MovementCorrectionReason::Custom(custom),
+        }
+    }
+}
+
+impl From<MovementCorrectionReason> for u8 {
+    fn from(r: MovementCorrectionReason) -> Self {
+        match r {
+            MovementCorrectionReason::KinematicViolation => 0,
+            MovementCorrectionReason::Reconciliation => 1,
+            MovementCorrectionReason::Veto => 2,
+            MovementCorrectionReason::OutOfBounds => 3,
+            MovementCorrectionReason::Custom(val) => val,
+        }
+    }
+}
+
+/// Server-originated movement snap-back correction (anti-cheat / kinematic violation / reconciliation).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MovementCorrectionPacket {
     pub entity_id: u64,
@@ -288,6 +348,15 @@ pub struct MovementCorrectionPacket {
 }
 
 impl MovementCorrectionPacket {
+    pub fn reason_enum(&self) -> MovementCorrectionReason {
+        MovementCorrectionReason::from(self.reason)
+    }
+
+    pub fn with_reason(mut self, reason: MovementCorrectionReason) -> Self {
+        self.reason = reason.into();
+        self
+    }
+
     pub fn encode(&self, dst: &mut BytesMut) {
         dst.put_u64_le(self.entity_id);
         self.corrected_position.encode(dst);
@@ -371,6 +440,84 @@ impl InteractionPacket {
             action_id,
             payload,
         })
+    }
+}
+
+/// Client-originated lag-compensated interaction/raycast payload embedded in `InteractionPacket.payload`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LagCompensationPayload {
+    /// Server-synchronized target timestamp (adjusted via client ping/clock offset estimation, in milliseconds).
+    pub client_timestamp: u64,
+    /// Origin of the interaction ray in 3D world space.
+    pub origin: Vec3,
+    /// Direction vector of the interaction ray (normalized on query execution).
+    pub direction: Vec3,
+    /// Maximum raycast range in world units.
+    pub max_distance: f32,
+    /// Client-side input sequence number at query invocation.
+    pub sequence: u32,
+}
+
+impl LagCompensationPayload {
+    /// Fixed binary serialization size in bytes (8 + 12 + 12 + 4 + 4 = 40 bytes).
+    pub const SIZE: usize = 40;
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u64_le(self.client_timestamp);
+        self.origin.encode(dst);
+        self.direction.encode(dst);
+        dst.put_f32_le(self.max_distance);
+        dst.put_u32_le(self.sequence);
+    }
+
+    pub fn encode_to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(Self::SIZE);
+        self.encode(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
+        if src.remaining() < Self::SIZE {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: Self::SIZE,
+                got: src.remaining(),
+            });
+        }
+        let client_timestamp = src.get_u64_le();
+        let origin = Vec3::decode(src)?;
+        let direction = Vec3::decode(src)?;
+        let max_distance = src.get_f32_le();
+        let sequence = src.get_u32_le();
+
+        if !origin.is_finite() || !direction.is_finite() {
+            return Err(ClientCodecError::InvalidData(
+                "Origin and direction must contain finite floats".to_string(),
+            ));
+        }
+
+        if !max_distance.is_finite() || max_distance <= 0.0 {
+            return Err(ClientCodecError::InvalidData(
+                "max_distance must be finite and positive".to_string(),
+            ));
+        }
+
+        if direction.length() < 1e-6 {
+            return Err(ClientCodecError::InvalidData(
+                "Direction vector is degenerate (near zero)".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            client_timestamp,
+            origin,
+            direction,
+            max_distance,
+            sequence,
+        })
+    }
+
+    pub fn normalized_direction(&self) -> Option<Vec3> {
+        self.direction.normalized()
     }
 }
 
