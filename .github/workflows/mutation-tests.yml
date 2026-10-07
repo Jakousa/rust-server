@@ -29,11 +29,13 @@ jobs:
       matrix:
         package: [mmo-schema, mmo-storage]
 
-    if: github.event_name == 'schedule' || inputs.package == 'all' || inputs.package == '' || inputs.package == matrix.package
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
 
       - name: Install Protoc
         run: |
@@ -54,6 +56,11 @@ jobs:
 
       - name: Run Nightly Mutation Testing
         run: |
+          if [ "${{ github.event_name }}" != "schedule" ] && [ -n "${{ inputs.package }}" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "${{ matrix.package }}" ]; then
+            echo "Skipping ${{ matrix.package }} (package filter: ${{ inputs.package }})"
+            mkdir -p mutants.out
+            exit 0
+          fi
           EXTRA_ARGS="${{ inputs.additional_args }}"
           if [ -z "$EXTRA_ARGS" ]; then
             EXTRA_ARGS="--jobs 2"
