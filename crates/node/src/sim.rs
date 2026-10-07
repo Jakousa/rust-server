@@ -56,6 +56,7 @@ pub struct TickSimulation {
     pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
     pub snapshot_interval_ticks: u64,
     pub history: crate::history::SpatialHistoryBuffer,
+    pub script_reloader: Option<Arc<mmo_gameplay::ScriptHotReloader>>,
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -150,6 +151,7 @@ impl TickSimulation {
             snapshot_sender: None,
             snapshot_interval_ticks: 20,
             history: crate::history::SpatialHistoryBuffer::default(),
+            script_reloader: None,
         }
     }
 
@@ -510,6 +512,31 @@ impl TickSimulation {
             &mut self.packets,
             &mut self.tick_systems,
         );
+    }
+
+    /// Attaches a script hot-reloader coordinator to this simulation node.
+    pub fn set_script_reloader(&mut self, reloader: Arc<mmo_gameplay::ScriptHotReloader>) {
+        self.script_reloader = Some(reloader);
+    }
+
+    /// Atomically reloads a WASM script module by ID at runtime.
+    pub fn reload_script(
+        &self,
+        module_id: &str,
+        wasm_bytes: &[u8],
+    ) -> Result<(), mmo_core::ScriptError> {
+        if let Some(reloader) = &self.script_reloader {
+            reloader.reload_module(module_id, wasm_bytes)
+        } else {
+            Err(mmo_core::ScriptError::ModuleNotFound(
+                "No script reloader attached to simulation node".to_string(),
+            ))
+        }
+    }
+
+    /// Returns a reference to the active script reloader, if attached.
+    pub fn script_reloader(&self) -> Option<&Arc<mmo_gameplay::ScriptHotReloader>> {
+        self.script_reloader.as_ref()
     }
 
     /// Increments the `tick_counter`, runs batch tick systems, iterates through active entities
@@ -959,11 +986,14 @@ impl TickSimulation {
         }
 
         // 6. Synchronous BeforeMove hook dispatch (veto / cancel support)
-        let ctx = self.hooks.dispatch(&Event::BeforeMove {
-            entity: guid,
-            from: current_pos,
-            to: new_pos,
-        });
+        let ctx = self.hooks.dispatch_with_entities(
+            &Event::BeforeMove {
+                entity: guid,
+                from: current_pos,
+                to: new_pos,
+            },
+            &mut self.entity_store,
+        );
         if ctx.is_canceled() {
             return Err(current_pos);
         }
@@ -1073,11 +1103,14 @@ impl TickSimulation {
             }
         }
 
-        let ctx = self.hooks.dispatch(&Event::BeforeMove {
-            entity: guid,
-            from: current_pos,
-            to: new_pos,
-        });
+        let ctx = self.hooks.dispatch_with_entities(
+            &Event::BeforeMove {
+                entity: guid,
+                from: current_pos,
+                to: new_pos,
+            },
+            &mut self.entity_store,
+        );
         if ctx.is_canceled() {
             return Err(current_pos);
         }
@@ -1775,5 +1808,94 @@ mod tests {
         let range_res = sim.validate_historical_range((0.0, 0.0, 0.0), target, t0, 15.0);
         assert!(range_res.is_ok());
         assert!((range_res.unwrap() - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_sim_script_hot_reload_and_interact_lifecycle() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let engine = Arc::new(mmo_gameplay::WasmScriptEngine::new().unwrap());
+        let runtime = Arc::new(mmo_gameplay::WasmRuntime::new(engine).unwrap());
+        let reloader = Arc::new(mmo_gameplay::ScriptHotReloader::new(runtime.clone()));
+
+        sim.set_script_reloader(reloader);
+        sim.add_plugin(Box::new(mmo_gameplay::WasmScriptPlugin::new(runtime)));
+        sim.init_plugins();
+
+        let e1 = Guid::new(mmo_core::EntityType::Player, 1, 10);
+        let e2 = Guid::new(mmo_core::EntityType::Player, 1, 20);
+        sim.spawn_entity(e1, (10.0, 10.0, 10.0));
+        sim.spawn_entity(e2, (20.0, 20.0, 20.0));
+
+        // Version 1 of the script: vetoes interaction
+        let wat_v1 = r#"
+            (module
+                (func (export "on_before_interact") (param i64 i64 i32) (result i32)
+                    i32.const 1
+                )
+            )
+        "#;
+        assert!(sim.reload_script("interact", wat_v1.as_bytes()).is_ok());
+
+        let ctx = sim.hooks.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: e1,
+                target: e2,
+                action_id: 10,
+            },
+            &mut sim.entity_store,
+        );
+        assert!(ctx.is_canceled());
+        assert_eq!(ctx.cancel_reason(), Some("script_veto"));
+
+        // Version 2 of the script: allows interaction
+        let wat_v2 = r#"
+            (module
+                (func (export "on_before_interact") (param i64 i64 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        assert!(sim.reload_script("interact", wat_v2.as_bytes()).is_ok());
+
+        let ctx2 = sim.hooks.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: e1,
+                target: e2,
+                action_id: 10,
+            },
+            &mut sim.entity_store,
+        );
+        assert!(!ctx2.is_canceled());
+
+        // Version 3: runaway loop fails closed
+        let wat_v3 = r#"
+            (module
+                (func (export "on_before_interact") (param i64 i64 i32) (result i32)
+                    (loop (br 0))
+                    i32.const 0
+                )
+            )
+        "#;
+        assert!(sim.reload_script("interact", wat_v3.as_bytes()).is_ok());
+
+        let ctx3 = sim.hooks.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: e1,
+                target: e2,
+                action_id: 10,
+            },
+            &mut sim.entity_store,
+        );
+        assert!(ctx3.is_canceled());
+        assert!(ctx3
+            .cancel_reason()
+            .unwrap()
+            .contains("script_error: out of fuel"));
+
+        // Simulation step continues unharmed
+        sim.step(0.05);
+        assert_eq!(sim.tick_counter, 1);
     }
 }

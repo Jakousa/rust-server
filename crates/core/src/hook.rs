@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::entity::EntityStore;
 use crate::guid::Guid;
 
 /// Gameplay lifecycle events that can be dispatched through the hook pipeline.
@@ -108,6 +109,18 @@ impl EventContext {
 pub trait HookHandler: Send + Sync {
     /// Handles a dispatched event and optionally modifies the event context.
     fn handle(&self, event: &Event, ctx: &mut EventContext);
+
+    /// Handles a dispatched event with access to the entity store.
+    ///
+    /// The default implementation delegates to [`HookHandler::handle`].
+    fn handle_with_entities(
+        &self,
+        event: &Event,
+        ctx: &mut EventContext,
+        _entities: &mut EntityStore,
+    ) {
+        self.handle(event, ctx);
+    }
 }
 
 /// Blanket implementation allowing closures to act as hook handlers.
@@ -126,6 +139,15 @@ struct ArcHookHandler(Arc<dyn HookHandler>);
 impl HookHandler for ArcHookHandler {
     fn handle(&self, event: &Event, ctx: &mut EventContext) {
         self.0.handle(event, ctx);
+    }
+
+    fn handle_with_entities(
+        &self,
+        event: &Event,
+        ctx: &mut EventContext,
+        entities: &mut EntityStore,
+    ) {
+        self.0.handle_with_entities(event, ctx, entities);
     }
 }
 
@@ -171,6 +193,24 @@ impl HookDispatcher {
         let mut ctx = EventContext::new();
         for handler in &self.handlers {
             handler.handle(event, &mut ctx);
+            if ctx.is_canceled() {
+                break;
+            }
+        }
+        ctx
+    }
+
+    /// Dispatches an event through all registered handlers with mutable access to `EntityStore`.
+    ///
+    /// Execution stops immediately if a handler cancels the event.
+    pub fn dispatch_with_entities(
+        &self,
+        event: &Event,
+        entities: &mut EntityStore,
+    ) -> EventContext {
+        let mut ctx = EventContext::new();
+        for handler in &self.handlers {
+            handler.handle_with_entities(event, &mut ctx, entities);
             if ctx.is_canceled() {
                 break;
             }

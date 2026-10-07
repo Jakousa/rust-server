@@ -18,6 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+
       - name: Install Protoc
         run: |
           sudo apt-get update
@@ -58,6 +62,11 @@ jobs:
         with:
           name: code-coverage-report
           path: lcov.info
+
+      - name: Free build cache before mutation testing
+        run: |
+          cargo clean
+          rm -rf /tmp/cargo-mutants*
 
       - name: Mutation Testing Gate (cargo-mutants)
         run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs
