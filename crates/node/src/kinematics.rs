@@ -6,6 +6,10 @@
 
 use std::fmt;
 
+use mmo_core::collision::{CollisionWorld, SpatialQueryFilter};
+use mmo_core::guid::Guid;
+use mmo_core::spatial::Vec3;
+
 /// Specific reason for a kinematic movement violation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KinematicViolationReason {
@@ -19,6 +23,11 @@ pub enum KinematicViolationReason {
     NonFiniteCoordinates,
     /// Non-monotonic or replayed movement sequence number.
     NonMonotonicSequence { seq: u32, last_seq: u32 },
+    /// Movement trajectory intersected solid collision geometry.
+    ObstacleCollision {
+        hit_point: (f32, f32, f32),
+        entity_id: Option<Guid>,
+    },
 }
 
 impl fmt::Display for KinematicViolationReason {
@@ -49,6 +58,16 @@ impl fmt::Display for KinematicViolationReason {
                 write!(
                     f,
                     "non-monotonic sequence: packet seq {seq} <= last {last_seq}"
+                )
+            }
+            Self::ObstacleCollision {
+                hit_point,
+                entity_id,
+            } => {
+                write!(
+                    f,
+                    "obstacle collision detected at ({:.2}, {:.2}, {:.2}) with entity {:?}",
+                    hit_point.0, hit_point.1, hit_point.2, entity_id
                 )
             }
         }
@@ -195,6 +214,70 @@ impl KinematicValidator {
 
         Ok(())
     }
+
+    /// Validates a proposed movement against both kinematic speed/distance bounds and
+    /// abstract collision geometry provided by `CollisionWorld`.
+    ///
+    /// Returns `Ok(())` if the trajectory is unobstructed and meets all kinematic constraints.
+    /// Returns `Err(KinematicViolation)` snapping back to `current_pos` if an obstacle is struck.
+    pub fn validate_move_with_collision(
+        &self,
+        current_pos: (f32, f32, f32),
+        new_pos: (f32, f32, f32),
+        dt_sec: f32,
+        collision: &dyn CollisionWorld,
+        mover_guid: Option<Guid>,
+    ) -> Result<(), KinematicViolation> {
+        // 1. Basic kinematic checks (speed, dt, NaN, teleport)
+        self.validate_move(current_pos, new_pos, dt_sec)?;
+
+        // 2. Translation vector
+        let dx = new_pos.0 - current_pos.0;
+        let dy = new_pos.1 - current_pos.1;
+        let dz = new_pos.2 - current_pos.2;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist < 1e-4 {
+            return Ok(());
+        }
+
+        // 3. Collision check along trajectory
+        let from_vec = Vec3::new(current_pos.0, current_pos.1, current_pos.2);
+        let dir = Vec3::new(dx / dist, dy / dist, dz / dist);
+        let filter = SpatialQueryFilter {
+            ignore_id: mover_guid,
+            collision_layers: u32::MAX,
+        };
+
+        // Small clearance margin (0.05m) to avoid false-positives when skimming edges
+        let check_dist = (dist - 0.05).max(0.0);
+        if check_dist > 0.0 {
+            if let Some(hit) = collision.raycast(from_vec, dir, check_dist, filter) {
+                if hit.distance < check_dist {
+                    return Err(KinematicViolation::new(
+                        current_pos,
+                        KinematicViolationReason::ObstacleCollision {
+                            hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                            entity_id: hit.entity_id,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // 4. Validate destination point traversability
+        let dest_vec = Vec3::new(new_pos.0, new_pos.1, new_pos.2);
+        if !collision.is_point_traversable(dest_vec) {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::ObstacleCollision {
+                    hit_point: new_pos,
+                    entity_id: None,
+                },
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for KinematicValidator {
@@ -302,5 +385,48 @@ mod tests {
             }
             other => panic!("expected TeleportDetected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_validate_move_with_collision_unobstructed_and_obstructed() {
+        use mmo_core::collision::AabbCollisionWorld;
+        use mmo_core::octree::BoundingBox3D;
+
+        let validator = KinematicValidator::new(10.0);
+        let mut collision = AabbCollisionWorld::new();
+        let obstacle = BoundingBox3D::new((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0));
+        let obstacle_guid = Guid(42);
+        collision.register_obstacle(obstacle_guid, obstacle);
+
+        let start = (-3.0, 0.0, 0.0);
+        // Clear move to (-2.0, 0, 0)
+        let clear_target = (-2.0, 0.0, 0.0);
+        let res_clear =
+            validator.validate_move_with_collision(start, clear_target, 0.5, &collision, None);
+        assert!(res_clear.is_ok());
+
+        // Obstructed move straight through the box from -3.0 to +3.0
+        let obstructed_target = (3.0, 0.0, 0.0);
+        let res_obstructed =
+            validator.validate_move_with_collision(start, obstructed_target, 1.0, &collision, None);
+        assert!(res_obstructed.is_err());
+        let violation = res_obstructed.unwrap_err();
+        assert_eq!(violation.snap_back(), start);
+        match violation.reason() {
+            KinematicViolationReason::ObstacleCollision {
+                hit_point,
+                entity_id,
+            } => {
+                assert!((hit_point.0 - (-1.0)).abs() < 1e-4);
+                assert_eq!(*entity_id, Some(obstacle_guid));
+            }
+            other => panic!("expected ObstacleCollision, got {other:?}"),
+        }
+
+        // Destination inside box
+        let inside_target = (0.0, 0.0, 0.0);
+        let res_inside =
+            validator.validate_move_with_collision(start, inside_target, 0.5, &collision, None);
+        assert!(res_inside.is_err());
     }
 }

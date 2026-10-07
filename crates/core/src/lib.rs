@@ -1,5 +1,6 @@
 pub mod action;
 pub mod attribute;
+pub mod collision;
 pub mod container;
 pub mod entity;
 pub mod guid;
@@ -11,6 +12,10 @@ pub mod social;
 pub mod spatial;
 pub mod telemetry;
 pub mod world;
+
+pub use collision::{
+    AabbCollisionWorld, CollisionWorld, EmptyCollisionWorld, RayHit, SpatialQueryFilter, SweepHit,
+};
 
 pub use action::{
     ActionCompletedEvent, ActionInterruptFlags, ActionInterruptedEvent, ActionProgressEvent,

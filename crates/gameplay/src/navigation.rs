@@ -91,6 +91,8 @@ pub struct NavAgentComponent {
     pub speed: f32,
     pub arrival_tolerance: f32,
     pub has_arrived: bool,
+    #[serde(default)]
+    pub path_waypoints: Vec<(f32, f32, f32)>,
 }
 
 impl NavAgentComponent {
@@ -100,12 +102,22 @@ impl NavAgentComponent {
             speed,
             arrival_tolerance,
             has_arrived: false,
+            path_waypoints: Vec::new(),
         }
     }
 
     pub fn with_target(mut self, target: (f32, f32, f32)) -> Self {
         self.target_position = Some(target);
         self
+    }
+
+    /// Sets an ordered sequence of navigation waypoints for multi-segment path traversal.
+    pub fn set_path(&mut self, mut waypoints: Vec<(f32, f32, f32)>) {
+        if !waypoints.is_empty() {
+            self.target_position = Some(waypoints.remove(0));
+            self.path_waypoints = waypoints;
+            self.has_arrived = false;
+        }
     }
 }
 
@@ -184,9 +196,14 @@ impl TickSystem for NavSteeringSystem {
                     let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
                     if dist <= agent.arrival_tolerance {
-                        agent.has_arrived = true;
-                        agent.target_position = None;
-                        should_advance_wp = true;
+                        if !agent.path_waypoints.is_empty() {
+                            agent.target_position = Some(agent.path_waypoints.remove(0));
+                            agent.has_arrived = false;
+                        } else {
+                            agent.has_arrived = true;
+                            agent.target_position = None;
+                            should_advance_wp = true;
+                        }
                     } else {
                         let step = (agent.speed * ctx.dt_sec).min(dist);
                         let ratio = step / dist;
@@ -198,9 +215,14 @@ impl TickSystem for NavSteeringSystem {
                         new_pos_opt = Some(new_pos);
 
                         if (dist - step) <= agent.arrival_tolerance {
-                            agent.has_arrived = true;
-                            agent.target_position = None;
-                            should_advance_wp = true;
+                            if !agent.path_waypoints.is_empty() {
+                                agent.target_position = Some(agent.path_waypoints.remove(0));
+                                agent.has_arrived = false;
+                            } else {
+                                agent.has_arrived = true;
+                                agent.target_position = None;
+                                should_advance_wp = true;
+                            }
                         } else {
                             agent.has_arrived = false;
                         }
@@ -403,5 +425,80 @@ mod tests {
                 .unwrap()
                 .is_leashed_out
         );
+    }
+
+    #[test]
+    fn test_nav_steering_system_with_path_waypoints() {
+        use mmo_core::{Entity, EntityStore, EventQueue, Guid, Octree, TickContext};
+
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-50.0, -50.0, -50.0),
+            (50.0, 50.0, 50.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut steering_system = NavSteeringSystem;
+
+        let guid = Guid(10);
+        let mut entity = Entity::new(guid, (0.0, 0.0, 0.0));
+        let mut agent = NavAgentComponent::new(10.0, 0.5);
+        // Multi-segment path: (5,0,0) -> (5,0,5) -> (10,0,5)
+        agent.set_path(vec![(5.0, 0.0, 0.0), (5.0, 0.0, 5.0), (10.0, 0.0, 5.0)]);
+        entity.add_component(agent);
+        let key = store.insert_entity(entity);
+        octree.insert(guid, (0.0, 0.0, 0.0));
+
+        // Step 1: Reach first waypoint (5, 0, 0) in 0.5s (10 speed * 0.5 = 5.0)
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.5,
+                tick: 1,
+            };
+            steering_system.update(&mut ctx);
+        }
+
+        let ent = store.get(key).unwrap();
+        let ag = ent.get_component::<NavAgentComponent>().unwrap();
+        // Should have transitioned to next waypoint (5.0, 0.0, 5.0) and not yet arrived at final
+        assert_eq!(ag.target_position, Some((5.0, 0.0, 5.0)));
+        assert!(!ag.has_arrived);
+
+        // Step 2: Reach second waypoint (5, 0, 5) in 0.5s
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.5,
+                tick: 2,
+            };
+            steering_system.update(&mut ctx);
+        }
+
+        let ent = store.get(key).unwrap();
+        let ag = ent.get_component::<NavAgentComponent>().unwrap();
+        // Should have transitioned to final waypoint (10.0, 0.0, 5.0)
+        assert_eq!(ag.target_position, Some((10.0, 0.0, 5.0)));
+        assert!(!ag.has_arrived);
+
+        // Step 3: Reach final waypoint in 0.5s
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.5,
+                tick: 3,
+            };
+            steering_system.update(&mut ctx);
+        }
+
+        let ent = store.get(key).unwrap();
+        let ag = ent.get_component::<NavAgentComponent>().unwrap();
+        assert!(ag.has_arrived);
+        assert_eq!(ag.target_position, None);
     }
 }
