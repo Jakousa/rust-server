@@ -9,11 +9,14 @@ publish.workspace = true
 [dependencies]
 mmo-core = { path = "../core" }
 serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+wasmtime = { version = "49.0", default-features = false, features = ["runtime", "cranelift", "wat", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }
 mmo-storage = { path = "../storage" }
 tempfile = "3.14"
+wat = "1.261"
 
 [lints]
 workspace = true

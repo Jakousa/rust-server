@@ -16,6 +16,7 @@ pub mod navmesh;
 pub mod party;
 pub mod perception;
 pub mod quest;
+pub mod scripting;
 pub mod spawner;
 pub mod threat;
 pub mod trade;
@@ -48,6 +49,10 @@ pub use perception::{
     HostileSpottedEvent, PerceptionComponent, PerceptionPlugin, PerceptionScanSystem,
 };
 pub use quest::{QuestLogComponent, QuestObjective, QuestPlugin, QuestRecord, QuestStatus};
+pub use scripting::{
+    register_host_api, validate_memory_bounds, HostContext, ScriptHookHandler, ScriptHotReloader,
+    ScriptTickSystem, WasmRuntime, WasmScriptEngine, WasmScriptPlugin,
+};
 pub use spawner::{
     SpawnCommandBuffer, SpawnEntityCommand, SpawnTemplate, SpawnerComponent, SpawnerPlugin,
     SpawnerSystem,
