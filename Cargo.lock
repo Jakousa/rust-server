@@ -1779,15 +1779,10 @@ dependencies = [
 name = "mmo-plugin-voxel"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "dashmap",
  "mmo-core",
  "serde",
- "serde_json",
- "tempfile",
  "thiserror 2.0.20",
- "tokio",
- "tracing",
 ]
 
 [[package]]
