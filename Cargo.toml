@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/gameplay",
     "crates/client-wasm",
+    "crates/plugins/voxel",
 ]
 resolver = "2"
 

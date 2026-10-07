@@ -5,6 +5,7 @@
 
 pub mod interp;
 pub mod state;
+pub mod voxel;
 pub mod world;
 
 use std::collections::{HashMap, VecDeque};

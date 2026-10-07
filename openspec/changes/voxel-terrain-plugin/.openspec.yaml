@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: voxel-terrain-plugin
+  title: Decoupled Volumetric Voxel & Deformable Terrain Plugin
+  status: proposed
+  created: 2026-10-07
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: plugins
+  specs:
+    - specs/plugins/voxel/spec.md
