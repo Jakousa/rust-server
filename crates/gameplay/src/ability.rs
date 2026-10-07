@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use mmo_core::collision::{CollisionWorld, SpatialQueryFilter};
 use mmo_core::spatial::{
     gather_cone_candidates, gather_sphere_candidates, partition_candidates_by_node,
     SpatialTargetCandidate, Vec3,
@@ -155,6 +156,80 @@ pub fn execute_or_start_ability(
         });
         Ok(true) // Instant completion
     }
+}
+
+/// Validates server-authoritative line of sight between caster and target.
+///
+/// Returns `Ok(())` if the trajectory is unobstructed.
+/// Returns `Err` if coordinates are non-finite or if solid collision geometry blocks line of sight.
+pub fn validate_ability_line_of_sight(
+    caster_pos: Vec3,
+    target_pos: Vec3,
+    collision_world: &dyn CollisionWorld,
+    caster_guid: Option<Guid>,
+) -> Result<(), &'static str> {
+    if !caster_pos.x.is_finite()
+        || !caster_pos.y.is_finite()
+        || !caster_pos.z.is_finite()
+        || !target_pos.x.is_finite()
+        || !target_pos.y.is_finite()
+        || !target_pos.z.is_finite()
+    {
+        return Err("Non-finite coordinates provided for line of sight");
+    }
+
+    let dir = Vec3::new(
+        target_pos.x - caster_pos.x,
+        target_pos.y - caster_pos.y,
+        target_pos.z - caster_pos.z,
+    );
+    let dist = dir.length();
+    if dist < 1e-4 {
+        return Ok(());
+    }
+
+    let norm_dir = match dir.normalized() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    // Small clearance margin (0.1m) at target destination
+    let max_check_dist = (dist - 0.1).max(0.0);
+    if max_check_dist > 0.0 {
+        let filter = SpatialQueryFilter::ignoring(caster_guid.unwrap_or(Guid(0)));
+        if let Some(hit) = collision_world.raycast(caster_pos, norm_dir, max_check_dist, filter) {
+            if hit.distance < max_check_dist {
+                return Err("Line of sight blocked by obstacle");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Executes an ability immediately or initiates a [`TimedAction`] with authoritative line of sight validation.
+pub fn execute_or_start_ability_with_collision(
+    entity_guid: Guid,
+    ability: &AbilityDefinition,
+    target_guid: Option<Guid>,
+    entities: &mut EntityStore,
+    events: &mut EventQueue,
+    collision_world: &dyn CollisionWorld,
+) -> Result<bool, &'static str> {
+    if let Some(target) = target_guid {
+        let caster_pos = entities
+            .get_by_guid(entity_guid)
+            .map(|e| Vec3::new(e.position.0, e.position.1, e.position.2))
+            .ok_or("Caster entity not found in store")?;
+        let target_pos = entities
+            .get_by_guid(target)
+            .map(|e| Vec3::new(e.position.0, e.position.1, e.position.2))
+            .ok_or("Target entity not found in store")?;
+
+        validate_ability_line_of_sight(caster_pos, target_pos, collision_world, Some(entity_guid))?;
+    }
+
+    execute_or_start_ability(entity_guid, ability, target_guid, entities, events)
 }
 
 /// Result of resolving candidate targets for a boundary-crossing AoE ability.
@@ -408,5 +483,85 @@ mod tests {
         assert_eq!(targeting.remote_batches.len(), 1);
         assert_eq!(targeting.remote_batches.get(&2).unwrap().len(), 1);
         assert_eq!(targeting.remote_batches.get(&2).unwrap()[0].guid, c2.guid);
+    }
+
+    #[test]
+    fn test_ability_line_of_sight_blocking_and_success() {
+        use mmo_core::collision::AabbCollisionWorld;
+        use mmo_core::octree::BoundingBox3D;
+        use mmo_core::Entity;
+
+        let mut collision = AabbCollisionWorld::new();
+        let wall = BoundingBox3D::new((4.0, -2.0, -2.0), (6.0, 2.0, 2.0));
+        let wall_id = Guid(99);
+        collision.register_obstacle(wall_id, wall);
+
+        let mut entities = EntityStore::new();
+        let mut events = EventQueue::new();
+
+        let caster_guid = Guid(1);
+        let mut caster = Entity::new(caster_guid, (0.0, 0.0, 0.0));
+        caster.add_component(ActionQueue::new());
+        entities.insert_entity(caster);
+
+        let target_guid = Guid(2);
+        let target = Entity::new(target_guid, (10.0, 0.0, 0.0));
+        entities.insert_entity(target);
+
+        let ability = AbilityDefinition {
+            id: 1,
+            name: "Fireball".to_string(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 1.0,
+            gcd_sec: 1.0,
+            range: 20.0,
+            resource_cost: None,
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        // 1. Cast directly through the wall should fail due to blocked line of sight
+        let result_blocked = execute_or_start_ability_with_collision(
+            caster_guid,
+            &ability,
+            Some(target_guid),
+            &mut entities,
+            &mut events,
+            &collision,
+        );
+        assert!(result_blocked.is_err());
+        assert_eq!(
+            result_blocked.unwrap_err(),
+            "Line of sight blocked by obstacle"
+        );
+
+        // 2. Remove the obstacle wall: cast now succeeds
+        collision.unregister_obstacle(wall_id);
+        let result_clear = execute_or_start_ability_with_collision(
+            caster_guid,
+            &ability,
+            Some(target_guid),
+            &mut entities,
+            &mut events,
+            &collision,
+        );
+        assert!(result_clear.is_ok());
+        assert!(result_clear.unwrap()); // Instant cast completed
+    }
+
+    #[test]
+    fn test_ability_los_nan_coordinates_rejected() {
+        use mmo_core::collision::EmptyCollisionWorld;
+        let collision = EmptyCollisionWorld;
+        let res = validate_ability_line_of_sight(
+            Vec3::new(f32::NAN, 0.0, 0.0),
+            Vec3::new(10.0, 0.0, 0.0),
+            &collision,
+            None,
+        );
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err(),
+            "Non-finite coordinates provided for line of sight"
+        );
     }
 }

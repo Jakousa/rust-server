@@ -26,6 +26,7 @@ pub struct TickSimulation {
     pub octree: Octree,
     pub hooks: HookDispatcher,
     pub kinematics: KinematicValidator,
+    pub collision_world: std::sync::Arc<std::sync::RwLock<dyn mmo_core::collision::CollisionWorld>>,
     pub tick_counter: u64,
     pub ghost_store: GhostStore,
     pub codecs: ComponentCodecRegistry,
@@ -118,6 +119,9 @@ impl TickSimulation {
             octree: Octree::new(bounds),
             hooks: HookDispatcher::new(),
             kinematics,
+            collision_world: std::sync::Arc::new(std::sync::RwLock::new(
+                mmo_core::collision::AabbCollisionWorld::new(),
+            )),
             tick_counter: 0,
             ghost_store: GhostStore::new(),
             codecs,
@@ -145,6 +149,40 @@ impl TickSimulation {
             snapshot_sender: None,
             snapshot_interval_ticks: 20,
         }
+    }
+
+    /// Configures an external or custom `CollisionWorld` implementation for authoritative simulation.
+    pub fn with_collision_world(
+        mut self,
+        collision_world: std::sync::Arc<std::sync::RwLock<dyn mmo_core::collision::CollisionWorld>>,
+    ) -> Self {
+        self.collision_world = collision_world;
+        self
+    }
+
+    /// Authoritatively registers a world object and synchronizes its bounds with the collision world.
+    pub fn insert_world_object(
+        &mut self,
+        obj: mmo_core::world::WorldObject,
+    ) -> Option<mmo_core::world::WorldObject> {
+        let id = obj.object_id;
+        let bounds = obj.bounds;
+        let prev = self.sectors.insert_object(obj);
+        if let Ok(mut collision) = self.collision_world.write() {
+            collision.register_obstacle(id, bounds);
+        }
+        prev
+    }
+
+    /// Authoritatively removes a world object and synchronizes its bounds with the collision world.
+    pub fn remove_world_object(&mut self, object_id: Guid) -> Option<mmo_core::world::WorldObject> {
+        let prev = self.sectors.remove_object(object_id);
+        if prev.is_some() {
+            if let Ok(mut collision) = self.collision_world.write() {
+                collision.unregister_obstacle(object_id);
+            }
+        }
+        prev
     }
 
     /// Validates whether an incoming upstream packet from a gateway carries a valid (non-stale) session epoch.
@@ -392,6 +430,9 @@ impl TickSimulation {
         );
         obj.properties = packet.properties.clone();
         self.sectors.insert_object(obj);
+        if let Ok(mut collision) = self.collision_world.write() {
+            collision.register_obstacle(object_id, bounds);
+        }
         Ok(object_id)
     }
 
@@ -789,8 +830,18 @@ impl TickSimulation {
         // 3. Compute server-authoritative delta time with sequence jitter tolerance
         let dt_sec = self.compute_server_dt_with_seq(guid, seq_delta);
 
-        // 4. Kinematic validation (speed caps, teleport threshold, NaN/Inf, dt bounds)
-        if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
+        // 4. Kinematic & Collision validation (speed caps, teleport threshold, NaN/Inf, dt bounds, obstacle collision)
+        if let Ok(collision_guard) = self.collision_world.read() {
+            if let Err(violation) = self.kinematics.validate_move_with_collision(
+                current_pos,
+                new_pos,
+                dt_sec,
+                &*collision_guard,
+                Some(guid),
+            ) {
+                return Err(violation.snap_back);
+            }
+        } else if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
             return Err(violation.snap_back);
         }
 
@@ -897,7 +948,17 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
-        if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
+        if let Ok(collision_guard) = self.collision_world.read() {
+            if let Err(violation) = self.kinematics.validate_move_with_collision(
+                current_pos,
+                new_pos,
+                dt_sec,
+                &*collision_guard,
+                Some(guid),
+            ) {
+                return Err(violation.snap_back);
+            }
+        } else if let Err(violation) = self.kinematics.validate_move(current_pos, new_pos, dt_sec) {
             return Err(violation.snap_back);
         }
 
@@ -1545,5 +1606,43 @@ mod tests {
             res_exhausted.is_none(),
             "Resync should be rejected when token bucket exhausted"
         );
+    }
+
+    #[test]
+    fn test_sim_movement_blocked_by_placed_world_object() {
+        use mmo_schema::client::{PlaceObjectPacket, Vec3};
+
+        let mut sim = TickSimulation::new(
+            1,
+            BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0)),
+        );
+        let player = Guid::new(EntityType::Player, 1, 1);
+        sim.spawn_entity(player, (5.0, 10.0, 10.0));
+
+        let sector = mmo_core::world::SectorCoord3D::from_world_pos((10.0, 10.0, 10.0));
+        sim.sectors.mark_sector_loaded(sector);
+
+        // Place object at (7.0, 10.0, 10.0) with scale 1.0
+        let place_pkt = PlaceObjectPacket {
+            prefab_id: 10,
+            pos: Vec3::new(7.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: std::collections::HashMap::new(),
+        };
+        let obj_id = sim.handle_place_object(player, &place_pkt).unwrap();
+
+        // Player attempts to move through the placed object from 5.0 to 9.0
+        let res = sim.process_client_move_deterministic(player, (9.0, 10.0, 10.0), 1.0);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), (5.0, 10.0, 10.0));
+
+        // Now remove the object
+        let removed = sim.remove_world_object(obj_id);
+        assert!(removed.is_some());
+
+        // Now unobstructed move succeeds
+        let res2 = sim.process_client_move_deterministic(player, (6.0, 10.0, 10.0), 0.5);
+        assert!(res2.is_ok());
     }
 }

@@ -290,6 +290,7 @@ mod tests {
                 position: (10.0, 20.0, 30.0),
                 rotation: 0.0,
                 attributes: serde_json::json!({}),
+                state_blob: None,
                 version: 1,
                 timestamp: 1000,
             },

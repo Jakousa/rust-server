@@ -12,6 +12,7 @@ pub mod guild;
 pub mod inventory;
 pub mod loot;
 pub mod navigation;
+pub mod navmesh;
 pub mod party;
 pub mod perception;
 pub mod quest;
@@ -20,7 +21,8 @@ pub mod threat;
 pub mod trade;
 
 pub use ability::{
-    execute_or_start_ability, AbilityDefinition, AbilityExecutedEvent, AbilityPlugin,
+    execute_or_start_ability, execute_or_start_ability_with_collision,
+    validate_ability_line_of_sight, AbilityDefinition, AbilityExecutedEvent, AbilityPlugin,
     AbilityTickSystem, CooldownTracker,
 };
 pub use ai_brain::{FsmBrainComponent, FsmBrainSystem, FsmState, MonsterAiPlugin};
@@ -40,6 +42,7 @@ pub use navigation::{
     LeashComponent, NavAgentComponent, NavSteeringSystem, NpcMovementPlugin, WaypointComponent,
     WaypointLoopMode,
 };
+pub use navmesh::{NavMeshPlugin, NavMeshPolygon, NavMeshWorld};
 pub use party::{PartyManager, PartyMemberComponent, PartyPlugin, PartyState};
 pub use perception::{
     HostileSpottedEvent, PerceptionComponent, PerceptionPlugin, PerceptionScanSystem,

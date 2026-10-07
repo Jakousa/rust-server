@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: collision-world-trait
+  title: Abstract CollisionWorld Trait & Server-Authoritative Spatial Raycasting
+  status: proposed
+  created: 2026-10-07
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: spatial
+  specs:
+    - specs/spatial/collision-world/spec.md
