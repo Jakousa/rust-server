@@ -38,9 +38,9 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
 
       - name: Install Protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,11 +48,10 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo tools
-        uses: cargo-bins/cargo-binstall@main
-
       - name: Install cargo-mutants
-        run: cargo binstall -y cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
 
       - name: Run Nightly Mutation Testing
         run: |
@@ -75,4 +74,3 @@ jobs:
         with:
           name: nightly-mutation-report-${{ matrix.package }}
           path: mutants.out/
-

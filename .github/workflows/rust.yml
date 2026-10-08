@@ -3,8 +3,18 @@ name: Continuous Integration
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'openspec/**'
+      - 'docs/**'
+      - '.github/dependabot.yml'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'openspec/**'
+      - 'docs/**'
+      - '.github/dependabot.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,8 +23,8 @@ env:
   RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
 
 jobs:
-  check-and-test:
-    name: Lint, Test & Verify
+  lint:
+    name: Lint & Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -35,7 +45,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt, llvm-tools-preview
+          components: clippy, rustfmt
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
@@ -43,7 +53,7 @@ jobs:
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete,cargo-llvm-cov,cargo-nextest,cargo-mutants
+          tool: cargo-deny,cargo-machete
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -57,6 +67,38 @@ jobs:
       - name: Unused Dependency Check (cargo-machete)
         run: cargo machete
 
+  test:
+    name: Test & Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
       - name: Run Tests with Code Coverage (cargo-llvm-cov)
         run: cargo llvm-cov nextest --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 85 --lcov --output-path lcov.info
 
@@ -67,17 +109,57 @@ jobs:
           name: code-coverage-report
           path: lcov.info
 
-      - name: Free build cache before mutation testing
+  mutants:
+    name: Mutation Testing Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for schema changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            schema:
+              - 'crates/schema/**'
+
+      - name: Free runner disk space
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
         run: |
-          cargo clean
-          rm -rf /tmp/cargo-mutants*
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+
+      - name: Install mold linker
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        run: sudo apt-get install -y mold
+
+      - name: Install Protoc
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust toolchain
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
 
       - name: Mutation Testing Gate (cargo-mutants)
-        run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs
+        if: github.event_name == 'push' || steps.filter.outputs.schema == 'true'
+        run: cargo mutants --package mmo-schema --file crates/schema/src/quantize.rs --jobs 2 -- --lib quantize
 
       - name: Upload Mutation Testing Artifact
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && (github.event_name == 'push' || steps.filter.outputs.schema == 'true')
         with:
           name: mutants-report
           path: mutants.out/
