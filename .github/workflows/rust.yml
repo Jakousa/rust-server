@@ -167,3 +167,26 @@ jobs:
         with:
           name: mutants-report
           path: mutants.out/
+
+  verify:
+    name: Lint, Test & Verify
+    needs: [lint, test, mutants]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all pipeline jobs passed
+        run: |
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "Lint & Audit job failed with status: ${{ needs.lint.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test & Coverage job failed with status: ${{ needs.test.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.mutants.result }}" == "failure" ]; then
+            echo "Mutation Testing Gate job failed with status: ${{ needs.mutants.result }}"
+            exit 1
+          fi
+          echo "All pipeline checks completed successfully!"
+
