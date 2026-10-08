@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
 
 jobs:
   check-and-test:
@@ -22,10 +24,13 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
 
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+
       - name: Install Protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,10 +41,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo tools
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: Install static analysis and coverage tools
-        run: cargo binstall -y cargo-deny cargo-machete cargo-llvm-cov cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete,cargo-llvm-cov,cargo-nextest,cargo-mutants
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -54,7 +58,7 @@ jobs:
         run: cargo machete
 
       - name: Run Tests with Code Coverage (cargo-llvm-cov)
-        run: cargo llvm-cov --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 85 --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --workspace --all-targets --ignore-filename-regex 'main\.rs' --fail-under-lines 85 --lcov --output-path lcov.info
 
       - name: Upload Coverage Artifact
         uses: actions/upload-artifact@v4
@@ -77,4 +81,3 @@ jobs:
         with:
           name: mutants-report
           path: mutants.out/
-
