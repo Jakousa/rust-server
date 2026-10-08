@@ -32,3 +32,6 @@ inefficient_to_string = "warn"
 large_types_passed_by_value = "warn"
 rc_buffer = "warn"
 trivially_copy_pass_by_ref = "warn"
+
+[profile.test]
+debug = 1
