@@ -1419,4 +1419,14 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item_instance_id, "item-expiring");
     }
+
+    #[test]
+    fn test_time_helpers() {
+        let ms = current_time_ms();
+        let secs = current_time_secs();
+        assert!(secs > 1_700_000_000);
+        assert!(ms > 1_700_000_000_000);
+        assert!(ms > secs * 900);
+        assert!(ms >= secs * 1000);
+    }
 }

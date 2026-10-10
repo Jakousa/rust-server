@@ -8,3 +8,5 @@ web/dist
 sbxenv.yaml
 mutants.out*/
 lcov.info
+.worktrees
+.worktrees/**

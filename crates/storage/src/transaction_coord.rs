@@ -1118,4 +1118,14 @@ mod tests {
         let aborted = coord.abort_transfer("non_existent_tx").await.unwrap();
         assert!(!aborted);
     }
+
+    #[test]
+    fn test_time_helpers() {
+        let ms = current_time_ms();
+        let secs = current_time_secs();
+        assert!(secs > 1_700_000_000);
+        assert!(ms > 1_700_000_000_000);
+        assert!(ms > secs * 900);
+        assert!(ms >= secs * 1000);
+    }
 }

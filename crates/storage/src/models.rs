@@ -525,4 +525,21 @@ mod tests {
         assert_eq!(wo.clone(), wo_dec);
         assert!(!format!("{:?}", wo).is_empty());
     }
+
+    #[test]
+    fn test_listing_status_display_and_from_str() {
+        let pairs = [
+            (ListingStatus::Active, "Active"),
+            (ListingStatus::Sold, "Sold"),
+            (ListingStatus::Cancelled, "Cancelled"),
+            (ListingStatus::Expired, "Expired"),
+        ];
+
+        for (status, expected_str) in pairs {
+            assert_eq!(format!("{}", status), expected_str);
+            assert_eq!(expected_str.parse::<ListingStatus>().unwrap(), status);
+        }
+
+        assert!("Unknown".parse::<ListingStatus>().is_err());
+    }
 }
