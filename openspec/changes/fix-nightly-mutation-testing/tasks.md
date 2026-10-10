@@ -27,6 +27,6 @@
   - [x] 4.3 Run `cargo test --workspace` <!-- id: 4.3 -->
 
 - [ ] 5. PR creation and auto-merge <!-- id: 5 -->
-  - [ ] 5.1 Commit and push to `fix/nightly-mutation-testing` <!-- id: 5.1 -->
-  - [ ] 5.2 Open PR and enable auto-merge <!-- id: 5.2 -->
+  - [x] 5.1 Commit and push to `fix/nightly-mutation-testing` <!-- id: 5.1 -->
+  - [x] 5.2 Open PR and enable auto-merge <!-- id: 5.2 -->
   - [ ] 5.3 Monitor CI check suite until merged <!-- id: 5.3 -->
