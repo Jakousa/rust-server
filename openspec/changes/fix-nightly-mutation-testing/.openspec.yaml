@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: fix-nightly-mutation-testing
+  title: Fix Nightly Mutation Testing Suite Failures and Harden Test Coverage
+  status: proposed
+  created: 2026-10-10
+  authors:
+    - AI Agent <agent@antigravity.internal>
+  domain: testing
+  specs:
+    - specs/testing/nightly-mutation-testing/spec.md

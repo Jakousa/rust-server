@@ -4155,4 +4155,670 @@ mod tests {
                             // No listing bytes follow
         assert!(MarketResponsePacket::decode(&mut buf2.freeze()).is_err());
     }
+
+    #[test]
+    fn test_vec3_normalized_exact_boundary() {
+        // len > 1e-6 returns Some; len <= 1e-6 returns None
+        let at_boundary = Vec3::new(1e-6, 0.0, 0.0);
+        assert_eq!(at_boundary.length(), 1e-6);
+        assert!(at_boundary.normalized().is_none());
+
+        let just_above = Vec3::new(1.0001e-6, 0.0, 0.0);
+        assert!(just_above.normalized().is_some());
+
+        // Verify exact component division (3-4-0 and 2-3-6 vectors)
+        let v = Vec3::new(3.0, 4.0, 0.0);
+        let n = v.normalized().unwrap();
+        assert!((n.x - 0.6).abs() < 1e-6);
+        assert!((n.y - 0.8).abs() < 1e-6);
+        assert!((n.z - 0.0).abs() < 1e-6);
+
+        let v3 = Vec3::new(2.0, 3.0, 6.0);
+        let n3 = v3.normalized().unwrap();
+        assert!((n3.x - (2.0 / 7.0)).abs() < 1e-6);
+        assert!((n3.y - (3.0 / 7.0)).abs() < 1e-6);
+        assert!((n3.z - (6.0 / 7.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lag_compensation_payload_unit() {
+        let payload = LagCompensationPayload {
+            client_timestamp: 123456789,
+            origin: Vec3::new(10.0, 20.0, 30.0),
+            direction: Vec3::new(0.0, 1.0, 0.0),
+            max_distance: 50.0,
+            sequence: 42,
+        };
+        let bytes = payload.encode_to_bytes();
+        assert_eq!(bytes.len(), LagCompensationPayload::SIZE);
+        let mut slice = bytes.clone();
+        let decoded = LagCompensationPayload::decode(&mut slice).expect("valid decode");
+        assert_eq!(decoded.client_timestamp, payload.client_timestamp);
+        assert_eq!(decoded.origin, payload.origin);
+        assert_eq!(decoded.direction, payload.direction);
+        assert_eq!(decoded.max_distance, payload.max_distance);
+        assert_eq!(decoded.sequence, payload.sequence);
+        assert_eq!(
+            decoded.normalized_direction(),
+            Some(Vec3::new(0.0, 1.0, 0.0))
+        );
+
+        // Truncated buffer
+        let mut short = bytes.slice(0..LagCompensationPayload::SIZE - 1);
+        let err = LagCompensationPayload::decode(&mut short).unwrap_err();
+        assert_eq!(
+            err,
+            ClientCodecError::BufferTooShort {
+                expected: LagCompensationPayload::SIZE,
+                got: LagCompensationPayload::SIZE - 1,
+            }
+        );
+
+        // Direction length exactly 1e-6: direction.length() < 1e-6 is false, so it succeeds.
+        // If mutated to <= 1e-6, it would fail.
+        let at_limit = LagCompensationPayload {
+            client_timestamp: 100,
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            direction: Vec3::new(1e-6, 0.0, 0.0),
+            max_distance: 10.0,
+            sequence: 1,
+        };
+        let at_limit_bytes = at_limit.encode_to_bytes();
+        let mut at_limit_slice = at_limit_bytes.clone();
+        assert!(LagCompensationPayload::decode(&mut at_limit_slice).is_ok());
+
+        // Below 1e-6 fails
+        let below_limit = LagCompensationPayload {
+            client_timestamp: 100,
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            direction: Vec3::new(0.5e-6, 0.0, 0.0),
+            max_distance: 10.0,
+            sequence: 1,
+        };
+        let mut below_slice = below_limit.encode_to_bytes();
+        assert!(LagCompensationPayload::decode(&mut below_slice).is_err());
+
+        // Non-finite origin with finite direction
+        let mut nan_origin = payload.clone();
+        nan_origin.origin = Vec3::new(f32::NAN, 0.0, 0.0);
+        assert!(LagCompensationPayload::decode(&mut nan_origin.encode_to_bytes()).is_err());
+
+        // Finite origin with non-finite direction
+        let mut nan_dir = payload.clone();
+        nan_dir.direction = Vec3::new(0.0, f32::NAN, 0.0);
+        assert!(LagCompensationPayload::decode(&mut nan_dir.encode_to_bytes()).is_err());
+
+        // Non-positive max_distance with finite values
+        let mut zero_dist = payload.clone();
+        zero_dist.max_distance = 0.0;
+        assert!(LagCompensationPayload::decode(&mut zero_dist.encode_to_bytes()).is_err());
+
+        let mut neg_dist = payload.clone();
+        neg_dist.max_distance = -5.0;
+        assert!(LagCompensationPayload::decode(&mut neg_dist.encode_to_bytes()).is_err());
+
+        // NaN max_distance
+        let mut nan_dist = payload.clone();
+        nan_dist.max_distance = f32::NAN;
+        assert!(LagCompensationPayload::decode(&mut nan_dist.encode_to_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_entity_delta_state_attribute_boundaries() {
+        // Line 947: attr_len > 256. attr_len == 256 succeeds, attr_len == 257 fails.
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1);
+        buf.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf, 256);
+        for i in 0..256 {
+            put_varint_u32(&mut buf, i);
+            put_varint_u32(&mut buf, 10);
+        }
+        let decoded =
+            EntityDeltaState::decode(&mut buf.freeze()).expect("256 attributes should succeed");
+        assert_eq!(decoded.attributes.len(), 256);
+
+        let mut buf_over = BytesMut::new();
+        put_varint_u64(&mut buf_over, 1);
+        buf_over.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf_over, 257);
+        for i in 0..257 {
+            put_varint_u32(&mut buf_over, i);
+            put_varint_u32(&mut buf_over, 10);
+        }
+        assert!(EntityDeltaState::decode(&mut buf_over.freeze()).is_err());
+
+        // Line 956: attr_id > u16::MAX as u32. attr_id == u16::MAX as u32 succeeds, u16::MAX + 1 fails.
+        let mut buf_max = BytesMut::new();
+        put_varint_u64(&mut buf_max, 1);
+        buf_max.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf_max, 1);
+        put_varint_u32(&mut buf_max, u16::MAX as u32);
+        put_varint_u32(&mut buf_max, 42);
+        let decoded_max = EntityDeltaState::decode(&mut buf_max.freeze())
+            .expect("attr_id == u16::MAX should succeed");
+        assert_eq!(decoded_max.attributes[0].attribute_id, u16::MAX);
+
+        let mut buf_exceed = BytesMut::new();
+        put_varint_u64(&mut buf_exceed, 1);
+        buf_exceed.put_u16_le(delta_flags::MASK_ATTRIBUTES);
+        put_varint_u32(&mut buf_exceed, 1);
+        put_varint_u32(&mut buf_exceed, u16::MAX as u32 + 1);
+        put_varint_u32(&mut buf_exceed, 42);
+        assert!(EntityDeltaState::decode(&mut buf_exceed.freeze()).is_err());
+    }
+
+    #[test]
+    fn test_world_object_spawn_and_delta_exact_boundaries() {
+        // Line 1155: src.remaining() < 16 * 4 (64)
+        let mut buf_64 = BytesMut::new();
+        put_varint_u64(&mut buf_64, 100); // object_id
+        put_varint_u32(&mut buf_64, 1); // prefab_id
+        for _ in 0..16 {
+            buf_64.put_f32_le(0.0);
+        }
+        // At line 1155, remaining is 64. Passes line 1155.
+        // At line 1187 state_flags fails or state_flags is missing:
+        let err = WorldObjectSpawnPacket::decode(&mut buf_64.clone().freeze()).unwrap_err();
+        assert_eq!(
+            err,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 0
+            }
+        );
+
+        // Add state_flags (varint 0) + 1 byte owner_type + owner_id (0) + 1 byte has_health (0) + properties (0) + revision (1)
+        let mut buf_valid = buf_64.clone();
+        put_varint_u32(&mut buf_valid, 0); // state_flags
+        buf_valid.put_u8(1); // owner_type (line 1188 check)
+        put_string(&mut buf_valid, ""); // owner_id
+        buf_valid.put_u8(0); // has_health (line 1196 check)
+        put_varint_u32(&mut buf_valid, 0); // properties len
+        put_varint_u64(&mut buf_valid, 1); // revision
+        let decoded =
+            WorldObjectSpawnPacket::decode(&mut buf_valid.freeze()).expect("valid decode");
+        assert_eq!(decoded.object_id, 100);
+
+        // WorldObjectDeltaPacket line 1276: src.remaining() < 1 for has_health
+        let mut buf_delta = BytesMut::new();
+        put_varint_u64(&mut buf_delta, 100);
+        put_varint_u64(&mut buf_delta, 1); // revision
+        buf_delta.put_u8(0); // has_flags = 0
+        buf_delta.put_u8(0); // has_health = 0
+        buf_delta.put_u8(0); // has_position = 0
+        buf_delta.put_u8(0); // has_rotation = 0
+        buf_delta.put_u8(0); // has_scale = 0
+        buf_delta.put_u8(0); // has_bounds = 0
+        buf_delta.put_u8(0); // has_owner = 0
+        buf_delta.put_u8(0); // has_properties = 0
+        let decoded_delta =
+            WorldObjectDeltaPacket::decode(&mut buf_delta.freeze()).expect("valid delta");
+        assert_eq!(decoded_delta.object_id, 100);
+
+        // PlaceObjectPacket line 1364: src.remaining() < 10 * 4 (40)
+        let mut buf_place = BytesMut::new();
+        put_varint_u32(&mut buf_place, 5); // prefab_id
+        for _ in 0..10 {
+            buf_place.put_f32_le(0.0);
+        }
+        put_varint_u32(&mut buf_place, 0); // properties len
+        let decoded_place =
+            PlaceObjectPacket::decode(&mut buf_place.freeze()).expect("valid place object");
+        assert_eq!(decoded_place.prefab_id, 5);
+
+        // AuthRequestPacket line 1451: src.remaining() < 2
+        let mut buf_auth_req = BytesMut::new();
+        buf_auth_req.put_u16_le(0); // token_len = 0
+                                    // 0 bytes follow, requires token_len + 4 = 4
+        let err_auth_req = AuthRequestPacket::decode(&mut buf_auth_req.freeze()).unwrap_err();
+        assert_eq!(
+            err_auth_req,
+            ClientCodecError::BufferTooShort {
+                expected: 4,
+                got: 0
+            }
+        );
+
+        // AuthResponsePacket line 1503: src.remaining() < 25 (exact MIN_SIZE 25)
+        let mut buf_auth_res = BytesMut::new();
+        buf_auth_res.put_u8(1); // success
+        buf_auth_res.put_u32_le(0); // error_code
+        buf_auth_res.put_u64_le(10); // session_id
+        buf_auth_res.put_u64_le(20); // player_guid
+        buf_auth_res.put_u16_le(0); // node_len = 0
+        buf_auth_res.put_u16_le(0); // msg_len = 0
+        assert_eq!(buf_auth_res.len(), 25);
+        let decoded_auth_res =
+            AuthResponsePacket::decode(&mut buf_auth_res.freeze()).expect("valid auth res");
+        assert_eq!(decoded_auth_res.session_id, 10);
+    }
+
+    #[test]
+    fn test_social_packets_exact_boundaries() {
+        // Line 1580: SocialMessagePacket MIN_SIZE = 29
+        let mut buf_msg = BytesMut::new();
+        buf_msg.put_u8(1); // channel_type
+        buf_msg.put_u64_le(10); // target_id
+        buf_msg.put_u64_le(20); // sender_guid
+        buf_msg.put_u16_le(0); // name_len = 0
+        buf_msg.put_u16_le(0); // content_len = 0
+        buf_msg.put_u64_le(999); // timestamp
+        assert_eq!(buf_msg.len(), 29);
+        let decoded_msg =
+            SocialMessagePacket::decode(&mut buf_msg.clone().freeze()).expect("exact 29 bytes");
+        assert_eq!(decoded_msg.sender_guid, 20);
+
+        // Buffer with 28 bytes fails line 1580
+        let err_28 =
+            SocialMessagePacket::decode(&mut buf_msg.clone().freeze().slice(0..28)).unwrap_err();
+        assert_eq!(
+            err_28,
+            ClientCodecError::BufferTooShort {
+                expected: 29,
+                got: 28
+            }
+        );
+
+        // Line 1590: src.remaining() < name_len (requires >= 29 bytes for line 1580)
+        let mut buf_name = BytesMut::new();
+        buf_name.put_u8(1);
+        buf_name.put_u64_le(10);
+        buf_name.put_u64_le(20);
+        buf_name.put_u16_le(10); // name_len = 10
+        buf_name.put_slice(b"0123456789"); // exactly 10 bytes name (total 29 bytes)
+        let err_name = SocialMessagePacket::decode(&mut buf_name.freeze()).unwrap_err();
+        assert_eq!(
+            err_name,
+            ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: 0
+            }
+        );
+
+        let mut buf_name_short = BytesMut::new();
+        buf_name_short.put_u8(1);
+        buf_name_short.put_u64_le(10);
+        buf_name_short.put_u64_le(20);
+        buf_name_short.put_u16_le(11); // name_len = 11
+        buf_name_short.put_slice(b"0123456789"); // 10 bytes name (total 29 bytes)
+        let err_name_short = SocialMessagePacket::decode(&mut buf_name_short.freeze()).unwrap_err();
+        assert_eq!(
+            err_name_short,
+            ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: 10
+            }
+        );
+
+        // Line 1600: src.remaining() < 2 (requires >= 29 bytes for line 1580, exactly 2 bytes remaining at line 1600)
+        let mut buf_content_len = BytesMut::new();
+        buf_content_len.put_u8(1);
+        buf_content_len.put_u64_le(10);
+        buf_content_len.put_u64_le(20);
+        buf_content_len.put_u16_le(10); // name_len = 10
+        buf_content_len.put_slice(b"0123456789"); // 10 bytes name (total 29 bytes)
+        buf_content_len.put_u16_le(0); // content_len = 0 (exactly 2 bytes remaining, total 31 bytes)
+        let err_content_len =
+            SocialMessagePacket::decode(&mut buf_content_len.freeze()).unwrap_err();
+        assert_eq!(
+            err_content_len,
+            ClientCodecError::BufferTooShort {
+                expected: 8,
+                got: 0
+            }
+        );
+
+        // Lines 1607 & 1609: src.remaining() < content_len + 8
+        let mut buf_content = BytesMut::new();
+        buf_content.put_u8(1);
+        buf_content.put_u64_le(10);
+        buf_content.put_u64_le(20);
+        buf_content.put_u16_le(0);
+        buf_content.put_u16_le(3); // content_len = 3
+        buf_content.put_slice(b"abc"); // 3 bytes
+        buf_content.put_slice(&[0u8; 7]); // only 7 bytes timestamp (needs 8)
+                                          // Remaining is 3 + 7 = 10 bytes. Expected: 3 + 8 = 11.
+        let err_content = SocialMessagePacket::decode(&mut buf_content.freeze()).unwrap_err();
+        assert_eq!(
+            err_content,
+            ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: 10
+            }
+        );
+
+        // SocialSubscribePacket line 1647: MIN_SIZE = 11
+        let mut buf_sub = BytesMut::new();
+        buf_sub.put_u8(1);
+        buf_sub.put_u64_le(10);
+        buf_sub.put_u16_le(0); // name_len = 0
+        assert_eq!(buf_sub.len(), 11);
+        let decoded_sub =
+            SocialSubscribePacket::decode(&mut buf_sub.clone().freeze()).expect("exact 11 bytes");
+        assert_eq!(decoded_sub.channel_name, "");
+        let err_sub_10 =
+            SocialSubscribePacket::decode(&mut buf_sub.clone().freeze().slice(0..10)).unwrap_err();
+        assert_eq!(
+            err_sub_10,
+            ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: 10
+            }
+        );
+
+        // SocialSubscribePacket line 1656: src.remaining() < name_len
+        let mut buf_sub_name = BytesMut::new();
+        buf_sub_name.put_u8(1);
+        buf_sub_name.put_u64_le(10);
+        buf_sub_name.put_u16_le(4);
+        buf_sub_name.put_slice(b"tes"); // only 3 bytes
+        let err_sub_name = SocialSubscribePacket::decode(&mut buf_sub_name.freeze()).unwrap_err();
+        assert_eq!(
+            err_sub_name,
+            ClientCodecError::BufferTooShort {
+                expected: 4,
+                got: 3
+            }
+        );
+
+        // SocialUnsubscribePacket lines 1691 & 1700
+        let mut buf_unsub = BytesMut::new();
+        buf_unsub.put_u8(1);
+        buf_unsub.put_u64_le(10);
+        buf_unsub.put_u16_le(0);
+        assert_eq!(buf_unsub.len(), 11);
+        let decoded_unsub = SocialUnsubscribePacket::decode(&mut buf_unsub.clone().freeze())
+            .expect("exact 11 bytes");
+        assert_eq!(decoded_unsub.channel_name, "");
+        let err_unsub_10 =
+            SocialUnsubscribePacket::decode(&mut buf_unsub.clone().freeze().slice(0..10))
+                .unwrap_err();
+        assert_eq!(
+            err_unsub_10,
+            ClientCodecError::BufferTooShort {
+                expected: 11,
+                got: 10
+            }
+        );
+
+        let mut buf_unsub_name = BytesMut::new();
+        buf_unsub_name.put_u8(1);
+        buf_unsub_name.put_u64_le(10);
+        buf_unsub_name.put_u16_le(4);
+        buf_unsub_name.put_slice(b"tes");
+        let err_unsub_name =
+            SocialUnsubscribePacket::decode(&mut buf_unsub_name.freeze()).unwrap_err();
+        assert_eq!(
+            err_unsub_name,
+            ClientCodecError::BufferTooShort {
+                expected: 4,
+                got: 3
+            }
+        );
+    }
+
+    #[test]
+    fn test_market_packets_exact_boundaries() {
+        // MarketListingWire line 1758: src.remaining() < 2
+        let mut buf_wire = BytesMut::new();
+        buf_wire.put_u16_le(0); // lid_len = 0
+                                // Remaining: 0. Expected: lid_len + 10 = 10
+        let err_wire = MarketListingWire::decode(&mut buf_wire.freeze()).unwrap_err();
+        assert_eq!(
+            err_wire,
+            ClientCodecError::BufferTooShort {
+                expected: 10,
+                got: 0
+            }
+        );
+
+        // MarketListingWire line 1765 & 1767: lid_len + 10
+        let mut buf_wire2 = BytesMut::new();
+        buf_wire2.put_u16_le(4); // lid_len = 4
+        buf_wire2.put_slice(b"list");
+        buf_wire2.put_u64_le(100); // seller_guid (8 bytes)
+        buf_wire2.put_u8(0); // only 1 byte for iid_len
+                             // Remaining: 13 bytes. Expected: 4 + 10 = 14
+        let err_wire2 = MarketListingWire::decode(&mut buf_wire2.freeze()).unwrap_err();
+        assert_eq!(
+            err_wire2,
+            ClientCodecError::BufferTooShort {
+                expected: 14,
+                got: 13
+            }
+        );
+
+        // MarketListingWire line 1765 exact boundary (< vs <=)
+        // With remaining == lid_len + 10 (0 + 10 = 10):
+        // '<' is false, so it consumes lid, seller_guid, and iid_len, failing at line 1776 with BufferTooShort { expected: 28, got: 0 }.
+        // '<=' is true, so it prematurely fails at line 1765 with BufferTooShort { expected: 10, got: 10 }.
+        let mut buf_wire_exact_boundary = BytesMut::new();
+        buf_wire_exact_boundary.put_u16_le(0); // lid_len = 0
+        buf_wire_exact_boundary.put_u64_le(100); // seller_guid (8 bytes)
+        buf_wire_exact_boundary.put_u16_le(0); // iid_len = 0 (2 bytes)
+        let err_wire_boundary =
+            MarketListingWire::decode(&mut buf_wire_exact_boundary.freeze()).unwrap_err();
+        assert_eq!(
+            err_wire_boundary,
+            ClientCodecError::BufferTooShort {
+                expected: 28,
+                got: 0
+            }
+        );
+
+        // MarketListingWire line 1776 & 1778: iid_len + 28
+        let mut buf_wire3 = BytesMut::new();
+        buf_wire3.put_u16_le(0); // lid_len = 0
+        buf_wire3.put_u64_le(100); // seller_guid
+        buf_wire3.put_u16_le(2); // iid_len = 2
+        buf_wire3.put_slice(b"it");
+        buf_wire3.put_slice(&[0u8; 27]); // 27 bytes (1 byte short of 28)
+                                         // Remaining: 2 + 27 = 29. Expected: 2 + 28 = 30.
+        let err_wire3 = MarketListingWire::decode(&mut buf_wire3.freeze()).unwrap_err();
+        assert_eq!(
+            err_wire3,
+            ClientCodecError::BufferTooShort {
+                expected: 30,
+                got: 29
+            }
+        );
+
+        // Exact wire listing decode
+        let mut buf_wire_exact = BytesMut::new();
+        buf_wire_exact.put_u16_le(0);
+        buf_wire_exact.put_u64_le(100);
+        buf_wire_exact.put_u16_le(0);
+        buf_wire_exact.put_u32_le(1);
+        buf_wire_exact.put_u64_le(10);
+        buf_wire_exact.put_u64_le(1000);
+        buf_wire_exact.put_u64_le(2000);
+        let decoded_wire =
+            MarketListingWire::decode(&mut buf_wire_exact.freeze()).expect("valid wire listing");
+        assert_eq!(decoded_wire.seller_guid, 100);
+
+        // MarketListRequestPacket lines 1824 & 1831: iid_len + 28
+        let mut buf_list = BytesMut::new();
+        buf_list.put_u16_le(0); // iid_len = 0
+        let err_list = MarketListRequestPacket::decode(&mut buf_list.freeze()).unwrap_err();
+        assert_eq!(
+            err_list,
+            ClientCodecError::BufferTooShort {
+                expected: 28,
+                got: 0
+            }
+        );
+
+        let mut buf_list2 = BytesMut::new();
+        buf_list2.put_u16_le(2);
+        buf_list2.put_slice(b"it");
+        buf_list2.put_slice(&[0u8; 27]); // 29 bytes. Expected: 2 + 28 = 30
+        let err_list2 = MarketListRequestPacket::decode(&mut buf_list2.freeze()).unwrap_err();
+        assert_eq!(
+            err_list2,
+            ClientCodecError::BufferTooShort {
+                expected: 30,
+                got: 29
+            }
+        );
+
+        let mut buf_list_exact = BytesMut::new();
+        buf_list_exact.put_u16_le(0);
+        buf_list_exact.put_u64_le(1);
+        buf_list_exact.put_u32_le(0);
+        buf_list_exact.put_u64_le(50);
+        buf_list_exact.put_u64_le(3600);
+        let decoded_list =
+            MarketListRequestPacket::decode(&mut buf_list_exact.freeze()).expect("valid list req");
+        assert_eq!(decoded_list.price, 50);
+
+        // MarketBuyRequestPacket lines 1875 & 1882: lid_len + 24
+        let mut buf_buy = BytesMut::new();
+        buf_buy.put_u16_le(0); // lid_len = 0
+        let err_buy = MarketBuyRequestPacket::decode(&mut buf_buy.freeze()).unwrap_err();
+        assert_eq!(
+            err_buy,
+            ClientCodecError::BufferTooShort {
+                expected: 24,
+                got: 0
+            }
+        );
+
+        let mut buf_buy2 = BytesMut::new();
+        buf_buy2.put_u16_le(3);
+        buf_buy2.put_slice(b"lid");
+        buf_buy2.put_slice(&[0u8; 23]); // 26 bytes. Expected: 3 + 24 = 27
+        let err_buy2 = MarketBuyRequestPacket::decode(&mut buf_buy2.freeze()).unwrap_err();
+        assert_eq!(
+            err_buy2,
+            ClientCodecError::BufferTooShort {
+                expected: 27,
+                got: 26
+            }
+        );
+
+        let mut buf_buy_exact = BytesMut::new();
+        buf_buy_exact.put_u16_le(0);
+        buf_buy_exact.put_u64_le(10);
+        buf_buy_exact.put_u64_le(20);
+        buf_buy_exact.put_u64_le(100);
+        let decoded_buy =
+            MarketBuyRequestPacket::decode(&mut buf_buy_exact.freeze()).expect("valid buy req");
+        assert_eq!(decoded_buy.price, 100);
+
+        // MarketCancelRequestPacket lines 1920 & 1927: lid_len + 8
+        let mut buf_cancel = BytesMut::new();
+        buf_cancel.put_u16_le(0);
+        let err_cancel = MarketCancelRequestPacket::decode(&mut buf_cancel.freeze()).unwrap_err();
+        assert_eq!(
+            err_cancel,
+            ClientCodecError::BufferTooShort {
+                expected: 8,
+                got: 0
+            }
+        );
+
+        let mut buf_cancel2 = BytesMut::new();
+        buf_cancel2.put_u16_le(2);
+        buf_cancel2.put_slice(b"id");
+        buf_cancel2.put_slice(&[0u8; 7]); // 9 bytes. Expected: 2 + 8 = 10
+        let err_cancel2 = MarketCancelRequestPacket::decode(&mut buf_cancel2.freeze()).unwrap_err();
+        assert_eq!(
+            err_cancel2,
+            ClientCodecError::BufferTooShort {
+                expected: 10,
+                got: 9
+            }
+        );
+
+        let mut buf_cancel_exact = BytesMut::new();
+        buf_cancel_exact.put_u16_le(0);
+        buf_cancel_exact.put_u64_le(5);
+        let decoded_cancel = MarketCancelRequestPacket::decode(&mut buf_cancel_exact.freeze())
+            .expect("valid cancel req");
+        assert_eq!(decoded_cancel.dst_container_id, 5);
+
+        // MarketQueryRequestPacket line 1965: 28 bytes
+        let mut buf_query = BytesMut::new();
+        buf_query.put_slice(&[0u8; 27]);
+        let err_query = MarketQueryRequestPacket::decode(&mut buf_query.freeze()).unwrap_err();
+        assert_eq!(
+            err_query,
+            ClientCodecError::BufferTooShort {
+                expected: 28,
+                got: 27
+            }
+        );
+
+        let mut buf_query_exact = BytesMut::new();
+        buf_query_exact.put_u32_le(10);
+        buf_query_exact.put_u64_le(0);
+        buf_query_exact.put_u64_le(500);
+        buf_query_exact.put_u32_le(0);
+        buf_query_exact.put_u32_le(20);
+        assert_eq!(buf_query_exact.len(), 28);
+        let decoded_query = MarketQueryRequestPacket::decode(&mut buf_query_exact.freeze())
+            .expect("valid query req");
+        assert_eq!(decoded_query.limit, 20);
+
+        // MarketResponsePacket lines 2012 & 2022
+        let mut buf_resp = BytesMut::new();
+        buf_resp.put_slice(&[0u8; 9]);
+        let err_resp = MarketResponsePacket::decode(&mut buf_resp.freeze()).unwrap_err();
+        assert_eq!(
+            err_resp,
+            ClientCodecError::BufferTooShort {
+                expected: 10,
+                got: 9
+            }
+        );
+
+        let mut buf_resp_exact = BytesMut::new();
+        buf_resp_exact.put_u8(1); // request_type
+        buf_resp_exact.put_u8(1); // success
+        buf_resp_exact.put_u32_le(0); // error_code
+        buf_resp_exact.put_u16_le(0); // msg_len = 0
+        buf_resp_exact.put_u16_le(0); // listings = 0
+        assert_eq!(buf_resp_exact.len(), 10);
+        let decoded_resp =
+            MarketResponsePacket::decode(&mut buf_resp_exact.freeze()).expect("valid resp");
+        assert_eq!(decoded_resp.request_type, 1);
+
+        let mut buf_resp_msg = BytesMut::new();
+        buf_resp_msg.put_u8(1);
+        buf_resp_msg.put_u8(1);
+        buf_resp_msg.put_u32_le(0);
+        buf_resp_msg.put_u16_le(3); // msg_len = 3
+        buf_resp_msg.put_slice(b"err"); // 3 bytes
+        buf_resp_msg.put_u8(0); // only 1 byte for listings count
+                                // Remaining: 3 + 1 = 4. Expected: 3 + 2 = 5
+        let err_resp_msg = MarketResponsePacket::decode(&mut buf_resp_msg.freeze()).unwrap_err();
+        assert_eq!(
+            err_resp_msg,
+            ClientCodecError::BufferTooShort {
+                expected: 5,
+                got: 4
+            }
+        );
+
+        // msg_len = 1 with 2 bytes remaining (msg_len + 2: 1 + 2 = 3. If mutated to *, 1 * 2 = 2)
+        let mut buf_resp_msg_one = BytesMut::new();
+        buf_resp_msg_one.put_u8(1);
+        buf_resp_msg_one.put_u8(1);
+        buf_resp_msg_one.put_u32_le(0);
+        buf_resp_msg_one.put_u16_le(1); // msg_len = 1
+        buf_resp_msg_one.put_u8(b'a'); // 1 byte for message
+        buf_resp_msg_one.put_u8(0); // only 1 byte for listings count (needs 2)
+                                    // Total buffer is 10 bytes. After reading header (8 bytes), 2 bytes remain.
+                                    // Expected is msg_len + 2 = 3, got 2.
+        let err_resp_msg_one =
+            MarketResponsePacket::decode(&mut buf_resp_msg_one.freeze()).unwrap_err();
+        assert_eq!(
+            err_resp_msg_one,
+            ClientCodecError::BufferTooShort {
+                expected: 3,
+                got: 2
+            }
+        );
+    }
 }

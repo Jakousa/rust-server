@@ -23,7 +23,22 @@ exclude_re = [
     'replace -= with \+= in BitWriter::write_bits',
     'replace -= with /= in BitWriter::write_bits',
     'replace > with >= in BitReader.*::read_bits',
+
+    # External-service-dependent mutants (Postgres and Redis are not hosted in headless CI unit tests):
+    'replace > with .* in <impl SessionCacheBackend for RedisCache>::remove_session',
+    '<impl SocialBus for RedisSocialBus>::publish',
+    'Database::is_postgres',
+    'Database::pg_pool',
+    'Database::ensure_entity_snapshots_blob_column',
+    'Database::ensure_items_container_column',
+    'Database::ping -> Result<(), StorageError> with Ok\(\(\)',
+    'replace \|\| with && in Database::connect',
 ]
+
+# Respect .gitignore when copying workspace to scratch directories
+gitignore = true
+
 
 # Test timeout multiplier relative to baseline cargo test
 timeout_multiplier = 2.0
+

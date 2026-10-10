@@ -228,7 +228,10 @@ mod tests {
             .await
             .unwrap();
 
-        let received = rx.recv().await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .unwrap();
         assert_eq!(received, SocialEnvelope::Chat(chat));
     }
 
@@ -253,7 +256,10 @@ mod tests {
             .await
             .unwrap();
 
-        let received = rx.recv().await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .unwrap();
         assert_eq!(received, SocialEnvelope::Chat(whisper));
     }
 

@@ -1525,5 +1525,29 @@ mod tests {
         if let Err(StorageError::TradeError(msg)) = empty_items_trade {
             assert!(msg.contains("No items specified"));
         }
+
+        // 3. Remove non-existent item returns false
+        let removed = repo.remove_item("non_existent_item_guid").await.unwrap();
+        assert!(!removed);
+
+        // 4. One participant missing returns NotFound
+        let missing_sender = repo
+            .execute_trade("trade_missing_s", 99998, 8002, &["item_1".to_string()])
+            .await;
+        assert!(matches!(missing_sender, Err(StorageError::NotFound(_))));
+
+        let missing_recipient = repo
+            .execute_trade("trade_missing_r", 8001, 99999, &["item_1".to_string()])
+            .await;
+        assert!(matches!(missing_recipient, Err(StorageError::NotFound(_))));
+
+        // 5. Reverse participant GUID ordering (sender > recipient)
+        let reverse_order_missing = repo
+            .execute_trade("trade_rev", 8002, 99999, &["item_1".to_string()])
+            .await;
+        assert!(matches!(
+            reverse_order_missing,
+            Err(StorageError::NotFound(_))
+        ));
     }
 }
