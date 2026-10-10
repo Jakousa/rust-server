@@ -2,7 +2,7 @@
 
 - [x] 1. Update infrastructure and configuration <!-- id: 1 -->
   - [x] 1.1 Add `.worktrees/` to `.gitignore` <!-- id: 1.1 -->
-  - [x] 1.2 Update `.cargo/mutants.toml` with `additional_cargo_test_args = ["--lib"]` and exclusions for unviable Postgres/Redis runtime backend methods <!-- id: 1.2 -->
+  - [x] 1.2 Update `.cargo/mutants.toml` with exclusions for unviable Postgres/Redis runtime backend methods and configure `.github/workflows/mutation-tests.yml` with `-- --lib` <!-- id: 1.2 -->
   - [x] 1.3 Verify `.cargo/mutants.toml` parsing with `cargo mutants --list --package mmo-schema` <!-- id: 1.3 -->
 
 - [x] 2. Harden `mmo-schema` codec test suite <!-- id: 2 -->

@@ -38,8 +38,6 @@ exclude_re = [
 # Respect .gitignore when copying workspace to scratch directories
 gitignore = true
 
-# Run library unit tests directly, skipping slow integration proptests and doc-tests per mutant
-additional_cargo_test_args = ["--lib"]
 
 # Test timeout multiplier relative to baseline cargo test
 timeout_multiplier = 2.0

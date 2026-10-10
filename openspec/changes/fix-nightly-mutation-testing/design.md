@@ -20,8 +20,8 @@ Mutation testing verifies that the test suite actually asserts the correctness o
    - External services: Unit tests execute against SQLite and in-memory backends without live Postgres or Redis daemons. Code branches dedicated to `RedisCache`, `RedisSocialBus`, and Postgres connection management cannot execute without live external services, so they must be declared in `.cargo/mutants.toml` exclusions.
 
 3. **Performance & Infrastructure Optimization**:
-   - `additional_cargo_test_args = ["--lib"]` in `.cargo/mutants.toml` speeds up mutation evaluation by skipping documentation tests and multi-iteration integration proptests (`tests/packet_proptest.rs`).
-   - Adding `.worktrees/` to `.gitignore` prevents cargo-mutants from creating multi-gigabyte temporary workspace copies.
+   - Supplying `-- --lib` via `.github/workflows/mutation-tests.yml` speeds up nightly mutation evaluation by running library unit tests directly and skipping slow integration proptests (`tests/packet_proptest.rs`) and doc-tests, while avoiding duplicate argument collision with PR gates in `rust.yml`.
+   - Adding `.worktrees/` to `.gitignore` and `gitignore = true` in `.cargo/mutants.toml` prevents cargo-mutants from creating multi-gigabyte temporary workspace copies.
 
 ## Security & Anti-Cheat Considerations
 - Ensuring packet decoding enforces strict buffer boundary checks prevents buffer over-read panics and denial-of-service vulnerabilities in network gateway actors.
