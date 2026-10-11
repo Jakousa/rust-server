@@ -1069,7 +1069,7 @@ pub async fn execute_entity_migration(
     let endpoint = if target_node_addr.starts_with("http") {
         target_node_addr.to_string()
     } else {
-        format!("http://{}", target_node_addr)
+        format!("https://{}", target_node_addr)
     };
 
     let mut client = match NodeServiceClient::connect(endpoint).await {
@@ -1104,7 +1104,7 @@ pub async fn execute_entity_migration(
         let gw_endpoint = if gw_addr.starts_with("http") {
             gw_addr.to_string()
         } else {
-            format!("http://{}", gw_addr)
+            format!("https://{}", gw_addr)
         };
         if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
             let _ = gw_client
@@ -1261,7 +1261,7 @@ pub async fn execute_batch_entity_migration(
     let endpoint = if target_node_addr.starts_with("http") {
         target_node_addr.to_string()
     } else {
-        format!("http://{}", target_node_addr)
+        format!("https://{}", target_node_addr)
     };
 
     let mut client = match NodeServiceClient::connect(endpoint).await {
@@ -1325,7 +1325,7 @@ pub async fn execute_batch_entity_migration(
         let gw_endpoint = if gw_addr.starts_with("http") {
             gw_addr.to_string()
         } else {
-            format!("http://{}", gw_addr)
+            format!("https://{}", gw_addr)
         };
         if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
             let updates = session_updates
@@ -1547,7 +1547,12 @@ impl GhostBroadcaster {
         endpoint: &str,
         request: GhostSyncRequest,
     ) -> Result<GhostSyncResponse, tonic::Status> {
-        let mut client = NodeServiceClient::connect(endpoint.to_string())
+        let endpoint_str = if endpoint.starts_with("http") {
+            endpoint.to_string()
+        } else {
+            format!("https://{endpoint}")
+        };
+        let mut client = NodeServiceClient::connect(endpoint_str)
             .await
             .map_err(|e| tonic::Status::unavailable(format!("Endpoint connection failed: {e}")))?;
         let resp = client.sync_ghosts(request).await?;
@@ -1965,7 +1970,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect client
-        let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        let channel = tonic::transport::Channel::from_shared(format!("https://{}", addr))
             .unwrap()
             .connect()
             .await

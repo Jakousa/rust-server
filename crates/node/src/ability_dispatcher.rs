@@ -85,7 +85,7 @@ impl CrossNodeDispatcher {
             let endpoint_str = if endpoint.starts_with("http") {
                 endpoint
             } else {
-                format!("http://{}", endpoint)
+                format!("https://{}", endpoint)
             };
 
             let res = tokio::time::timeout(timeout, async {
@@ -131,7 +131,7 @@ impl CrossNodeDispatcher {
             let endpoint_str = if endpoint.starts_with("http") {
                 endpoint
             } else {
-                format!("http://{}", endpoint)
+                format!("https://{}", endpoint)
             };
 
             let res = tokio::time::timeout(timeout, async {
