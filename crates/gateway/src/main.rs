@@ -143,9 +143,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.mark_ready();
     println!("Edge Gateway actively listening for client connections on {listen_addr}");
 
+    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(capacity as usize));
+
     loop {
         match listener.accept().await {
             Ok((socket, _remote_addr)) => {
+                let permit = match connection_semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        metrics::counter!("mmo_gateway_connections_rejected_max_capacity")
+                            .increment(1);
+                        eprintln!(
+                            "[Gateway] Connection rejected: maximum capacity ({capacity}) reached"
+                        );
+                        continue;
+                    }
+                };
+
                 let session_id = server.next_session_id();
                 let server_clone = Arc::clone(&server);
                 let target_node = default_node_addr.clone();
@@ -154,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = server_clone.register_session_fallback(session_id, target_node);
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = server_clone.handle_connection(socket, session_id).await {
                         // Connection ended or error
                         let _ = e;

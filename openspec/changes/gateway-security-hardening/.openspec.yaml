@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: gateway-security-hardening
+  title: Gateway Maximum Frame Size, Bounded Streams & Slowloris Mitigation
+  status: proposed
+  created: 2026-10-11
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: gateway
+  specs:
+    - specs/gateway/security-hardening/spec.md

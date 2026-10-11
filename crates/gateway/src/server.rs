@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -223,17 +224,20 @@ impl PacketDispatcher {
     }
 }
 
+/// Default bounded capacity for reliable session stream queues.
+pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 1024;
+
 /// Sinks for forwarding outgoing packets to a connected client session.
 #[derive(Clone)]
 pub struct SessionSink {
     /// Bounded channel for unreliable datagrams (e.g. movement, entity deltas). Drops on full.
     pub datagram_tx: mpsc::Sender<Bytes>,
-    /// Unbounded channel for reliable packets (e.g. interaction results, trades, auth). Never dropped under backpressure.
-    pub stream_tx: mpsc::UnboundedSender<Bytes>,
+    /// Bounded channel for reliable packets (e.g. interaction results, trades, auth). Drops or disconnects on backpressure.
+    pub stream_tx: mpsc::Sender<Bytes>,
 }
 
 impl SessionSink {
-    pub fn new(datagram_tx: mpsc::Sender<Bytes>, stream_tx: mpsc::UnboundedSender<Bytes>) -> Self {
+    pub fn new(datagram_tx: mpsc::Sender<Bytes>, stream_tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             datagram_tx,
             stream_tx,
@@ -243,7 +247,7 @@ impl SessionSink {
 
 impl From<mpsc::Sender<Bytes>> for SessionSink {
     fn from(datagram_tx: mpsc::Sender<Bytes>) -> Self {
-        let (stream_tx, _) = mpsc::unbounded_channel();
+        let (stream_tx, _) = mpsc::channel(DEFAULT_STREAM_CHANNEL_CAPACITY);
         Self {
             datagram_tx,
             stream_tx,
@@ -361,7 +365,12 @@ impl GatewayInterceptHandler {
                             let subscribers = sub_mgr.get_subscribers(&topic_name);
                             for sid in subscribers {
                                 if let Some(sink) = sinks.get(&sid) {
-                                    let _ = sink.stream_tx.send(encoded.clone());
+                                    if sink.stream_tx.try_send(encoded.clone()).is_err() {
+                                        metrics::counter!(
+                                            "mmo_gateway_session_stream_full_dropped"
+                                        )
+                                        .increment(1);
+                                    }
                                 }
                             }
                         }
@@ -391,7 +400,9 @@ impl GatewayInterceptHandler {
     pub fn send_packet_to_session(&self, session_id: u64, packet: &ClientPacket) {
         if let Some(sink) = self.session_sinks.get(&session_id) {
             let encoded = Bytes::from(packet.encode());
-            let _ = sink.stream_tx.send(encoded);
+            if sink.stream_tx.try_send(encoded).is_err() {
+                metrics::counter!("mmo_gateway_session_stream_full_dropped").increment(1);
+            }
         }
     }
 
@@ -450,7 +461,10 @@ impl GatewayInterceptHandler {
                     let subscribers = self.subscription_manager.get_subscribers(&topic);
                     for sid in subscribers {
                         if let Some(sink) = self.session_sinks.get(&sid) {
-                            let _ = sink.stream_tx.send(encoded.clone());
+                            if sink.stream_tx.try_send(encoded.clone()).is_err() {
+                                metrics::counter!("mmo_gateway_session_stream_full_dropped")
+                                    .increment(1);
+                            }
                         }
                     }
                 }
@@ -712,6 +726,7 @@ pub struct GatewayServer {
     subscription_manager: Arc<GatewaySubscriptionManager>,
     marketplace_service: Option<Arc<GatewayMarketplaceService>>,
     active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    handshake_timeout: Option<Duration>,
 }
 
 impl GatewayServer {
@@ -733,6 +748,7 @@ impl GatewayServer {
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
+            handshake_timeout: None,
         }
     }
 
@@ -757,6 +773,7 @@ impl GatewayServer {
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
+            handshake_timeout: None,
         }
     }
 
@@ -783,6 +800,17 @@ impl GatewayServer {
     /// Accesses the default simulation node address, if configured.
     pub fn default_node_address(&self) -> Option<&str> {
         self.default_node_address.as_deref()
+    }
+
+    /// Sets an unauthenticated handshake timeout (default: 10 seconds) for Slowloris mitigation.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Returns the configured unauthenticated handshake timeout (defaults to 10 seconds).
+    pub fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout.unwrap_or(Duration::from_secs(10))
     }
 
     /// Resolves the destination simulation node address for a player during initial authentication or handover.
@@ -1151,9 +1179,10 @@ impl GatewayServer {
                     }
                 }
             } else {
-                match sink.stream_tx.send(bytes) {
+                match sink.stream_tx.try_send(bytes) {
                     Ok(_) => true,
                     Err(_) => {
+                        metrics::counter!("mmo_gateway_session_stream_full_dropped").increment(1);
                         metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                         false
                     }
@@ -1191,7 +1220,11 @@ impl GatewayServer {
             let success = if is_ephemeral {
                 sink.datagram_tx.try_send(encoded.clone()).is_ok()
             } else {
-                sink.stream_tx.send(encoded.clone()).is_ok()
+                let res = sink.stream_tx.try_send(encoded.clone());
+                if res.is_err() {
+                    metrics::counter!("mmo_gateway_session_stream_full_dropped").increment(1);
+                }
+                res.is_ok()
             };
             if success {
                 sent_count += 1;
@@ -1223,7 +1256,7 @@ impl GatewayServer {
     ) -> Result<(), GatewayError> {
         let (mut read_half, mut write_half) = socket.into_split();
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
         self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
 
@@ -1259,6 +1292,7 @@ impl GatewayServer {
         let mut buf = BytesMut::with_capacity(8192);
 
         // Enforce edge authentication handshake if authenticator is configured
+        let mut first_packet = None;
         if let Some(ref auth) = self.authenticator {
             let timeout_duration = auth.auth_timeout();
             let auth_fut = async {
@@ -1357,6 +1391,73 @@ impl GatewayServer {
                     )));
                 }
             }
+        } else {
+            // Unauthenticated connection: enforce handshake timeout (Slowloris mitigation)
+            let timeout_duration = self.handshake_timeout();
+            let handshake_fut = async {
+                loop {
+                    if let Some(packet) =
+                        ClientPacket::decode_frame(&mut buf).map_err(GatewayError::Codec)?
+                    {
+                        return Ok::<ClientPacket, GatewayError>(packet);
+                    }
+                    let bytes_read = read_half
+                        .read_buf(&mut buf)
+                        .await
+                        .map_err(GatewayError::Io)?;
+                    if bytes_read == 0 {
+                        return Err(GatewayError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Client disconnected before completing initial handshake frame",
+                        )));
+                    }
+                    metrics::counter!("mmo_gateway_bytes_received_total")
+                        .increment(bytes_read as u64);
+                }
+            };
+
+            match tokio::time::timeout(timeout_duration, handshake_fut).await {
+                Ok(res) => {
+                    first_packet = Some(res?);
+                }
+                Err(_) => {
+                    metrics::counter!("mmo_gateway_handshake_timeout").increment(1);
+                    return Err(GatewayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Client connection handshake timed out (Slowloris mitigation)",
+                    )));
+                }
+            }
+        }
+
+        let handle_incoming_packet = |packet: ClientPacket| async {
+            metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
+                .increment(1);
+            if let ClientPacket::Ping(ping) = &packet {
+                let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                    client_timestamp: ping.timestamp,
+                    server_timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                });
+                let _ = self.send_packet_to_session(session_id, &pong).await;
+                return Ok::<(), GatewayError>(());
+            }
+
+            if intercept_handler.handle_packet(session_id, &packet).await {
+                return Ok(());
+            }
+
+            let routed = self.dispatcher.dispatch_packet(session_id, packet)?;
+            if let Some(ref tx) = self.packet_tx {
+                let _ = tx.send(routed).await;
+            }
+            Ok(())
+        };
+
+        if let Some(packet) = first_packet {
+            handle_incoming_packet(packet).await?;
         }
 
         loop {
@@ -1373,28 +1474,7 @@ impl GatewayServer {
             while let Some(packet) =
                 ClientPacket::decode_frame(&mut buf).map_err(GatewayError::Codec)?
             {
-                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
-                    .increment(1);
-                if let ClientPacket::Ping(ping) = &packet {
-                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                        client_timestamp: ping.timestamp,
-                        server_timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64,
-                    });
-                    let _ = self.send_packet_to_session(session_id, &pong).await;
-                    continue;
-                }
-
-                if intercept_handler.handle_packet(session_id, &packet).await {
-                    continue;
-                }
-
-                let routed = self.dispatcher.dispatch_packet(session_id, packet)?;
-                if let Some(ref tx) = self.packet_tx {
-                    let _ = tx.send(routed).await;
-                }
+                handle_incoming_packet(packet).await?;
             }
         }
 
@@ -1461,7 +1541,7 @@ impl GatewayServer {
         let active_send_stream: Arc<tokio::sync::Mutex<Option<quinn::SendStream>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
         self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
 
@@ -1770,7 +1850,7 @@ mod tests {
     use bytes::Bytes;
     use mmo_core::guid::EntityType;
     use mmo_schema::client::{InteractionPacket, InteractionType, MovementPacket, Vec3};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_framing_and_dispatch_mock_client_packets() {
@@ -2505,7 +2585,7 @@ mod tests {
         let router = Arc::new(SessionRouter::new());
         let sinks = Arc::new(DashMap::new());
         let (dtx, _drx) = mpsc::channel(10);
-        let (stx, _srx) = mpsc::unbounded_channel();
+        let (stx, _srx) = mpsc::channel(10);
         sinks.insert(99, SessionSink::new(dtx, stx));
 
         let service = GatewayServiceImpl::with_sinks(Arc::clone(&router), Arc::clone(&sinks));
@@ -2550,5 +2630,76 @@ mod tests {
         assert!(revoke_resp.success);
         assert_eq!(router.get_route_by_guid(guid), None);
         assert!(!sinks.contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn test_slowloris_handshake_timeout_disconnects_idle_client() {
+        let router = Arc::new(SessionRouter::new());
+        let server =
+            Arc::new(GatewayServer::new(router).with_handshake_timeout(Duration::from_millis(50)));
+        let listener = server.bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let srv = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            srv.handle_connection(socket, 123).await
+        });
+
+        let mut client_stream = TcpStream::connect(local_addr).await.unwrap();
+
+        // Server should timeout and terminate connection because client sends no handshake
+        let res = server_task.await.unwrap();
+        assert!(res.is_err());
+
+        // Client stream should read EOF
+        let mut buf = [0u8; 10];
+        let n = client_stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bounded_stream_backpressure_drops_when_saturated() {
+        let router = Arc::new(SessionRouter::new());
+        let server = Arc::new(GatewayServer::new(router));
+        let session_id = 456;
+
+        let (dtx, _drx) = mpsc::channel(10);
+        let (stx, mut srx) = mpsc::channel(2); // tiny capacity of 2
+        server
+            .register_session_sink(session_id, SessionSink::new(dtx, stx))
+            .unwrap();
+
+        let pkt = ClientPacket::InteractionResult(mmo_schema::client::InteractionResultPacket {
+            action_id: 1,
+            success: true,
+            error_code: 0,
+            payload: Vec::new(),
+        });
+
+        // First 2 sends succeed and fill the channel
+        assert!(server
+            .send_packet_to_session(session_id, &pkt)
+            .await
+            .unwrap());
+        assert!(server
+            .send_packet_to_session(session_id, &pkt)
+            .await
+            .unwrap());
+
+        // Third send encounters backpressure and drops packet cleanly (returns false, doesn't panic)
+        assert!(!server
+            .send_packet_to_session(session_id, &pkt)
+            .await
+            .unwrap());
+
+        // Drain one packet from the stream receiver
+        assert!(srx.recv().await.is_some());
+
+        // Now channel has slot again, next send succeeds
+        assert!(server
+            .send_packet_to_session(session_id, &pkt)
+            .await
+            .unwrap());
     }
 }

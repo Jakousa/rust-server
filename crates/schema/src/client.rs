@@ -20,6 +20,9 @@ pub const PACKET_MAGIC: u16 = 0x4D4D;
 /// Minimum header size in bytes: magic (2) + opcode (2) + payload_len (4) = 8 bytes.
 pub const HEADER_SIZE: usize = 8;
 
+/// Maximum allowed packet payload size in bytes (64 KiB) to prevent memory exhaustion attacks.
+pub const MAX_PACKET_PAYLOAD_SIZE: usize = 64 * 1024;
+
 /// Errors that can occur during packet framing, encoding, or decoding.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ClientCodecError {
@@ -37,6 +40,9 @@ pub enum ClientCodecError {
 
     #[error("Invalid packet data: {0}")]
     InvalidData(String),
+
+    #[error("Packet payload too large: {size} bytes exceeds maximum allowed {max} bytes")]
+    PacketTooLarge { size: usize, max: usize },
 }
 
 /// Operation codes distinguishing packet types on the wire.
@@ -2172,6 +2178,13 @@ impl ClientPacket {
         let opcode = Opcode::from_u16(opcode_val)?;
         let payload_len = bytes.get_u32_le() as usize;
 
+        if payload_len > MAX_PACKET_PAYLOAD_SIZE {
+            return Err(ClientCodecError::PacketTooLarge {
+                size: payload_len,
+                max: MAX_PACKET_PAYLOAD_SIZE,
+            });
+        }
+
         if bytes.remaining() < payload_len {
             return Err(ClientCodecError::LengthMismatch {
                 expected: payload_len,
@@ -2281,6 +2294,12 @@ impl ClientPacket {
         }
 
         let payload_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        if payload_len > MAX_PACKET_PAYLOAD_SIZE {
+            return Err(ClientCodecError::PacketTooLarge {
+                size: payload_len,
+                max: MAX_PACKET_PAYLOAD_SIZE,
+            });
+        }
         let total_frame_size = HEADER_SIZE + payload_len;
 
         if buf.len() < total_frame_size {
@@ -3308,6 +3327,40 @@ mod tests {
                 expected: PACKET_MAGIC,
                 got: 0x9999,
             })
+        );
+    }
+
+    #[test]
+    fn test_packet_too_large_rejection() {
+        // Frame exceeding MAX_PACKET_PAYLOAD_SIZE
+        let mut frame_oversized = BytesMut::new();
+        frame_oversized.put_u16_le(PACKET_MAGIC);
+        frame_oversized.put_u16_le(Opcode::Ping as u16);
+        let oversized_len = (MAX_PACKET_PAYLOAD_SIZE + 1) as u32;
+        frame_oversized.put_u32_le(oversized_len);
+
+        // decode_frame must immediately error without buffering or waiting for payload
+        let err = ClientPacket::decode_frame(&mut frame_oversized).unwrap_err();
+        assert_eq!(
+            err,
+            ClientCodecError::PacketTooLarge {
+                size: (MAX_PACKET_PAYLOAD_SIZE + 1),
+                max: MAX_PACKET_PAYLOAD_SIZE,
+            }
+        );
+
+        // decode_bytes must also reject oversized payload
+        let mut bytes_oversized = BytesMut::new();
+        bytes_oversized.put_u16_le(PACKET_MAGIC);
+        bytes_oversized.put_u16_le(Opcode::Ping as u16);
+        bytes_oversized.put_u32_le(0xFFFF_FFFF); // 4 GiB
+        let err_bytes = ClientPacket::decode_bytes(bytes_oversized.freeze()).unwrap_err();
+        assert_eq!(
+            err_bytes,
+            ClientCodecError::PacketTooLarge {
+                size: 0xFFFF_FFFF,
+                max: MAX_PACKET_PAYLOAD_SIZE,
+            }
         );
     }
 
