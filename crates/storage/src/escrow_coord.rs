@@ -1030,6 +1030,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_escrow_expiry_multiple_concurrent_reaper() {
+        let db = Database::connect_memory().await.unwrap();
+        let container_repo = ContainerRepository::new(db.clone());
+        let c_dep = 7101;
+        let c_ben = 7102;
+        let c_esc = 7103;
+        container_repo
+            .create_container(&ContainerRecordBuilder::new(c_dep).capacity(30).build())
+            .await
+            .unwrap();
+        container_repo
+            .create_container(&ContainerRecordBuilder::new(c_ben).capacity(30).build())
+            .await
+            .unwrap();
+        container_repo
+            .create_container(
+                &ContainerRecordBuilder::new(c_esc)
+                    .capacity(30)
+                    .owner_type("system")
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let char_repo = CharacterRepository::new(db.clone());
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+
+        for i in 0..15 {
+            let item_id = format!("expire_gem_{i}");
+            let item = ItemRecordBuilder::new(&item_id)
+                .container_id(c_dep)
+                .slot(i)
+                .item_def_id(90)
+                .build();
+            char_repo.add_item(&item).await.unwrap();
+
+            escrow_coord
+                .create_escrow(
+                    &format!("escrow_expire_{i}"),
+                    c_dep,
+                    c_ben,
+                    c_esc,
+                    &[item_id],
+                    &format!("secret_{i}"),
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let reaped = escrow_coord.reap_expired_escrows().await.unwrap();
+        assert_eq!(reaped, 15);
+
+        for i in 0..15 {
+            let item_after = char_repo
+                .get_item(&format!("expire_gem_{i}"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(item_after.container_id, c_dep);
+        }
+    }
+
+    #[tokio::test]
     async fn test_escrow_error_branches_and_helpers() {
         assert_eq!(hash_secret("abc"), hash_secret("abc"));
         assert_ne!(hash_secret("abc"), hash_secret("def"));
