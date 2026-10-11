@@ -259,17 +259,37 @@ impl MarketplaceRepository {
 
                 let res: Result<MarketListingRecord, StorageError> = async {
                     // 1. Verify buyer ownership of target and payment containers
-                    for cid in [buyer_container_id, payment_container_id] {
-                        let c = sqlx::query(
-                            "SELECT owner_id FROM containers WHERE container_id = ?",
-                        )
-                        .bind(cid as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?
-                        .ok_or(StorageError::ContainerNotFound(cid))?;
-                        let owner_id: String = c.try_get("owner_id")?;
-                        if owner_id != buyer_guid.to_string() {
-                            return Err(StorageError::UnauthorizedContainerAccess(cid));
+                    let mut cids = vec![buyer_container_id, payment_container_id];
+                    cids.sort_unstable();
+                    cids.dedup();
+
+                    let placeholders = vec!["?"; cids.len()].join(", ");
+                    let query_str = format!("SELECT container_id, owner_id FROM containers WHERE container_id IN ({})", placeholders);
+
+                    let mut q = sqlx::query(&query_str);
+                    for cid in &cids {
+                        q = q.bind(*cid as i64);
+                    }
+
+                    let rows = q.fetch_all(&mut *conn).await?;
+                    if rows.len() != cids.len() {
+                        let mut found_cids = Vec::with_capacity(rows.len());
+                        for r in &rows {
+                            found_cids.push(r.try_get::<i64, _>("container_id")?);
+                        }
+                        let missing = cids
+                            .into_iter()
+                            .find(|cid| !found_cids.contains(&(*cid as i64)))
+                            .unwrap_or(buyer_container_id);
+                        return Err(StorageError::ContainerNotFound(missing));
+                    }
+
+                    let buyer_guid_str = buyer_guid.to_string();
+                    for row in rows {
+                        let owner_id: String = row.try_get("owner_id")?;
+                        let cid_i64: i64 = row.try_get("container_id")?;
+                        if owner_id != buyer_guid_str {
+                            return Err(StorageError::UnauthorizedContainerAccess(cid_i64 as u64));
                         }
                     }
 
@@ -900,19 +920,44 @@ impl MarketplaceRepository {
     ) -> Result<MarketListingRecord, StorageError> {
         let mut tx = pool.begin().await?;
 
-        for cid in [buyer_container_id, payment_container_id] {
-            let c_sql = sql_for_dialect(
-                "SELECT owner_id FROM containers WHERE container_id = ? FOR UPDATE",
-                true,
-            );
-            let c = sqlx::query::<sqlx::Postgres>(&c_sql)
-                .bind(cid as i64)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StorageError::ContainerNotFound(cid))?;
-            let owner_id: String = c.try_get("owner_id")?;
-            if owner_id != buyer_guid.to_string() {
-                return Err(StorageError::UnauthorizedContainerAccess(cid));
+        let mut cids = vec![buyer_container_id, payment_container_id];
+        cids.sort_unstable();
+        cids.dedup();
+
+        let mut placeholders = Vec::new();
+        for i in 1..=cids.len() {
+            placeholders.push(format!("${}", i));
+        }
+        let in_clause = placeholders.join(", ");
+        let query_str = format!(
+            "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) FOR UPDATE",
+            in_clause
+        );
+
+        let mut q = sqlx::query::<sqlx::Postgres>(&query_str);
+        for cid in &cids {
+            q = q.bind(*cid as i64);
+        }
+
+        let rows = q.fetch_all(&mut *tx).await?;
+        if rows.len() != cids.len() {
+            let mut found_cids = Vec::with_capacity(rows.len());
+            for r in &rows {
+                found_cids.push(r.try_get::<i64, _>("container_id")?);
+            }
+            let missing = cids
+                .into_iter()
+                .find(|cid| !found_cids.contains(&(*cid as i64)))
+                .unwrap_or(buyer_container_id);
+            return Err(StorageError::ContainerNotFound(missing));
+        }
+
+        let buyer_guid_str = buyer_guid.to_string();
+        for row in rows {
+            let owner_id: String = row.try_get("owner_id")?;
+            let cid_i64: i64 = row.try_get("container_id")?;
+            if owner_id != buyer_guid_str {
+                return Err(StorageError::UnauthorizedContainerAccess(cid_i64 as u64));
             }
         }
 
@@ -1509,6 +1554,93 @@ mod tests {
             StorageError::UnauthorizedContainerAccess(cid) => assert_eq!(cid, 10),
             other => panic!("Expected UnauthorizedContainerAccess, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_marketplace_purchase_listing_container_validations() {
+        let (db, repo) = setup_test_db().await;
+
+        let seller_guid = 1001;
+        let buyer_guid = 2002;
+        let seller_container = 10;
+        let escrow_container = 99;
+        let buyer_container = 20;
+        let payment_container = 21;
+
+        create_container(&db, seller_container, "1001", 10).await;
+        create_container(&db, escrow_container, "system", 50).await;
+        create_container(&db, buyer_container, "2002", 10).await;
+        create_container(&db, payment_container, "2002", 10).await;
+
+        create_item(&db, "item-sword-1", seller_container, 0, 500).await;
+
+        let listing = repo
+            .create_listing(
+                seller_guid,
+                seller_container,
+                0,
+                100,
+                3600,
+                escrow_container,
+            )
+            .await
+            .unwrap();
+
+        // 1. Missing buyer container
+        let err_missing_buyer = repo
+            .purchase_listing(
+                buyer_guid,
+                &listing.listing_id,
+                9991,
+                payment_container,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err_missing_buyer,
+            StorageError::ContainerNotFound(9991)
+        ));
+
+        // 2. Missing payment container
+        let err_missing_payment = repo
+            .purchase_listing(buyer_guid, &listing.listing_id, buyer_container, 9992, 100)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err_missing_payment,
+            StorageError::ContainerNotFound(9992)
+        ));
+
+        // 3. Unauthorized container access (buyer 3003 tries to use 2002's container)
+        let imposter_guid = 3003;
+        let err_unauth = repo
+            .purchase_listing(
+                imposter_guid,
+                &listing.listing_id,
+                buyer_container,
+                payment_container,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err_unauth,
+            StorageError::UnauthorizedContainerAccess(_)
+        ));
+
+        // 4. Successful purchase with identical buyer and payment container (deduplication)
+        let purchased = repo
+            .purchase_listing(
+                buyer_guid,
+                &listing.listing_id,
+                buyer_container,
+                buyer_container,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchased.status, ListingStatus::Sold);
     }
 
     #[tokio::test]
