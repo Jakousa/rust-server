@@ -923,7 +923,10 @@ impl MarketplaceRepository {
             placeholders.push(format!("${}", i));
         }
         let in_clause = placeholders.join(", ");
-        let query_str = format!("SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) FOR UPDATE", in_clause);
+        let query_str = format!(
+            "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) FOR UPDATE",
+            in_clause
+        );
 
         let mut q = sqlx::query::<sqlx::Postgres>(&query_str);
         for cid in &cids {
@@ -932,8 +935,14 @@ impl MarketplaceRepository {
 
         let rows = q.fetch_all(&mut *tx).await?;
         if rows.len() != cids.len() {
-            let found_cids: Vec<i64> = rows.iter().map(|r| r.try_get("container_id").unwrap()).collect();
-            let missing = cids.into_iter().find(|cid| !found_cids.contains(&(*cid as i64))).unwrap();
+            let found_cids: Vec<i64> = rows
+                .iter()
+                .map(|r| r.try_get("container_id").unwrap())
+                .collect();
+            let missing = cids
+                .into_iter()
+                .find(|cid| !found_cids.contains(&(*cid as i64)))
+                .unwrap();
             return Err(StorageError::ContainerNotFound(missing));
         }
 
