@@ -43,11 +43,10 @@ impl TransactionCoordinator {
         let now_ms = current_time_ms();
         let expires_at_ms = now_ms + ttl_ms as i64;
 
-        let (first_id, second_id) = if src_container_id < dst_container_id {
-            (src_container_id, dst_container_id)
-        } else {
-            (dst_container_id, src_container_id)
-        };
+        let (first_id, second_id) = (
+            src_container_id.min(dst_container_id),
+            src_container_id.max(dst_container_id),
+        );
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -201,150 +200,19 @@ impl TransactionCoordinator {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-
-                // 1. Acquire row-level locks on both containers in strictly increasing numerical order
-                let c1 = sqlx::query("SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE")
-                    .bind(first_id as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let c2 = sqlx::query("SELECT container_id, capacity FROM containers WHERE container_id = $2 FOR UPDATE")
-                    .bind(second_id as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-
-                if c1.is_none() {
-                    return Err(StorageError::ContainerNotFound(first_id));
-                }
-                if c2.is_none() {
-                    return Err(StorageError::ContainerNotFound(second_id));
-                }
-
-                let dst_capacity: i32 = if dst_container_id == first_id {
-                    c1.unwrap().try_get("capacity")?
-                } else {
-                    c2.unwrap().try_get("capacity")?
-                };
-
-                if dst_slot >= dst_capacity as u32 {
-                    return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
-                }
-
-                // 2. Fetch source item
-                let src_item = sqlx::query(
-                    "SELECT item_instance_id FROM items WHERE container_id = $1 AND slot = $2",
+                self.prepare_transfer_postgres(
+                    pool,
+                    tx_id,
+                    src_container_id,
+                    src_slot,
+                    dst_container_id,
+                    dst_slot,
+                    first_id,
+                    second_id,
+                    expires_at_ms,
+                    now_ms,
                 )
-                .bind(src_container_id as i64)
-                .bind(src_slot as i32)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                let item_instance_id: String = match src_item {
-                    Some(row) => row.try_get("item_instance_id")?,
-                    None => {
-                        return Err(StorageError::ItemNotFound(
-                            format!("slot:{}", src_slot),
-                            src_container_id,
-                        ))
-                    }
-                };
-
-                // 3. Check destination slot is not occupied
-                let dst_occupied =
-                    sqlx::query("SELECT 1 FROM items WHERE container_id = $1 AND slot = $2")
-                        .bind(dst_container_id as i64)
-                        .bind(dst_slot as i32)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-
-                if dst_occupied.is_some() {
-                    return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
-                }
-
-                // 4. Check for active non-expired reservations
-                let active_src_res = sqlx::query(
-                    "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
-                )
-                .bind(src_container_id as i64)
-                .bind(src_slot as i32)
-                .bind(now_ms)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if active_src_res.is_some() {
-                    return Err(StorageError::SlotReserved(src_slot, src_container_id));
-                }
-
-                let active_dst_res = sqlx::query(
-                    "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
-                )
-                .bind(dst_container_id as i64)
-                .bind(dst_slot as i32)
-                .bind(now_ms)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if active_dst_res.is_some() {
-                    return Err(StorageError::SlotReserved(dst_slot, dst_container_id));
-                }
-
-                // Clean up any stale expired reservations
-                sqlx::query("DELETE FROM container_reservations WHERE container_id IN ($1, $2) AND slot IN ($3, $4) AND expires_at_epoch_ms <= $5")
-                    .bind(src_container_id as i64)
-                    .bind(dst_container_id as i64)
-                    .bind(src_slot as i32)
-                    .bind(dst_slot as i32)
-                    .bind(now_ms)
-                    .execute(&mut *tx)
-                    .await?;
-
-                // 5. Insert reservations
-                let src_res_id = format!("{}_src", tx_id);
-                let dst_res_id = format!("{}_dst", tx_id);
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
-                    VALUES ($1, $2, $3, $4, $5, 'transfer_out', $6, $7)
-                    "#
-                )
-                .bind(&src_res_id)
-                .bind(tx_id)
-                .bind(src_container_id as i64)
-                .bind(src_slot as i32)
-                .bind(&item_instance_id)
-                .bind(expires_at_ms)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
-                    VALUES ($1, $2, $3, $4, NULL, 'transfer_in', $5, $6)
-                    "#
-                )
-                .bind(&dst_res_id)
-                .bind(tx_id)
-                .bind(dst_container_id as i64)
-                .bind(dst_slot as i32)
-                .bind(expires_at_ms)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok(ReservationRecord {
-                    reservation_id: src_res_id,
-                    tx_id: tx_id.to_string(),
-                    container_id: src_container_id,
-                    slot: src_slot,
-                    item_instance_id: Some(item_instance_id),
-                    reservation_type: "transfer_out".to_string(),
-                    expires_at_epoch_ms: expires_at_ms,
-                    created_at_epoch_ms: now_ms,
-                })
+                .await
             }
         }
     }
@@ -477,117 +345,18 @@ impl TransactionCoordinator {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-
-                // 1. Lock container row
-                let c = sqlx::query("SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE")
-                    .bind(container_id as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-
-                let cap: i32 = match c {
-                    Some(row) => row.try_get("capacity")?,
-                    None => return Err(StorageError::ContainerNotFound(container_id)),
-                };
-
-                if slot >= cap as u32 {
-                    return Err(StorageError::SlotOccupied(slot, container_id));
-                }
-
-                // 2. Validate items based on reservation_type
-                if reservation_type == "transfer_out" {
-                    let src_item = sqlx::query(
-                        "SELECT item_instance_id FROM items WHERE container_id = $1 AND slot = $2",
-                    )
-                    .bind(container_id as i64)
-                    .bind(slot as i32)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-
-                    let found_id: String = match src_item {
-                        Some(row) => row.try_get("item_instance_id")?,
-                        None => {
-                            return Err(StorageError::ItemNotFound(
-                                format!("slot:{}", slot),
-                                container_id,
-                            ))
-                        }
-                    };
-
-                    if let Some(expected_id) = item_instance_id {
-                        if found_id != expected_id {
-                            return Err(StorageError::ItemNotFound(
-                                expected_id.to_string(),
-                                container_id,
-                            ));
-                        }
-                    }
-                } else if reservation_type == "transfer_in" {
-                    let occupied =
-                        sqlx::query("SELECT 1 FROM items WHERE container_id = $1 AND slot = $2")
-                            .bind(container_id as i64)
-                            .bind(slot as i32)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-
-                    if occupied.is_some() {
-                        return Err(StorageError::SlotOccupied(slot, container_id));
-                    }
-                }
-
-                // 3. Check for active reservation
-                let active_res = sqlx::query(
-                    "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
-                )
-                .bind(container_id as i64)
-                .bind(slot as i32)
-                .bind(now_ms)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if active_res.is_some() {
-                    return Err(StorageError::SlotReserved(slot, container_id));
-                }
-
-                // Cleanup any expired reservation on this slot
-                sqlx::query(
-                    "DELETE FROM container_reservations WHERE container_id = $1 AND slot = $2",
-                )
-                .bind(container_id as i64)
-                .bind(slot as i32)
-                .execute(&mut *tx)
-                .await?;
-
-                // 4. Insert reservation
-                sqlx::query(
-                    r#"
-                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    "#
-                )
-                .bind(&reservation_id)
-                .bind(tx_id)
-                .bind(container_id as i64)
-                .bind(slot as i32)
-                .bind(item_instance_id)
-                .bind(reservation_type)
-                .bind(expires_at_ms)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok(ReservationRecord {
-                    reservation_id,
-                    tx_id: tx_id.to_string(),
+                self.reserve_slot_postgres(
+                    pool,
+                    tx_id,
                     container_id,
                     slot,
-                    item_instance_id: item_instance_id.map(|s| s.to_string()),
-                    reservation_type: reservation_type.to_string(),
-                    expires_at_epoch_ms: expires_at_ms,
-                    created_at_epoch_ms: now_ms,
-                })
+                    item_instance_id,
+                    reservation_type,
+                    reservation_id,
+                    expires_at_ms,
+                    now_ms,
+                )
+                .await
             }
         }
     }
@@ -706,92 +475,8 @@ impl TransactionCoordinator {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-
-                let rows = sqlx::query(
-                    "SELECT reservation_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms FROM container_reservations WHERE tx_id = $1"
-                )
-                .bind(tx_id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-                if rows.len() != 2 {
-                    return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
-                }
-
-                let mut src_info = None;
-                let mut dst_info = None;
-
-                for r in rows {
-                    let res_type: String = r.try_get("reservation_type")?;
-                    let cid: i64 = r.try_get("container_id")?;
-                    let slot: i32 = r.try_get("slot")?;
-                    let item_id: Option<String> = r.try_get("item_instance_id")?;
-
-                    if res_type == "transfer_out" {
-                        src_info = Some((cid as u64, slot as u32, item_id.unwrap_or_default()));
-                    } else if res_type == "transfer_in" {
-                        dst_info = Some((cid as u64, slot as u32));
-                    }
-                }
-
-                let (src_cid, _src_slot, item_id) = src_info
-                    .ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
-                let (dst_cid, dst_slot) = dst_info
-                    .ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
-
-                // Atomic check-and-delete
-                let deleted = sqlx::query(
-                    "DELETE FROM container_reservations WHERE tx_id = $1 AND expires_at_epoch_ms > $2"
-                )
-                .bind(tx_id)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
-                if deleted < 2 {
-                    return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
-                }
-
-                sqlx::query(
-                    "UPDATE items SET container_id = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4"
-                )
-                .bind(dst_cid as i64)
-                .bind(dst_slot as i32)
-                .bind(now_secs)
-                .bind(&item_id)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query("UPDATE containers SET version = version + 1, updated_at = $1 WHERE container_id IN ($2, $3)")
-                    .bind(now_secs)
-                    .bind(src_cid as i64)
-                    .bind(dst_cid as i64)
-                    .execute(&mut *tx)
-                    .await?;
-
-                sqlx::query(
-                    "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES ($1, $2, $3, $4, 'committed', $5)"
-                )
-                .bind(tx_id)
-                .bind(src_cid as i64)
-                .bind(dst_cid as i64)
-                .bind(&item_id)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok(ContainerTransactionRecord {
-                    tx_id: tx_id.to_string(),
-                    src_container_id: src_cid,
-                    dst_container_id: dst_cid,
-                    item_instance_id: item_id,
-                    status: "committed".to_string(),
-                    timestamp_epoch_ms: now_ms,
-                })
+                self.commit_transfer_postgres(pool, tx_id, now_ms, now_secs)
+                    .await
             }
         }
     }
@@ -822,22 +507,8 @@ impl TransactionCoordinator {
                 affected
             }
             DbBackend::Postgres(pool) => {
-                let affected = sqlx::query(&query_del_str)
-                    .bind(tx_id)
-                    .execute(pool)
+                self.abort_transfer_postgres(pool, tx_id, &query_del_str, now_ms)
                     .await?
-                    .rows_affected();
-
-                if affected > 0 {
-                    let _ = sqlx::query(
-                        "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES ($1, 0, 0, '', 'aborted', $2)"
-                    )
-                    .bind(tx_id)
-                    .bind(now_ms)
-                    .execute(pool)
-                    .await;
-                }
-                affected
             }
         };
 
@@ -859,10 +530,8 @@ impl TransactionCoordinator {
                     .collect()
             }
             DbBackend::Postgres(pool) => {
-                let rows = sqlx::query(&query_str).bind(now_ms).fetch_all(pool).await?;
-                rows.into_iter()
-                    .filter_map(|r| r.try_get("tx_id").ok())
-                    .collect()
+                self.reap_expired_reservations_postgres(pool, &query_str, now_ms)
+                    .await?
             }
         };
 
@@ -874,6 +543,429 @@ impl TransactionCoordinator {
         }
 
         Ok(reaped)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_transfer_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        tx_id: &str,
+        src_container_id: u64,
+        src_slot: u32,
+        dst_container_id: u64,
+        dst_slot: u32,
+        first_id: u64,
+        second_id: u64,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<ReservationRecord, StorageError> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Acquire row-level locks on both containers in strictly increasing numerical order
+        let c1 = sqlx::query(
+            "SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE",
+        )
+        .bind(first_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let c2 = sqlx::query(
+            "SELECT container_id, capacity FROM containers WHERE container_id = $2 FOR UPDATE",
+        )
+        .bind(second_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if c1.is_none() {
+            return Err(StorageError::ContainerNotFound(first_id));
+        }
+        if c2.is_none() {
+            return Err(StorageError::ContainerNotFound(second_id));
+        }
+
+        let dst_capacity: i32 = if dst_container_id == first_id {
+            c1.unwrap().try_get("capacity")?
+        } else {
+            c2.unwrap().try_get("capacity")?
+        };
+
+        if dst_slot >= dst_capacity as u32 {
+            return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
+        }
+
+        // 2. Fetch source item
+        let src_item =
+            sqlx::query("SELECT item_instance_id FROM items WHERE container_id = $1 AND slot = $2")
+                .bind(src_container_id as i64)
+                .bind(src_slot as i32)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let item_instance_id: String = match src_item {
+            Some(row) => row.try_get("item_instance_id")?,
+            None => {
+                return Err(StorageError::ItemNotFound(
+                    format!("slot:{}", src_slot),
+                    src_container_id,
+                ))
+            }
+        };
+
+        // 3. Check destination slot is not occupied
+        let dst_occupied = sqlx::query("SELECT 1 FROM items WHERE container_id = $1 AND slot = $2")
+            .bind(dst_container_id as i64)
+            .bind(dst_slot as i32)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        if dst_occupied.is_some() {
+            return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
+        }
+
+        // 4. Check for active non-expired reservations
+        let active_src_res = sqlx::query(
+            "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
+        )
+        .bind(src_container_id as i64)
+        .bind(src_slot as i32)
+        .bind(now_ms)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if active_src_res.is_some() {
+            return Err(StorageError::SlotReserved(src_slot, src_container_id));
+        }
+
+        let active_dst_res = sqlx::query(
+            "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
+        )
+        .bind(dst_container_id as i64)
+        .bind(dst_slot as i32)
+        .bind(now_ms)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if active_dst_res.is_some() {
+            return Err(StorageError::SlotReserved(dst_slot, dst_container_id));
+        }
+
+        // Clean up any stale expired reservations
+        sqlx::query("DELETE FROM container_reservations WHERE container_id IN ($1, $2) AND slot IN ($3, $4) AND expires_at_epoch_ms <= $5")
+            .bind(src_container_id as i64)
+            .bind(dst_container_id as i64)
+            .bind(src_slot as i32)
+            .bind(dst_slot as i32)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+
+        // 5. Insert reservations
+        let src_res_id = format!("{}_src", tx_id);
+        let dst_res_id = format!("{}_dst", tx_id);
+
+        sqlx::query(
+            r#"
+            INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+            VALUES ($1, $2, $3, $4, $5, 'transfer_out', $6, $7)
+            "#
+        )
+        .bind(&src_res_id)
+        .bind(tx_id)
+        .bind(src_container_id as i64)
+        .bind(src_slot as i32)
+        .bind(&item_instance_id)
+        .bind(expires_at_ms)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+            VALUES ($1, $2, $3, $4, NULL, 'transfer_in', $5, $6)
+            "#
+        )
+        .bind(&dst_res_id)
+        .bind(tx_id)
+        .bind(dst_container_id as i64)
+        .bind(dst_slot as i32)
+        .bind(expires_at_ms)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ReservationRecord {
+            reservation_id: src_res_id,
+            tx_id: tx_id.to_string(),
+            container_id: src_container_id,
+            slot: src_slot,
+            item_instance_id: Some(item_instance_id),
+            reservation_type: "transfer_out".to_string(),
+            expires_at_epoch_ms: expires_at_ms,
+            created_at_epoch_ms: now_ms,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve_slot_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        tx_id: &str,
+        container_id: u64,
+        slot: u32,
+        item_instance_id: Option<&str>,
+        reservation_type: &str,
+        reservation_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<ReservationRecord, StorageError> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Lock container row
+        let c = sqlx::query(
+            "SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE",
+        )
+        .bind(container_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let cap: i32 = match c {
+            Some(row) => row.try_get("capacity")?,
+            None => return Err(StorageError::ContainerNotFound(container_id)),
+        };
+
+        if slot >= cap as u32 {
+            return Err(StorageError::SlotOccupied(slot, container_id));
+        }
+
+        // 2. Validate items based on reservation_type
+        if reservation_type == "transfer_out" {
+            let src_item = sqlx::query(
+                "SELECT item_instance_id FROM items WHERE container_id = $1 AND slot = $2",
+            )
+            .bind(container_id as i64)
+            .bind(slot as i32)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let found_id: String = match src_item {
+                Some(row) => row.try_get("item_instance_id")?,
+                None => {
+                    return Err(StorageError::ItemNotFound(
+                        format!("slot:{}", slot),
+                        container_id,
+                    ))
+                }
+            };
+
+            if let Some(expected_id) = item_instance_id {
+                if found_id != expected_id {
+                    return Err(StorageError::ItemNotFound(
+                        expected_id.to_string(),
+                        container_id,
+                    ));
+                }
+            }
+        } else if reservation_type == "transfer_in" {
+            let occupied = sqlx::query("SELECT 1 FROM items WHERE container_id = $1 AND slot = $2")
+                .bind(container_id as i64)
+                .bind(slot as i32)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+            if occupied.is_some() {
+                return Err(StorageError::SlotOccupied(slot, container_id));
+            }
+        }
+
+        // 3. Check for active reservation
+        let active_res = sqlx::query(
+            "SELECT 1 FROM container_reservations WHERE container_id = $1 AND slot = $2 AND expires_at_epoch_ms > $3"
+        )
+        .bind(container_id as i64)
+        .bind(slot as i32)
+        .bind(now_ms)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if active_res.is_some() {
+            return Err(StorageError::SlotReserved(slot, container_id));
+        }
+
+        // Cleanup any expired reservation on this slot
+        sqlx::query("DELETE FROM container_reservations WHERE container_id = $1 AND slot = $2")
+            .bind(container_id as i64)
+            .bind(slot as i32)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Insert reservation
+        sqlx::query(
+            r#"
+            INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#
+        )
+        .bind(&reservation_id)
+        .bind(tx_id)
+        .bind(container_id as i64)
+        .bind(slot as i32)
+        .bind(item_instance_id)
+        .bind(reservation_type)
+        .bind(expires_at_ms)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ReservationRecord {
+            reservation_id,
+            tx_id: tx_id.to_string(),
+            container_id,
+            slot,
+            item_instance_id: item_instance_id.map(|s| s.to_string()),
+            reservation_type: reservation_type.to_string(),
+            expires_at_epoch_ms: expires_at_ms,
+            created_at_epoch_ms: now_ms,
+        })
+    }
+
+    async fn commit_transfer_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        tx_id: &str,
+        now_ms: i64,
+        now_secs: i64,
+    ) -> Result<ContainerTransactionRecord, StorageError> {
+        let mut tx = pool.begin().await?;
+
+        let rows = sqlx::query(
+            "SELECT reservation_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms FROM container_reservations WHERE tx_id = $1"
+        )
+        .bind(tx_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.len() != 2 {
+            return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
+        }
+
+        let mut src_info = None;
+        let mut dst_info = None;
+
+        for r in rows {
+            let res_type: String = r.try_get("reservation_type")?;
+            let cid: i64 = r.try_get("container_id")?;
+            let slot: i32 = r.try_get("slot")?;
+            let item_id: Option<String> = r.try_get("item_instance_id")?;
+
+            if res_type == "transfer_out" {
+                src_info = Some((cid as u64, slot as u32, item_id.unwrap_or_default()));
+            } else if res_type == "transfer_in" {
+                dst_info = Some((cid as u64, slot as u32));
+            }
+        }
+
+        let (src_cid, _src_slot, item_id) =
+            src_info.ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
+        let (dst_cid, dst_slot) =
+            dst_info.ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
+
+        // Atomic check-and-delete
+        let deleted = sqlx::query(
+            "DELETE FROM container_reservations WHERE tx_id = $1 AND expires_at_epoch_ms > $2",
+        )
+        .bind(tx_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if deleted < 2 {
+            return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
+        }
+
+        sqlx::query(
+            "UPDATE items SET container_id = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4"
+        )
+        .bind(dst_cid as i64)
+        .bind(dst_slot as i32)
+        .bind(now_secs)
+        .bind(&item_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE containers SET version = version + 1, updated_at = $1 WHERE container_id IN ($2, $3)")
+            .bind(now_secs)
+            .bind(src_cid as i64)
+            .bind(dst_cid as i64)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES ($1, $2, $3, $4, 'committed', $5)"
+        )
+        .bind(tx_id)
+        .bind(src_cid as i64)
+        .bind(dst_cid as i64)
+        .bind(&item_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ContainerTransactionRecord {
+            tx_id: tx_id.to_string(),
+            src_container_id: src_cid,
+            dst_container_id: dst_cid,
+            item_instance_id: item_id,
+            status: "committed".to_string(),
+            timestamp_epoch_ms: now_ms,
+        })
+    }
+
+    async fn abort_transfer_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        tx_id: &str,
+        query_del_str: &str,
+        now_ms: i64,
+    ) -> Result<u64, StorageError> {
+        let affected = sqlx::query::<sqlx::Postgres>(query_del_str)
+            .bind(tx_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+        if affected > 0 {
+            let _ = sqlx::query(
+                "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES ($1, 0, 0, '', 'aborted', $2)"
+            )
+            .bind(tx_id)
+            .bind(now_ms)
+            .execute(pool)
+            .await;
+        }
+        Ok(affected)
+    }
+
+    async fn reap_expired_reservations_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        query_str: &str,
+        now_ms: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows = sqlx::query::<sqlx::Postgres>(query_str)
+            .bind(now_ms)
+            .fetch_all(pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String, _>("tx_id").ok())
+            .collect())
     }
 }
 
@@ -936,11 +1028,15 @@ mod tests {
         char_repo.add_item(&item).await.unwrap();
 
         // 1. Prepare transfer (C1 slot 0 -> C2 slot 5)
+        let now_ms = current_time_ms();
         let res = coord
             .prepare_transfer("tx_success_1", c1, 0, c2, 5, 5000)
             .await
             .unwrap();
         assert_eq!(res.slot, 0);
+        assert!(
+            res.expires_at_epoch_ms >= now_ms + 4000 && res.expires_at_epoch_ms <= now_ms + 6000
+        );
 
         // 2. Reject concurrent duplicate reservation on same slot
         let dup = coord.prepare_transfer("tx_dup_2", c1, 0, c2, 6, 5000).await;
@@ -991,6 +1087,28 @@ mod tests {
         let aborted = coord.abort_transfer("tx_abort_1").await.unwrap();
         assert!(aborted);
 
+        // Verify status 'aborted' was recorded in container_transactions
+        let tx_row = sqlx::query("SELECT status FROM container_transactions WHERE tx_id = ?")
+            .bind("tx_abort_1")
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        assert!(tx_row.is_some());
+        assert_eq!(
+            tx_row.unwrap().try_get::<String, _>("status").unwrap(),
+            "aborted"
+        );
+
+        // Verify non-existent abort does not insert into container_transactions
+        let non_aborted = coord.abort_transfer("tx_non_existent").await.unwrap();
+        assert!(!non_aborted);
+        let non_row = sqlx::query("SELECT 1 FROM container_transactions WHERE tx_id = ?")
+            .bind("tx_non_existent")
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        assert!(non_row.is_none());
+
         // Item still in C1 slot 2
         let item_after = char_repo.get_item("ring_01").await.unwrap().unwrap();
         assert_eq!(item_after.container_id, c1);
@@ -1031,12 +1149,31 @@ mod tests {
             .await
             .unwrap();
 
+        let item2 = ItemRecord {
+            item_instance_id: "helm_02".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 53,
+            slot: 4,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item2).await.unwrap();
+
+        coord
+            .prepare_transfer("tx_expire_2", c1, 4, c2, 6, 1)
+            .await
+            .unwrap();
+
         // Sleep to ensure lease expiration
         tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
 
-        // 2. Run reaper
+        // 2. Run reaper (reaps 2 transactions)
         let reaped = coord.reap_expired_reservations().await.unwrap();
-        assert_eq!(reaped, 1);
+        assert_eq!(reaped, 2);
 
         // Commit fails because reservation was reaped
         let commit_res = coord.commit_transfer("tx_expire_1").await;
@@ -1052,6 +1189,23 @@ mod tests {
         let (c1, c2) = setup_test_containers(&db).await;
         let char_repo = CharacterRepository::new(db.clone());
         let coord = TransactionCoordinator::new(db.clone());
+
+        // Exact slot capacity boundary (c2 capacity is 10, slot 10 is out of bounds)
+        let err_cap_exact = coord
+            .prepare_transfer("tx_cap_exact", c1, 0, c2, 10, 5000)
+            .await;
+        assert!(matches!(
+            err_cap_exact,
+            Err(StorageError::SlotOccupied(10, _))
+        ));
+
+        let err_res_cap = coord
+            .reserve_slot("tx_res_cap", c2, 10, None, "transfer", 5000)
+            .await;
+        assert!(matches!(
+            err_res_cap,
+            Err(StorageError::SlotOccupied(10, _))
+        ));
 
         // 1. ContainerNotFound
         let err_c = coord
@@ -1097,26 +1251,177 @@ mod tests {
         char_repo.add_item(&item1).await.unwrap();
         char_repo.add_item(&item2).await.unwrap();
 
+        // Test reverse order container IDs: src_container_id > dst_container_id
+        let res_rev = coord
+            .prepare_transfer("tx_rev_order", c2, 1, c1, 5, 5000)
+            .await
+            .unwrap();
+        assert_eq!(res_rev.container_id, c2);
+        coord.abort_transfer("tx_rev_order").await.unwrap();
+
         // 4. Destination slot occupied
         let err_occ = coord.prepare_transfer("tx_err_4", c1, 0, c2, 1, 5000).await;
         assert!(matches!(err_occ, Err(StorageError::SlotOccupied(1, _))));
 
-        // 5. Test reserve_slot directly
+        // 5. Test reserve_slot directly with transfer_out and TTL assertion
+        let now_ms = current_time_ms();
         let res1 = coord
-            .reserve_slot("tx_res_1", c1, 0, Some("edge_item_1"), "transfer", 5000)
+            .reserve_slot("tx_res_1", c1, 0, Some("edge_item_1"), "transfer_out", 5000)
             .await
             .unwrap();
         assert_eq!(res1.slot, 0);
+        assert!(
+            res1.expires_at_epoch_ms >= now_ms + 4000 && res1.expires_at_epoch_ms <= now_ms + 6000
+        );
+
+        // Mismatched item_instance_id rejected
+        let res_mismatch = coord
+            .reserve_slot("tx_res_mis", c1, 0, Some("wrong_id"), "transfer_out", 5000)
+            .await;
+        assert!(matches!(res_mismatch, Err(StorageError::ItemNotFound(..))));
+
+        // reserve_slot transfer_in on empty slot 3 succeeds
+        let res_in = coord
+            .reserve_slot("tx_res_in", c1, 3, None, "transfer_in", 5000)
+            .await
+            .unwrap();
+        assert_eq!(res_in.slot, 3);
+
+        // reserve_slot transfer_in on occupied slot 0 rejected
+        let res_in_occ = coord
+            .reserve_slot("tx_res_in_occ", c1, 0, None, "transfer_in", 5000)
+            .await;
+        assert!(matches!(res_in_occ, Err(StorageError::SlotOccupied(0, _))));
 
         // Duplicate reservation rejected
         let res_dup = coord
-            .reserve_slot("tx_res_2", c1, 0, Some("edge_item_1"), "transfer", 5000)
+            .reserve_slot("tx_res_2", c1, 0, Some("edge_item_1"), "transfer_out", 5000)
             .await;
         assert!(matches!(res_dup, Err(StorageError::SlotReserved(0, _))));
 
         // Non-existent abort returns false
         let aborted = coord.abort_transfer("non_existent_tx").await.unwrap();
         assert!(!aborted);
+    }
+
+    #[tokio::test]
+    async fn test_2pc_commit_partial_reservation_expiry() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c1, c2) = setup_test_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        let item = ItemRecord {
+            item_instance_id: "partial_item".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 100,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item).await.unwrap();
+
+        coord
+            .prepare_transfer("tx_partial", c1, 0, c2, 5, 5000)
+            .await
+            .unwrap();
+
+        // Expire only one of the two reservations (the transfer_in one)
+        sqlx::query("UPDATE container_reservations SET expires_at_epoch_ms = 0 WHERE tx_id = ? AND reservation_type = 'transfer_in'")
+            .bind("tx_partial")
+            .execute(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+
+        // commit_transfer must fail because deleted < 2 (only 1 row was unexpired)
+        let res = coord.commit_transfer("tx_partial").await;
+        assert!(matches!(
+            res,
+            Err(StorageError::ReservationExpiredOrAborted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_2pc_asymmetric_container_capacities() {
+        let db = Database::connect_memory().await.unwrap();
+        let container_repo = ContainerRepository::new(db.clone());
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        let c_small = ContainerRecord {
+            container_id: 7001,
+            owner_type: "character".to_string(),
+            owner_id: "1001".to_string(),
+            name: "Small".to_string(),
+            capacity: 5,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        let c_large = ContainerRecord {
+            container_id: 7002,
+            owner_type: "character".to_string(),
+            owner_id: "1001".to_string(),
+            name: "Large".to_string(),
+            capacity: 20,
+            access_policy: "owner_only".to_string(),
+            version: 1,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        container_repo.create_container(&c_small).await.unwrap();
+        container_repo.create_container(&c_large).await.unwrap();
+
+        let item = ItemRecord {
+            item_instance_id: "asym_item_1".to_string(),
+            character_guid: 1001,
+            container_id: 7001,
+            item_def_id: 1,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item).await.unwrap();
+
+        let item2 = ItemRecord {
+            item_instance_id: "asym_item_2".to_string(),
+            character_guid: 1001,
+            container_id: 7002,
+            item_def_id: 2,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item2).await.unwrap();
+
+        // 7001 (cap 5) -> 7002 (cap 20): dst is 7002, slot 10 is VALID (< 20)
+        let res1 = coord
+            .prepare_transfer("tx_asym_1", 7001, 0, 7002, 10, 5000)
+            .await;
+        assert!(res1.is_ok());
+
+        // 7002 (cap 20) -> 7001 (cap 5): dst is 7001, slot 10 is INVALID (>= 5)
+        let res2 = coord
+            .prepare_transfer("tx_asym_2", 7002, 0, 7001, 10, 5000)
+            .await;
+        assert!(matches!(res2, Err(StorageError::SlotOccupied(10, 7001))));
+
+        // 7002 (cap 20) -> 7001 (cap 5): dst is 7001, slot 3 is VALID (< 5)
+        let res3 = coord
+            .prepare_transfer("tx_asym_3", 7002, 0, 7001, 3, 5000)
+            .await;
+        assert!(res3.is_ok());
     }
 
     #[test]

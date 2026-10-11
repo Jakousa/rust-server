@@ -857,11 +857,10 @@ impl CharacterRepository {
             ));
         }
 
-        let (first_guid, second_guid) = if sender_guid < recipient_guid {
-            (sender_guid, recipient_guid)
-        } else {
-            (recipient_guid, sender_guid)
-        };
+        let (first_guid, second_guid) = (
+            sender_guid.min(recipient_guid),
+            sender_guid.max(recipient_guid),
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -991,121 +990,141 @@ impl CharacterRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-
-                // 1. Dialect-specific row locking in ascending numerical order
-                let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
-                    .bind(first_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
-                    .bind(second_guid as i64)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                if c1.is_none() || c2.is_none() {
-                    return Err(StorageError::NotFound(
-                        "One or both trade participant characters not found".to_string(),
-                    ));
-                }
-
-                // 2. Fetch recipient inventory capacity
-                let inv_row =
-                    sqlx::query("SELECT capacity FROM inventories WHERE character_guid = $1")
-                        .bind(recipient_guid as i64)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                let capacity = inv_row
-                    .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
-                    .unwrap_or(30) as u32;
-
-                // 3. Fetch recipient occupied slots
-                let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = $1")
-                    .bind(recipient_guid as i64)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                    .into_iter()
-                    .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                    .collect();
-
-                let mut free_slots = Vec::new();
-                for slot_idx in 0..capacity {
-                    if !occupied_slots.contains(&slot_idx) {
-                        free_slots.push(slot_idx);
-                    }
-                }
-
-                if free_slots.len() < item_instance_ids.len() {
-                    return Err(StorageError::InventoryFull(recipient_guid, capacity));
-                }
-
-                // 4. Verify sender owns each item
-                for item_id in item_instance_ids {
-                    let item_row =
-                        sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = $1")
-                            .bind(item_id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-
-                    match item_row {
-                        Some(r) => {
-                            let owner: i64 = r.try_get("character_guid")?;
-                            if owner as u64 != sender_guid {
-                                return Err(StorageError::ItemNotFound(
-                                    item_id.clone(),
-                                    sender_guid,
-                                ));
-                            }
-                        }
-                        None => {
-                            return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
-                        }
-                    }
-                }
-
-                // 5. Transfer items to recipient free slots
-                for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                    sqlx::query(
-                        "UPDATE items SET character_guid = $1, container_id = $2, slot = $3, updated_at = $4 WHERE item_instance_id = $5",
-                    )
-                    .bind(recipient_guid as i64)
-                    .bind(recipient_guid as i64)
-                    .bind(*target_slot as i32)
-                    .bind(now)
-                    .bind(item_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-
-                // 6. Record audit trail
-                let items_json = serde_json::to_string(item_instance_ids)?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    "#,
-                )
-                .bind(trade_id)
-                .bind(sender_guid as i64)
-                .bind(recipient_guid as i64)
-                .bind(&items_json)
-                .bind(TradeStatus::Committed.to_string())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok(TradeRecord {
-                    trade_id: trade_id.to_string(),
+                self.execute_trade_postgres(
+                    pool,
+                    trade_id,
                     sender_guid,
                     recipient_guid,
-                    items_json,
-                    status: TradeStatus::Committed,
-                    created_at: now,
-                })
+                    item_instance_ids,
+                    first_guid,
+                    second_guid,
+                    now,
+                )
+                .await
             }
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_trade_postgres(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        trade_id: &str,
+        sender_guid: u64,
+        recipient_guid: u64,
+        item_instance_ids: &[String],
+        first_guid: u64,
+        second_guid: u64,
+        now: i64,
+    ) -> Result<TradeRecord, StorageError> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Dialect-specific row locking in ascending numerical order
+        let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
+            .bind(first_guid as i64)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
+            .bind(second_guid as i64)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if c1.is_none() || c2.is_none() {
+            return Err(StorageError::NotFound(
+                "One or both trade participant characters not found".to_string(),
+            ));
+        }
+
+        // 2. Fetch recipient inventory capacity
+        let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = $1")
+            .bind(recipient_guid as i64)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let capacity = inv_row
+            .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
+            .unwrap_or(30) as u32;
+
+        // 3. Fetch recipient occupied slots
+        let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = $1")
+            .bind(recipient_guid as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+            .collect();
+
+        let mut free_slots = Vec::new();
+        for slot_idx in 0..capacity {
+            if !occupied_slots.contains(&slot_idx) {
+                free_slots.push(slot_idx);
+            }
+        }
+
+        if free_slots.len() < item_instance_ids.len() {
+            return Err(StorageError::InventoryFull(recipient_guid, capacity));
+        }
+
+        // 4. Verify sender owns each item
+        for item_id in item_instance_ids {
+            let item_row =
+                sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = $1")
+                    .bind(item_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+
+            match item_row {
+                Some(r) => {
+                    let owner: i64 = r.try_get("character_guid")?;
+                    if owner as u64 != sender_guid {
+                        return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
+                    }
+                }
+                None => {
+                    return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
+                }
+            }
+        }
+
+        // 5. Transfer items to recipient free slots
+        for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+            sqlx::query(
+                "UPDATE items SET character_guid = $1, container_id = $2, slot = $3, updated_at = $4 WHERE item_instance_id = $5",
+            )
+            .bind(recipient_guid as i64)
+            .bind(recipient_guid as i64)
+            .bind(*target_slot as i32)
+            .bind(now)
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 6. Record audit trail
+        let items_json = serde_json::to_string(item_instance_ids)?;
+        sqlx::query(
+            r#"
+            INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(trade_id)
+        .bind(sender_guid as i64)
+        .bind(recipient_guid as i64)
+        .bind(&items_json)
+        .bind(TradeStatus::Committed.to_string())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(TradeRecord {
+            trade_id: trade_id.to_string(),
+            sender_guid,
+            recipient_guid,
+            items_json,
+            status: TradeStatus::Committed,
+            created_at: now,
+        })
     }
 }
 
@@ -1495,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_trade_validation_boundaries() {
         let db = Database::connect_memory().await.unwrap();
-        let repo = CharacterRepository::new(db);
+        let repo = CharacterRepository::new(db.clone());
 
         repo.create_account("acc_trade_val", "val_user")
             .await
@@ -1541,13 +1560,73 @@ mod tests {
             .await;
         assert!(matches!(missing_recipient, Err(StorageError::NotFound(_))));
 
-        // 5. Reverse participant GUID ordering (sender > recipient)
+        // 5. Reverse participant GUID ordering (sender > recipient) with missing participant
         let reverse_order_missing = repo
             .execute_trade("trade_rev", 8002, 99999, &["item_1".to_string()])
             .await;
         assert!(matches!(
             reverse_order_missing,
             Err(StorageError::NotFound(_))
+        ));
+
+        // 6. Valid reverse trade: sender_guid (8002) > recipient_guid (8001)
+        // Set recipient 8001 capacity to exactly 1 to verify free_slots.len() < items.len() exact boundary
+        sqlx::query("UPDATE inventories SET capacity = 1 WHERE character_guid = 8001")
+            .execute(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+
+        let item_rev = ItemRecord {
+            item_instance_id: "trade_item_rev".to_string(),
+            character_guid: 8002,
+            container_id: 0,
+            item_def_id: 99,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&item_rev).await.unwrap();
+
+        let trade_rev_ok = repo
+            .execute_trade(
+                "trade_rev_valid",
+                8002,
+                8001,
+                &["trade_item_rev".to_string()],
+            )
+            .await;
+        assert!(trade_rev_ok.is_ok());
+
+        // Now recipient 8001 is completely full (capacity 1, 1 item).
+        // Trading another item to 8001 must fail with InventoryFull.
+        let item_full = ItemRecord {
+            item_instance_id: "trade_item_full".to_string(),
+            character_guid: 8002,
+            container_id: 0,
+            item_def_id: 99,
+            slot: 1,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&item_full).await.unwrap();
+
+        let trade_full_err = repo
+            .execute_trade(
+                "trade_full_err",
+                8002,
+                8001,
+                &["trade_item_full".to_string()],
+            )
+            .await;
+        assert!(matches!(
+            trade_full_err,
+            Err(StorageError::InventoryFull(8001, 1))
         ));
     }
 }
