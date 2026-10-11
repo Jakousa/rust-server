@@ -34,7 +34,7 @@ path = "tests/it/main.rs"
 
 [[bench]]
 name = "engine_benchmarks"
-path = "../../benches/engine_benchmarks.rs"
+path = "benches/engine_benchmarks.rs"
 harness = false
 
 [lints]

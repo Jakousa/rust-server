@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy manifests and source files
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY benches ./benches
 
 # Build release binaries for all workspace members
 RUN cargo build --release --bins
