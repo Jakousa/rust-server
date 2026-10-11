@@ -656,13 +656,24 @@ mod tests {
         // 4. Corrupted file (should be caught and recorded in LoadReport without aborting)
         fs::write(monsters_dir.join("corrupted.json"), "{ invalid json syntax").unwrap();
 
-        // 5. Ingest entire directory tree
+        // 5. Non-matching file extensions (should be ignored and not attempted to be loaded)
+        fs::write(items_dir.join("readme.txt"), "This should be ignored").unwrap();
+        fs::write(items_dir.join("temp.tmp"), "Ignore me").unwrap();
+
+        // 6. Ingest entire directory tree
         let store = DataStore::new();
         let report = store.load_directory(root);
 
         assert_eq!(report.loaded, 4); // iron_sword, minor_heal, major_heal, goblin_scout
         assert_eq!(report.errors.len(), 1); // corrupted.json error
         assert!(!report.is_ok());
+
+        // Test LoadReport::is_ok when empty
+        let clean_report = LoadReport {
+            loaded: 10,
+            errors: Vec::new(),
+        };
+        assert!(clean_report.is_ok());
 
         // Verify loaded items
         let sword = store.get("items", "iron_sword").expect("iron_sword loaded");
@@ -679,5 +690,29 @@ mod tests {
             .get("monsters", "goblin_scout")
             .expect("goblin_scout loaded");
         assert_eq!(goblin.get_i64("hp"), Some(60));
+    }
+
+    #[test]
+    fn test_data_document_get_and_get_path() {
+        let mut props = DynamicProperties::new();
+        props.set("name", "Excalibur");
+
+        let mut element_map = HashMap::new();
+        element_map.insert("fire".to_string(), PropertyValue::Int(100));
+
+        let mut combat_map = HashMap::new();
+        combat_map.insert("element".to_string(), PropertyValue::Object(element_map));
+
+        props.set("combat", PropertyValue::Object(combat_map));
+
+        let doc = DataDocument::new("weapons", "excalibur", props);
+
+        let val = doc.get("name").expect("property exists");
+        assert_eq!(val.as_str(), Some("Excalibur"));
+        assert!(doc.get("missing").is_none());
+
+        let path_val = doc.get_path("combat.element.fire").expect("path exists");
+        assert_eq!(path_val.as_i64(), Some(100));
+        assert!(doc.get_path("combat.element.ice").is_none());
     }
 }

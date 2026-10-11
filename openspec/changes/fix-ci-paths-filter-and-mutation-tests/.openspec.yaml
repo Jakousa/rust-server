@@ -1,0 +1,12 @@
+schemaVersion: "1"
+change:
+  name: fix-ci-paths-filter-and-mutation-tests
+  title: Fix CI paths filter for non-code PRs and achieve 100% kill rate in nightly mutation testing
+  status: proposed
+  created: 2026-10-11
+  authors:
+    - AI Agent <agent@antigravity.internal>
+  domain: ci
+  specs:
+    - specs/ci/workflow/spec.md
+    - specs/testing/mutation-testing/spec.md

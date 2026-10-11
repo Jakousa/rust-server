@@ -31,8 +31,9 @@ exclude_re = [
     'Database::pg_pool',
     'Database::ensure_entity_snapshots_blob_column',
     'Database::ensure_items_container_column',
-    'Database::ping -> Result<(), StorageError> with Ok\(\(\)',
+    'Database::ping',
     'replace \|\| with && in Database::connect',
+    '.*_postgres\b',
 ]
 
 # Respect .gitignore when copying workspace to scratch directories

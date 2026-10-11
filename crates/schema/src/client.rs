@@ -4821,4 +4821,124 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_movement_correction_reason_conversions() {
+        let cases = [
+            (MovementCorrectionReason::KinematicViolation, 0u8),
+            (MovementCorrectionReason::Reconciliation, 1u8),
+            (MovementCorrectionReason::Veto, 2u8),
+            (MovementCorrectionReason::OutOfBounds, 3u8),
+            (MovementCorrectionReason::Custom(42), 42u8),
+            (MovementCorrectionReason::Custom(255), 255u8),
+        ];
+
+        for (reason, byte) in cases {
+            assert_eq!(u8::from(reason), byte);
+            assert_eq!(MovementCorrectionReason::from(byte), reason);
+        }
+    }
+
+    #[test]
+    fn test_world_object_spawn_exact_boundary_conditions() {
+        let mut base = BytesMut::new();
+        put_varint_u64(&mut base, 42); // object_id
+        put_varint_u32(&mut base, 7); // prefab_id
+        base.put_slice(&[0u8; 64]); // pos/rot/scale/bounds
+        put_varint_u32(&mut base, 0); // state_flags
+
+        // Exactly 1 byte remaining before owner_type (< 1 check at line 1188):
+        let mut buf_exact_owner = base.clone();
+        buf_exact_owner.put_u8(1); // 1 byte for owner_type
+        let err_exact_owner = WorldObjectSpawnPacket::decode(&mut buf_exact_owner.freeze())
+            .expect_err("should fail after reading owner_type");
+        assert_ne!(
+            err_exact_owner,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 1
+            },
+            "boundary check < 1 mutated to <= 1"
+        );
+
+        // Exactly 1 byte remaining before has_health (< 1 check at line 1196):
+        let mut base_with_owner = base.clone();
+        base_with_owner.put_u8(1); // owner_type
+        put_string(&mut base_with_owner, ""); // owner_id empty string
+        let mut buf_exact_health = base_with_owner.clone();
+        buf_exact_health.put_u8(0); // 1 byte for has_health
+        let err_exact_health = WorldObjectSpawnPacket::decode(&mut buf_exact_health.freeze())
+            .expect_err("should fail after reading has_health");
+        assert_ne!(
+            err_exact_health,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 1
+            },
+            "boundary check < 1 mutated to <= 1"
+        );
+    }
+
+    #[test]
+    fn test_world_object_delta_exact_boundary_conditions() {
+        let mut base = BytesMut::new();
+        put_varint_u64(&mut base, 55); // object_id
+        put_varint_u64(&mut base, 12); // revision
+        base.put_u8(0); // has_flags = 0
+
+        // Exactly 1 byte remaining before has_health (< 1 check at line 1276):
+        let mut buf_exact_health = base.clone();
+        buf_exact_health.put_u8(0); // 1 byte for has_health
+        let err_exact_health = WorldObjectDeltaPacket::decode(&mut buf_exact_health.freeze())
+            .expect_err("should fail after reading has_health");
+        assert_ne!(
+            err_exact_health,
+            ClientCodecError::BufferTooShort {
+                expected: 1,
+                got: 1
+            },
+            "boundary check < 1 mutated to <= 1"
+        );
+    }
+
+    #[test]
+    fn test_place_object_exact_boundary_conditions() {
+        let mut base = BytesMut::new();
+        put_varint_u32(&mut base, 10); // prefab_id
+
+        // Exactly 40 bytes remaining (< 40 check at line 1364):
+        let mut buf_exact_40 = base.clone();
+        buf_exact_40.put_slice(&[0u8; 40]);
+        let err_exact_40 = PlaceObjectPacket::decode(&mut buf_exact_40.freeze())
+            .expect_err("should fail after reading 40 bytes when properties map is missing");
+        assert_ne!(
+            err_exact_40,
+            ClientCodecError::BufferTooShort {
+                expected: 40,
+                got: 40
+            },
+            "boundary check < 40 mutated to <= 40"
+        );
+    }
+
+    #[test]
+    fn test_auth_response_exact_boundary_conditions() {
+        let mut base = BytesMut::new();
+        base.put_u8(1); // success
+        base.put_u32_le(0); // error_code
+        base.put_u64_le(100); // session_id
+        base.put_u64_le(200); // player_guid
+        base.put_u16_le(4); // node_len = 4
+        base.put_slice(b"node"); // exactly 4 bytes remaining in buffer
+
+        let err_exact = AuthResponsePacket::decode(&mut base.freeze())
+            .expect_err("should fail after reading node bytes when message len is missing");
+        assert_eq!(
+            err_exact,
+            ClientCodecError::BufferTooShort {
+                expected: 2,
+                got: 0
+            }
+        );
+    }
 }
