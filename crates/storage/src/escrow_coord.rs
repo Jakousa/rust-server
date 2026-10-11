@@ -418,9 +418,15 @@ impl EscrowCoordinator {
             }
         };
 
+        use futures_util::StreamExt;
+
         let mut reaped = 0;
-        for id in &escrow_ids {
-            if self.refund_escrow(id).await? {
+        let mut stream = futures_util::stream::iter(escrow_ids.iter())
+            .map(|id| self.refund_escrow(id))
+            .buffer_unordered(10);
+
+        while let Some(res) = stream.next().await {
+            if res? {
                 reaped += 1;
             }
         }
