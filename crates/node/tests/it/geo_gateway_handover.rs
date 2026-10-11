@@ -41,7 +41,7 @@ async fn test_end_to_end_geo_gateway_roaming_handover_and_epoch_guard() {
     let router_a = Arc::new(SessionRouter::new());
     let sinks_a = Arc::new(dashmap::DashMap::new());
     let (dtx_a, _drx_a) = tokio::sync::mpsc::channel(10);
-    let (stx_a, _srx_a) = tokio::sync::mpsc::unbounded_channel();
+    let (stx_a, _srx_a) = tokio::sync::mpsc::channel(10);
     sinks_a.insert(1001, SessionSink::new(dtx_a, stx_a));
 
     let gw_a_service = GatewayServiceImpl::with_sinks(Arc::clone(&router_a), Arc::clone(&sinks_a));
@@ -62,7 +62,7 @@ async fn test_end_to_end_geo_gateway_roaming_handover_and_epoch_guard() {
     let router_b = Arc::new(SessionRouter::new());
     let sinks_b = Arc::new(dashmap::DashMap::new());
     let (dtx_b, _drx_b) = tokio::sync::mpsc::channel(10);
-    let (stx_b, _srx_b) = tokio::sync::mpsc::unbounded_channel();
+    let (stx_b, _srx_b) = tokio::sync::mpsc::channel(10);
     sinks_b.insert(2002, SessionSink::new(dtx_b, stx_b));
 
     let gw_b_service = GatewayServiceImpl::with_sinks(Arc::clone(&router_b), Arc::clone(&sinks_b));

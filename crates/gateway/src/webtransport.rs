@@ -221,7 +221,7 @@ impl WebTransportServer {
         intercept_handler: Option<crate::server::GatewayInterceptHandler>,
     ) {
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(1024);
 
         session_sinks.insert(session_id, SessionSink::new(datagram_tx, stream_tx));
         metrics::gauge!("mmo_gateway_active_sessions").set(session_sinks.len() as f64);
