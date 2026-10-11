@@ -1069,7 +1069,7 @@ pub async fn execute_entity_migration(
     let endpoint = if target_node_addr.starts_with("http") {
         target_node_addr.to_string()
     } else {
-        format!("http://{}", target_node_addr)
+        format!("https://{}", target_node_addr)
     };
 
     let mut client = match NodeServiceClient::connect(endpoint).await {
@@ -1104,7 +1104,7 @@ pub async fn execute_entity_migration(
         let gw_endpoint = if gw_addr.starts_with("http") {
             gw_addr.to_string()
         } else {
-            format!("http://{}", gw_addr)
+            format!("https://{}", gw_addr)
         };
         if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
             let _ = gw_client
@@ -1261,7 +1261,7 @@ pub async fn execute_batch_entity_migration(
     let endpoint = if target_node_addr.starts_with("http") {
         target_node_addr.to_string()
     } else {
-        format!("http://{}", target_node_addr)
+        format!("https://{}", target_node_addr)
     };
 
     let mut client = match NodeServiceClient::connect(endpoint).await {
@@ -1325,7 +1325,7 @@ pub async fn execute_batch_entity_migration(
         let gw_endpoint = if gw_addr.starts_with("http") {
             gw_addr.to_string()
         } else {
-            format!("http://{}", gw_addr)
+            format!("https://{}", gw_addr)
         };
         if let Ok(mut gw_client) = GatewayServiceClient::connect(gw_endpoint).await {
             let updates = session_updates
