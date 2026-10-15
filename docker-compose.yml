@@ -20,6 +20,7 @@ services:
       NODE_ID: "1"
       LISTEN_ADDR: "0.0.0.0:50052"
       DIRECTOR_ADDR: "http://director:50051"
+      GATEWAY_GRPC_ADDR: "http://gateway:50050"
       DATABASE_URL: ${DATABASE_URL:-sqlite://mmo.db}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
@@ -36,6 +37,7 @@ services:
       NODE_ID: "2"
       LISTEN_ADDR: "0.0.0.0:50053"
       DIRECTOR_ADDR: "http://director:50051"
+      GATEWAY_GRPC_ADDR: "http://gateway:50050"
       DATABASE_URL: ${DATABASE_URL:-sqlite://mmo.db}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:

@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: drain-dispatch-aoi-broadcast-jobs
+  title: Drain & Dispatch AoI Broadcast Jobs & Wire Gateway Backhaul
+  status: proposed
+  created: 2026-10-15
+  authors:
+    - MMO Engineering Team
+  domain: simulation
+  specs:
+    - specs/simulation/aoi/spec.md

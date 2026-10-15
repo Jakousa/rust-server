@@ -1,4 +1,6 @@
 use mmo_gateway::{GatewayServer, SessionRouter};
+use mmo_schema::cluster::node_service_client::NodeServiceClient;
+use mmo_schema::cluster::ForwardClientPacketRequest;
 use mmo_storage::cache::{MemoryCache, RedisCache, SessionCacheBackend};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -74,12 +76,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
     let server = Arc::new(GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache));
 
-    // Background worker to consume/log routed packets
+    // Background worker to consume routed client packets and forward to node cluster via BackhaulPool
+    let backhaul_pool = Arc::clone(server.backhaul_pool());
     tokio::spawn(async move {
         while let Some(pkt) = packet_rx.recv().await {
-            // Forward or log routed packet
-            if pkt.is_movement() {
-                // In production, forward to destination node via internal channel
+            let (ch, rx_opt) = backhaul_pool.get_or_create(&pkt.node_address);
+            if let Some(mut rx) = rx_opt {
+                let node_addr = pkt.node_address.clone();
+                let ch_clone = Arc::clone(&ch);
+                tokio::spawn(async move {
+                    let endpoint = if node_addr.starts_with("http") {
+                        node_addr
+                    } else {
+                        format!("http://{}", node_addr)
+                    };
+                    let mut client_opt = None;
+                    while let Some(packet) = rx.recv().await {
+                        if client_opt.is_none() {
+                            client_opt = NodeServiceClient::connect(endpoint.clone()).await.ok();
+                        }
+                        if let Some(ref mut client) = client_opt {
+                            let req = ForwardClientPacketRequest {
+                                session_id: packet.session_id,
+                                guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
+                                packet_data: packet.packet.encode(),
+                            };
+                            match client.forward_client_packet(req).await {
+                                Ok(_) => ch_clone.record_success(),
+                                Err(e) => {
+                                    ch_clone.record_failure();
+                                    eprintln!("[Gateway Backhaul] Failed forwarding to node: {e}");
+                                    client_opt = None;
+                                }
+                            }
+                        } else {
+                            ch_clone.record_failure();
+                        }
+                    }
+                });
+            }
+            if let Err(e) = backhaul_pool.send_packet(pkt) {
+                eprintln!("[Gateway] Failed forwarding packet to BackhaulPool: {e:?}");
             }
         }
     });

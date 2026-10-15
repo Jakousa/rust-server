@@ -22,11 +22,11 @@ use mmo_schema::client::{ClientCodecError, ClientPacket};
 use mmo_schema::cluster::director_service_client::DirectorServiceClient;
 use mmo_schema::cluster::gateway_service_server::{GatewayService, GatewayServiceServer};
 use mmo_schema::cluster::{
-    BatchRouteUpdateRequest, BatchRouteUpdateResponse, GatewayHeartbeatRequest,
-    MultiGatewayRouteBroadcastRequest, MultiGatewayRouteBroadcastResponse,
-    ReassignNodeRoutesRequest, ReassignNodeRoutesResponse, RegisterGatewayRequest,
-    RevokeGatewaySessionRequest, RevokeGatewaySessionResponse, RouteUpdateRequest,
-    RouteUpdateResponse,
+    BatchRouteUpdateRequest, BatchRouteUpdateResponse, DeliverBroadcastJobsRequest,
+    DeliverBroadcastJobsResponse, GatewayHeartbeatRequest, MultiGatewayRouteBroadcastRequest,
+    MultiGatewayRouteBroadcastResponse, ReassignNodeRoutesRequest, ReassignNodeRoutesResponse,
+    RegisterGatewayRequest, RevokeGatewaySessionRequest, RevokeGatewaySessionResponse,
+    RouteUpdateRequest, RouteUpdateResponse,
 };
 use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
@@ -706,6 +706,46 @@ impl GatewayService for GatewayServiceImpl {
         Ok(tonic::Response::new(MultiGatewayRouteBroadcastResponse {
             success: true,
             acknowledged_gateways: 1,
+        }))
+    }
+
+    async fn deliver_broadcast_jobs(
+        &self,
+        request: tonic::Request<DeliverBroadcastJobsRequest>,
+    ) -> Result<tonic::Response<DeliverBroadcastJobsResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut delivered = 0;
+        let mut disconnected = Vec::new();
+        if let Some(ref sinks) = self.session_sinks {
+            for batch in req.jobs {
+                if let Some(sink_entry) = sinks.get(&batch.session_id) {
+                    let sink = sink_entry.value();
+                    for pkt_bytes in batch.packets {
+                        let bytes = Bytes::from(pkt_bytes);
+                        let is_ephemeral = is_ephemeral_packet(&bytes);
+                        let sent = if is_ephemeral {
+                            sink.datagram_tx.try_send(bytes).is_ok()
+                        } else {
+                            sink.stream_tx.try_send(bytes).is_ok()
+                        };
+                        if sent {
+                            delivered += 1;
+                        }
+                    }
+                } else {
+                    disconnected.push(batch.session_id);
+                }
+            }
+        }
+        metrics::counter!("mmo_gateway_broadcast_jobs_delivered_total").increment(delivered as u64);
+        if !disconnected.is_empty() {
+            metrics::counter!("mmo_gateway_broadcast_jobs_disconnected_total")
+                .increment(disconnected.len() as u64);
+        }
+        Ok(tonic::Response::new(DeliverBroadcastJobsResponse {
+            success: true,
+            delivered_count: delivered,
+            disconnected_sessions: disconnected,
         }))
     }
 }
