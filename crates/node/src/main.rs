@@ -7,6 +7,7 @@ use tonic::transport::Server;
 use mmo_core::BoundingBox3D;
 use mmo_node::{NodeServiceImpl, TickSimulation, WriteBehindSnapshotter};
 use mmo_schema::cluster::director_service_client::DirectorServiceClient;
+use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_server::NodeServiceServer;
 use mmo_schema::cluster::{BoundingBox, HeartbeatRequest, RegisterNodeRequest, Vector3};
 use mmo_storage::db::Database;
@@ -29,6 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_addr =
         std::env::var("DIRECTOR_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
+    let gateway_grpc_addr =
+        std::env::var("GATEWAY_GRPC_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50050".to_string());
+
     let db_url = std::env::var("DATABASE_URL").ok();
 
     println!("============================================================");
@@ -38,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Listen Address   : {}", listen_addr);
     println!("Admin Address    : {}", admin_addr);
     println!("Director Address : {}", director_addr);
+    println!("Gateway Address  : {}", gateway_grpc_addr);
     println!(
         "Database URL     : {}",
         db_url
@@ -231,7 +236,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 3. Fixed 20 Hz (50ms) simulation game loop with clamped tick accumulator
+    // 3. AoI Broadcast Delivery Decoupler & Gateway Worker
+    let (broadcast_tx, mut broadcast_rx) =
+        tokio::sync::mpsc::channel::<Vec<mmo_node::aoi::AoiBroadcastJob>>(128);
+    let sim_for_cleanup = Arc::clone(&sim);
+    let gw_endpoint = gateway_grpc_addr.clone();
+    tokio::spawn(async move {
+        println!("[Node {node_id}] AoI broadcast delivery worker active (Gateway: {gw_endpoint})");
+        let mut client_opt = None;
+        while let Some(jobs) = broadcast_rx.recv().await {
+            if client_opt.is_none() {
+                client_opt = GatewayServiceClient::connect(gw_endpoint.clone())
+                    .await
+                    .ok();
+            }
+
+            if let Some(ref mut client) = client_opt {
+                let session_batches = jobs
+                    .into_iter()
+                    .map(|job| {
+                        let packets = job.packets.into_iter().map(|p| p.encode()).collect();
+                        mmo_schema::cluster::SessionPacketBatch {
+                            session_id: job.session_id,
+                            packets,
+                        }
+                    })
+                    .collect();
+
+                let req = mmo_schema::cluster::DeliverBroadcastJobsRequest {
+                    jobs: session_batches,
+                };
+
+                match client.deliver_broadcast_jobs(req).await {
+                    Ok(resp) => {
+                        let inner = resp.into_inner();
+                        if !inner.disconnected_sessions.is_empty() {
+                            let mut sim_guard = sim_for_cleanup.write().await;
+                            for sid in inner.disconnected_sessions {
+                                if let Some(obs) = sim_guard.unregister_aoi_observer(sid) {
+                                    sim_guard.entity_store.despawn_by_guid(obs.player_guid);
+                                    sim_guard.octree.remove_by_guid(obs.player_guid);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[Node {node_id}] Failed delivering broadcast jobs to Gateway: {e}"
+                        );
+                        client_opt = None;
+                    }
+                }
+            } else {
+                metrics::counter!("mmo_node_broadcast_jobs_gateway_unreachable_total").increment(1);
+            }
+        }
+    });
+
+    // 4. Fixed 20 Hz (50ms) simulation game loop with clamped tick accumulator
     println!("[Node {node_id}] Starting 20 Hz simulation tick loop...");
     let tick_duration = Duration::from_millis(50);
     const MAX_CATCHUP_TICKS: usize = 3;
@@ -247,6 +309,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while tokio::time::Instant::now() >= next_tick && catchup < MAX_CATCHUP_TICKS {
             let mut sim_guard = sim.write().await;
             sim_guard.step_tick();
+            let jobs = sim_guard.drain_broadcast_jobs();
+            if !jobs.is_empty() {
+                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                    broadcast_tx.try_send(jobs)
+                {
+                    metrics::counter!("mmo_node_broadcast_jobs_dropped_backpressure").increment(1);
+                }
+            }
             catchup += 1;
             next_tick += tick_duration;
         }

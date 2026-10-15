@@ -2,6 +2,7 @@
 mod common;
 
 mod aoi_broadcast;
+mod aoi_drain_dispatch;
 mod container_transfer;
 mod content_loop;
 mod cross_partition_ability;

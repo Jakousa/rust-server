@@ -396,6 +396,33 @@ message VerifyRealmTransferClaimResponse {
   string error_message = 2;
 }
 
+// Client Packet Forwarding & AoI Delivery Messages
+message ForwardClientPacketRequest {
+  uint64 session_id = 1;
+  uint64 guid = 2;
+  bytes packet_data = 3;
+}
+
+message ForwardClientPacketResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message SessionPacketBatch {
+  uint64 session_id = 1;
+  repeated bytes packets = 2;
+}
+
+message DeliverBroadcastJobsRequest {
+  repeated SessionPacketBatch jobs = 1;
+}
+
+message DeliverBroadcastJobsResponse {
+  bool success = 1;
+  uint32 delivered_count = 2;
+  repeated uint64 disconnected_sessions = 3;
+}
+
 // Services
 service DirectorService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -421,6 +448,7 @@ service NodeService {
   rpc CommitContainerTransfer (CommitContainerTransferRequest) returns (CommitContainerTransferResponse);
   rpc AbortContainerTransfer (AbortContainerTransferRequest) returns (AbortContainerTransferResponse);
   rpc TakeoverSessionRoute (TakeoverSessionRouteRequest) returns (TakeoverSessionRouteResponse);
+  rpc ForwardClientPacket (ForwardClientPacketRequest) returns (ForwardClientPacketResponse);
 }
 
 service GatewayService {
@@ -429,6 +457,8 @@ service GatewayService {
   rpc ReassignNodeRoutes (ReassignNodeRoutesRequest) returns (ReassignNodeRoutesResponse);
   rpc RevokeGatewaySession (RevokeGatewaySessionRequest) returns (RevokeGatewaySessionResponse);
   rpc BroadcastRoute (MultiGatewayRouteBroadcastRequest) returns (MultiGatewayRouteBroadcastResponse);
+  rpc DeliverBroadcastJobs (DeliverBroadcastJobsRequest) returns (DeliverBroadcastJobsResponse);
 }
+
 
 

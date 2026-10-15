@@ -15,11 +15,11 @@ use mmo_schema::cluster::{
     AbortContainerTransferRequest, AbortContainerTransferResponse, BatchMigrateEntityRequest,
     BatchMigrateEntityResponse, BatchRemoteAbilityRequest, BatchRemoteAbilityResponse,
     BatchRouteUpdateRequest, CommitContainerTransferRequest, CommitContainerTransferResponse,
-    GhostEntity, GhostSyncRequest, GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse,
-    RemoteAbilityErrorCode, RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest,
-    RemoteCommandResponse, ReserveContainerSlotRequest, ReserveContainerSlotResponse,
-    RouteUpdateRequest, SerializedComponent, TakeoverSessionRouteRequest,
-    TakeoverSessionRouteResponse, Vector3,
+    ForwardClientPacketRequest, ForwardClientPacketResponse, GhostEntity, GhostSyncRequest,
+    GhostSyncResponse, MigrateEntityRequest, MigrateEntityResponse, RemoteAbilityErrorCode,
+    RemoteAbilityRequest, RemoteAbilityResponse, RemoteCommandRequest, RemoteCommandResponse,
+    ReserveContainerSlotRequest, ReserveContainerSlotResponse, RouteUpdateRequest,
+    SerializedComponent, TakeoverSessionRouteRequest, TakeoverSessionRouteResponse, Vector3,
 };
 
 use crate::sim::{ContainerTransferNotification, TickSimulation};
@@ -833,6 +833,138 @@ impl NodeService for NodeServiceImpl {
             error_message: String::new(),
             authoritative_epoch: req.session_epoch,
         }))
+    }
+
+    /// Receives and authoritatively executes an incoming forwarded client packet (e.g. movement, action).
+    async fn forward_client_packet(
+        &self,
+        request: tonic::Request<ForwardClientPacketRequest>,
+    ) -> Result<tonic::Response<ForwardClientPacketResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let max_size =
+            mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE + mmo_schema::client::HEADER_SIZE;
+        if req.packet_data.len() > max_size {
+            return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                success: false,
+                error_message: format!(
+                    "Packet size {} exceeds maximum allowed {}",
+                    req.packet_data.len(),
+                    max_size
+                ),
+            }));
+        }
+
+        let mut data = bytes::BytesMut::from(&req.packet_data[..]);
+        match mmo_schema::client::ClientPacket::decode_frame(&mut data) {
+            Ok(Some(packet)) => {
+                let guid = Guid::from_raw(req.guid);
+                match packet {
+                    mmo_schema::client::ClientPacket::Movement(m) => {
+                        // Anti-spoofing check
+                        if req.guid != 0 && m.entity_id != req.guid {
+                            metrics::counter!("mmo_node_spoofed_packets_dropped_total")
+                                .increment(1);
+                            return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                success: false,
+                                error_message: "Entity ID mismatch in movement packet".to_string(),
+                            }));
+                        }
+
+                        let mut sim = self.sim.write().await;
+                        match sim.process_client_move_with_seq(
+                            guid,
+                            (m.position.x, m.position.y, m.position.z),
+                            m.sequence,
+                        ) {
+                            Ok(_) => {
+                                metrics::counter!("mmo_node_client_movements_processed_total")
+                                    .increment(1);
+                                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: true,
+                                    error_message: String::new(),
+                                }))
+                            }
+                            Err(snap_back) => {
+                                // Anti-Cheat / Kinematic / Collision snapback
+                                let correction = mmo_schema::client::MovementCorrectionPacket {
+                                    entity_id: guid.raw(),
+                                    corrected_position: mmo_schema::client::Vec3::new(
+                                        snap_back.0,
+                                        snap_back.1,
+                                        snap_back.2,
+                                    ),
+                                    corrected_velocity: mmo_schema::client::Vec3::new(
+                                        0.0, 0.0, 0.0,
+                                    ),
+                                    sequence: m.sequence,
+                                    reason: mmo_schema::client::MovementCorrectionReason::KinematicViolation.into(),
+                                };
+                                sim.pending_broadcast_jobs
+                                    .push(crate::aoi::AoiBroadcastJob {
+                                        session_id: req.session_id,
+                                        player_guid: guid,
+                                        packets: vec![
+                                            mmo_schema::client::ClientPacket::MovementCorrection(
+                                                correction,
+                                            ),
+                                        ],
+                                    });
+                                metrics::counter!("mmo_node_movement_corrections_total")
+                                    .increment(1);
+                                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: false,
+                                    error_message: "Movement corrected".to_string(),
+                                }))
+                            }
+                        }
+                    }
+                    mmo_schema::client::ClientPacket::ClientAck(ack) => {
+                        let sim = self.sim.read().await;
+                        sim.queue_client_ack(ack);
+                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: true,
+                            error_message: String::new(),
+                        }))
+                    }
+                    mmo_schema::client::ClientPacket::PlaceObject(po) => {
+                        let mut sim = self.sim.write().await;
+                        let _ = sim.handle_place_object(guid, &po);
+                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: true,
+                            error_message: String::new(),
+                        }))
+                    }
+                    mmo_schema::client::ClientPacket::InteractObject(io) => {
+                        let sim = self.sim.read().await;
+                        let _ = sim.handle_interact_object(guid, &io);
+                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: true,
+                            error_message: String::new(),
+                        }))
+                    }
+                    mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
+                        let mut sim = self.sim.write().await;
+                        sim.handle_world_object_resync(guid, &resync);
+                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: true,
+                            error_message: String::new(),
+                        }))
+                    }
+                    _ => Ok(tonic::Response::new(ForwardClientPacketResponse {
+                        success: true,
+                        error_message: String::new(),
+                    })),
+                }
+            }
+            Ok(None) => Ok(tonic::Response::new(ForwardClientPacketResponse {
+                success: false,
+                error_message: "Incomplete frame received".to_string(),
+            })),
+            Err(e) => Ok(tonic::Response::new(ForwardClientPacketResponse {
+                success: false,
+                error_message: e.to_string(),
+            })),
+        }
     }
 }
 

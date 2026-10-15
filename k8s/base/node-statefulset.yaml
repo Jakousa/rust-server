@@ -45,6 +45,8 @@ spec:
               value: "0.0.0.0:9091"
             - name: DIRECTOR_ADDR
               value: "http://mmo-director:50051"
+            - name: GATEWAY_GRPC_ADDR
+              value: "http://mmo-gateway:50050"
             - name: DATABASE_URL
               value: "postgres://mmo:mmo_secret@postgres.mmo.svc.cluster.local:5432/mmo_db"
           ports:
