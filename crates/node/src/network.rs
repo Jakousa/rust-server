@@ -857,13 +857,22 @@ impl NodeService for NodeServiceImpl {
         let mut data = bytes::BytesMut::from(&req.packet_data[..]);
         match mmo_schema::client::ClientPacket::decode_frame(&mut data) {
             Ok(Some(packet)) => {
-                let guid = Guid::from_raw(req.guid);
-                match packet {
-                    mmo_schema::client::ClientPacket::Movement(m) => {
-                        // Anti-spoofing check
-                        if req.guid != 0 && m.entity_id != req.guid {
-                            metrics::counter!("mmo_node_spoofed_packets_dropped_total")
-                                .increment(1);
+                use tracing::Instrument;
+                let opcode = packet.opcode().as_str();
+                let span = tracing::info_span!(
+                    "node_packet_process",
+                    session_id = req.session_id,
+                    opcode = opcode
+                );
+                async move {
+                    let guid = Guid::from_raw(req.guid);
+                    match packet {
+                        mmo_schema::client::ClientPacket::Movement(m) => {
+                            // Anti-spoofing check
+                            if req.guid != 0 && m.entity_id != req.guid {
+                                tracing::warn!("Spoofed movement entity_id rejected");
+                                metrics::counter!("mmo_node_spoofed_packets_dropped_total")
+                                    .increment(1);
                             return Ok(tonic::Response::new(ForwardClientPacketResponse {
                                 success: false,
                                 error_message: "Entity ID mismatch in movement packet".to_string(),
@@ -955,15 +964,21 @@ impl NodeService for NodeServiceImpl {
                         error_message: String::new(),
                     })),
                 }
+                }
+                .instrument(span)
+                .await
             }
             Ok(None) => Ok(tonic::Response::new(ForwardClientPacketResponse {
                 success: false,
                 error_message: "Incomplete frame received".to_string(),
             })),
-            Err(e) => Ok(tonic::Response::new(ForwardClientPacketResponse {
-                success: false,
-                error_message: e.to_string(),
-            })),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to decode forwarded client packet");
+                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                    success: false,
+                    error_message: e.to_string(),
+                }))
+            }
         }
     }
 }

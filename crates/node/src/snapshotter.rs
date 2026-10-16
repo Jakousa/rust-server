@@ -237,8 +237,11 @@ impl WriteBehindSnapshotter {
                                     }
                                 }
 
-                                // Debounce briefly to coalesce rapid consecutive ticks
-                                sleep(debounce).await;
+                                // Debounce briefly to coalesce rapid consecutive ticks (or wake early on shutdown)
+                                tokio::select! {
+                                    _ = sleep(debounce) => {}
+                                    _ = shutdown_rx.changed() => {}
+                                }
 
                                 // Drain any items that arrived during debounce
                                 if let Some(ref mut channel) = rx {
@@ -250,6 +253,9 @@ impl WriteBehindSnapshotter {
                                 }
 
                                 self.flush_batch().await;
+                                if *shutdown_rx.borrow() {
+                                    break;
+                                }
                             }
                             None => {
                                 // Channel closed
@@ -259,9 +265,22 @@ impl WriteBehindSnapshotter {
                         }
                     }
                     _ = self.notify.notified() => {
-                        // Debounce briefly to coalesce rapid sequential ticks
-                        sleep(debounce).await;
+                        // Debounce briefly to coalesce rapid sequential ticks (or wake early on shutdown)
+                        tokio::select! {
+                            _ = sleep(debounce) => {}
+                            _ = shutdown_rx.changed() => {}
+                        }
+                        if let Some(ref mut channel) = rx {
+                            while let Ok(p) = channel.try_recv() {
+                                let g = p.guid;
+                                let s = EntitySnapshot::from(p);
+                                self.mark_dirty(g, s);
+                            }
+                        }
                         self.flush_batch().await;
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
                     }
                 }
             }
@@ -384,6 +403,81 @@ impl WriteBehindSnapshotter {
             codecs.deserialize_into(&snapshot.attributes, &mut entity.components)
         }
     }
+}
+
+/// Executes the orderly node draining sequence upon receiving a termination signal:
+/// 1. Marks telemetry readiness probe unready (`telemetry.mark_unready()`).
+/// 2. Aborts the background Director heartbeat task to prevent re-registration races.
+/// 3. Signals the `WriteBehindSnapshotter` to shut down, awaits its worker handle with a 5-second timeout,
+///    and performs a final `flush_batch()` to persist any remaining dirty snapshots.
+/// 4. Invokes Director's `DeregisterNode` RPC with a bounded 2-second timeout.
+/// 5. Signals the gRPC `NodeServiceServer` to shut down cleanly.
+pub async fn drain_and_shutdown_node(
+    node_id: u16,
+    telemetry: &mmo_core::TelemetryServer,
+    heartbeat_handle: tokio::task::JoinHandle<()>,
+    snapshotter: Option<Arc<WriteBehindSnapshotter>>,
+    snapshot_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    director_addr: &str,
+    grpc_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+) -> usize {
+    telemetry.mark_unready();
+    heartbeat_handle.abort();
+
+    let mut total_flushed = 0;
+    if let Some(snap) = snapshotter {
+        snap.shutdown();
+        if let Some(worker) = snapshot_worker_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+        }
+        total_flushed += snap.flush_batch().await;
+    }
+
+    let endpoint = if director_addr.starts_with("http://") || director_addr.starts_with("https://")
+    {
+        director_addr.to_string()
+    } else {
+        format!("http://{director_addr}")
+    };
+
+    let dereg_res: Result<Result<_, String>, _> =
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            let mut client =
+                mmo_schema::cluster::director_service_client::DirectorServiceClient::connect(
+                    endpoint,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .deregister_node(mmo_schema::cluster::DeregisterNodeRequest {
+                    node_id: u32::from(node_id),
+                })
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+
+    match dereg_res {
+        Ok(Ok(resp)) => {
+            println!(
+                "[Node {node_id}] Deregistered from Director (success={})",
+                resp.into_inner().success
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!(
+                "[Node {node_id}] Director deregistration failed (proceeding with shutdown): {e}"
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "[Node {node_id}] Director deregistration timed out after 2s (proceeding with shutdown)"
+            );
+        }
+    }
+
+    let _ = grpc_shutdown_tx.send(());
+    total_flushed
 }
 
 #[cfg(test)]
@@ -677,5 +771,64 @@ mod tests {
         assert_eq!(payload.guid, guid);
         assert_eq!(payload.position, (5.0, 10.0, 15.0));
         assert_eq!(payload.version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_drain_and_shutdown_node_flushes_snapshots_and_handles_unreachable_director() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+        // Set a long debounce so only shutdown/flush drains the snapshot
+        let snapshotter = Arc::new(WriteBehindSnapshotter::with_full_config(
+            repo.clone(),
+            1000,
+            100,
+            1000,
+            Duration::from_secs(10),
+        ));
+        let worker_handle = snapshotter.clone().start_worker();
+
+        let guid = Guid::new(EntityType::Player, 1, 4242);
+        assert!(snapshotter.enqueue_snapshot(SnapshotPayload {
+            guid,
+            position: (77.0, 88.0, 99.0),
+            rotation: 0.5,
+            attributes: serde_json::json!({"level": 10}),
+            state_blob: Some(vec![9, 9]),
+            version: 7,
+            timestamp: 9999,
+        }));
+
+        let telemetry = mmo_core::TelemetryServer::init().unwrap();
+        telemetry.mark_ready();
+        assert!(telemetry.is_ready());
+
+        let heartbeat_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let (grpc_tx, grpc_rx) = tokio::sync::oneshot::channel();
+
+        // Point to an unused local port so Director connection fails fast or times out cleanly
+        drain_and_shutdown_node(
+            1,
+            &telemetry,
+            heartbeat_handle,
+            Some(snapshotter.clone()),
+            Some(worker_handle),
+            "http://127.0.0.1:59998",
+            grpc_tx,
+        )
+        .await;
+
+        assert!(!telemetry.is_ready());
+        assert!(grpc_rx.await.is_ok());
+
+        // Verify the uncommitted snapshot was flushed to persistent storage before exit
+        let saved = repo
+            .get_snapshot(guid.raw())
+            .await
+            .unwrap()
+            .expect("snapshot must be flushed on clean node shutdown");
+        assert_eq!(saved.version, 7);
+        assert_eq!(saved.position, (77.0, 88.0, 99.0));
     }
 }

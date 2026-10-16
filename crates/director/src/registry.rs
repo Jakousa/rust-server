@@ -578,6 +578,11 @@ impl GatewayRegistry {
         stale_gateways
     }
 
+    /// Explicitly deregisters a gateway from the registry.
+    pub fn deregister_gateway(&mut self, gateway_id: &str) -> Option<GatewayDescriptor> {
+        self.gateways.remove(gateway_id)
+    }
+
     /// Returns the total number of registered gateways.
     pub fn gateway_count(&self) -> usize {
         self.gateways.len()

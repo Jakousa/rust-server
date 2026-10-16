@@ -50,3 +50,37 @@ pub use world::{
     world_object_flags, ObjectHealth, SectorCoord3D, SectorSpatialIndex, Transform3D, WorldObject,
     SECTOR_SIZE,
 };
+
+/// Awaits an asynchronous termination signal (Ctrl+C / SIGINT or Unix SIGTERM).
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                eprintln!("[Core] Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            eprintln!("[Core] Received SIGINT (Ctrl+C), starting graceful shutdown");
+        },
+        _ = terminate => {
+            eprintln!("[Core] Received SIGTERM, starting graceful shutdown");
+        },
+    }
+}

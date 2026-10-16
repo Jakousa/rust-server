@@ -1039,6 +1039,82 @@ impl GatewayServer {
         })
     }
 
+    /// Executes the orderly gateway draining sequence upon receiving a termination signal:
+    /// 1. Marks telemetry readiness probe unready (`telemetry.mark_unready()`).
+    /// 2. Aborts the background Director heartbeat task to prevent re-registration races.
+    /// 3. Invokes Director's `DeregisterGateway` RPC with a bounded 2-second timeout.
+    /// 4. Waits up to `drain_grace_period` for active client sessions to drain in-flight writes,
+    ///    then closes all remaining session sinks and pub/sub subscriptions.
+    pub async fn drain_and_shutdown(
+        &self,
+        telemetry: &mmo_core::TelemetryServer,
+        heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+        director_addr: &str,
+        gateway_id: &str,
+        drain_grace_period: Duration,
+    ) -> usize {
+        telemetry.mark_unready();
+        if let Some(hb) = heartbeat_handle {
+            hb.abort();
+        }
+
+        let endpoint =
+            if director_addr.starts_with("http://") || director_addr.starts_with("https://") {
+                director_addr.to_string()
+            } else {
+                format!("http://{director_addr}")
+            };
+        let gw_id = gateway_id.to_string();
+
+        let dereg_res: Result<Result<_, String>, _> =
+            tokio::time::timeout(Duration::from_secs(2), async move {
+                let mut client = DirectorServiceClient::connect(endpoint)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client
+                    .deregister_gateway(mmo_schema::cluster::DeregisterGatewayRequest {
+                        gateway_id: gw_id,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+
+        match dereg_res {
+            Ok(Ok(resp)) => {
+                println!(
+                    "[Gateway] Deregistered '{gateway_id}' from Director (success={})",
+                    resp.into_inner().success
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[Gateway] Director deregistration failed (proceeding with shutdown): {e}"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[Gateway] Director deregistration timed out after 2s (proceeding with shutdown)"
+                );
+            }
+        }
+
+        if !self.session_sinks.is_empty() && !drain_grace_period.is_zero() {
+            tokio::time::sleep(drain_grace_period).await;
+        }
+
+        let closed_sinks = self.session_sinks.len();
+        self.session_sinks.clear();
+        metrics::gauge!("mmo_gateway_active_sessions").set(0.0);
+
+        for entry in self.active_bus_subscriptions.iter() {
+            entry.value().abort();
+        }
+        self.active_bus_subscriptions.clear();
+
+        closed_sinks
+    }
+
     /// Accesses the session sinks map.
     pub fn session_sinks(&self) -> Arc<DashMap<u64, SessionSink>> {
         Arc::clone(&self.session_sinks)
@@ -2741,5 +2817,42 @@ mod tests {
             .send_packet_to_session(session_id, &pkt)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_drain_and_shutdown_clears_sinks_and_marks_unready() {
+        let router = Arc::new(SessionRouter::new());
+        let server = Arc::new(GatewayServer::new(router));
+
+        let (dtx, _drx) = mpsc::channel(10);
+        let (stx, mut srx) = mpsc::channel(10);
+        server
+            .register_session_sink(1001, SessionSink::new(dtx, stx))
+            .unwrap();
+        assert_eq!(server.active_sink_count().unwrap(), 1);
+
+        let telemetry = mmo_core::TelemetryServer::init().unwrap();
+        telemetry.mark_ready();
+        assert!(telemetry.is_ready());
+
+        let hb_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let closed = server
+            .drain_and_shutdown(
+                &telemetry,
+                Some(hb_handle),
+                "http://127.0.0.1:59997",
+                "gw-test-drain",
+                Duration::from_millis(20),
+            )
+            .await;
+
+        assert_eq!(closed, 1);
+        assert!(!telemetry.is_ready());
+        assert_eq!(server.active_sink_count().unwrap(), 0);
+        // Sink sender was dropped, so receiver closes
+        assert!(srx.recv().await.is_none());
     }
 }

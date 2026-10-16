@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let node_addr = pkt.node_address.clone();
                 let ch_clone = Arc::clone(&ch);
                 tokio::spawn(async move {
+                    use tracing::Instrument;
                     let endpoint = if node_addr.starts_with("http") {
                         node_addr
                     } else {
@@ -92,26 +93,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let mut client_opt = None;
                     while let Some(packet) = rx.recv().await {
-                        if client_opt.is_none() {
-                            client_opt = NodeServiceClient::connect(endpoint.clone()).await.ok();
-                        }
-                        if let Some(ref mut client) = client_opt {
-                            let req = ForwardClientPacketRequest {
-                                session_id: packet.session_id,
-                                guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
-                                packet_data: packet.packet.encode(),
-                            };
-                            match client.forward_client_packet(req).await {
-                                Ok(_) => ch_clone.record_success(),
-                                Err(e) => {
-                                    ch_clone.record_failure();
-                                    eprintln!("[Gateway Backhaul] Failed forwarding to node: {e}");
-                                    client_opt = None;
-                                }
+                        let opcode = packet.packet.opcode().as_str();
+                        let span = tracing::info_span!(
+                            "client_packet_forward",
+                            session_id = packet.session_id,
+                            opcode = opcode,
+                            target_node = %endpoint
+                        );
+                        async {
+                            if client_opt.is_none() {
+                                client_opt =
+                                    NodeServiceClient::connect(endpoint.clone()).await.ok();
                             }
-                        } else {
-                            ch_clone.record_failure();
+                            if let Some(ref mut client) = client_opt {
+                                let req = ForwardClientPacketRequest {
+                                    session_id: packet.session_id,
+                                    guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
+                                    packet_data: packet.packet.encode(),
+                                };
+                                match client.forward_client_packet(req).await {
+                                    Ok(_) => ch_clone.record_success(),
+                                    Err(e) => {
+                                        ch_clone.record_failure();
+                                        tracing::error!(error = %e, "Failed forwarding client packet to node");
+                                        eprintln!(
+                                            "[Gateway Backhaul] Failed forwarding to node: {e}"
+                                        );
+                                        client_opt = None;
+                                    }
+                                }
+                            } else {
+                                ch_clone.record_failure();
+                            }
                         }
+                        .instrument(span)
+                        .await;
                     }
                 });
             }
@@ -121,12 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let grpc_service = server.create_service();
-    tokio::spawn(async move {
+    let grpc_handle = tokio::spawn(async move {
         println!("[Gateway] gRPC Service listening on {grpc_addr}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(grpc_service.into_server())
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, async move {
+                let _ = grpc_shutdown_rx.await;
+            })
             .await
         {
             eprintln!("[Gateway] gRPC Server failed: {e}");
@@ -165,9 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Spawn Director Gateway Heartbeat Loop
-    GatewayServer::spawn_heartbeat_loop(
-        director_addr,
-        gateway_id,
+    let heartbeat_handle = GatewayServer::spawn_heartbeat_loop(
+        director_addr.clone(),
+        gateway_id.clone(),
         region,
         listen_addr.clone(),
         grpc_addr.to_string(),
@@ -181,40 +200,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Edge Gateway actively listening for client connections on {listen_addr}");
 
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(capacity as usize));
+    let shutdown_fut = mmo_core::shutdown_signal();
+    tokio::pin!(shutdown_fut);
 
     loop {
-        match listener.accept().await {
-            Ok((socket, _remote_addr)) => {
-                let permit = match connection_semaphore.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        metrics::counter!("mmo_gateway_connections_rejected_max_capacity")
-                            .increment(1);
-                        eprintln!(
-                            "[Gateway] Connection rejected: maximum capacity ({capacity}) reached"
-                        );
-                        continue;
-                    }
-                };
-
-                let session_id = server.next_session_id();
-                let server_clone = Arc::clone(&server);
-                let target_node = default_node_addr.clone();
-
-                // Register initial session routing to default node
-                let _ = server_clone.register_session_fallback(session_id, target_node);
-
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) = server_clone.handle_connection(socket, session_id).await {
-                        // Connection ended or error
-                        let _ = e;
-                    }
-                });
+        tokio::select! {
+            _ = &mut shutdown_fut => {
+                println!("[Gateway] Shutdown signal received, stopping TCP accept loop...");
+                break;
             }
-            Err(e) => {
-                eprintln!("[Gateway] Failed to accept client connection: {e}");
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((socket, _remote_addr)) => {
+                        let permit = match connection_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                metrics::counter!("mmo_gateway_connections_rejected_max_capacity")
+                                    .increment(1);
+                                eprintln!(
+                                    "[Gateway] Connection rejected: maximum capacity ({capacity}) reached"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let session_id = server.next_session_id();
+                        let server_clone = Arc::clone(&server);
+                        let target_node = default_node_addr.clone();
+
+                        // Register initial session routing to default node
+                        let _ = server_clone.register_session_fallback(session_id, target_node);
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = server_clone.handle_connection(socket, session_id).await {
+                                // Connection ended or error
+                                let _ = e;
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[Gateway] Failed to accept client connection: {e}");
+                    }
+                }
             }
         }
     }
+
+    let drained = server
+        .drain_and_shutdown(
+            &telemetry,
+            Some(heartbeat_handle),
+            &director_addr,
+            &gateway_id,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+    let _ = grpc_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), grpc_handle).await;
+    println!("[Gateway] Clean shutdown complete (closed {drained} active session(s)).");
+    Ok(())
 }
