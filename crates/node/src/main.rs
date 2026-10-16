@@ -58,41 +58,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
     let mut tick_sim = TickSimulation::new(node_id, bounds);
 
-    let _snapshotter = if let Some(ref url) = db_url {
+    let (snapshotter, snapshot_worker_handle) = if let Some(ref url) = db_url {
         match Database::connect(url).await {
             Ok(db) => {
                 println!("[Node {}] Connected to database at {}", node_id, url);
                 let repo = CharacterRepository::new(db);
                 let snapshotter = Arc::new(WriteBehindSnapshotter::new(repo));
                 tick_sim.set_snapshot_sender(snapshotter.sender());
-                let _handle = snapshotter.clone().start_worker();
+                let handle = snapshotter.clone().start_worker();
                 println!(
                     "[Node {}] Asynchronous write-behind snapshot worker active",
                     node_id
                 );
-                Some(snapshotter)
+                (Some(snapshotter), Some(handle))
             }
             Err(e) => {
                 eprintln!("[Node {}] Database connection failed: {}", node_id, e);
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let sim = Arc::new(RwLock::new(tick_sim));
 
-    // 1. Start gRPC NodeService server
+    // 1. Start gRPC NodeService server with graceful shutdown support
+    let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let node_service = NodeServiceImpl::new(Arc::clone(&sim));
-    tokio::spawn(async move {
+    let grpc_handle = tokio::spawn(async move {
         println!(
             "[Node {}] gRPC service listening on {}",
             node_id, listen_addr
         );
         if let Err(e) = Server::builder()
             .add_service(NodeServiceServer::new(node_service))
-            .serve(listen_addr)
+            .serve_with_shutdown(listen_addr, async move {
+                let _ = grpc_shutdown_rx.await;
+            })
             .await
         {
             eprintln!("[Node {node_id}] gRPC Server failed: {e}");
@@ -103,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let director_endpoint = director_addr.clone();
     let sim_clone = Arc::clone(&sim);
     let telemetry_clone = telemetry.clone();
-    tokio::spawn(async move {
+    let heartbeat_handle = tokio::spawn(async move {
         println!("[Node {node_id}] Attempting connection to Director at {director_endpoint}...");
         let mut client = loop {
             match DirectorServiceClient::connect(director_endpoint.clone()).await {
@@ -241,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::sync::mpsc::channel::<Vec<mmo_node::aoi::AoiBroadcastJob>>(128);
     let sim_for_cleanup = Arc::clone(&sim);
     let gw_endpoint = gateway_grpc_addr.clone();
-    tokio::spawn(async move {
+    let broadcast_handle = tokio::spawn(async move {
         println!("[Node {node_id}] AoI broadcast delivery worker active (Gateway: {gw_endpoint})");
         let mut client_opt = None;
         while let Some(jobs) = broadcast_rx.recv().await {
@@ -298,11 +301,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tick_duration = Duration::from_millis(50);
     const MAX_CATCHUP_TICKS: usize = 3;
     let mut next_tick = tokio::time::Instant::now() + tick_duration;
+    let shutdown_fut = mmo_core::shutdown_signal();
+    tokio::pin!(shutdown_fut);
 
     loop {
         let now = tokio::time::Instant::now();
         if now < next_tick {
-            tokio::time::sleep_until(next_tick).await;
+            tokio::select! {
+                _ = &mut shutdown_fut => {
+                    println!("[Node {node_id}] Shutdown signal received, initiating drain...");
+                    break;
+                }
+                _ = tokio::time::sleep_until(next_tick) => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_fut => {
+                    println!("[Node {node_id}] Shutdown signal received, initiating drain...");
+                    break;
+                }
+                _ = std::future::ready(()) => {}
+            }
         }
 
         let mut catchup = 0;
@@ -327,4 +347,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             next_tick = now_after + tick_duration;
         }
     }
+
+    drop(broadcast_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(1), broadcast_handle).await;
+
+    mmo_node::drain_and_shutdown_node(
+        node_id,
+        &telemetry,
+        heartbeat_handle,
+        snapshotter,
+        snapshot_worker_handle,
+        &director_addr,
+        grpc_shutdown_tx,
+    )
+    .await;
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), grpc_handle).await;
+    println!("[Node {node_id}] Clean shutdown complete.");
+    Ok(())
 }

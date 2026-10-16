@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: graceful-shutdown-and-ops
+  title: Graceful Shutdown Draining, Dynamic Director Gateway Discovery & OpenTelemetry Tracing
+  status: proposed
+  created: 2026-10-15
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: operations
+  specs:
+    - specs/operations/graceful-shutdown/spec.md

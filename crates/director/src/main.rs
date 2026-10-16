@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_grpc_addr = std::env::var("GATEWAY_GRPC_ADDR")
         .unwrap_or_else(|_| "http://mmo-gateway:50050".to_string());
 
-    tokio::spawn(async move {
+    let detector_handle = tokio::spawn(async move {
         let dead_timeout_ms: u64 = std::env::var("NODE_DEAD_TIMEOUT_MS")
             .unwrap_or_else(|_| "5000".to_string())
             .parse()
@@ -48,33 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recovery_events
                 );
 
-                if let Ok(mut client) =
-                    mmo_schema::cluster::gateway_service_client::GatewayServiceClient::connect(
-                        gateway_grpc_addr.clone(),
-                    )
-                    .await
-                {
-                    for ev in &recovery_events {
-                        let dead_addr = format!(
-                            "mmo-node-{}.mmo-node:50052",
-                            ev.previous_node_id.saturating_sub(1)
-                        );
-                        let new_addr = format!(
-                            "mmo-node-{}.mmo-node:50052",
-                            ev.new_node_id.saturating_sub(1)
-                        );
-                        let req = mmo_schema::cluster::ReassignNodeRoutesRequest {
-                            dead_node_address: dead_addr.clone(),
-                            new_node_address: new_addr.clone(),
-                        };
-                        if let Ok(resp) = client.reassign_node_routes(req).await {
-                            eprintln!(
-                                "[Director] Propagated route reassignment: {dead_addr} -> {new_addr} ({} routes updated)",
-                                resp.into_inner().reassigned_count
-                            );
-                        }
-                    }
-                }
+                svc_clone
+                    .broadcast_route_reassignments(&recovery_events, &gateway_grpc_addr)
+                    .await;
             }
         }
     });
@@ -93,10 +69,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Director gRPC service listening on {addr}");
     println!("Director Admin service listening on {admin_addr}");
+    let telemetry_shutdown = telemetry.clone();
     Server::builder()
         .add_service(DirectorServiceServer::new(service))
-        .serve(addr)
+        .serve_with_shutdown(addr, async move {
+            mmo_core::shutdown_signal().await;
+            println!("[Director] Shutdown signal received, initiating graceful drain...");
+            telemetry_shutdown.mark_unready();
+            detector_handle.abort();
+        })
         .await?;
 
+    println!("[Director] Clean shutdown complete.");
     Ok(())
 }

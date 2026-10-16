@@ -10,12 +10,14 @@ use tonic::{Request, Response, Status};
 use mmo_core::BoundingBox3D;
 use mmo_schema::cluster::director_service_server::DirectorService;
 use mmo_schema::cluster::{
-    BoundingBox, CreateInstanceRequest, CreateInstanceResponse, GatewayHeartbeatRequest,
-    GatewayHeartbeatResponse, HeartbeatRequest, HeartbeatResponse, InstanceHeartbeatRequest,
-    InstanceHeartbeatResponse, IssueRealmTransferClaimRequest, IssueRealmTransferClaimResponse,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse,
-    SplitReportRequest, SplitReportResponse, TerminateInstanceRequest, TerminateInstanceResponse,
-    Vector3, VerifyRealmTransferClaimRequest, VerifyRealmTransferClaimResponse,
+    BoundingBox, CreateInstanceRequest, CreateInstanceResponse, DeregisterGatewayRequest,
+    DeregisterGatewayResponse, DeregisterNodeRequest, DeregisterNodeResponse,
+    GatewayHeartbeatRequest, GatewayHeartbeatResponse, HeartbeatRequest, HeartbeatResponse,
+    InstanceHeartbeatRequest, InstanceHeartbeatResponse, IssueRealmTransferClaimRequest,
+    IssueRealmTransferClaimResponse, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterNodeRequest, RegisterNodeResponse, SplitReportRequest, SplitReportResponse,
+    TerminateInstanceRequest, TerminateInstanceResponse, Vector3, VerifyRealmTransferClaimRequest,
+    VerifyRealmTransferClaimResponse,
 };
 
 use crate::coordinator::GlobalOctreeCoordinator;
@@ -201,6 +203,96 @@ impl DirectorServiceImpl {
         let stale = reg.remove_stale_gateways(timeout);
         metrics::gauge!("mmo_director_active_gateways").set(reg.get_active_gateways().len() as f64);
         stale
+    }
+
+    /// Resolves active gateway gRPC endpoints from `GatewayRegistry`, falling back to `fallback_gateway_addr`
+    /// when no active gateways are dynamically registered.
+    pub async fn resolve_gateway_endpoints(&self, fallback_gateway_addr: &str) -> Vec<String> {
+        let active_gateways = self.gateway_registry.read().await.get_active_gateways();
+        if !active_gateways.is_empty() {
+            active_gateways
+                .into_iter()
+                .map(|g| {
+                    if g.grpc_addr.starts_with("http://") || g.grpc_addr.starts_with("https://") {
+                        g.grpc_addr
+                    } else {
+                        format!("http://{}", g.grpc_addr)
+                    }
+                })
+                .collect()
+        } else if !fallback_gateway_addr.trim().is_empty() {
+            let trimmed = fallback_gateway_addr.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                vec![trimmed.to_string()]
+            } else {
+                vec![format!("http://{trimmed}")]
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Broadcasts `ReassignNodeRoutesRequest` concurrently across all active gateways (or fallback)
+    /// with a bounded 2-second timeout per gateway. Returns the number of gateways that succeeded.
+    pub async fn broadcast_route_reassignments(
+        &self,
+        recovery_events: &[crate::coordinator::PartitionRecoveryEvent],
+        fallback_gateway_addr: &str,
+    ) -> usize {
+        if recovery_events.is_empty() {
+            return 0;
+        }
+
+        let targets = self.resolve_gateway_endpoints(fallback_gateway_addr).await;
+        let requests: Vec<mmo_schema::cluster::ReassignNodeRoutesRequest> = recovery_events
+            .iter()
+            .map(|ev| mmo_schema::cluster::ReassignNodeRoutesRequest {
+                dead_node_address: format!(
+                    "mmo-node-{}.mmo-node:50052",
+                    ev.previous_node_id.saturating_sub(1)
+                ),
+                new_node_address: format!(
+                    "mmo-node-{}.mmo-node:50052",
+                    ev.new_node_id.saturating_sub(1)
+                ),
+            })
+            .collect();
+
+        let mut join_handles = Vec::with_capacity(targets.len());
+        for target in targets {
+            let reqs = requests.clone();
+            join_handles.push(tokio::spawn(async move {
+                let res = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                    let mut client =
+                        mmo_schema::cluster::gateway_service_client::GatewayServiceClient::connect(
+                            target.clone(),
+                        )
+                        .await
+                        .ok()?;
+                    for req in reqs {
+                        let dead_addr = req.dead_node_address.clone();
+                        let new_addr = req.new_node_address.clone();
+                        let resp = client.reassign_node_routes(req).await.ok()?;
+                        eprintln!(
+                            "[Director] Propagated route reassignment to {target}: {dead_addr} -> {new_addr} ({} routes updated)",
+                            resp.into_inner().reassigned_count
+                        );
+                    }
+                    Some(())
+                })
+                .await;
+
+                matches!(res, Ok(Some(())))
+            }));
+        }
+
+        let mut succeeded = 0;
+        for handle in join_handles {
+            if let Ok(true) = handle.await {
+                succeeded += 1;
+            }
+        }
+        succeeded
     }
 }
 
@@ -510,6 +602,76 @@ impl DirectorService for DirectorServiceImpl {
                 }))
             }
         }
+    }
+
+    async fn deregister_node(
+        &self,
+        request: Request<DeregisterNodeRequest>,
+    ) -> Result<Response<DeregisterNodeResponse>, Status> {
+        let req = request.into_inner();
+        if req.node_id == 0 {
+            return Err(Status::invalid_argument(
+                "node_id must be greater than zero",
+            ));
+        }
+
+        // Enforce strict global lock order: instance_registry -> registry -> coordinator
+        let mut inst_reg = self.instance_registry.write().await;
+        let mut reg = self.registry.write().await;
+
+        let removed = reg.deregister_node(req.node_id);
+        if removed.is_none() {
+            return Ok(Response::new(DeregisterNodeResponse { success: false }));
+        }
+
+        let dead_nodes = vec![req.node_id];
+        let evicted = inst_reg.evict_instances_on_nodes(&dead_nodes);
+        if !evicted.is_empty() {
+            metrics::counter!("mmo_director_orphaned_instances_evicted_total")
+                .increment(evicted.len() as u64);
+        }
+
+        let mut coord = self.coordinator.write().await;
+        let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
+        if !events.is_empty() {
+            metrics::counter!("mmo_director_partition_recoveries_total")
+                .increment(events.len() as u64);
+            metrics::gauge!("mmo_director_topology_epoch").set(coord.topology_epoch() as f64);
+        }
+
+        metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
+        metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
+
+        println!(
+            "[Director] Node {} cleanly deregistered; recovered {} partitions, evicted {} instances",
+            req.node_id,
+            events.len(),
+            evicted.len()
+        );
+
+        Ok(Response::new(DeregisterNodeResponse { success: true }))
+    }
+
+    async fn deregister_gateway(
+        &self,
+        request: Request<DeregisterGatewayRequest>,
+    ) -> Result<Response<DeregisterGatewayResponse>, Status> {
+        let req = request.into_inner();
+        let gateway_id = req.gateway_id.trim();
+        if gateway_id.is_empty() {
+            return Err(Status::invalid_argument("gateway_id cannot be empty"));
+        }
+
+        let mut gw_reg = self.gateway_registry.write().await;
+        let removed = gw_reg.deregister_gateway(gateway_id);
+        let success = removed.is_some();
+        if success {
+            metrics::gauge!("mmo_director_active_gateways")
+                .set(gw_reg.get_active_gateways().len() as f64);
+            println!("[Director] Gateway '{gateway_id}' cleanly deregistered");
+        }
+
+        Ok(Response::new(DeregisterGatewayResponse { success }))
     }
 }
 
@@ -1015,5 +1177,275 @@ mod tests {
 
         assert!(!replay_resp.valid);
         assert!(replay_resp.error_message.contains("Replay"));
+    }
+
+    #[tokio::test]
+    async fn test_service_deregister_node_lifecycle_and_partition_recovery() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. Invalid node_id (0) rejected
+        let invalid_req = Request::new(DeregisterNodeRequest { node_id: 0 });
+        let err = service.deregister_node(invalid_req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // 2. Register node 1 and node 2
+        let bounds = Some(bounding_box_3d_to_proto(&BoundingBox3D::new(
+            (0.0, 0.0, 0.0),
+            (100.0, 100.0, 100.0),
+        )));
+        let reg_req1 = Request::new(RegisterNodeRequest {
+            node_id: 1,
+            listen_addr: "127.0.0.1:50051".to_string(),
+            bounds,
+        });
+        service.register_node(reg_req1).await.unwrap();
+
+        let reg_req2 = Request::new(RegisterNodeRequest {
+            node_id: 2,
+            listen_addr: "127.0.0.1:50052".to_string(),
+            bounds: None,
+        });
+        service.register_node(reg_req2).await.unwrap();
+        assert_eq!(service.registry.read().await.len(), 2);
+
+        // 3. Deregister node 1 cleanly
+        let dereg_req = Request::new(DeregisterNodeRequest { node_id: 1 });
+        let dereg_resp = service
+            .deregister_node(dereg_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(dereg_resp.success);
+        assert_eq!(service.registry.read().await.len(), 1);
+
+        // Node 2 should now have the partition assigned via recovery
+        {
+            let reg = service.registry.read().await;
+            let node2 = reg.get_node(2).expect("node 2 should exist");
+            assert!(!node2.assigned_bounds.is_empty());
+        }
+
+        // 4. Repeated deregistration is idempotent (returns success = false)
+        let repeat_req = Request::new(DeregisterNodeRequest { node_id: 1 });
+        let repeat_resp = service
+            .deregister_node(repeat_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!repeat_resp.success);
+    }
+
+    #[tokio::test]
+    async fn test_service_deregister_gateway_lifecycle() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. Empty gateway_id rejected
+        let invalid_req = Request::new(DeregisterGatewayRequest {
+            gateway_id: "   ".to_string(),
+        });
+        let err = service.deregister_gateway(invalid_req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // 2. Register gateway
+        let reg_req = Request::new(RegisterGatewayRequest {
+            gateway_id: "gw-test-1".to_string(),
+            region: "us-east".to_string(),
+            listen_addr: "0.0.0.0:8080".to_string(),
+            grpc_addr: "127.0.0.1:50050".to_string(),
+            probe_addr: "0.0.0.0:8081".to_string(),
+            capacity: 5000,
+        });
+        service.register_gateway(reg_req).await.unwrap();
+        assert_eq!(service.gateway_registry.read().await.gateway_count(), 1);
+
+        // 3. Deregister gateway
+        let dereg_req = Request::new(DeregisterGatewayRequest {
+            gateway_id: "gw-test-1".to_string(),
+        });
+        let resp = service
+            .deregister_gateway(dereg_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(service.gateway_registry.read().await.gateway_count(), 0);
+
+        // 4. Repeated deregistration is idempotent
+        let repeat_req = Request::new(DeregisterGatewayRequest {
+            gateway_id: "gw-test-1".to_string(),
+        });
+        let repeat_resp = service
+            .deregister_gateway(repeat_req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!repeat_resp.success);
+    }
+
+    struct MockGatewayService {
+        reassigned: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    #[tonic::async_trait]
+    impl mmo_schema::cluster::gateway_service_server::GatewayService for MockGatewayService {
+        async fn update_route(
+            &self,
+            _request: Request<mmo_schema::cluster::RouteUpdateRequest>,
+        ) -> Result<Response<mmo_schema::cluster::RouteUpdateResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn update_batch_routes(
+            &self,
+            _request: Request<mmo_schema::cluster::BatchRouteUpdateRequest>,
+        ) -> Result<Response<mmo_schema::cluster::BatchRouteUpdateResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn reassign_node_routes(
+            &self,
+            request: Request<mmo_schema::cluster::ReassignNodeRoutesRequest>,
+        ) -> Result<Response<mmo_schema::cluster::ReassignNodeRoutesResponse>, Status> {
+            let req = request.into_inner();
+            self.reassigned
+                .lock()
+                .unwrap()
+                .push((req.dead_node_address, req.new_node_address));
+            Ok(Response::new(
+                mmo_schema::cluster::ReassignNodeRoutesResponse {
+                    success: true,
+                    reassigned_count: 3,
+                },
+            ))
+        }
+
+        async fn revoke_gateway_session(
+            &self,
+            _request: Request<mmo_schema::cluster::RevokeGatewaySessionRequest>,
+        ) -> Result<Response<mmo_schema::cluster::RevokeGatewaySessionResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn broadcast_route(
+            &self,
+            _request: Request<mmo_schema::cluster::MultiGatewayRouteBroadcastRequest>,
+        ) -> Result<Response<mmo_schema::cluster::MultiGatewayRouteBroadcastResponse>, Status>
+        {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn deliver_broadcast_jobs(
+            &self,
+            _request: Request<mmo_schema::cluster::DeliverBroadcastJobsRequest>,
+        ) -> Result<Response<mmo_schema::cluster::DeliverBroadcastJobsResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_gateway_route_broadcast_and_fallback() {
+        let service = DirectorServiceImpl::default_service();
+
+        // 1. When no gateways are registered, falls back to GATEWAY_GRPC_ADDR
+        let fallback = service.resolve_gateway_endpoints("127.0.0.1:50050").await;
+        assert_eq!(fallback, vec!["http://127.0.0.1:50050".to_string()]);
+
+        // 2. Spawn two mock Gateway gRPC servers on ephemeral ports
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let reassigned1 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r1_clone = Arc::clone(&reassigned1);
+        tokio::spawn(async move {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from_listener(listener1, true, None)
+                    .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(
+                    mmo_schema::cluster::gateway_service_server::GatewayServiceServer::new(
+                        MockGatewayService {
+                            reassigned: r1_clone,
+                        },
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let reassigned2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r2_clone = Arc::clone(&reassigned2);
+        tokio::spawn(async move {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from_listener(listener2, true, None)
+                    .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(
+                    mmo_schema::cluster::gateway_service_server::GatewayServiceServer::new(
+                        MockGatewayService {
+                            reassigned: r2_clone,
+                        },
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        // 3. Register both gateways with Director
+        service
+            .register_gateway(Request::new(RegisterGatewayRequest {
+                gateway_id: "gw-1".to_string(),
+                region: "us-east".to_string(),
+                listen_addr: "127.0.0.1:8080".to_string(),
+                grpc_addr: addr1.to_string(),
+                probe_addr: "127.0.0.1:8081".to_string(),
+                capacity: 1000,
+            }))
+            .await
+            .unwrap();
+
+        service
+            .register_gateway(Request::new(RegisterGatewayRequest {
+                gateway_id: "gw-2".to_string(),
+                region: "eu-central".to_string(),
+                listen_addr: "127.0.0.1:8082".to_string(),
+                grpc_addr: format!("http://{addr2}"),
+                probe_addr: "127.0.0.1:8083".to_string(),
+                capacity: 1000,
+            }))
+            .await
+            .unwrap();
+
+        // 4. Broadcast a partition recovery event across all active gateways
+        let event = crate::coordinator::PartitionRecoveryEvent {
+            bounds: BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
+            previous_node_id: 1,
+            new_node_id: 2,
+            epoch: 5,
+        };
+
+        let succeeded = service
+            .broadcast_route_reassignments(&[event], "http://127.0.0.1:59999")
+            .await;
+        assert_eq!(succeeded, 2);
+
+        let rec1 = reassigned1.lock().unwrap().clone();
+        let rec2 = reassigned2.lock().unwrap().clone();
+        assert_eq!(
+            rec1,
+            vec![(
+                "mmo-node-0.mmo-node:50052".to_string(),
+                "mmo-node-1.mmo-node:50052".to_string()
+            )]
+        );
+        assert_eq!(
+            rec2,
+            vec![(
+                "mmo-node-0.mmo-node:50052".to_string(),
+                "mmo-node-1.mmo-node:50052".to_string()
+            )]
+        );
     }
 }
