@@ -39,7 +39,7 @@ export class WorldObjectRenderer {
   /**
    * Updates world objects from a flat Float32Array buffer (16 floats per object).
    * Memory layout:
-   * [objectId, prefabId, x, y, z, qx, qy, qz, qw, sx, sy, sz, stateFlags, hpPct, revision, padding]
+   * [objectId_lo, prefabId, x, y, z, qx, qy, qz, qw, sx, sy, sz, stateFlags, hpPct, revision, objectId_hi]
    */
   updateFromBuffer(buffer) {
     if (!buffer || buffer.length === 0) {
@@ -53,7 +53,9 @@ export class WorldObjectRenderer {
 
     for (let i = 0; i < count; i++) {
       const offset = i * STRIDE;
-      const objectId = Number(buffer[offset]);
+      const lo = BigInt(Math.round(buffer[offset]));
+      const hi = BigInt(Math.round(buffer[offset + 15]));
+      const objectId = (hi << 32n) | lo;
       const prefabId = Number(buffer[offset + 1]);
       const x = buffer[offset + 2];
       const y = buffer[offset + 3];

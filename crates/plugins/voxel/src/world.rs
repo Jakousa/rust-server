@@ -25,6 +25,7 @@ pub struct VoxelWorld {
     rate_limiter: Arc<Mutex<ExcavationRateLimiter>>,
     config: ExcavationConfig,
     global_revision: Arc<AtomicU64>,
+    pending_events: Arc<Mutex<Vec<VoxelChangeEvent>>>,
 }
 
 impl Default for VoxelWorld {
@@ -42,6 +43,7 @@ impl VoxelWorld {
             rate_limiter: Arc::new(Mutex::new(ExcavationRateLimiter::new())),
             config,
             global_revision: Arc::new(AtomicU64::new(0)),
+            pending_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -78,7 +80,7 @@ impl VoxelWorld {
         let (_, chunk_arc) = self.chunks.remove(&coord)?;
         let chunk = match Arc::try_unwrap(chunk_arc) {
             Ok(rw) => rw.into_inner().unwrap_or_else(|e| e.into_inner()),
-            Err(shared) => shared.read().unwrap().clone(),
+            Err(shared) => shared.read().unwrap_or_else(|e| e.into_inner()).clone(),
         };
 
         // Flag adjacent neighbors dirty to regenerate boundaries
@@ -117,7 +119,7 @@ impl VoxelWorld {
         };
 
         let idx = index_from_local(lx, ly, lz);
-        let mut rate_limiter = self.rate_limiter.lock().unwrap();
+        let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         let mut chunk = match chunk_arc.write() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -151,17 +153,21 @@ impl VoxelWorld {
                 }
                 self.global_revision.fetch_add(1, Ordering::Relaxed);
 
-                (
-                    result,
-                    Some(VoxelChangeEvent {
-                        entity_guid: entity,
-                        chunk_coord,
-                        voxel_coord: target,
-                        local_index: idx,
-                        old_voxel,
-                        new_voxel,
-                    }),
-                )
+                let event = VoxelChangeEvent {
+                    entity_guid: entity,
+                    chunk_coord,
+                    voxel_coord: target,
+                    local_index: idx,
+                    old_voxel,
+                    new_voxel,
+                };
+
+                self.pending_events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(event.clone());
+
+                (result, Some(event))
             }
             _ => (result, None),
         }
@@ -175,37 +181,37 @@ impl VoxelWorld {
 
         // +X neighbor (x + 1): sample its x = 0 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x + 1, center.y, center.z)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.pos_x = Some(extract_slice_x(&chunk, 0));
         }
 
         // -X neighbor (x - 1): sample its x = 15 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x - 1, center.y, center.z)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.neg_x = Some(extract_slice_x(&chunk, 15));
         }
 
         // +Y neighbor (y + 1): sample its y = 0 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x, center.y + 1, center.z)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.pos_y = Some(extract_slice_y(&chunk, 0));
         }
 
         // -Y neighbor (y - 1): sample its y = 15 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x, center.y - 1, center.z)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.neg_y = Some(extract_slice_y(&chunk, 15));
         }
 
         // +Z neighbor (z + 1): sample its z = 0 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x, center.y, center.z + 1)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.pos_z = Some(extract_slice_z(&chunk, 0));
         }
 
         // -Z neighbor (z - 1): sample its z = 15 slice
         if let Some(c) = self.get_chunk(VoxelChunkCoord::new(center.x, center.y, center.z - 1)) {
-            let chunk = c.read().unwrap();
+            let chunk = c.read().unwrap_or_else(|e| e.into_inner());
             slices.neg_z = Some(extract_slice_z(&chunk, 15));
         }
 
@@ -216,7 +222,7 @@ impl VoxelWorld {
     pub fn build_mesh(&self, coord: VoxelChunkCoord) -> Option<VoxelMesh> {
         let chunk_arc = self.get_chunk(coord)?;
         let chunk_snapshot = {
-            let lock = chunk_arc.read().unwrap();
+            let lock = chunk_arc.read().unwrap_or_else(|e| e.into_inner());
             lock.clone()
         };
 
@@ -234,6 +240,27 @@ impl VoxelWorld {
             }
         }
         coords
+    }
+
+    /// Drains all buffered `VoxelChangeEvent`s for distribution to event queue.
+    pub fn drain_events(&self) -> Vec<VoxelChangeEvent> {
+        let mut events = self
+            .pending_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *events)
+    }
+
+    /// Prunes rate limiter records for entities no longer active in the entity store.
+    pub fn prune_rate_limiter(&self, entities: &mmo_core::entity::EntityStore) {
+        let mut limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+        limiter.prune(entities);
+    }
+
+    /// Returns the number of entities currently tracked by the rate limiter.
+    pub fn rate_limiter_len(&self) -> usize {
+        let limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+        limiter.len()
     }
 
     /// Monotonically increasing world mutation revision.

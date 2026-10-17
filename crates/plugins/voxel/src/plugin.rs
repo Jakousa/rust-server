@@ -16,6 +16,7 @@ use crate::net::{
     VoxelModifyResponsePacket, SUB_OPCODE_CHUNK_REQUEST, SUB_OPCODE_MODIFY_REQUEST,
     VOXEL_MODULE_ID,
 };
+use crate::persistence::VoxelWriteBehindService;
 use crate::world::VoxelWorld;
 
 /// Packet handler dispatching modular voxel networking packets.
@@ -48,7 +49,7 @@ impl ModularPacketHandler for VoxelPacketHandler {
 
                 if let Some(chunk_arc) = self.world.get_chunk(req.chunk) {
                     let rle = {
-                        let chunk = chunk_arc.read().unwrap();
+                        let chunk = chunk_arc.read().unwrap_or_else(|e| e.into_inner());
                         encode_rle(&chunk)
                     };
                     let resp = VoxelChunkDataPacket {
@@ -114,11 +115,26 @@ impl ModularPacketHandler for VoxelPacketHandler {
 /// Tick system managing voxel dirty chunk processing during simulation update.
 pub struct VoxelTickSystem {
     world: VoxelWorld,
+    write_behind: VoxelWriteBehindService,
 }
 
 impl VoxelTickSystem {
     pub fn new(world: VoxelWorld) -> Self {
-        Self { world }
+        Self {
+            world,
+            write_behind: VoxelWriteBehindService::default(),
+        }
+    }
+
+    pub fn with_write_behind(world: VoxelWorld, write_behind: VoxelWriteBehindService) -> Self {
+        Self {
+            world,
+            write_behind,
+        }
+    }
+
+    pub fn write_behind(&self) -> &VoxelWriteBehindService {
+        &self.write_behind
     }
 }
 
@@ -127,9 +143,25 @@ impl TickSystem for VoxelTickSystem {
         "voxel_terrain_tick_system"
     }
 
-    fn update(&mut self, _ctx: &mut TickContext) {
-        // Drain dirty chunks for batch processing/broadcasting
-        let _dirty_coords = self.world.drain_dirty_chunks();
+    fn update(&mut self, ctx: &mut TickContext) {
+        // 1. Drain buffered VoxelChangeEvents into ctx.events
+        for ev in self.world.drain_events() {
+            ctx.events.push(ev);
+        }
+
+        // 2. Drain dirty chunks, enqueue to write-behind, mark clean
+        for coord in self.world.drain_dirty_chunks() {
+            if let Some(chunk_arc) = self.world.get_chunk(coord) {
+                let mut chunk = chunk_arc.write().unwrap_or_else(|e| e.into_inner());
+                if chunk.is_dirty() {
+                    self.write_behind.enqueue(coord, &chunk);
+                    chunk.mark_clean();
+                }
+            }
+        }
+
+        // 3. Prune despawned entities from rate limiter
+        self.world.prune_rate_limiter(ctx.entities);
     }
 }
 
@@ -137,15 +169,30 @@ impl TickSystem for VoxelTickSystem {
 #[derive(Clone)]
 pub struct VoxelTerrainPlugin {
     world: VoxelWorld,
+    write_behind: VoxelWriteBehindService,
 }
 
 impl VoxelTerrainPlugin {
     pub fn new(world: VoxelWorld) -> Self {
-        Self { world }
+        Self {
+            world,
+            write_behind: VoxelWriteBehindService::default(),
+        }
+    }
+
+    pub fn with_write_behind(world: VoxelWorld, write_behind: VoxelWriteBehindService) -> Self {
+        Self {
+            world,
+            write_behind,
+        }
     }
 
     pub fn world(&self) -> &VoxelWorld {
         &self.world
+    }
+
+    pub fn write_behind(&self) -> &VoxelWriteBehindService {
+        &self.write_behind
     }
 }
 
@@ -163,7 +210,10 @@ impl GameplayPlugin for VoxelTerrainPlugin {
 
         // 2. Register tick system for dirty chunk management
         ctx.tick_systems
-            .push(Box::new(VoxelTickSystem::new(self.world.clone())));
+            .push(Box::new(VoxelTickSystem::with_write_behind(
+                self.world.clone(),
+                self.write_behind.clone(),
+            )));
     }
 }
 

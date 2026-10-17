@@ -172,3 +172,106 @@ fn test_high_throughput_excavation_and_persistence_stress() {
         assert_eq!(restored.get(i), ((i % 10) + 2) as u16);
     }
 }
+
+#[test]
+fn test_voxel_tick_system_persistence_events_and_pruning() {
+    use mmo_core::plugin::TickContext;
+    use mmo_core::{BoundingBox3D, Octree};
+    use mmo_plugin_voxel::VoxelChangeEvent;
+
+    let world = VoxelWorld::default();
+    let write_behind = VoxelWriteBehindService::new(100);
+    let plugin = VoxelTerrainPlugin::with_write_behind(world.clone(), write_behind.clone());
+
+    let mut manager = PluginManager::new();
+    manager.add_plugin(Box::new(plugin));
+
+    let mut hooks = HookDispatcher::new();
+    let mut codecs = ComponentCodecRegistry::new();
+    let mut event_queue = EventQueue::new();
+    let mut packets = ModularPacketRouter::new();
+    let mut tick_systems = Vec::new();
+
+    manager.build_all(
+        &mut hooks,
+        &mut codecs,
+        &mut event_queue,
+        &mut packets,
+        &mut tick_systems,
+    );
+
+    assert_eq!(tick_systems.len(), 1);
+
+    // Insert chunk at (0, 0, 0)
+    let coord = VoxelChunkCoord::new(0, 0, 0);
+    let chunk = PaletteChunk::new_homogeneous(1);
+    world.insert_chunk(coord, chunk);
+
+    // Spawn player entity
+    let mut entities = EntityStore::new();
+    let player_guid = Guid::new(EntityType::Player, 1, 42);
+    let player = Entity::new(player_guid, (2.0, 2.0, 2.0));
+    entities.insert_entity(player);
+
+    let mut octree = Octree::new(BoundingBox3D::new(
+        (-100.0, -100.0, -100.0),
+        (100.0, 100.0, 100.0),
+    ));
+
+    // Player modifies a voxel at (2, 2, 2)
+    let (res, _) = world.modify_voxel(
+        player_guid,
+        VoxelCoord::new(2, 2, 2),
+        0,
+        (2.0, 2.0, 2.0),
+        1000,
+    );
+    assert!(matches!(
+        res,
+        mmo_plugin_voxel::VoxelModifyResult::Success { .. }
+    ));
+    assert_eq!(world.rate_limiter_len(), 1);
+
+    // Run tick system
+    {
+        let mut ctx = TickContext {
+            tick: 1,
+            dt_sec: 0.05,
+            entities: &mut entities,
+            events: &mut event_queue,
+            octree: &mut octree,
+        };
+        tick_systems[0].update(&mut ctx);
+    }
+
+    // 1. VoxelChangeEvent was emitted to event_queue
+    let drained_events = event_queue.drain::<VoxelChangeEvent>();
+    assert_eq!(drained_events.len(), 1);
+    assert_eq!(drained_events[0].entity_guid, player_guid);
+    assert_eq!(drained_events[0].voxel_coord, VoxelCoord::new(2, 2, 2));
+
+    // 2. Dirty chunk was enqueued to VoxelWriteBehindService and marked clean
+    assert_eq!(write_behind.pending_count(), 1);
+    let chunk_arc = world.get_chunk(coord).unwrap();
+    assert!(!chunk_arc
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_dirty());
+
+    // 3. Despawn player entity
+    entities.despawn_by_guid(player_guid);
+
+    // Run tick system again -> rate limiter should prune despawned player
+    {
+        let mut ctx = TickContext {
+            tick: 2,
+            dt_sec: 0.05,
+            entities: &mut entities,
+            events: &mut event_queue,
+            octree: &mut octree,
+        };
+        tick_systems[0].update(&mut ctx);
+    }
+
+    assert_eq!(world.rate_limiter_len(), 0);
+}
