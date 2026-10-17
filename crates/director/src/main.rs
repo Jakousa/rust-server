@@ -27,7 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .unwrap_or(5000);
         let dead_timeout = Duration::from_millis(dead_timeout_ms);
-        eprintln!("[Director] Starting dead node detector loop (timeout={dead_timeout_ms}ms)");
+        let gateway_timeout_ms: u64 = std::env::var("GATEWAY_DEAD_TIMEOUT_MS")
+            .unwrap_or_else(|_| "5000".to_string())
+            .parse()
+            .unwrap_or(5000);
+        let gateway_timeout = Duration::from_millis(gateway_timeout_ms);
+        eprintln!("[Director] Starting dead node detector loop (timeout={dead_timeout_ms}ms, gateway_timeout={gateway_timeout_ms}ms)");
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut tick_count = 0u64;
         loop {
@@ -51,6 +56,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 svc_clone
                     .broadcast_route_reassignments(&recovery_events, &gateway_grpc_addr)
                     .await;
+            }
+
+            let stale_gateways = svc_clone
+                .check_and_recover_stale_gateways(gateway_timeout)
+                .await;
+            if !stale_gateways.is_empty() {
+                eprintln!(
+                    "[Director] Evicted stale edge gateways: {:?}",
+                    stale_gateways
+                );
+            }
+
+            let reaped_instances = svc_clone.reap_idle_instances().await;
+            if reaped_instances > 0 {
+                eprintln!("[Director] Reaped {reaped_instances} idle dynamic instances");
             }
         }
     });

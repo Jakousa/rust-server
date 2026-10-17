@@ -68,6 +68,11 @@ impl RealmFederationAuthority {
         })
     }
 
+    /// Returns the local realm identifier managed by this authority.
+    pub fn realm_id(&self) -> &str {
+        &self.realm_id
+    }
+
     /// Constructs the canonical binary digest over which HMAC-SHA256 is evaluated.
     fn payload_bytes(
         guid: u64,

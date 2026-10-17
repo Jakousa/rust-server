@@ -1654,8 +1654,9 @@ impl GatewayServer {
         let is_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(
             self.authenticator.is_none(),
         ));
-        let active_send_stream: Arc<tokio::sync::Mutex<Option<quinn::SendStream>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let active_send_stream: Arc<
+            tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<quinn::SendStream>>>>,
+        > = Arc::new(tokio::sync::Mutex::new(None));
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
         let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
@@ -1671,15 +1672,18 @@ impl GatewayServer {
                     }
                     Some(bytes) = stream_rx.recv() => {
                         let mut lock = active_stream_writer.lock().await;
-                        if let Some(ref mut send) = *lock {
-                            if send.write_all(&bytes).await.is_err() {
+                        if let Some(ref send_arc) = *lock {
+                            if send_arc.lock().await.write_all(&bytes).await.is_err() {
+                                *lock = None;
                                 break;
                             }
-                        } else if let Ok((mut send, _recv)) = conn_writer.open_bi().await {
-                            if send.write_all(&bytes).await.is_err() {
+                        } else if let Ok((send, _recv)) = conn_writer.open_bi().await {
+                            let send_arc = Arc::new(tokio::sync::Mutex::new(send));
+                            if send_arc.lock().await.write_all(&bytes).await.is_err() {
+                                *lock = None;
                                 break;
                             }
-                            *lock = Some(send);
+                            *lock = Some(send_arc);
                         }
                     }
                     else => break,
@@ -1725,7 +1729,13 @@ impl GatewayServer {
                                     metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
                                     metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
                                     let _ = connection.send_datagram(pong_bytes);
+                                    continue;
                                 }
+
+                                if intercept_handler.handle_packet(session_id, &packet).await {
+                                    continue;
+                                }
+
                                 match self.dispatcher.dispatch_packet(session_id, packet) {
                                     Ok(routed) => {
                                         if let Some(ref tx) = self.packet_tx {
@@ -1744,7 +1754,13 @@ impl GatewayServer {
                 bi_res = connection.accept_bi() => {
                     match bi_res {
                         Ok((send, mut recv)) => {
-                            *active_send_stream.lock().await = Some(send);
+                            let stream_send = Arc::new(tokio::sync::Mutex::new(send));
+                            if is_authenticated.load(Ordering::Acquire) {
+                                let mut lock = active_send_stream.lock().await;
+                                if lock.is_none() {
+                                    *lock = Some(stream_send.clone());
+                                }
+                            }
                             let active_stream = active_send_stream.clone();
                             let dispatcher = self.dispatcher.clone();
                             let packet_tx = self.packet_tx.clone();
@@ -1754,6 +1770,7 @@ impl GatewayServer {
                             let cache = self.cache.clone();
                             let default_node = self.default_node_address.clone();
                             let intercept = intercept_handler.clone();
+                            let stream_send_clone = stream_send.clone();
                             tokio::spawn(async move {
                                 let mut buf = BytesMut::with_capacity(8192);
                                 let mut chunk = [0u8; 4096];
@@ -1809,10 +1826,7 @@ impl GatewayServer {
                                                                     assigned_node: String::new(),
                                                                     error_message: "Cluster unavailable".to_string(),
                                                                 });
-                                                                let mut lock = active_stream.lock().await;
-                                                                if let Some(ref mut s) = *lock {
-                                                                    let _ = s.write_all(&resp.encode()).await;
-                                                                }
+                                                                let _ = stream_send_clone.lock().await.write_all(&resp.encode()).await;
                                                                 return;
                                                             }
                                                         };
@@ -1840,6 +1854,12 @@ impl GatewayServer {
 
                                                         // Memory ordering: register route before releasing authenticated state
                                                         is_auth.store(true, Ordering::Release);
+                                                        {
+                                                            let mut lock = active_stream.lock().await;
+                                                            if lock.is_none() {
+                                                                *lock = Some(stream_send_clone.clone());
+                                                            }
+                                                        }
 
                                                         let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
                                                             success: true,
@@ -1849,10 +1869,7 @@ impl GatewayServer {
                                                             assigned_node: initial_node,
                                                             error_message: String::new(),
                                                         });
-                                                        let mut lock = active_stream.lock().await;
-                                                        if let Some(ref mut s) = *lock {
-                                                            let _ = s.write_all(&resp.encode()).await;
-                                                        }
+                                                        let _ = stream_send_clone.lock().await.write_all(&resp.encode()).await;
                                                     }
                                                     Err(e) => {
                                                         let resp = ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
@@ -1863,10 +1880,7 @@ impl GatewayServer {
                                                             assigned_node: String::new(),
                                                             error_message: e.to_string(),
                                                         });
-                                                        let mut lock = active_stream.lock().await;
-                                                        if let Some(ref mut s) = *lock {
-                                                            let _ = s.write_all(&resp.encode()).await;
-                                                        }
+                                                        let _ = stream_send_clone.lock().await.write_all(&resp.encode()).await;
                                                         return;
                                                     }
                                                 }
@@ -1898,10 +1912,7 @@ impl GatewayServer {
                                                     let pong_bytes = pong.encode();
                                                     metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
                                                     metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
-                                                    let mut lock = active_stream.lock().await;
-                                                    if let Some(ref mut send) = *lock {
-                                                        let _ = send.write_all(&pong_bytes).await;
-                                                    }
+                                                    let _ = stream_send_clone.lock().await.write_all(&pong_bytes).await;
                                                     continue;
                                                 }
 
@@ -2523,6 +2534,95 @@ mod tests {
         client.close(0, "normal test close");
         let _ = server_task.await;
         assert!(!server.has_session_sink(session_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_quic_datagram_interception_and_stream_isolation() {
+        use crate::quic::QuicClientSession;
+
+        let router = Arc::new(SessionRouter::new());
+        let (packet_tx, mut packet_rx) = mpsc::channel(100);
+        let server = Arc::new(GatewayServer::with_packet_channel(
+            router.clone(),
+            packet_tx,
+        ));
+
+        let session_id = 101;
+        let player_guid = Guid::new(EntityType::Player, 1, 101);
+        let node_addr = "127.0.0.1:50051".to_string();
+        server
+            .register_session(session_id, player_guid, node_addr.clone())
+            .unwrap();
+
+        let quic_endpoint = server
+            .bind_quic_self_signed("127.0.0.1:0".parse().unwrap(), &["localhost", "127.0.0.1"])
+            .expect("bind quic");
+        let local_addr = quic_endpoint.local_addr().unwrap();
+
+        let srv = server.clone();
+        let srv_endpoint = quic_endpoint.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = srv_endpoint.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let _ = srv.handle_quic_connection(conn, session_id).await;
+        });
+
+        let client = QuicClientSession::connect(local_addr, "localhost")
+            .await
+            .expect("client connect");
+
+        // Wait for sink registration
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // 1. Send Ping via datagram -> Should receive Pong via datagram, and packet_rx should NOT receive anything
+        let ping = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 8888 });
+        client.send_datagram(&ping).expect("send datagram ping");
+
+        let pong_dgram =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), client.read_datagram())
+                .await
+                .expect("timeout waiting for datagram pong")
+                .expect("read datagram pong");
+        match pong_dgram {
+            ClientPacket::Pong(pong) => assert_eq!(pong.client_timestamp, 8888),
+            other => panic!("Expected Pong datagram, got {other:?}"),
+        }
+
+        // Verify datagram ping did NOT get routed to packet_rx (short-circuited)
+        assert!(packet_rx.try_recv().is_err());
+
+        // 2. Send SocialMessage via datagram -> intercept_handler intercepts it, and packet_rx should NOT receive anything
+        let chat = ClientPacket::SocialMessage(mmo_schema::client::SocialMessagePacket {
+            channel_type: 0,
+            sender_guid: player_guid.raw(),
+            sender_name: "Hero".to_string(),
+            target_id: 0,
+            content: "Hello datagram chat".to_string(),
+            timestamp: 1000,
+        });
+        client.send_datagram(&chat).expect("send datagram chat");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(packet_rx.try_recv().is_err());
+
+        // 3. Stream isolation: open another bidirectional stream and verify downstream push still works
+        let (mut extra_send, _extra_recv) = client.connection.open_bi().await.unwrap();
+        let stream_ping = ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: 9999 });
+        extra_send.write_all(&stream_ping.encode()).await.unwrap();
+
+        let interaction_res =
+            ClientPacket::InteractionResult(mmo_schema::client::InteractionResultPacket {
+                action_id: 42,
+                success: true,
+                error_code: 0,
+                payload: vec![1, 2, 3],
+            });
+        server
+            .send_packet_to_session(session_id, &interaction_res)
+            .await
+            .unwrap();
+
+        client.close(0, "test done");
+        let _ = server_task.await;
     }
 
     #[tokio::test]

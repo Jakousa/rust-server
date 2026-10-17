@@ -62,16 +62,27 @@ pub struct DirectorServiceImpl {
 }
 
 impl DirectorServiceImpl {
+    /// Initializes `RealmFederationAuthority` from `REALM_ID` and `FEDERATION_HMAC_SECRET`
+    /// environment variables, falling back to safe defaults when absent or empty.
+    pub fn federation_authority_from_env() -> RealmFederationAuthority {
+        let realm_id = std::env::var("REALM_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "realm-default".to_string());
+        let secret = std::env::var("FEDERATION_HMAC_SECRET")
+            .ok()
+            .filter(|s| s.len() >= 16)
+            .map(|s| s.into_bytes())
+            .unwrap_or_else(|| b"cluster-realm-federation-default-secret-key".to_vec());
+        RealmFederationAuthority::new(realm_id, secret).expect("valid federation authority")
+    }
+
     /// Creates a new `DirectorServiceImpl` with shared registry, coordinator, and default registries.
     pub fn new(
         registry: Arc<RwLock<NodeRegistry>>,
         coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
     ) -> Self {
-        let auth = RealmFederationAuthority::new(
-            "realm-default",
-            b"cluster-realm-federation-default-secret-key".to_vec(),
-        )
-        .expect("valid default auth");
+        let auth = Self::federation_authority_from_env();
         Self {
             registry,
             coordinator,
@@ -87,11 +98,7 @@ impl DirectorServiceImpl {
         coordinator: Arc<RwLock<GlobalOctreeCoordinator>>,
         gateway_registry: Arc<RwLock<GatewayRegistry>>,
     ) -> Self {
-        let auth = RealmFederationAuthority::new(
-            "realm-default",
-            b"cluster-realm-federation-default-secret-key".to_vec(),
-        )
-        .expect("valid default auth");
+        let auth = Self::federation_authority_from_env();
         Self {
             registry,
             coordinator,
@@ -120,11 +127,7 @@ impl DirectorServiceImpl {
 
     /// Creates a `DirectorServiceImpl` with default empty registry, world coordinator, and gateway registry.
     pub fn default_service() -> Self {
-        let auth = RealmFederationAuthority::new(
-            "realm-default",
-            b"cluster-realm-federation-default-secret-key".to_vec(),
-        )
-        .expect("valid default auth");
+        let auth = Self::federation_authority_from_env();
         Self {
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             coordinator: Arc::new(RwLock::new(GlobalOctreeCoordinator::default())),
@@ -145,6 +148,13 @@ impl DirectorServiceImpl {
         // Enforce strict global lock order: instance_registry -> registry -> coordinator
         let mut inst_reg = self.instance_registry.write().await;
         let mut reg = self.registry.write().await;
+
+        let dead_addrs: std::collections::HashMap<u32, String> = reg
+            .active_nodes()
+            .into_iter()
+            .map(|n| (n.node_id, n.listen_addr.clone()))
+            .collect();
+
         let dead_nodes = reg.check_dead_nodes(timeout);
 
         if dead_nodes.is_empty() {
@@ -171,7 +181,7 @@ impl DirectorServiceImpl {
         }
 
         let mut coord = self.coordinator.write().await;
-        let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
+        let events = coord.recover_orphaned_partitions(&dead_nodes, &dead_addrs, &mut reg);
         if !events.is_empty() {
             metrics::counter!("mmo_director_partition_recoveries_total")
                 .increment(events.len() as u64);
@@ -247,14 +257,8 @@ impl DirectorServiceImpl {
         let requests: Vec<mmo_schema::cluster::ReassignNodeRoutesRequest> = recovery_events
             .iter()
             .map(|ev| mmo_schema::cluster::ReassignNodeRoutesRequest {
-                dead_node_address: format!(
-                    "mmo-node-{}.mmo-node:50052",
-                    ev.previous_node_id.saturating_sub(1)
-                ),
-                new_node_address: format!(
-                    "mmo-node-{}.mmo-node:50052",
-                    ev.new_node_id.saturating_sub(1)
-                ),
+                dead_node_address: ev.previous_node_address.clone(),
+                new_node_address: ev.new_node_address.clone(),
             })
             .collect();
 
@@ -619,6 +623,12 @@ impl DirectorService for DirectorServiceImpl {
         let mut inst_reg = self.instance_registry.write().await;
         let mut reg = self.registry.write().await;
 
+        let dereg_addr = reg.get_node(req.node_id).map(|n| n.listen_addr.clone());
+        let mut dead_addrs = std::collections::HashMap::new();
+        if let Some(ref addr) = dereg_addr {
+            dead_addrs.insert(req.node_id, addr.clone());
+        }
+
         let removed = reg.deregister_node(req.node_id);
         if removed.is_none() {
             return Ok(Response::new(DeregisterNodeResponse { success: false }));
@@ -632,7 +642,7 @@ impl DirectorService for DirectorServiceImpl {
         }
 
         let mut coord = self.coordinator.write().await;
-        let events = coord.recover_orphaned_partitions(&dead_nodes, &mut reg);
+        let events = coord.recover_orphaned_partitions(&dead_nodes, &dead_addrs, &mut reg);
         if !events.is_empty() {
             metrics::counter!("mmo_director_partition_recoveries_total")
                 .increment(events.len() as u64);
@@ -641,6 +651,14 @@ impl DirectorService for DirectorServiceImpl {
 
         metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
         metrics::gauge!("mmo_director_active_instances").set(inst_reg.len() as f64);
+
+        drop(coord);
+        drop(reg);
+        drop(inst_reg);
+
+        if !events.is_empty() {
+            self.broadcast_route_reassignments(&events, "").await;
+        }
 
         println!(
             "[Director] Node {} cleanly deregistered; recovered {} partitions, evicted {} instances",
@@ -1423,6 +1441,8 @@ mod tests {
             bounds: BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0)),
             previous_node_id: 1,
             new_node_id: 2,
+            previous_node_address: "mmo-node-0.mmo-node:50052".to_string(),
+            new_node_address: "mmo-node-1.mmo-node:50052".to_string(),
             epoch: 5,
         };
 
@@ -1447,5 +1467,134 @@ mod tests {
                 "mmo-node-1.mmo-node:50052".to_string()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn test_dead_node_failover_resolves_registered_addresses() {
+        let service = DirectorServiceImpl::default_service();
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+
+        let node1 = {
+            let mut reg = service.registry.write().await;
+            reg.register_node("10.42.0.15:50052".to_string(), vec![bounds])
+        };
+        let node2 = {
+            let mut reg = service.registry.write().await;
+            reg.register_node("10.42.0.16:50052".to_string(), vec![])
+        };
+
+        {
+            let mut coord = service.coordinator.write().await;
+            coord.assign_initial_node(node1);
+        }
+
+        // Expire node 1 heartbeat
+        {
+            let mut reg = service.registry.write().await;
+            if let Some(n) = reg.get_node_mut(node1) {
+                n.last_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            }
+        }
+
+        let events = service
+            .check_and_recover_dead_nodes(std::time::Duration::from_millis(500))
+            .await;
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.previous_node_id, node1);
+        assert_eq!(ev.new_node_id, node2);
+        assert_eq!(ev.previous_node_address, "10.42.0.15:50052");
+        assert_eq!(ev.new_node_address, "10.42.0.16:50052");
+    }
+
+    #[tokio::test]
+    async fn test_graceful_deregistration_broadcasts_route_reassignments() {
+        let service = DirectorServiceImpl::default_service();
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+
+        // Spawn mock gateway
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = listener.local_addr().unwrap();
+        let reassigned = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r_clone = Arc::clone(&reassigned);
+        tokio::spawn(async move {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+            tonic::transport::Server::builder()
+                .add_service(
+                    mmo_schema::cluster::gateway_service_server::GatewayServiceServer::new(
+                        MockGatewayService {
+                            reassigned: r_clone,
+                        },
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        service
+            .register_gateway(Request::new(RegisterGatewayRequest {
+                gateway_id: "gw-test-dereg".to_string(),
+                region: "us-east".to_string(),
+                listen_addr: "127.0.0.1:8080".to_string(),
+                grpc_addr: format!("http://{gw_addr}"),
+                probe_addr: "127.0.0.1:8081".to_string(),
+                capacity: 1000,
+            }))
+            .await
+            .unwrap();
+
+        let node1 = {
+            let mut reg = service.registry.write().await;
+            reg.register_node("10.42.0.15:50052".to_string(), vec![bounds])
+        };
+        let _node2 = {
+            let mut reg = service.registry.write().await;
+            reg.register_node("10.42.0.16:50052".to_string(), vec![])
+        };
+
+        {
+            let mut coord = service.coordinator.write().await;
+            coord.assign_initial_node(node1);
+        }
+
+        let resp = service
+            .deregister_node(Request::new(DeregisterNodeRequest { node_id: node1 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+
+        // Wait briefly for route reassignment broadcast
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rec = reassigned.lock().unwrap().clone();
+        assert_eq!(
+            rec,
+            vec![(
+                "10.42.0.15:50052".to_string(),
+                "10.42.0.16:50052".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_federation_authority_from_env() {
+        std::env::set_var("REALM_ID", "realm-custom-test");
+        std::env::set_var(
+            "FEDERATION_HMAC_SECRET",
+            "super-secret-key-that-is-at-least-16-bytes",
+        );
+
+        let auth = DirectorServiceImpl::federation_authority_from_env();
+        assert_eq!(auth.realm_id(), "realm-custom-test");
+
+        std::env::remove_var("REALM_ID");
+        std::env::remove_var("FEDERATION_HMAC_SECRET");
+
+        let default_auth = DirectorServiceImpl::federation_authority_from_env();
+        assert_eq!(default_auth.realm_id(), "realm-default");
     }
 }
