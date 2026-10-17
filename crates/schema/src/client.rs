@@ -3365,6 +3365,63 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_payload_boundary_and_exact_size() {
+        // Enforce protocol constant: MAX_PACKET_PAYLOAD_SIZE must be exactly 64 KiB (65,536 bytes)
+        assert_eq!(MAX_PACKET_PAYLOAD_SIZE, 64 * 1024);
+        assert_eq!(MAX_PACKET_PAYLOAD_SIZE, 65_536);
+
+        // Verify intermediate payload size (e.g. 2048 bytes > 64 + 1024 = 1088) is accepted
+        let mut frame_mid = BytesMut::new();
+        frame_mid.put_u16_le(PACKET_MAGIC);
+        frame_mid.put_u16_le(Opcode::Ping as u16);
+        frame_mid.put_u32_le(2048);
+        assert_eq!(ClientPacket::decode_frame(&mut frame_mid).unwrap(), None);
+
+        // Exact boundary: payload_len == MAX_PACKET_PAYLOAD_SIZE (65,536 bytes)
+        // decode_frame must NOT reject as PacketTooLarge; it accepts the header and awaits the payload
+        let mut frame_exact = BytesMut::new();
+        frame_exact.put_u16_le(PACKET_MAGIC);
+        frame_exact.put_u16_le(Opcode::Ping as u16);
+        frame_exact.put_u32_le(MAX_PACKET_PAYLOAD_SIZE as u32);
+        let res_frame = ClientPacket::decode_frame(&mut frame_exact);
+        assert_eq!(
+            res_frame.unwrap(),
+            None,
+            "decode_frame must accept payload_len == MAX_PACKET_PAYLOAD_SIZE without PacketTooLarge error"
+        );
+
+        // decode_bytes must NOT reject payload_len == MAX_PACKET_PAYLOAD_SIZE as PacketTooLarge.
+        // Because bytes.remaining() (0) < payload_len, it must return LengthMismatch instead.
+        let mut bytes_exact = BytesMut::new();
+        bytes_exact.put_u16_le(PACKET_MAGIC);
+        bytes_exact.put_u16_le(Opcode::Ping as u16);
+        bytes_exact.put_u32_le(MAX_PACKET_PAYLOAD_SIZE as u32);
+        let res_bytes = ClientPacket::decode_bytes(bytes_exact.freeze());
+        assert_eq!(
+            res_bytes.unwrap_err(),
+            ClientCodecError::LengthMismatch {
+                expected: MAX_PACKET_PAYLOAD_SIZE,
+                got: 0,
+            },
+            "decode_bytes must accept payload_len == MAX_PACKET_PAYLOAD_SIZE without PacketTooLarge error"
+        );
+
+        // decode_bytes with payload_len == MAX_PACKET_PAYLOAD_SIZE + 1 must be rejected
+        let mut bytes_oversized_boundary = BytesMut::new();
+        bytes_oversized_boundary.put_u16_le(PACKET_MAGIC);
+        bytes_oversized_boundary.put_u16_le(Opcode::Ping as u16);
+        bytes_oversized_boundary.put_u32_le((MAX_PACKET_PAYLOAD_SIZE + 1) as u32);
+        let res_bytes_oversized = ClientPacket::decode_bytes(bytes_oversized_boundary.freeze());
+        assert_eq!(
+            res_bytes_oversized.unwrap_err(),
+            ClientCodecError::PacketTooLarge {
+                size: MAX_PACKET_PAYLOAD_SIZE + 1,
+                max: MAX_PACKET_PAYLOAD_SIZE,
+            }
+        );
+    }
+
+    #[test]
     fn test_interaction_type_roundtrip() {
         for (val, expected) in [
             (0, InteractionType::Talk),
