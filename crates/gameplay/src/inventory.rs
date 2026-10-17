@@ -40,6 +40,8 @@ impl ItemStack {
 pub struct InventoryComponent {
     pub slots: Vec<Option<ItemStack>>,
     pub max_weight: f32,
+    #[serde(default)]
+    pub currency: u64,
 }
 
 impl InventoryComponent {
@@ -47,7 +49,13 @@ impl InventoryComponent {
         Self {
             slots: vec![None; capacity],
             max_weight,
+            currency: 0,
         }
+    }
+
+    pub fn with_currency(mut self, currency: u64) -> Self {
+        self.currency = currency;
+        self
     }
 
     pub fn current_weight(&self) -> f32 {
@@ -60,6 +68,42 @@ impl InventoryComponent {
 
     pub fn is_encumbered(&self) -> bool {
         self.current_weight() > self.max_weight
+    }
+
+    pub fn has_item_stack(&self, item: &ItemStack) -> bool {
+        let total: u32 = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|s| s.item_id == item.item_id && s.name == item.name)
+            .map(|s| s.quantity)
+            .sum();
+        total >= item.quantity
+    }
+
+    pub fn remove_item_stack(&mut self, item: &ItemStack) -> bool {
+        if !self.has_item_stack(item) {
+            return false;
+        }
+
+        let mut remaining = item.quantity;
+        for slot in self.slots.iter_mut() {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(ref mut stack) = slot {
+                if stack.item_id == item.item_id && stack.name == item.name {
+                    if stack.quantity <= remaining {
+                        remaining -= stack.quantity;
+                        *slot = None;
+                    } else {
+                        stack.quantity -= remaining;
+                        remaining = 0;
+                    }
+                }
+            }
+        }
+        remaining == 0
     }
 
     pub fn add_item(&mut self, item: ItemStack) -> Result<usize, &'static str> {
@@ -120,7 +164,22 @@ pub struct EncumbranceHookHandler;
 
 impl HookHandler for EncumbranceHookHandler {
     fn handle(&self, _event: &Event, _ctx: &mut EventContext) {
-        // Dispatched via simulation hook; specific check logic runs when entity components are inspected
+        // Fallback when entity store is not available
+    }
+
+    fn handle_with_entities(
+        &self,
+        event: &Event,
+        ctx: &mut EventContext,
+        entities: &mut EntityStore,
+    ) {
+        if let Event::BeforeMove { entity, .. } = event {
+            if let Some(ent) = entities.get_by_guid(*entity) {
+                if check_encumbrance(&ent.components) {
+                    ctx.cancel("encumbered");
+                }
+            }
+        }
     }
 }
 
@@ -209,11 +268,7 @@ impl GameplayPlugin for InventoryPlugin {
         ctx.packets.register(0x01, Box::new(InventoryPacketHandler));
 
         // 3. Register encumbrance veto hook on BeforeMove
-        ctx.hooks.register_fn(|event, _event_ctx| {
-            if let Event::BeforeMove { .. } = event {
-                // The simulation loop can invoke custom checks, or hooks can inspect context
-            }
-        });
+        ctx.hooks.register_handler(Box::new(EncumbranceHookHandler));
     }
 }
 
@@ -416,5 +471,32 @@ mod tests {
             let eq = entity.get_component::<EquipmentComponent>().unwrap();
             assert!(eq.get_equipped(&equip_slot).is_some());
         }
+    }
+
+    #[test]
+    fn test_encumbrance_hook_handler_cancels_before_move() {
+        use mmo_core::EntityType;
+
+        let mut store = EntityStore::new();
+        let player = Guid::new(EntityType::Player, 1, 777);
+        let key = store.spawn(player, (0.0, 0.0, 0.0));
+
+        // Capacity 2, max_weight 10.0
+        let mut inv = InventoryComponent::new(2, 10.0);
+        let heavy = ItemStack::new(1, "Boulders", 1, 25.0); // 25.0 > 10.0 -> encumbered
+        inv.add_item(heavy).unwrap();
+        store.get_mut(key).unwrap().add_component(inv);
+
+        let handler = EncumbranceHookHandler;
+        let ev = Event::BeforeMove {
+            entity: player,
+            from: (0.0, 0.0, 0.0),
+            to: (1.0, 0.0, 0.0),
+        };
+        let mut ctx = EventContext::new();
+
+        handler.handle_with_entities(&ev, &mut ctx, &mut store);
+        assert!(ctx.is_canceled());
+        assert_eq!(ctx.cancel_reason(), Some("encumbered"));
     }
 }

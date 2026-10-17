@@ -127,7 +127,14 @@ impl GuildManager {
     }
 
     /// Creates a new guild with the specified founding leader and vault size.
+    /// If the leader was already in a guild, they are cleanly removed from that guild's roster.
     pub fn create_guild(&mut self, name: &str, leader: Guid, vault_capacity: usize) -> u64 {
+        if let Some(old_gid) = self.player_to_guild.remove(&leader) {
+            if let Some(old_g) = self.guilds.get_mut(&old_gid) {
+                old_g.members.remove(&leader);
+            }
+        }
+
         let guild_id = self.next_guild_id;
         self.next_guild_id += 1;
 
@@ -136,6 +143,20 @@ impl GuildManager {
         self.player_to_guild.insert(leader, guild_id);
 
         guild_id
+    }
+
+    /// Attempts to create a new guild with the specified founding leader and vault size.
+    /// Returns Err if the leader is already in a guild.
+    pub fn try_create_guild(
+        &mut self,
+        name: &str,
+        leader: Guid,
+        vault_capacity: usize,
+    ) -> Result<u64, &'static str> {
+        if self.player_to_guild.contains_key(&leader) {
+            return Err("Player already in a guild");
+        }
+        Ok(self.create_guild(name, leader, vault_capacity))
     }
 
     pub fn get_guild(&self, guild_id: u64) -> Option<&GuildState> {
@@ -147,16 +168,38 @@ impl GuildManager {
     }
 
     /// Adds a member to an existing guild, updating roster and mapping.
+    /// Fails if the player is already a member of any guild.
     pub fn add_member(
         &mut self,
         guild_id: u64,
         player: Guid,
         rank: GuildRank,
     ) -> Result<(), &'static str> {
+        if self.player_to_guild.contains_key(&player) {
+            return Err("Player already in a guild");
+        }
         let guild = self.guilds.get_mut(&guild_id).ok_or("Guild not found")?;
         guild.add_member(player, rank);
         self.player_to_guild.insert(player, guild_id);
         Ok(())
+    }
+
+    /// Removes a member from their current guild.
+    pub fn remove_member(&mut self, player: Guid) -> Result<GuildRank, &'static str> {
+        let guild_id = self
+            .player_to_guild
+            .get(&player)
+            .copied()
+            .ok_or("Player is not in a guild")?;
+        let guild = self.guilds.get_mut(&guild_id).ok_or("Guild not found")?;
+        if player == guild.leader {
+            return Err("Cannot remove guild leader without transferring leadership");
+        }
+        let rank = guild
+            .remove_member(player)
+            .ok_or("Player not found in guild roster")?;
+        self.player_to_guild.remove(&player);
+        Ok(rank)
     }
 
     /// Atomically transfers an item from player's inventory to the shared guild vault.
@@ -294,5 +337,51 @@ mod tests {
             .unwrap();
         assert_eq!(officer_inv.slots[0], Some(ore));
         assert_eq!(mgr.get_guild(guild_id).unwrap().vault.slots[0], None);
+    }
+
+    #[test]
+    fn test_duplicate_guild_membership_rejected() {
+        let leader_a = Guid::new(EntityType::Player, 1, 10);
+        let member_b = Guid::new(EntityType::Player, 1, 20);
+
+        let mut mgr = GuildManager::new();
+        let g1 = mgr.create_guild("Guild One", leader_a, 5);
+        assert!(mgr.add_member(g1, member_b, GuildRank::Member).is_ok());
+
+        // 1. Try to add member_b who is already in g1 to g1 or another guild
+        let leader_c = Guid::new(EntityType::Player, 1, 30);
+        let g2 = mgr.create_guild("Guild Two", leader_c, 5);
+        let res = mgr.add_member(g2, member_b, GuildRank::Officer);
+        assert_eq!(res, Err("Player already in a guild"));
+
+        // 2. Try try_create_guild with player already in guild
+        let res_create = mgr.try_create_guild("Guild Three", leader_a, 5);
+        assert_eq!(res_create, Err("Player already in a guild"));
+    }
+
+    #[test]
+    fn test_remove_member_and_roster_consistency() {
+        let leader = Guid::new(EntityType::Player, 1, 100);
+        let member = Guid::new(EntityType::Player, 1, 200);
+
+        let mut mgr = GuildManager::new();
+        let g1 = mgr.create_guild("Alpha", leader, 5);
+        assert!(mgr.add_member(g1, member, GuildRank::Member).is_ok());
+
+        // Cannot remove leader
+        assert_eq!(
+            mgr.remove_member(leader),
+            Err("Cannot remove guild leader without transferring leadership")
+        );
+
+        // Remove member succeeds and cleans player_to_guild mapping
+        assert_eq!(mgr.remove_member(member), Ok(GuildRank::Member));
+        assert!(!mgr.player_to_guild.contains_key(&member));
+        assert!(!mgr.get_guild(g1).unwrap().members.contains_key(&member));
+
+        // Member can now join a different guild
+        let leader_b = Guid::new(EntityType::Player, 1, 300);
+        let g2 = mgr.create_guild("Beta", leader_b, 5);
+        assert!(mgr.add_member(g2, member, GuildRank::Officer).is_ok());
     }
 }

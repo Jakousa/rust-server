@@ -120,6 +120,20 @@ impl TickSystem for HealthRegenSystem {
     }
 }
 
+/// Batch tick system that drains queued DamageEvents, applies damage, and emits EntityDiedEvents.
+#[derive(Default)]
+pub struct DamageProcessingSystem;
+
+impl TickSystem for DamageProcessingSystem {
+    fn name(&self) -> &'static str {
+        "DamageProcessingSystem"
+    }
+
+    fn update(&mut self, ctx: &mut TickContext) {
+        let _ = process_damage_events(ctx.events, ctx.entities);
+    }
+}
+
 /// Standalone plugin for combat, health, and attribute systems.
 pub struct CombatPlugin;
 
@@ -133,7 +147,8 @@ impl GameplayPlugin for CombatPlugin {
         ctx.codecs.register::<HealthComponent>("health");
         ctx.codecs.register::<StatsComponent>("stats");
 
-        // 2. Register batch tick system
+        // 2. Register batch tick systems
+        ctx.tick_systems.push(Box::new(DamageProcessingSystem));
         ctx.tick_systems.push(Box::new(HealthRegenSystem));
     }
 }
@@ -408,5 +423,50 @@ mod tests {
             .unwrap()
             .current_hp;
         assert_eq!(def_hp, 75.0); // 100.0 - 25.0 = 75.0
+    }
+
+    #[test]
+    fn test_damage_processing_system_ticks_and_damages_entity() {
+        let mut store = EntityStore::new();
+        let mut queue = EventQueue::new();
+        let mut octree = mmo_core::Octree::new(mmo_core::BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+
+        let attacker = Guid::new(EntityType::Player, 1, 501);
+        let defender = Guid::new(EntityType::Player, 1, 502);
+
+        let _att_key = store.spawn(attacker, (0.0, 0.0, 0.0));
+        let def_key = store.spawn(defender, (5.0, 0.0, 0.0));
+
+        store
+            .get_mut(def_key)
+            .unwrap()
+            .add_component(HealthComponent::new(100.0, 0.0));
+
+        queue.push(DamageEvent {
+            source: attacker,
+            target: defender,
+            raw_damage: 35.0,
+        });
+
+        let mut sys = DamageProcessingSystem;
+        let mut ctx = TickContext {
+            tick: 1,
+            dt_sec: 0.1,
+            entities: &mut store,
+            events: &mut queue,
+            octree: &mut octree,
+        };
+        sys.update(&mut ctx);
+
+        let hp = store
+            .get(def_key)
+            .unwrap()
+            .get_component::<HealthComponent>()
+            .unwrap()
+            .current_hp;
+        assert_eq!(hp, 65.0);
     }
 }

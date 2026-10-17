@@ -161,11 +161,13 @@ impl TickSystem for ScriptTickSystem {
                 ScriptValue::I64(ctx.tick as i64),
                 ScriptValue::F32(ctx.dt_sec),
             ];
-            if let Err(e) = self.runtime.execute_function(
+            if let Err(e) = self.runtime.execute_function_with_tick_context(
                 "world_tick",
                 "on_world_tick",
                 &args,
-                Some(ctx.entities),
+                ctx.entities,
+                ctx.octree,
+                ctx.events,
                 100_000,
             ) {
                 // Log and swallow per-tick script failures to preserve tick deadline

@@ -7,7 +7,9 @@ use crate::combat::HealthComponent;
 
 /// Host execution context passed into guest WASM invocations.
 pub struct HostContext {
-    pub entities_ptr: *mut EntityStore,
+    pub(crate) entities_ptr: *mut EntityStore,
+    pub(crate) octree_ptr: *mut mmo_core::Octree,
+    pub(crate) events_ptr: *mut mmo_core::EventQueue,
     pub logs: Vec<(i32, String)>,
     pub dispatched_events: Vec<(i32, u64, Vec<u8>)>,
 }
@@ -17,6 +19,8 @@ impl HostContext {
     pub fn empty() -> Self {
         Self {
             entities_ptr: std::ptr::null_mut(),
+            octree_ptr: std::ptr::null_mut(),
+            events_ptr: std::ptr::null_mut(),
             logs: Vec::new(),
             dispatched_events: Vec::new(),
         }
@@ -26,6 +30,8 @@ impl HostContext {
     pub fn new(entities: Option<&mut EntityStore>) -> Self {
         Self {
             entities_ptr: entities.map_or(std::ptr::null_mut(), |e| e as *mut EntityStore),
+            octree_ptr: std::ptr::null_mut(),
+            events_ptr: std::ptr::null_mut(),
             logs: Vec::new(),
             dispatched_events: Vec::new(),
         }
@@ -35,6 +41,23 @@ impl HostContext {
     pub fn with_entities(entities: &mut EntityStore) -> Self {
         Self {
             entities_ptr: entities as *mut EntityStore,
+            octree_ptr: std::ptr::null_mut(),
+            events_ptr: std::ptr::null_mut(),
+            logs: Vec::new(),
+            dispatched_events: Vec::new(),
+        }
+    }
+
+    /// Creates a host context bound to an active tick context (entities, octree, events).
+    pub(crate) fn with_tick_context(
+        entities: &mut EntityStore,
+        octree: &mut mmo_core::Octree,
+        events: &mut mmo_core::EventQueue,
+    ) -> Self {
+        Self {
+            entities_ptr: entities as *mut EntityStore,
+            octree_ptr: octree as *mut mmo_core::Octree,
+            events_ptr: events as *mut mmo_core::EventQueue,
             logs: Vec::new(),
             dispatched_events: Vec::new(),
         }
@@ -126,6 +149,9 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
             "env",
             "entity_set_pos",
             |caller: Caller<'_, HostContext>, guid: i64, x: f32, y: f32, z: f32| -> i32 {
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                    return -1;
+                }
                 let entities_ptr = caller.data().entities_ptr;
                 if entities_ptr.is_null() {
                     return -1;
@@ -133,7 +159,17 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
                 let target_guid = Guid::from_raw(guid as u64);
                 let entities = unsafe { &mut *entities_ptr };
                 if let Some(entity) = entities.get_mut_by_guid(target_guid) {
+                    let old_pos = entity.position;
                     entity.position = (x, y, z);
+
+                    let octree_ptr = caller.data().octree_ptr;
+                    if !octree_ptr.is_null() {
+                        let octree = unsafe { &mut *octree_ptr };
+                        if !octree.remove(target_guid, old_pos) {
+                            octree.remove_by_guid(target_guid);
+                        }
+                        octree.insert(target_guid, (x, y, z));
+                    }
                     0
                 } else {
                     -1
@@ -181,12 +217,33 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
                 let entities = unsafe { &mut *entities_ptr };
                 if let Some(entity) = entities.get_mut_by_guid(target_guid) {
                     if let Some(health) = entity.components.get_component_mut::<HealthComponent>() {
-                        if delta < 0 {
-                            health.take_damage((-delta) as f32);
+                        let died = if delta < 0 {
+                            health.take_damage(-(delta as i64) as f32)
                         } else {
                             health.heal(delta as f32);
+                            false
+                        };
+                        let new_hp = health.current_hp;
+
+                        if let Some(attrs) = entity
+                            .components
+                            .get_component_mut::<mmo_core::AttributeSet>()
+                        {
+                            let _ = attrs.set_current("health", new_hp);
                         }
-                        health.current_hp as i32
+
+                        if died {
+                            let events_ptr = caller.data().events_ptr;
+                            if !events_ptr.is_null() {
+                                let events = unsafe { &mut *events_ptr };
+                                events.push(crate::combat::EntityDiedEvent {
+                                    entity: target_guid,
+                                    killer: None,
+                                });
+                            }
+                        }
+
+                        new_hp as i32
                     } else {
                         -1
                     }
