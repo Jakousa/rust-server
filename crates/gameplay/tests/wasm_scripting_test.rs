@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use mmo_core::guid::EntityType;
 use mmo_core::{
-    ComponentCodecRegistry, Entity, EntityStore, Event, EventQueue, Guid, HookDispatcher,
-    ModularPacketRouter, PluginManager, ScriptError, ScriptValue,
+    AttributeSet, BoundingBox3D, ComponentCodecRegistry, Entity, EntityStore, Event, EventQueue,
+    Guid, HookDispatcher, ModularPacketRouter, Octree, PluginManager, ScriptError, ScriptValue,
 };
 use mmo_gameplay::{
-    HealthComponent, ScriptHotReloader, WasmRuntime, WasmScriptEngine, WasmScriptPlugin,
+    combat::EntityDiedEvent, HealthComponent, ScriptHotReloader, WasmRuntime, WasmScriptEngine,
+    WasmScriptPlugin,
 };
 
 #[test]
@@ -323,4 +324,174 @@ fn test_plugin_veto_and_fail_closed_pipeline() {
     );
     assert!(ctx4.is_canceled());
     assert_eq!(ctx4.cancel_reason(), Some("script_error: out of fuel"));
+}
+
+#[test]
+fn test_wasm_entity_set_pos_updates_octree_and_rejects_nan() {
+    let engine = Arc::new(WasmScriptEngine::new().unwrap());
+    let runtime = Arc::new(WasmRuntime::new(engine.clone()).unwrap());
+
+    let mut entities = EntityStore::new();
+    let guid = Guid::new(EntityType::Player, 1, 999);
+    let key = entities.spawn(guid, (10.0, 10.0, 10.0));
+
+    let mut octree = Octree::new(BoundingBox3D::new(
+        (-100.0, -100.0, -100.0),
+        (100.0, 100.0, 100.0),
+    ));
+    octree.insert(guid, (10.0, 10.0, 10.0));
+
+    let mut events = EventQueue::new();
+
+    let wat = r#"
+    (module
+        (import "env" "entity_set_pos" (func $set_pos (param i64 f32 f32 f32) (result i32)))
+        (func (export "teleport") (param i64 f32 f32 f32) (result i32)
+            (call $set_pos (local.get 0) (local.get 1) (local.get 2) (local.get 3))
+        )
+    )
+    "#;
+    engine
+        .load_module("movement", &wat::parse_str(wat).unwrap())
+        .unwrap();
+
+    // 1. NaN coordinate rejection
+    let (res_nan, _) = runtime
+        .execute_function_with_tick_context(
+            "movement",
+            "teleport",
+            &[
+                ScriptValue::I64(guid.raw() as i64),
+                ScriptValue::F32(f32::NAN),
+                ScriptValue::F32(20.0),
+                ScriptValue::F32(30.0),
+            ],
+            &mut entities,
+            &mut octree,
+            &mut events,
+            50_000,
+        )
+        .unwrap();
+    assert_eq!(res_nan, vec![ScriptValue::I32(-1)]);
+    assert_eq!(entities.get(key).unwrap().position, (10.0, 10.0, 10.0));
+
+    // 2. Valid move updates entity position and synchronizes Octree
+    let (res_ok, _) = runtime
+        .execute_function_with_tick_context(
+            "movement",
+            "teleport",
+            &[
+                ScriptValue::I64(guid.raw() as i64),
+                ScriptValue::F32(50.0),
+                ScriptValue::F32(50.0),
+                ScriptValue::F32(50.0),
+            ],
+            &mut entities,
+            &mut octree,
+            &mut events,
+            50_000,
+        )
+        .unwrap();
+    assert_eq!(res_ok, vec![ScriptValue::I32(0)]);
+    assert_eq!(entities.get(key).unwrap().position, (50.0, 50.0, 50.0));
+
+    // Old position in octree is empty, new position contains guid
+    assert!(octree.query_radius((10.0, 10.0, 10.0), 1.0).is_empty());
+    let found = octree.query_radius((50.0, 50.0, 50.0), 1.0);
+    assert_eq!(found, vec![guid]);
+}
+
+#[test]
+fn test_wasm_entity_modify_health_syncs_attributes_and_emits_death() {
+    let engine = Arc::new(WasmScriptEngine::new().unwrap());
+    let runtime = Arc::new(WasmRuntime::new(engine.clone()).unwrap());
+
+    let mut entities = EntityStore::new();
+    let guid = Guid::new(EntityType::Player, 1, 888);
+    let key = entities.spawn(guid, (0.0, 0.0, 0.0));
+
+    let mut attrs = AttributeSet::new();
+    attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+
+    let ent = entities.get_mut(key).unwrap();
+    ent.add_component(HealthComponent::new(100.0, 0.0));
+    ent.add_component(attrs);
+
+    let mut octree = Octree::new(BoundingBox3D::new(
+        (-100.0, -100.0, -100.0),
+        (100.0, 100.0, 100.0),
+    ));
+    let mut events = EventQueue::new();
+
+    let wat = r#"
+    (module
+        (import "env" "entity_modify_health" (func $mod_hp (param i64 i32) (result i32)))
+        (func (export "apply_damage") (param i64 i32) (result i32)
+            (call $mod_hp (local.get 0) (local.get 1))
+        )
+    )
+    "#;
+    engine
+        .load_module("combat_mod", &wat::parse_str(wat).unwrap())
+        .unwrap();
+
+    // 1. Partial damage
+    let (res_dmg, _) = runtime
+        .execute_function_with_tick_context(
+            "combat_mod",
+            "apply_damage",
+            &[ScriptValue::I64(guid.raw() as i64), ScriptValue::I32(-40)],
+            &mut entities,
+            &mut octree,
+            &mut events,
+            50_000,
+        )
+        .unwrap();
+    assert_eq!(res_dmg, vec![ScriptValue::I32(60)]);
+
+    let ent = entities.get(key).unwrap();
+    assert_eq!(
+        ent.get_component::<HealthComponent>().unwrap().current_hp,
+        60.0
+    );
+    assert_eq!(
+        ent.get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap(),
+        60.0
+    );
+    assert!(events.is_empty());
+
+    // 2. Lethal damage -> health 0, AttributeSet 0, emits EntityDiedEvent
+    let (res_lethal, _) = runtime
+        .execute_function_with_tick_context(
+            "combat_mod",
+            "apply_damage",
+            &[ScriptValue::I64(guid.raw() as i64), ScriptValue::I32(-100)],
+            &mut entities,
+            &mut octree,
+            &mut events,
+            50_000,
+        )
+        .unwrap();
+    assert_eq!(res_lethal, vec![ScriptValue::I32(0)]);
+
+    let ent = entities.get(key).unwrap();
+    assert_eq!(
+        ent.get_component::<HealthComponent>().unwrap().current_hp,
+        0.0
+    );
+    assert_eq!(
+        ent.get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap(),
+        0.0
+    );
+
+    let death_events = events.drain::<EntityDiedEvent>();
+    assert_eq!(death_events.len(), 1);
+    assert_eq!(death_events[0].entity, guid);
+    assert_eq!(death_events[0].killer, None);
 }

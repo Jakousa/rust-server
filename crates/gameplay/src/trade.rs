@@ -235,24 +235,67 @@ impl TradeManager {
             .get_component_mut::<InventoryComponent>()
             .ok_or("Player 2 has no inventory")?;
 
-        // 1. Verify capacity for incoming items
-        let free_slots1 = inv1.slots.iter().filter(|s| s.is_none()).count();
-        let free_slots2 = inv2.slots.iter().filter(|s| s.is_none()).count();
-
-        if free_slots1 < session.offer_b.items.len() {
-            return Err("Player 1 has insufficient inventory slots for trade");
+        // 1. Verify currency balances
+        if inv1.currency < session.offer_a.currency {
+            return Err("Player A has insufficient currency");
         }
-        if free_slots2 < session.offer_a.items.len() {
-            return Err("Player 2 has insufficient inventory slots for trade");
+        if inv2.currency < session.offer_b.currency {
+            return Err("Player B has insufficient currency");
         }
 
-        // 2. Perform atomic transfer
+        // 2. Verify item ownership and remove offered items on cloned staging inventories
+        let mut test_inv1 = inv1.clone();
+        let mut test_inv2 = inv2.clone();
+
         for item in &session.offer_a.items {
-            let _ = inv2.add_item(item.clone());
+            if !test_inv1.remove_item_stack(item) {
+                return Err("Player A no longer possesses offered item");
+            }
         }
         for item in &session.offer_b.items {
-            let _ = inv1.add_item(item.clone());
+            if !test_inv2.remove_item_stack(item) {
+                return Err("Player B no longer possesses offered item");
+            }
         }
+
+        // 3. Verify weight limits
+        let weight_a_to_b: f32 = session.offer_a.items.iter().map(|i| i.total_weight()).sum();
+        let weight_b_to_a: f32 = session.offer_b.items.iter().map(|i| i.total_weight()).sum();
+
+        if test_inv1.current_weight() + weight_b_to_a > test_inv1.max_weight {
+            return Err("Player A would exceed max weight");
+        }
+        if test_inv2.current_weight() + weight_a_to_b > test_inv2.max_weight {
+            return Err("Player B would exceed max weight");
+        }
+
+        // 4. Verify slot capacities and add incoming items
+        for item in &session.offer_b.items {
+            if test_inv1.add_item(item.clone()).is_err() {
+                return Err("Player A has insufficient inventory slots for trade");
+            }
+        }
+        for item in &session.offer_a.items {
+            if test_inv2.add_item(item.clone()).is_err() {
+                return Err("Player B has insufficient inventory slots for trade");
+            }
+        }
+
+        // 5. Settle currency
+        test_inv1.currency = test_inv1
+            .currency
+            .checked_sub(session.offer_a.currency)
+            .and_then(|c| c.checked_add(session.offer_b.currency))
+            .ok_or("Currency overflow")?;
+        test_inv2.currency = test_inv2
+            .currency
+            .checked_sub(session.offer_b.currency)
+            .and_then(|c| c.checked_add(session.offer_a.currency))
+            .ok_or("Currency overflow")?;
+
+        // 6. Commit verified state back to entity components
+        *inv1 = test_inv1;
+        *inv2 = test_inv2;
 
         session.completed = true;
         let completed_event = TradeCompletedEvent {
@@ -296,12 +339,12 @@ mod tests {
         let k2 = store.spawn(p2, (2.0, 0.0, 0.0)); // 2m distance (< 5m)
 
         // Give both players inventories
-        let mut inv1 = InventoryComponent::new(4, 100.0);
+        let mut inv1 = InventoryComponent::new(4, 100.0).with_currency(100);
         let sword = ItemStack::new(10, "Excalibur", 1, 10.0);
         inv1.add_item(sword.clone()).unwrap();
         store.get_mut(k1).unwrap().add_component(inv1);
 
-        let mut inv2 = InventoryComponent::new(4, 100.0);
+        let mut inv2 = InventoryComponent::new(4, 100.0).with_currency(0);
         let shield = ItemStack::new(20, "Aegis Shield", 1, 12.0);
         inv2.add_item(shield.clone()).unwrap();
         store.get_mut(k2).unwrap().add_component(inv2);
@@ -369,9 +412,151 @@ mod tests {
             .get_component::<InventoryComponent>()
             .unwrap();
 
-        // Verify Player 1 now has shield and Player 2 has sword
-        assert_eq!(p1_inv.slots[1], Some(shield));
-        assert_eq!(p2_inv.slots[1], Some(sword));
+        // Verify Player 1 now has shield and Player 2 has sword (no duplication)
+        assert_eq!(p1_inv.slots[0], Some(shield));
+        assert_eq!(p1_inv.slots[1], None);
+        assert_eq!(p1_inv.currency, 50);
+
+        assert_eq!(p2_inv.slots[0], Some(sword));
+        assert_eq!(p2_inv.slots[1], None);
+        assert_eq!(p2_inv.currency, 50);
+    }
+
+    #[test]
+    fn test_trade_fails_when_offered_item_missing() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 100);
+        let p2 = Guid::new(EntityType::Player, 1, 200);
+
+        let k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (2.0, 0.0, 0.0));
+
+        let inv1 = InventoryComponent::new(4, 100.0);
+        store.get_mut(k1).unwrap().add_component(inv1);
+
+        let mut inv2 = InventoryComponent::new(4, 100.0);
+        let shield = ItemStack::new(20, "Shield", 1, 5.0);
+        inv2.add_item(shield.clone()).unwrap();
+        store.get_mut(k2).unwrap().add_component(inv2);
+
+        let mut trade_mgr = TradeManager::new();
+        let session_id = trade_mgr.start_session(p1, p2, &store).unwrap();
+
+        // Player A offers a sword they do not have
+        let phantom_sword = ItemStack::new(10, "Ghost Sword", 1, 5.0);
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(
+                p1,
+                TradeOffer {
+                    items: vec![phantom_sword],
+                    currency: 0,
+                },
+            )
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(
+                p2,
+                TradeOffer {
+                    items: vec![shield],
+                    currency: 0,
+                },
+            )
+            .unwrap();
+
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p1)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p2)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p1)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p2)
+            .unwrap();
+
+        let res = trade_mgr.execute_atomic_swap(session_id, &mut store);
+        assert_eq!(res, Err("Player A no longer possesses offered item"));
+    }
+
+    #[test]
+    fn test_trade_fails_when_insufficient_currency() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 100);
+        let p2 = Guid::new(EntityType::Player, 1, 200);
+
+        let k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (2.0, 0.0, 0.0));
+
+        let inv1 = InventoryComponent::new(4, 100.0).with_currency(10);
+        store.get_mut(k1).unwrap().add_component(inv1);
+
+        let inv2 = InventoryComponent::new(4, 100.0).with_currency(100);
+        store.get_mut(k2).unwrap().add_component(inv2);
+
+        let mut trade_mgr = TradeManager::new();
+        let session_id = trade_mgr.start_session(p1, p2, &store).unwrap();
+
+        // Player A offers 50 currency but only has 10
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(
+                p1,
+                TradeOffer {
+                    items: vec![],
+                    currency: 50,
+                },
+            )
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .set_offer(
+                p2,
+                TradeOffer {
+                    items: vec![],
+                    currency: 10,
+                },
+            )
+            .unwrap();
+
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p1)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .lock(p2)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p1)
+            .unwrap();
+        trade_mgr
+            .get_session_mut(session_id)
+            .unwrap()
+            .accept(p2)
+            .unwrap();
+
+        let res = trade_mgr.execute_atomic_swap(session_id, &mut store);
+        assert_eq!(res, Err("Player A has insufficient currency"));
     }
 
     #[test]

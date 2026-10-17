@@ -104,37 +104,55 @@ pub fn execute_or_start_ability(
     entities: &mut EntityStore,
     events: &mut EventQueue,
 ) -> Result<bool, &'static str> {
+    // 1. Target & Range Check before mutating any caster state
+    if let Some(target) = target_guid {
+        let caster_pos = entities
+            .get_by_guid(entity_guid)
+            .ok_or("Entity not found in store")?
+            .position;
+        let target_pos = entities
+            .get_by_guid(target)
+            .ok_or("Target entity not found in store")?
+            .position;
+
+        if ability.range > 0.0 {
+            let dx = target_pos.0 - caster_pos.0;
+            let dy = target_pos.1 - caster_pos.1;
+            let dz = target_pos.2 - caster_pos.2;
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            if dist_sq > ability.range * ability.range {
+                return Err("Target is out of range");
+            }
+        }
+    }
+
     let entity = entities
         .get_mut_by_guid(entity_guid)
         .ok_or("Entity not found in store")?;
 
-    // 1. Check cooldowns
+    // 2. Check cooldowns
     if let Some(cd) = entity.get_component::<CooldownTracker>() {
         if cd.is_on_cooldown(ability.id) {
             return Err("Ability is currently on cooldown");
         }
     }
 
-    // 2. Check and deduct resource cost
+    // 3. Pre-validate resource cost (read-only)
     if let Some((ref resource_name, cost)) = ability.resource_cost {
-        if let Some(attrs) = entity.get_component_mut::<AttributeSet>() {
-            let current = attrs
-                .get_current(resource_name)
-                .ok_or("Required resource attribute not found on entity")?;
-            if current < cost {
-                return Err("Insufficient resource to activate ability");
-            }
-            attrs.modify_current(resource_name, -cost)?;
+        let attrs = entity
+            .get_component::<AttributeSet>()
+            .ok_or("Required resource attribute not found on entity")?;
+        let current = attrs
+            .get_current(resource_name)
+            .ok_or("Required resource attribute not found on entity")?;
+        if current < cost {
+            return Err("Insufficient resource to activate ability");
         }
     }
 
-    // 3. Trigger cooldowns
-    if let Some(cd) = entity.get_component_mut::<CooldownTracker>() {
-        cd.start_cooldown(ability.id, ability.cooldown_sec, ability.gcd_sec);
-    }
-
-    // 4. Handle cast time vs instant execution
-    if ability.cast_time_sec > 0.0 {
+    // 4. Validate and start ActionQueue BEFORE deducting resources/cooldowns
+    let is_instant = ability.cast_time_sec <= 0.0;
+    if !is_instant {
         let timed_action = TimedAction::new(
             ability.id,
             ability.cast_time_sec,
@@ -146,15 +164,33 @@ pub fn execute_or_start_ability(
             .get_component_mut::<ActionQueue>()
             .ok_or("Entity does not have an ActionQueue component")?;
         queue.start_action(entity_guid, timed_action, QueuePolicy::RejectIfBusy, events)?;
-        Ok(false) // Cast in progress
-    } else {
-        // Instant execution
+    } else if let Some(queue) = entity.get_component::<ActionQueue>() {
+        if queue.is_busy() {
+            return Err("Entity is currently busy with an active action");
+        }
+    }
+
+    // 5. Deduct resource cost now that ActionQueue has succeeded
+    if let Some((ref resource_name, cost)) = ability.resource_cost {
+        if let Some(attrs) = entity.get_component_mut::<AttributeSet>() {
+            attrs.modify_current(resource_name, -cost)?;
+        }
+    }
+
+    // 6. Trigger cooldowns
+    if let Some(cd) = entity.get_component_mut::<CooldownTracker>() {
+        cd.start_cooldown(ability.id, ability.cooldown_sec, ability.gcd_sec);
+    }
+
+    if is_instant {
         events.push(AbilityExecutedEvent {
             entity: entity_guid,
             ability_id: ability.id,
             target: target_guid,
         });
-        Ok(true) // Instant completion
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -563,5 +599,98 @@ mod tests {
             res.unwrap_err(),
             "Non-finite coordinates provided for line of sight"
         );
+    }
+
+    #[test]
+    fn test_ability_out_of_range_preserves_mana_and_cooldown() {
+        let mut entities = EntityStore::new();
+        let mut events = EventQueue::new();
+        let caster = Guid(10);
+        let target = Guid(20);
+
+        let k_c = entities.spawn(caster, (0.0, 0.0, 0.0));
+        let _k_t = entities.spawn(target, (50.0, 0.0, 0.0)); // 50m away
+
+        let mut attrs = AttributeSet::new();
+        attrs.add_attribute("mana", 100.0, 0.0, 100.0, 0.0);
+        entities.get_mut(k_c).unwrap().add_component(attrs);
+        entities
+            .get_mut(k_c)
+            .unwrap()
+            .add_component(CooldownTracker::new());
+
+        let ability = AbilityDefinition {
+            id: 99,
+            name: "ShortRangeBlast".into(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 5.0,
+            gcd_sec: 1.5,
+            range: 30.0, // max 30m
+            resource_cost: Some(("mana".into(), 40.0)),
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        let res =
+            execute_or_start_ability(caster, &ability, Some(target), &mut entities, &mut events);
+        assert_eq!(res, Err("Target is out of range"));
+
+        let ent = entities.get_by_guid(caster).unwrap();
+        let mana = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("mana")
+            .unwrap();
+        assert_eq!(mana, 100.0); // 100% mana preserved
+
+        let cd = ent.get_component::<CooldownTracker>().unwrap();
+        assert!(!cd.is_on_cooldown(99)); // No cooldown triggered
+    }
+
+    #[test]
+    fn test_ability_busy_queue_preserves_mana_and_cooldown() {
+        let mut entities = EntityStore::new();
+        let mut events = EventQueue::new();
+        let caster = Guid(11);
+
+        let k_c = entities.spawn(caster, (0.0, 0.0, 0.0));
+
+        let mut attrs = AttributeSet::new();
+        attrs.add_attribute("energy", 100.0, 0.0, 100.0, 0.0);
+        let mut queue = ActionQueue::new();
+        let dummy_action = TimedAction::new(1, 10.0, ActionInterruptFlags::default(), None);
+        queue
+            .start_action(caster, dummy_action, QueuePolicy::RejectIfBusy, &mut events)
+            .unwrap();
+
+        let ent = entities.get_mut(k_c).unwrap();
+        ent.add_component(attrs);
+        ent.add_component(queue);
+        ent.add_component(CooldownTracker::new());
+
+        let instant_ability = AbilityDefinition {
+            id: 101,
+            name: "InstantSlash".into(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 3.0,
+            gcd_sec: 1.0,
+            range: 5.0,
+            resource_cost: Some(("energy".into(), 30.0)),
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        let res =
+            execute_or_start_ability(caster, &instant_ability, None, &mut entities, &mut events);
+        assert_eq!(res, Err("Entity is currently busy with an active action"));
+
+        let ent = entities.get_by_guid(caster).unwrap();
+        let energy = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("energy")
+            .unwrap();
+        assert_eq!(energy, 100.0); // 100% energy preserved
+
+        let cd = ent.get_component::<CooldownTracker>().unwrap();
+        assert!(!cd.is_on_cooldown(101)); // No cooldown triggered
     }
 }

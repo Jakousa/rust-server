@@ -36,12 +36,40 @@ impl WasmRuntime {
         entities: Option<&mut EntityStore>,
         fuel_limit: u64,
     ) -> Result<(Vec<ScriptValue>, u64), ScriptError> {
+        let host_ctx = HostContext::new(entities);
+        self.execute_function_internal(module_id, func_name, args, host_ctx, fuel_limit)
+    }
+
+    /// Executes an exported function with full tick context (entities, octree, and events).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_function_with_tick_context(
+        &self,
+        module_id: &str,
+        func_name: &str,
+        args: &[ScriptValue],
+        entities: &mut EntityStore,
+        octree: &mut mmo_core::Octree,
+        events: &mut mmo_core::EventQueue,
+        fuel_limit: u64,
+    ) -> Result<(Vec<ScriptValue>, u64), ScriptError> {
+        let host_ctx = HostContext::with_tick_context(entities, octree, events);
+        self.execute_function_internal(module_id, func_name, args, host_ctx, fuel_limit)
+    }
+
+    fn execute_function_internal(
+        &self,
+        module_id: &str,
+        func_name: &str,
+        args: &[ScriptValue],
+        host_ctx: HostContext,
+        fuel_limit: u64,
+    ) -> Result<(Vec<ScriptValue>, u64), ScriptError> {
         let module = self
             .engine
             .get_module(module_id)
             .ok_or_else(|| ScriptError::ModuleNotFound(module_id.to_string()))?;
 
-        let mut store = Store::new(self.engine.engine(), HostContext::new(entities));
+        let mut store = Store::new(self.engine.engine(), host_ctx);
         store
             .set_fuel(fuel_limit)
             .map_err(|e| ScriptError::ExecutionError(format!("Failed to set fuel: {e}")))?;
