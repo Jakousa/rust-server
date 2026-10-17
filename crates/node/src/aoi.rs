@@ -386,13 +386,23 @@ impl AoiManager {
         }
     }
 
-    /// Registers a new player session as an AoI observer.
+    /// Registers a new player session as an AoI observer, evicting any previous session for this player.
     pub fn register_observer(
         &mut self,
         session_id: u64,
         player_guid: Guid,
         config: ObserverConfig,
     ) {
+        if let Some(old_session_id) = self.guid_to_session.get(&player_guid).copied() {
+            if old_session_id != session_id {
+                self.observers.remove(&old_session_id);
+            }
+        }
+        if let Some(old_obs) = self.observers.remove(&session_id) {
+            if old_obs.player_guid != player_guid {
+                self.guid_to_session.remove(&old_obs.player_guid);
+            }
+        }
         let observer = ObserverState::new(session_id, player_guid, config);
         self.observers.insert(session_id, observer);
         self.guid_to_session.insert(player_guid, session_id);
@@ -1697,5 +1707,29 @@ mod tests {
             1,
             "Rate-limited refresh emitted after full_refresh_interval_ticks"
         );
+    }
+
+    #[test]
+    fn test_register_observer_evicts_old_session_on_takeover() {
+        let mut aoi = AoiManager::new();
+        let player_guid = make_guid(1234);
+
+        aoi.register_observer(10, player_guid, ObserverConfig::default());
+        assert_eq!(aoi.observers.len(), 1);
+        assert!(aoi.get_observer(10).is_some());
+        assert_eq!(aoi.guid_to_session.get(&player_guid), Some(&10));
+
+        // Reconnect / handover with session 20
+        aoi.register_observer(20, player_guid, ObserverConfig::default());
+        assert_eq!(aoi.observers.len(), 1);
+        assert!(
+            aoi.get_observer(10).is_none(),
+            "Old session 10 must be evicted"
+        );
+        assert!(
+            aoi.get_observer(20).is_some(),
+            "New session 20 must be active"
+        );
+        assert_eq!(aoi.guid_to_session.get(&player_guid), Some(&20));
     }
 }

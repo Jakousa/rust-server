@@ -5,6 +5,7 @@
 
 pub mod ability_dispatcher;
 pub mod aoi;
+pub mod combat_pipeline;
 pub mod history;
 pub mod instance;
 pub mod kinematics;
@@ -19,6 +20,7 @@ pub use ability_dispatcher::{
     CrossNodeDispatcher, DEFAULT_DISPATCH_TIMEOUT,
 };
 pub use aoi::{AoiBroadcastJob, AoiManager, CachedEntityState, ObserverConfig, ObserverState};
+pub use combat_pipeline::{apply_combat_effect, CombatEffectOutcome};
 pub use history::{
     HistoricalEntityRecord, HistoricalHitResult, HistoricalQueryError, HistoricalTickFrame,
     SpatialHistoryBuffer,

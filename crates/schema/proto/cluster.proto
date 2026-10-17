@@ -417,6 +417,7 @@ message ForwardClientPacketRequest {
   uint64 session_id = 1;
   uint64 guid = 2;
   bytes packet_data = 3;
+  uint64 session_epoch = 4;
 }
 
 message ForwardClientPacketResponse {

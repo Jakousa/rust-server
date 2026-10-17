@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     session_id: packet.session_id,
                                     guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
                                     packet_data: packet.packet.encode(),
+                                    session_epoch: 0,
                                 };
                                 match client.forward_client_packet(req).await {
                                     Ok(_) => ch_clone.record_success(),

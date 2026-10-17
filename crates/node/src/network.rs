@@ -866,6 +866,51 @@ impl NodeService for NodeServiceImpl {
                 );
                 async move {
                     let guid = Guid::from_raw(req.guid);
+                    if let mmo_schema::client::ClientPacket::ClientAck(ack) = packet {
+                        let sim = self.sim.read().await;
+                        if !sim.is_valid_upstream_epoch(guid, req.session_epoch) {
+                            metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+                            return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                success: false,
+                                error_message: format!(
+                                    "Stale session epoch {} < authoritative epoch",
+                                    req.session_epoch
+                                ),
+                            }));
+                        }
+                        sim.queue_client_ack(ack);
+                        return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: true,
+                            error_message: String::new(),
+                        }));
+                    }
+
+                    let mut sim = self.sim.write().await;
+                    if !sim.is_valid_upstream_epoch(guid, req.session_epoch) {
+                        metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+                        return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: false,
+                            error_message: format!(
+                                "Stale session epoch {} < authoritative epoch",
+                                req.session_epoch
+                            ),
+                        }));
+                    }
+
+                    if !sim.entity_store.contains_guid(guid) {
+                        return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: false,
+                            error_message: format!("Entity {} not found on node", guid),
+                        }));
+                    }
+
+                    if sim.is_migrating(guid) {
+                        return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                            success: false,
+                            error_message: format!("Entity {} is migrating", guid),
+                        }));
+                    }
+
                     match packet {
                         mmo_schema::client::ClientPacket::Movement(m) => {
                             // Anti-spoofing check
@@ -873,97 +918,230 @@ impl NodeService for NodeServiceImpl {
                                 tracing::warn!("Spoofed movement entity_id rejected");
                                 metrics::counter!("mmo_node_spoofed_packets_dropped_total")
                                     .increment(1);
-                            return Ok(tonic::Response::new(ForwardClientPacketResponse {
-                                success: false,
-                                error_message: "Entity ID mismatch in movement packet".to_string(),
-                            }));
-                        }
+                                return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: false,
+                                    error_message: "Entity ID mismatch in movement packet".to_string(),
+                                }));
+                            }
 
-                        let mut sim = self.sim.write().await;
-                        match sim.process_client_move_with_seq(
-                            guid,
-                            (m.position.x, m.position.y, m.position.z),
-                            m.sequence,
-                        ) {
-                            Ok(_) => {
-                                metrics::counter!("mmo_node_client_movements_processed_total")
+                            match sim.process_client_move_with_seq(
+                                guid,
+                                (m.position.x, m.position.y, m.position.z),
+                                m.sequence,
+                            ) {
+                                Ok(_) => {
+                                    metrics::counter!("mmo_node_client_movements_processed_total")
+                                        .increment(1);
+                                    Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                        success: true,
+                                        error_message: String::new(),
+                                    }))
+                                }
+                                Err(snap_back) => {
+                                    // Anti-Cheat / Kinematic / Collision snapback
+                                    let correction = mmo_schema::client::MovementCorrectionPacket {
+                                        entity_id: guid.raw(),
+                                        corrected_position: mmo_schema::client::Vec3::new(
+                                            snap_back.0,
+                                            snap_back.1,
+                                            snap_back.2,
+                                        ),
+                                        corrected_velocity: mmo_schema::client::Vec3::new(
+                                            0.0, 0.0, 0.0,
+                                        ),
+                                        sequence: m.sequence,
+                                        reason: mmo_schema::client::MovementCorrectionReason::KinematicViolation.into(),
+                                    };
+                                    sim.pending_broadcast_jobs
+                                        .push(crate::aoi::AoiBroadcastJob {
+                                            session_id: req.session_id,
+                                            player_guid: guid,
+                                            packets: vec![
+                                                mmo_schema::client::ClientPacket::MovementCorrection(
+                                                    correction,
+                                                ),
+                                            ],
+                                        });
+                                    metrics::counter!("mmo_node_movement_corrections_total")
+                                        .increment(1);
+                                    Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                        success: false,
+                                        error_message: "Movement corrected".to_string(),
+                                    }))
+                                }
+                            }
+                        }
+                        mmo_schema::client::ClientPacket::PlaceObject(po) => {
+                            match sim.handle_place_object(guid, &po) {
+                                Ok(_) => {
+                                    metrics::counter!("mmo_node_place_object_success_total")
+                                        .increment(1);
+                                    Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                        success: true,
+                                        error_message: String::new(),
+                                    }))
+                                }
+                                Err(e) => {
+                                    metrics::counter!("mmo_node_place_object_failed_total")
+                                        .increment(1);
+                                    Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                        success: false,
+                                        error_message: e.to_string(),
+                                    }))
+                                }
+                            }
+                        }
+                        mmo_schema::client::ClientPacket::InteractObject(io) => {
+                            if sim.handle_interact_object(guid, &io) {
+                                metrics::counter!("mmo_node_interact_object_success_total")
                                     .increment(1);
                                 Ok(tonic::Response::new(ForwardClientPacketResponse {
                                     success: true,
                                     error_message: String::new(),
                                 }))
-                            }
-                            Err(snap_back) => {
-                                // Anti-Cheat / Kinematic / Collision snapback
-                                let correction = mmo_schema::client::MovementCorrectionPacket {
-                                    entity_id: guid.raw(),
-                                    corrected_position: mmo_schema::client::Vec3::new(
-                                        snap_back.0,
-                                        snap_back.1,
-                                        snap_back.2,
-                                    ),
-                                    corrected_velocity: mmo_schema::client::Vec3::new(
-                                        0.0, 0.0, 0.0,
-                                    ),
-                                    sequence: m.sequence,
-                                    reason: mmo_schema::client::MovementCorrectionReason::KinematicViolation.into(),
-                                };
-                                sim.pending_broadcast_jobs
-                                    .push(crate::aoi::AoiBroadcastJob {
-                                        session_id: req.session_id,
-                                        player_guid: guid,
-                                        packets: vec![
-                                            mmo_schema::client::ClientPacket::MovementCorrection(
-                                                correction,
-                                            ),
-                                        ],
-                                    });
-                                metrics::counter!("mmo_node_movement_corrections_total")
+                            } else {
+                                metrics::counter!("mmo_node_interact_object_failed_total")
                                     .increment(1);
                                 Ok(tonic::Response::new(ForwardClientPacketResponse {
                                     success: false,
-                                    error_message: "Movement corrected".to_string(),
+                                    error_message: "Interaction failed or vetoed".to_string(),
                                 }))
                             }
                         }
-                    }
-                    mmo_schema::client::ClientPacket::ClientAck(ack) => {
-                        let sim = self.sim.read().await;
-                        sim.queue_client_ack(ack);
-                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                        mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
+                            if let Some(spawn) = sim.handle_world_object_resync(guid, &resync) {
+                                sim.pending_broadcast_jobs.push(crate::aoi::AoiBroadcastJob {
+                                    session_id: req.session_id,
+                                    player_guid: guid,
+                                    packets: vec![
+                                        mmo_schema::client::ClientPacket::WorldObjectSpawn(spawn),
+                                    ],
+                                });
+                                metrics::counter!("mmo_node_world_object_resync_success_total")
+                                    .increment(1);
+                                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: true,
+                                    error_message: String::new(),
+                                }))
+                            } else {
+                                metrics::counter!("mmo_node_world_object_resync_dropped_total")
+                                    .increment(1);
+                                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: false,
+                                    error_message: "World object not found or rate limited".to_string(),
+                                }))
+                            }
+                        }
+                        mmo_schema::client::ClientPacket::Interaction(interact) => {
+                            if req.guid != 0
+                                && interact.source_guid != 0
+                                && interact.source_guid != req.guid
+                            {
+                                tracing::warn!("Spoofed interaction source_guid rejected");
+                                metrics::counter!("mmo_node_spoofed_packets_dropped_total")
+                                    .increment(1);
+                                return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: false,
+                                    error_message: "Spoofed source_guid in interaction packet".to_string(),
+                                }));
+                            }
+
+                            let (module_id, sub_opcode) = if interact.action_id > 0xFFFF {
+                                (
+                                    (interact.action_id >> 16) as u16,
+                                    (interact.action_id & 0xFFFF) as u16,
+                                )
+                            } else {
+                                (
+                                    interact.action_id as u16,
+                                    match interact.interaction_type {
+                                        mmo_schema::client::InteractionType::Custom(sub) => {
+                                            sub as u16
+                                        }
+                                        _ => 0,
+                                    },
+                                )
+                            };
+
+                            let sim = &mut *sim;
+                            if sim.packets.has_module(module_id) {
+                                match sim.packets.dispatch(
+                                    module_id,
+                                    sub_opcode,
+                                    guid,
+                                    &interact.payload,
+                                    &mut sim.entity_store,
+                                ) {
+                                    Ok(response_payload) => {
+                                        if let Some(payload) = response_payload {
+                                            sim.pending_broadcast_jobs.push(
+                                                crate::aoi::AoiBroadcastJob {
+                                                    session_id: req.session_id,
+                                                    player_guid: guid,
+                                                    packets: vec![
+                                                        mmo_schema::client::ClientPacket::InteractionResult(
+                                                            mmo_schema::client::InteractionResultPacket {
+                                                                action_id: interact.action_id,
+                                                                success: true,
+                                                                error_code: 0,
+                                                                payload,
+                                                            },
+                                                        ),
+                                                    ],
+                                                },
+                                            );
+                                        }
+                                        metrics::counter!("mmo_node_modular_packet_success_total")
+                                            .increment(1);
+                                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                            success: true,
+                                            error_message: String::new(),
+                                        }))
+                                    }
+                                    Err(e) => {
+                                        metrics::counter!("mmo_node_modular_packet_error_total")
+                                            .increment(1);
+                                        Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                            success: false,
+                                            error_message: e.to_string(),
+                                        }))
+                                    }
+                                }
+                            } else {
+                                let target = Guid::from_raw(interact.target_guid);
+                                let ctx = sim.hooks.dispatch_with_entities(
+                                    &mmo_core::Event::BeforeInteract {
+                                        initiator: guid,
+                                        target,
+                                        action_id: interact.action_id,
+                                    },
+                                    &mut sim.entity_store,
+                                );
+                                if ctx.is_canceled() {
+                                    return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                        success: false,
+                                        error_message: "Interaction canceled by plugin hook".to_string(),
+                                    }));
+                                }
+                                sim.hooks.dispatch_with_entities(
+                                    &mmo_core::Event::OnInteract {
+                                        initiator: guid,
+                                        target,
+                                        action_id: interact.action_id,
+                                    },
+                                    &mut sim.entity_store,
+                                );
+                                Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                    success: true,
+                                    error_message: String::new(),
+                                }))
+                            }
+                        }
+                        _ => Ok(tonic::Response::new(ForwardClientPacketResponse {
                             success: true,
                             error_message: String::new(),
-                        }))
+                        })),
                     }
-                    mmo_schema::client::ClientPacket::PlaceObject(po) => {
-                        let mut sim = self.sim.write().await;
-                        let _ = sim.handle_place_object(guid, &po);
-                        Ok(tonic::Response::new(ForwardClientPacketResponse {
-                            success: true,
-                            error_message: String::new(),
-                        }))
-                    }
-                    mmo_schema::client::ClientPacket::InteractObject(io) => {
-                        let sim = self.sim.read().await;
-                        let _ = sim.handle_interact_object(guid, &io);
-                        Ok(tonic::Response::new(ForwardClientPacketResponse {
-                            success: true,
-                            error_message: String::new(),
-                        }))
-                    }
-                    mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
-                        let mut sim = self.sim.write().await;
-                        sim.handle_world_object_resync(guid, &resync);
-                        Ok(tonic::Response::new(ForwardClientPacketResponse {
-                            success: true,
-                            error_message: String::new(),
-                        }))
-                    }
-                    _ => Ok(tonic::Response::new(ForwardClientPacketResponse {
-                        success: true,
-                        error_message: String::new(),
-                    })),
-                }
                 }
                 .instrument(span)
                 .await
@@ -1065,79 +1243,34 @@ pub fn execute_remote_ability(
         }
     }
 
-    // 4. Alive check
-    if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
-        if health.is_dead {
+    // 4. Alive check & Apply effects via unified combat pipeline
+    let outcome = match crate::combat_pipeline::apply_combat_effect(
+        entity,
+        target_guid,
+        Some(caster_guid),
+        damage,
+        healing,
+        &mut sim.event_queue,
+    ) {
+        Ok(out) => out,
+        Err(err) => {
             return RemoteAbilityResponse {
                 success: false,
                 error_code: RemoteAbilityErrorCode::RemoteAbilityTargetDead as i32,
-                error_message: format!("Target entity {} is dead", target_guid),
+                error_message: format!("Target entity {} is dead: {}", target_guid, err),
                 target_guid: target_guid.raw(),
                 current_health: 0,
                 cast_id,
             };
         }
-    }
-
-    // 5. Apply effects
-    let mut current_health = 0u32;
-    if damage > 0 {
-        let effective_damage =
-            if let Some(stats) = entity.get_component::<mmo_gameplay::combat::StatsComponent>() {
-                stats.mitigate_damage(damage as f32)
-            } else {
-                damage as f32
-            };
-
-        let mut died = false;
-        if let Some(health) = entity.get_component_mut::<mmo_gameplay::HealthComponent>() {
-            died = health.take_damage(effective_damage);
-            current_health = health.current_hp.round() as u32;
-        }
-
-        if died {
-            sim.event_queue.push(mmo_gameplay::combat::EntityDiedEvent {
-                entity: target_guid,
-                killer: Some(caster_guid),
-            });
-        }
-
-        // Interrupt active action if configured with cancel_on_damage
-        if let Some(queue) = entity.get_component_mut::<mmo_core::ActionQueue>() {
-            let should_interrupt = queue
-                .current()
-                .map(|a| a.interrupt_flags.cancel_on_damage)
-                .unwrap_or(false);
-            if should_interrupt {
-                queue.interrupt(
-                    target_guid,
-                    mmo_core::InterruptReason::Damage,
-                    &mut sim.event_queue,
-                );
-            }
-        }
-
-        if let Some(attrs) = entity.get_component_mut::<mmo_core::AttributeSet>() {
-            let _ = attrs.modify_current("health", -effective_damage);
-        }
-    } else if healing > 0 {
-        if let Some(health) = entity.get_component_mut::<mmo_gameplay::HealthComponent>() {
-            health.heal(healing as f32);
-            current_health = health.current_hp.round() as u32;
-        }
-        if let Some(attrs) = entity.get_component_mut::<mmo_core::AttributeSet>() {
-            let _ = attrs.modify_current("health", healing as f32);
-        }
-    } else if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
-        current_health = health.current_hp.round() as u32;
-    }
+    };
 
     RemoteAbilityResponse {
         success: true,
         error_code: RemoteAbilityErrorCode::RemoteAbilitySuccess as i32,
         error_message: String::new(),
         target_guid: target_guid.raw(),
-        current_health,
+        current_health: outcome.current_health,
         cast_id,
     }
 }
@@ -1269,6 +1402,11 @@ pub async fn execute_entity_migration(
         let mut sim_guard = sim.write().await;
         sim_guard.release_migration_lease(guid);
         sim_guard.kinematic_states.remove(&guid);
+        sim_guard.last_migration_ticks.remove(&guid);
+        sim_guard.session_epochs.remove(&guid);
+        sim_guard.aoi.unregister_by_guid(guid);
+        sim_guard.sectors.clear_rate_limit(guid);
+        sim_guard.instances.remove_entity(guid);
         if session_id != 0 {
             sim_guard.unregister_aoi_observer(session_id);
         }
@@ -1451,6 +1589,11 @@ pub async fn execute_batch_entity_migration(
         for &guid in guids {
             sim_guard.release_migration_lease(guid);
             sim_guard.kinematic_states.remove(&guid);
+            sim_guard.last_migration_ticks.remove(&guid);
+            sim_guard.session_epochs.remove(&guid);
+            sim_guard.aoi.unregister_by_guid(guid);
+            sim_guard.sectors.clear_rate_limit(guid);
+            sim_guard.instances.remove_entity(guid);
             if let Some((_, sid)) = session_updates.iter().find(|(g, _)| *g == guid) {
                 if *sid != 0 {
                     sim_guard.unregister_aoi_observer(*sid);
@@ -1708,6 +1851,7 @@ mod tests {
     use mmo_core::guid::EntityType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::RwLock;
     use tokio_stream::wrappers::TcpListenerStream;
 
     fn test_bounds() -> BoundingBox3D {
@@ -2950,6 +3094,240 @@ mod tests {
             let notif = s.container_transfer_receiver.try_recv().unwrap();
             assert_eq!(notif.tx_id, "tx_grpc_abort");
             assert!(!notif.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_epoch_fencing() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let guid = Guid::new(EntityType::Player, 1, 42);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(guid, (0.0, 0.0, 0.0));
+            s.session_epochs.insert(guid, 2);
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        let move_pkt =
+            mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
+                entity_id: guid.raw(),
+                position: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                timestamp: 100,
+                sequence: 1,
+            });
+
+        // Stale epoch 1 (less than authoritative epoch 2)
+        let resp_stale = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 1,
+                guid: guid.raw(),
+                packet_data: move_pkt.encode(),
+                session_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_stale.success);
+        assert!(resp_stale.error_message.contains("Stale session epoch"));
+
+        // Current epoch 2 succeeds
+        let resp_ok = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 1,
+                guid: guid.raw(),
+                packet_data: move_pkt.encode(),
+                session_epoch: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp_ok.success);
+    }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_place_object_error() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let guid = Guid::new(EntityType::Player, 1, 50);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(guid, (0.0, 0.0, 0.0));
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        // Invalid placement with NaN coordinate
+        let place_pkt =
+            mmo_schema::client::ClientPacket::PlaceObject(mmo_schema::client::PlaceObjectPacket {
+                prefab_id: 1,
+                pos: mmo_schema::client::Vec3::new(f32::NAN, 0.0, 0.0),
+                rot: (0.0, 0.0, 0.0, 1.0),
+                scale: mmo_schema::client::Vec3::new(1.0, 1.0, 1.0),
+                properties: std::collections::HashMap::new(),
+            });
+
+        let resp = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 1,
+                guid: guid.raw(),
+                packet_data: place_pkt.encode(),
+                session_epoch: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error_message.contains("finite"));
+    }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_world_object_resync_queued() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let player = Guid::new(EntityType::Player, 1, 60);
+        let obj_guid = Guid::new(EntityType::DynamicObject, 1, 777);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(player, (0.0, 0.0, 0.0));
+            let obj = mmo_core::world::WorldObject::new(
+                obj_guid,
+                1,
+                mmo_core::world::Transform3D::new(
+                    (5.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                    (1.0, 1.0, 1.0),
+                ),
+                BoundingBox3D::new((4.0, -1.0, -1.0), (6.0, 1.0, 1.0)),
+                mmo_core::container::ContainerOwner::Character(10),
+            );
+            s.insert_world_object(obj);
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        let resync_pkt = mmo_schema::client::ClientPacket::WorldObjectResync(
+            mmo_schema::client::WorldObjectResyncPacket {
+                object_id: obj_guid.raw(),
+            },
+        );
+
+        let resp = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 55,
+                guid: player.raw(),
+                packet_data: resync_pkt.encode(),
+                session_epoch: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.success);
+
+        // Verify pending broadcast jobs has WorldObjectSpawn
+        let s = sim.read().await;
+        assert_eq!(s.pending_broadcast_jobs.len(), 1);
+        let job = &s.pending_broadcast_jobs[0];
+        assert_eq!(job.session_id, 55);
+        assert_eq!(job.player_guid, player);
+        assert!(matches!(
+            job.packets[0],
+            mmo_schema::client::ClientPacket::WorldObjectSpawn(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_modular_router_and_anti_spoofing() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let player = Guid::new(EntityType::Player, 1, 70);
+
+        struct TestModuleHandler;
+        impl mmo_core::ModularPacketHandler for TestModuleHandler {
+            fn handle(
+                &self,
+                _entity_guid: Guid,
+                sub_opcode: u16,
+                payload: &[u8],
+                _entities: &mut EntityStore,
+            ) -> Result<Option<Vec<u8>>, mmo_core::PacketHandlerError> {
+                assert_eq!(sub_opcode, 1);
+                assert_eq!(payload, b"ping");
+                Ok(Some(b"pong".to_vec()))
+            }
+        }
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(player, (0.0, 0.0, 0.0));
+            s.packets.register(0x00A0, Box::new(TestModuleHandler));
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        // 1. Spoofed source_guid rejected
+        let spoofed_pkt =
+            mmo_schema::client::ClientPacket::Interaction(mmo_schema::client::InteractionPacket {
+                source_guid: 9999, // mismatch with player
+                target_guid: 0,
+                interaction_type: mmo_schema::client::InteractionType::Custom(1),
+                action_id: 0x00A0_0001,
+                payload: bytes::Bytes::from_static(b"ping"),
+            });
+
+        let resp_spoofed = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 1,
+                guid: player.raw(),
+                packet_data: spoofed_pkt.encode(),
+                session_epoch: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_spoofed.success);
+        assert!(resp_spoofed.error_message.contains("Spoofed"));
+
+        // 2. Valid interaction dispatched to module
+        let valid_pkt =
+            mmo_schema::client::ClientPacket::Interaction(mmo_schema::client::InteractionPacket {
+                source_guid: player.raw(),
+                target_guid: 0,
+                interaction_type: mmo_schema::client::InteractionType::Custom(1),
+                action_id: 0x00A0_0001,
+                payload: bytes::Bytes::from_static(b"ping"),
+            });
+
+        let resp_valid = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 1,
+                guid: player.raw(),
+                packet_data: valid_pkt.encode(),
+                session_epoch: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp_valid.success);
+
+        // Verify response packet queued
+        let s = sim.read().await;
+        assert_eq!(s.pending_broadcast_jobs.len(), 1);
+        let job = &s.pending_broadcast_jobs[0];
+        if let mmo_schema::client::ClientPacket::InteractionResult(ref res) = job.packets[0] {
+            assert_eq!(res.payload, b"pong");
+            assert!(res.success);
+        } else {
+            panic!("Expected InteractionResultPacket");
         }
     }
 }

@@ -181,6 +181,16 @@ pub fn cast_cross_partition_ability(
 ) -> Result<CastOutcome, &'static str> {
     // 1. Check if target is local
     if sim.entity_store.contains_guid(target_guid) {
+        let target_ent = sim
+            .entity_store
+            .get_by_guid(target_guid)
+            .ok_or("Target not found")?;
+        if let Some(health) = target_ent.get_component::<mmo_gameplay::HealthComponent>() {
+            if health.is_dead {
+                return Err("Target entity is dead");
+            }
+        }
+
         let caster = sim
             .entity_store
             .get_mut_by_guid(caster_guid)
@@ -209,21 +219,18 @@ pub fn cast_cross_partition_ability(
         }
 
         // Apply effect directly to local target
-        if let Some(target_ent) = sim.entity_store.get_mut_by_guid(target_guid) {
-            if damage > 0 {
-                if let Some(health) =
-                    target_ent.get_component_mut::<mmo_gameplay::HealthComponent>()
-                {
-                    health.take_damage(damage as f32);
-                }
-            } else if healing > 0 {
-                if let Some(health) =
-                    target_ent.get_component_mut::<mmo_gameplay::HealthComponent>()
-                {
-                    health.heal(healing as f32);
-                }
-            }
-        }
+        let target_ent = sim
+            .entity_store
+            .get_mut_by_guid(target_guid)
+            .ok_or("Target not found")?;
+        crate::combat_pipeline::apply_combat_effect(
+            target_ent,
+            target_guid,
+            Some(caster_guid),
+            damage,
+            healing,
+            &mut sim.event_queue,
+        )?;
 
         return Ok(CastOutcome::LocalExecuted);
     }
@@ -416,20 +423,18 @@ pub fn cast_boundary_sphere_aoe(
     let mut local_hit_count = 0;
     for local_cand in &targeting.local_targets {
         if let Some(target_ent) = sim.entity_store.get_mut_by_guid(local_cand.guid) {
-            if damage_per_target > 0 {
-                if let Some(health) =
-                    target_ent.get_component_mut::<mmo_gameplay::HealthComponent>()
-                {
-                    health.take_damage(damage_per_target as f32);
-                }
-            } else if healing_per_target > 0 {
-                if let Some(health) =
-                    target_ent.get_component_mut::<mmo_gameplay::HealthComponent>()
-                {
-                    health.heal(healing_per_target as f32);
-                }
+            if crate::combat_pipeline::apply_combat_effect(
+                target_ent,
+                local_cand.guid,
+                Some(caster_guid),
+                damage_per_target,
+                healing_per_target,
+                &mut sim.event_queue,
+            )
+            .is_ok()
+            {
+                local_hit_count += 1;
             }
-            local_hit_count += 1;
         }
     }
 
@@ -666,5 +671,114 @@ mod tests {
             .get_current("energy")
             .unwrap();
         assert_eq!(energy, 75.0);
+    }
+
+    #[tokio::test]
+    async fn test_cast_local_target_dead_rejected_without_resource_loss() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let caster = Guid::new(EntityType::Player, 1, 10);
+        let dead_target = Guid::new(EntityType::Player, 1, 20);
+
+        sim.spawn_entity(caster, (0.0, 0.0, 0.0));
+        let ent = sim.entity_store.get_mut_by_guid(caster).unwrap();
+        let mut attrs = AttributeSet::new();
+        attrs.add_attribute("energy", 100.0, 0.0, 100.0, 0.0);
+        ent.add_component(attrs);
+        ent.add_component(CooldownTracker::new());
+
+        sim.spawn_entity(dead_target, (5.0, 0.0, 0.0));
+        let ent_t = sim.entity_store.get_mut_by_guid(dead_target).unwrap();
+        let mut health = mmo_gameplay::HealthComponent::new(100.0, 0.0);
+        health.take_damage(100.0); // kills it
+        assert!(health.is_dead);
+        ent_t.add_component(health);
+
+        let dispatcher = CrossNodeDispatcher::new(1);
+        let ability = AbilityDefinition {
+            id: 1,
+            name: "Fireball".into(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 5.0,
+            gcd_sec: 1.0,
+            range: 20.0,
+            resource_cost: Some(("energy".into(), 25.0)),
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        let res = cast_cross_partition_ability(
+            &mut sim,
+            &dispatcher,
+            caster,
+            &ability,
+            dead_target,
+            50,
+            0,
+        );
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Target entity is dead");
+
+        // Caster energy should NOT be deducted
+        let ent_c = sim.entity_store.get_by_guid(caster).unwrap();
+        let energy = ent_c
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("energy")
+            .unwrap();
+        assert_eq!(energy, 100.0);
+
+        // Cooldown should NOT be started
+        let cd = ent_c.get_component::<CooldownTracker>().unwrap();
+        assert!(!cd.is_on_cooldown(1));
+    }
+
+    #[test]
+    fn test_cast_local_target_mitigation_and_death_event() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let caster = Guid::new(EntityType::Player, 1, 10);
+        let target = Guid::new(EntityType::Player, 1, 30);
+
+        sim.spawn_entity(caster, (0.0, 0.0, 0.0));
+        let ent = sim.entity_store.get_mut_by_guid(caster).unwrap();
+        ent.add_component(CooldownTracker::new());
+
+        sim.spawn_entity(target, (5.0, 0.0, 0.0));
+        let ent_t = sim.entity_store.get_mut_by_guid(target).unwrap();
+        ent_t.add_component(mmo_gameplay::HealthComponent::new(20.0, 0.0));
+        let stats = mmo_gameplay::combat::StatsComponent::new(10, 50); // 33.3% mitigation
+        ent_t.add_component(stats);
+
+        let dispatcher = CrossNodeDispatcher::new(1);
+        let ability = AbilityDefinition {
+            id: 2,
+            name: "Strike".into(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 0.0,
+            gcd_sec: 0.0,
+            range: 10.0,
+            resource_cost: None,
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        // 30 base damage -> 20 mitigated damage -> exactly 0 HP -> dies
+        let outcome =
+            cast_cross_partition_ability(&mut sim, &dispatcher, caster, &ability, target, 30, 0)
+                .expect("cast succeeds");
+
+        assert_eq!(outcome, CastOutcome::LocalExecuted);
+
+        let ent_t = sim.entity_store.get_by_guid(target).unwrap();
+        let health = ent_t
+            .get_component::<mmo_gameplay::HealthComponent>()
+            .unwrap();
+        assert!(health.is_dead);
+
+        // Verify EntityDiedEvent in sim.event_queue
+        let death_events = sim
+            .event_queue
+            .drain::<mmo_gameplay::combat::EntityDiedEvent>();
+        assert_eq!(death_events.len(), 1);
+        assert_eq!(death_events[0].entity, target);
+        assert_eq!(death_events[0].killer, Some(caster));
     }
 }

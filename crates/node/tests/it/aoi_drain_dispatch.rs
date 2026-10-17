@@ -152,6 +152,7 @@ async fn test_e2e_forward_client_packet_and_movement_correction_snapback() {
         session_id,
         guid: player_guid.raw(),
         packet_data: valid_move.encode(),
+        session_epoch: 0,
     };
 
     let resp = node_client
@@ -183,6 +184,7 @@ async fn test_e2e_forward_client_packet_and_movement_correction_snapback() {
         session_id,
         guid: player_guid.raw(),
         packet_data: invalid_move.encode(),
+        session_epoch: 0,
     };
 
     let resp_invalid = node_client

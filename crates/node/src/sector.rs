@@ -186,6 +186,11 @@ impl SectorManager {
         bucket.try_consume(cap, refill)
     }
 
+    /// Clears any rate limit tracking bucket for a player (e.g. upon entity despawn or migration).
+    pub fn clear_rate_limit(&mut self, player_guid: Guid) -> bool {
+        self.rate_limits.remove(&player_guid).is_some()
+    }
+
     /// Authoritatively validates a placement request against distance, rate limits, line of sight, and collision.
     pub fn validate_placement(
         &mut self,
