@@ -3,7 +3,7 @@
 //! Tracks cluster-wide octree partition bounds, evaluates node density thresholds,
 //! issues split and merge commands, and assigns sub-octants to simulation nodes.
 
-use mmo_core::{BoundingBox3D, EntityType, Guid, Octree};
+use mmo_core::BoundingBox3D;
 
 use crate::registry::NodeRegistry;
 
@@ -73,6 +73,34 @@ pub fn subdivide_bounds(bounds: &BoundingBox3D) -> [BoundingBox3D; 8] {
             (bounds.max.0, bounds.max.1, bounds.max.2),
         ),
     ]
+}
+
+/// Computes the union bounding box that tightly encloses both `a` and `b`.
+pub fn union_bounds(a: &BoundingBox3D, b: &BoundingBox3D) -> BoundingBox3D {
+    BoundingBox3D::new(
+        (
+            a.min.0.min(b.min.0),
+            a.min.1.min(b.min.1),
+            a.min.2.min(b.min.2),
+        ),
+        (
+            a.max.0.max(b.max.0),
+            a.max.1.max(b.max.1),
+            a.max.2.max(b.max.2),
+        ),
+    )
+}
+
+/// Resolves a node's network listen address from registry metadata, falling back to the Kubernetes
+/// StatefulSet DNS convention `mmo-node-{id-1}.mmo-node:50052` when empty or unregistered.
+pub fn fallback_node_addr(node_id: u32, registered: Option<&str>) -> String {
+    if let Some(addr) = registered {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    format!("mmo-node-{}.mmo-node:50052", node_id.saturating_sub(1))
 }
 
 /// Node representation in the global octree topology hierarchy.
@@ -341,11 +369,13 @@ impl GlobalOctreeNode {
                 }
             }
             GlobalOctreeNode::Branch { bounds, children } => {
-                if !bounds.intersects(old_bounds) {
-                    return false;
-                }
                 for child in children.iter_mut() {
                     if child.update_leaf_bounds(old_bounds, new_bounds) {
+                        let mut b = *children[0].bounds();
+                        for c in &children[1..] {
+                            b = union_bounds(&b, c.bounds());
+                        }
+                        *bounds = b;
                         return true;
                     }
                 }
@@ -361,6 +391,8 @@ pub struct PartitionRecoveryEvent {
     pub bounds: BoundingBox3D,
     pub previous_node_id: u32,
     pub new_node_id: u32,
+    pub previous_node_address: String,
+    pub new_node_address: String,
     pub epoch: u64,
 }
 
@@ -391,7 +423,6 @@ pub struct GlobalOctreeCoordinator {
     pub split_cooldown: std::time::Duration,
     pub last_split_times: std::collections::HashMap<u32, std::time::Instant>,
     pub root: GlobalOctreeNode,
-    pub spatial_index: Octree,
     pub topology_epoch: u64,
 }
 
@@ -440,8 +471,6 @@ impl GlobalOctreeCoordinator {
             entity_count: 0,
         };
 
-        let spatial_index = Octree::new(root_bounds);
-
         Self {
             split_threshold,
             merge_threshold,
@@ -449,7 +478,6 @@ impl GlobalOctreeCoordinator {
             split_cooldown,
             last_split_times: std::collections::HashMap::new(),
             root,
-            spatial_index,
             topology_epoch: 1,
         }
     }
@@ -487,15 +515,11 @@ impl GlobalOctreeCoordinator {
     /// Assigns the root octant to an initial node if it is currently unassigned.
     pub fn assign_initial_node(&mut self, node_id: u32) {
         if let GlobalOctreeNode::Leaf {
-            assigned_node_id,
-            bounds,
-            ..
+            assigned_node_id, ..
         } = &mut self.root
         {
             if assigned_node_id.is_none() {
                 *assigned_node_id = Some(node_id);
-                let guid = Guid::new(EntityType::Player, node_id as u16, 0);
-                self.spatial_index.insert(guid, bounds.center());
             }
         }
     }
@@ -614,21 +638,6 @@ impl GlobalOctreeCoordinator {
         }
         self.root.split_at(&original_bounds, &assignments_arr);
 
-        // 5. Update spatial index
-        let center = original_bounds.center();
-        let query_guids = self.spatial_index.query_radius(center, 0.1);
-        for guid in query_guids {
-            if guid.node_id() as u32 == reporting_node_id {
-                self.spatial_index.remove(guid, center);
-            }
-        }
-        for (i, (&child, &assigned_id)) in
-            sub_bounds.iter().zip(assigned_node_ids.iter()).enumerate()
-        {
-            let guid = Guid::new(EntityType::Player, assigned_id as u16, i as u32);
-            self.spatial_index.insert(guid, child.center());
-        }
-
         self.last_split_times
             .insert(reporting_node_id, std::time::Instant::now());
         self.topology_epoch += 1;
@@ -638,6 +647,7 @@ impl GlobalOctreeCoordinator {
 
     /// Smooths the dividing boundary between two adjacent leaf nodes based on entity centroids.
     ///
+    /// Evaluates adjacency along all three axes (X, Y, Z) and both neighbor orientations.
     /// Clamps centroids within each node's assigned bounds.
     /// If entity density ratio exceeds 2.0x, calculates an elastic displacement:
     /// delta = min(25.0, 0.1 * ((count_a - count_b)/(count_a + count_b)) * distance)
@@ -652,54 +662,163 @@ impl GlobalOctreeCoordinator {
         let bounds_a_list = self.get_assigned_bounds_for_node(primary.node_id);
         let bounds_b_list = self.get_assigned_bounds_for_node(neighbor.node_id);
 
+        let na = primary.entity_count as f32;
+        let nb = neighbor.entity_count as f32;
+        if na + nb == 0.0 || (na < 2.0 * nb && nb < 2.0 * na) {
+            return None;
+        }
+
         for ba in &bounds_a_list {
             for bb in &bounds_b_list {
-                // Check if ba and bb are adjacent along X axis (ba on left, bb on right)
-                if (ba.max.0 - bb.min.0).abs() < 0.001
-                    && (ba.min.1 - bb.min.1).abs() < 0.001
-                    && (ba.max.1 - bb.max.1).abs() < 0.001
-                    && (ba.min.2 - bb.min.2).abs() < 0.001
-                    && (ba.max.2 - bb.max.2).abs() < 0.001
-                {
-                    // Strict anti-cheat coordinate clamping to assigned bounds
-                    let ca_x = primary.centroid.0.clamp(ba.min.0, ba.max.0);
-                    let cb_x = neighbor.centroid.0.clamp(bb.min.0, bb.max.0);
+                // Check all 3 axes: 0 = X, 1 = Y, 2 = Z
+                for axis in 0..3 {
+                    let (ax1_match, ax2_match) = match axis {
+                        0 => (
+                            (ba.min.1 - bb.min.1).abs() < 0.001
+                                && (ba.max.1 - bb.max.1).abs() < 0.001,
+                            (ba.min.2 - bb.min.2).abs() < 0.001
+                                && (ba.max.2 - bb.max.2).abs() < 0.001,
+                        ),
+                        1 => (
+                            (ba.min.0 - bb.min.0).abs() < 0.001
+                                && (ba.max.0 - bb.max.0).abs() < 0.001,
+                            (ba.min.2 - bb.min.2).abs() < 0.001
+                                && (ba.max.2 - bb.max.2).abs() < 0.001,
+                        ),
+                        _ => (
+                            (ba.min.0 - bb.min.0).abs() < 0.001
+                                && (ba.max.0 - bb.max.0).abs() < 0.001,
+                            (ba.min.1 - bb.min.1).abs() < 0.001
+                                && (ba.max.1 - bb.max.1).abs() < 0.001,
+                        ),
+                    };
 
-                    let na = primary.entity_count as f32;
-                    let nb = neighbor.entity_count as f32;
-                    if na + nb == 0.0 {
+                    if !ax1_match || !ax2_match {
                         continue;
                     }
 
-                    // Check density ratio >= 2.0x
-                    if na >= 2.0 * nb || nb >= 2.0 * na {
-                        let imbalance = (na - nb) / (na + nb);
-                        let dist = (cb_x - ca_x).abs().max(10.0);
-                        let shift = (imbalance * 0.1 * dist).clamp(-25.0, 25.0);
+                    let (ba_min_ax, ba_max_ax) = match axis {
+                        0 => (ba.min.0, ba.max.0),
+                        1 => (ba.min.1, ba.max.1),
+                        _ => (ba.min.2, ba.max.2),
+                    };
+                    let (bb_min_ax, bb_max_ax) = match axis {
+                        0 => (bb.min.0, bb.max.0),
+                        1 => (bb.min.1, bb.max.1),
+                        _ => (bb.min.2, bb.max.2),
+                    };
 
-                        if shift.abs() >= 1.0 {
-                            let new_split_x = ba.max.0 + shift;
-                            // Ensure bounds do not collapse
-                            if new_split_x > ba.min.0 + 10.0 && new_split_x < bb.max.0 - 10.0 {
-                                let new_ba =
-                                    BoundingBox3D::new(ba.min, (new_split_x, ba.max.1, ba.max.2));
-                                let new_bb =
-                                    BoundingBox3D::new((new_split_x, bb.min.1, bb.min.2), bb.max);
+                    let is_ba_lower = if (ba_max_ax - bb_min_ax).abs() < 0.001 {
+                        true
+                    } else if (bb_max_ax - ba_min_ax).abs() < 0.001 {
+                        false
+                    } else {
+                        continue;
+                    };
 
-                                self.root.update_leaf_bounds(ba, new_ba);
-                                self.root.update_leaf_bounds(bb, new_bb);
+                    let (ca_ax, cb_ax) = match axis {
+                        0 => (
+                            primary.centroid.0.clamp(ba.min.0, ba.max.0),
+                            neighbor.centroid.0.clamp(bb.min.0, bb.max.0),
+                        ),
+                        1 => (
+                            primary.centroid.1.clamp(ba.min.1, ba.max.1),
+                            neighbor.centroid.1.clamp(bb.min.1, bb.max.1),
+                        ),
+                        _ => (
+                            primary.centroid.2.clamp(ba.min.2, ba.max.2),
+                            neighbor.centroid.2.clamp(bb.min.2, bb.max.2),
+                        ),
+                    };
 
-                                registry.remove_assigned_bounds(primary.node_id, ba);
-                                registry.add_assigned_bounds(primary.node_id, new_ba);
-                                registry.remove_assigned_bounds(neighbor.node_id, bb);
-                                registry.add_assigned_bounds(neighbor.node_id, new_bb);
+                    let (lower_min, split, upper_max, lower_load, upper_load, lower_c, upper_c) =
+                        if is_ba_lower {
+                            (ba_min_ax, ba_max_ax, bb_max_ax, na, nb, ca_ax, cb_ax)
+                        } else {
+                            (bb_min_ax, bb_max_ax, ba_max_ax, nb, na, cb_ax, ca_ax)
+                        };
 
-                                self.topology_epoch += 1;
-                                metrics::counter!("mmo_boundary_adjustments_total").increment(1);
-                                return Some((new_ba, new_bb));
-                            }
-                        }
+                    let imbalance = (lower_load - upper_load) / (lower_load + upper_load);
+                    let dist = (upper_c - lower_c).abs().max(10.0);
+                    let shift = (imbalance * 0.1 * dist).clamp(-25.0, 25.0);
+
+                    if shift.abs() < 1.0 {
+                        continue;
                     }
+
+                    let new_split = split + shift;
+                    if new_split <= lower_min + 10.0 || new_split >= upper_max - 10.0 {
+                        continue;
+                    }
+
+                    let (new_lower_bounds, new_upper_bounds) = match axis {
+                        0 => {
+                            let (l_min, l_max) = if is_ba_lower {
+                                (ba.min, ba.max)
+                            } else {
+                                (bb.min, bb.max)
+                            };
+                            let (u_min, u_max) = if is_ba_lower {
+                                (bb.min, bb.max)
+                            } else {
+                                (ba.min, ba.max)
+                            };
+                            (
+                                BoundingBox3D::new(l_min, (new_split, l_max.1, l_max.2)),
+                                BoundingBox3D::new((new_split, u_min.1, u_min.2), u_max),
+                            )
+                        }
+                        1 => {
+                            let (l_min, l_max) = if is_ba_lower {
+                                (ba.min, ba.max)
+                            } else {
+                                (bb.min, bb.max)
+                            };
+                            let (u_min, u_max) = if is_ba_lower {
+                                (bb.min, bb.max)
+                            } else {
+                                (ba.min, ba.max)
+                            };
+                            (
+                                BoundingBox3D::new(l_min, (l_max.0, new_split, l_max.2)),
+                                BoundingBox3D::new((u_min.0, new_split, u_min.2), u_max),
+                            )
+                        }
+                        _ => {
+                            let (l_min, l_max) = if is_ba_lower {
+                                (ba.min, ba.max)
+                            } else {
+                                (bb.min, bb.max)
+                            };
+                            let (u_min, u_max) = if is_ba_lower {
+                                (bb.min, bb.max)
+                            } else {
+                                (ba.min, ba.max)
+                            };
+                            (
+                                BoundingBox3D::new(l_min, (l_max.0, l_max.1, new_split)),
+                                BoundingBox3D::new((u_min.0, u_min.1, new_split), u_max),
+                            )
+                        }
+                    };
+
+                    let (new_ba, new_bb) = if is_ba_lower {
+                        (new_lower_bounds, new_upper_bounds)
+                    } else {
+                        (new_upper_bounds, new_lower_bounds)
+                    };
+
+                    self.root.update_leaf_bounds(ba, new_ba);
+                    self.root.update_leaf_bounds(bb, new_bb);
+
+                    registry.remove_assigned_bounds(primary.node_id, ba);
+                    registry.add_assigned_bounds(primary.node_id, new_ba);
+                    registry.remove_assigned_bounds(neighbor.node_id, bb);
+                    registry.add_assigned_bounds(neighbor.node_id, new_bb);
+
+                    self.topology_epoch += 1;
+                    metrics::counter!("mmo_boundary_adjustments_total").increment(1);
+                    return Some((new_ba, new_bb));
                 }
             }
         }
@@ -725,13 +844,6 @@ impl GlobalOctreeCoordinator {
         for (child_bound, assigned_nid) in child_leaves {
             if let Some(nid) = assigned_nid {
                 registry.remove_assigned_bounds(nid, &child_bound);
-                let center = child_bound.center();
-                let query = self.spatial_index.query_radius(center, 0.1);
-                for guid in query {
-                    if guid.node_id() as u32 == nid {
-                        self.spatial_index.remove(guid, center);
-                    }
-                }
             }
         }
 
@@ -742,8 +854,6 @@ impl GlobalOctreeCoordinator {
         let merged = self.root.merge_at(&parent_bounds, target_node_id);
 
         if merged {
-            let guid = Guid::new(EntityType::Player, target_node_id as u16, 0);
-            self.spatial_index.insert(guid, parent_bounds.center());
             self.topology_epoch += 1;
         }
 
@@ -753,11 +863,14 @@ impl GlobalOctreeCoordinator {
     /// Scans the topology tree for leaf octants assigned to evicted/dead simulation nodes,
     /// reassigning each orphaned partition to active surviving nodes balancing cluster load.
     ///
+    /// Resolves departed node addresses from `dead_node_addrs` and recipient node addresses
+    /// from `registry`, falling back to standard cluster DNS if empty.
     /// Returns a list of `PartitionRecoveryEvent`s describing the reassignments.
     /// If no active nodes remain, the partitions are set to unassigned (`None`).
     pub fn recover_orphaned_partitions(
         &mut self,
         dead_node_ids: &[u32],
+        dead_node_addrs: &std::collections::HashMap<u32, String>,
         registry: &mut NodeRegistry,
     ) -> Vec<PartitionRecoveryEvent> {
         if dead_node_ids.is_empty() {
@@ -786,24 +899,26 @@ impl GlobalOctreeCoordinator {
 
             self.root.assign_leaf_node(&bounds, target_node_id);
 
-            // Clean up spatial index entry for the previous dead node
-            let center = bounds.center();
-            let query = self.spatial_index.query_radius(center, 0.1);
-            for guid in query {
-                if guid.node_id() as u32 == prev_node_id {
-                    self.spatial_index.remove(guid, center);
-                }
-            }
-
             if let Some(new_node_id) = target_node_id {
                 registry.add_assigned_bounds(new_node_id, bounds);
-                let guid = Guid::new(EntityType::Player, new_node_id as u16, 0);
-                self.spatial_index.insert(guid, center);
+
+                let prev_addr = fallback_node_addr(
+                    prev_node_id,
+                    dead_node_addrs.get(&prev_node_id).map(|s| s.as_str()),
+                );
+                let new_addr = fallback_node_addr(
+                    new_node_id,
+                    registry
+                        .get_node(new_node_id)
+                        .map(|n| n.listen_addr.as_str()),
+                );
 
                 events.push(PartitionRecoveryEvent {
                     bounds,
                     previous_node_id: prev_node_id,
                     new_node_id,
+                    previous_node_address: prev_addr,
+                    new_node_address: new_addr,
                     epoch: current_epoch,
                 });
             }
@@ -999,13 +1114,17 @@ mod tests {
         assert_eq!(registry.active_node_ids(), vec![node2]);
 
         // Recover orphaned partitions belonging to node1
-        let events = coord.recover_orphaned_partitions(&[node1], &mut registry);
+        let mut dead_addrs = std::collections::HashMap::new();
+        dead_addrs.insert(node1, "127.0.0.1:50051".to_string());
+        let events = coord.recover_orphaned_partitions(&[node1], &dead_addrs, &mut registry);
         assert!(!events.is_empty());
         assert_eq!(coord.topology_epoch(), 3);
 
         for event in &events {
             assert_eq!(event.previous_node_id, node1);
             assert_eq!(event.new_node_id, node2);
+            assert_eq!(event.previous_node_address, "127.0.0.1:50051");
+            assert_eq!(event.new_node_address, "127.0.0.1:50052");
             assert_eq!(event.epoch, 3);
         }
 
@@ -1031,7 +1150,11 @@ mod tests {
         let _ = registry.deregister_node(node1);
         assert!(registry.active_node_ids().is_empty());
 
-        let events = coord.recover_orphaned_partitions(&[node1], &mut registry);
+        let events = coord.recover_orphaned_partitions(
+            &[node1],
+            &std::collections::HashMap::new(),
+            &mut registry,
+        );
         // Since no active node exists, events is empty (unassigned rather than reassigned)
         assert!(events.is_empty());
         assert_eq!(coord.topology_epoch(), 2);
@@ -1078,6 +1201,7 @@ mod tests {
         for item in leaves_arr.iter_mut().skip(2) {
             *item = (bound_b, node_b);
         }
+        let dummy_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (-50.0, -50.0, -50.0));
         coord.root = GlobalOctreeNode::Branch {
             bounds: root_bounds,
             children: Box::new([
@@ -1092,33 +1216,33 @@ mod tests {
                     entity_count: 50,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
                 GlobalOctreeNode::Leaf {
-                    bounds: bound_b,
-                    assigned_node_id: Some(node_b),
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
                     entity_count: 0,
                 },
             ]),
@@ -1146,5 +1270,157 @@ mod tests {
         assert_eq!(reg_a.assigned_bounds, vec![new_ba]);
         let reg_b = registry.get_node(node_b).unwrap();
         assert_eq!(reg_b.assigned_bounds, vec![new_bb]);
+
+        // Point inside the newly shifted strip (e.g. 101.0, 25.0, 25.0) routes to expanded node A
+        assert_eq!(coord.find_node_for_point((101.0, 25.0, 25.0)), Some(node_a));
+    }
+
+    #[test]
+    fn test_smooth_adjacent_boundaries_y_axis_and_routing() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 200.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(root_bounds);
+        let mut registry = NodeRegistry::new();
+
+        let bound_a = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let bound_b = BoundingBox3D::new((0.0, 100.0, 0.0), (100.0, 200.0, 100.0));
+
+        let node_a = registry.register_node("127.0.0.1:50051".to_string(), vec![bound_a]);
+        let node_b = registry.register_node("127.0.0.1:50052".to_string(), vec![bound_b]);
+
+        let dummy_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (-50.0, -50.0, -50.0));
+        coord.root = GlobalOctreeNode::Branch {
+            bounds: root_bounds,
+            children: Box::new([
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_a,
+                    assigned_node_id: Some(node_a),
+                    entity_count: 300,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_b,
+                    assigned_node_id: Some(node_b),
+                    entity_count: 50,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+            ]),
+        };
+
+        let smoothed = coord.smooth_adjacent_boundaries(
+            NodeSmoothingContext::new(node_a, (50.0, 50.0, 50.0), 300),
+            NodeSmoothingContext::new(node_b, (50.0, 150.0, 50.0), 50),
+            &mut registry,
+        );
+
+        assert!(smoothed.is_some());
+        let (new_ba, new_bb) = smoothed.unwrap();
+        assert!(new_ba.max.1 > 100.0);
+        assert_eq!(new_ba.max.1, new_bb.min.1);
+        assert_eq!(coord.find_node_for_point((25.0, 101.0, 25.0)), Some(node_a));
+    }
+
+    #[test]
+    fn test_smooth_adjacent_boundaries_z_axis_and_reverse_order() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 200.0));
+        let mut coord = GlobalOctreeCoordinator::new(root_bounds);
+        let mut registry = NodeRegistry::new();
+
+        let bound_lower = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let bound_upper = BoundingBox3D::new((0.0, 0.0, 100.0), (100.0, 100.0, 200.0));
+
+        let node_lower = registry.register_node("127.0.0.1:50051".to_string(), vec![bound_lower]);
+        let node_upper = registry.register_node("127.0.0.1:50052".to_string(), vec![bound_upper]);
+
+        let dummy_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (-50.0, -50.0, -50.0));
+        coord.root = GlobalOctreeNode::Branch {
+            bounds: root_bounds,
+            children: Box::new([
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_lower,
+                    assigned_node_id: Some(node_lower),
+                    entity_count: 50,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: bound_upper,
+                    assigned_node_id: Some(node_upper),
+                    entity_count: 300,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+                GlobalOctreeNode::Leaf {
+                    bounds: dummy_bounds,
+                    assigned_node_id: None,
+                    entity_count: 0,
+                },
+            ]),
+        };
+
+        // Primary is node_upper (reverse order: primary has higher coordinate along Z axis)
+        let smoothed = coord.smooth_adjacent_boundaries(
+            NodeSmoothingContext::new(node_upper, (50.0, 50.0, 150.0), 300),
+            NodeSmoothingContext::new(node_lower, (50.0, 50.0, 50.0), 50),
+            &mut registry,
+        );
+
+        assert!(smoothed.is_some());
+        let (new_upper, new_lower) = smoothed.unwrap();
+        // Shift should move split to the left (< 100.0) expanding upper partition
+        assert!(new_upper.min.2 < 100.0);
+        assert_eq!(new_lower.max.2, new_upper.min.2);
+        assert_eq!(
+            coord.find_node_for_point((25.0, 25.0, 99.0)),
+            Some(node_upper)
+        );
     }
 }
