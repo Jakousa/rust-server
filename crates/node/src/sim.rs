@@ -440,10 +440,10 @@ impl TickSimulation {
         Ok(object_id)
     }
 
-    /// Handles a client `InteractObject` request, validating range and interactivity.
-    /// Returns `true` if the interaction is permitted; plugins react via hooks/events.
+    /// Handles a client `InteractObject` request, validating range, interactivity, and plugin hooks.
+    /// Returns `true` if the interaction is permitted and not vetoed; plugins react via hooks/events.
     pub fn handle_interact_object(
-        &self,
+        &mut self,
         player: Guid,
         packet: &mmo_schema::client::InteractObjectPacket,
     ) -> bool {
@@ -451,7 +451,8 @@ impl TickSimulation {
         let Some(ent) = self.entity_store.get_by_guid(player) else {
             return false;
         };
-        let Some(obj) = self.sectors.get_object(Guid::from_raw(packet.object_id)) else {
+        let target_guid = Guid::from_raw(packet.object_id);
+        let Some(obj) = self.sectors.get_object(target_guid) else {
             return false;
         };
         if !obj.has_flag(world_object_flags::INTERACTIVE)
@@ -459,7 +460,32 @@ impl TickSimulation {
         {
             return false;
         }
-        obj.bounds.distance_to_point(ent.position) <= crate::sector::MAX_INTERACTION_DISTANCE
+        if obj.bounds.distance_to_point(ent.position) > crate::sector::MAX_INTERACTION_DISTANCE {
+            return false;
+        }
+
+        let ctx = self.hooks.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: player,
+                target: target_guid,
+                action_id: packet.action_type,
+            },
+            &mut self.entity_store,
+        );
+        if ctx.is_canceled() {
+            return false;
+        }
+
+        self.hooks.dispatch_with_entities(
+            &Event::OnInteract {
+                initiator: player,
+                target: target_guid,
+                action_id: packet.action_type,
+            },
+            &mut self.entity_store,
+        );
+
+        true
     }
 
     /// Authoritatively handles a client `WorldObjectResync` request with token-bucket rate limiting,
@@ -483,6 +509,9 @@ impl TickSimulation {
         self.kinematic_states.remove(&guid);
         self.migrating_leases.remove(&guid);
         self.last_migration_ticks.remove(&guid);
+        self.session_epochs.remove(&guid);
+        self.aoi.unregister_by_guid(guid);
+        self.sectors.clear_rate_limit(guid);
         self.instances.remove_entity(guid);
         if let Some(entity) = self.entity_store.despawn_by_guid(guid) {
             if !self.octree.remove(guid, entity.position) {
@@ -625,6 +654,11 @@ impl TickSimulation {
             self.aoi
                 .update_observers(&self.entity_store, &self.octree, self.tick_counter, now_ms);
         self.pending_broadcast_jobs.append(&mut aoi_jobs);
+
+        let mut world_obj_jobs = self
+            .aoi
+            .update_world_object_observers(&self.entity_store, &self.sectors);
+        self.pending_broadcast_jobs.append(&mut world_obj_jobs);
 
         // 3.5. Periodic asynchronous write-behind snapshot dispatch
         if let Some(ref sender) = self.snapshot_sender {
@@ -1897,5 +1931,131 @@ mod tests {
         // Simulation step continues unharmed
         sim.step(0.05);
         assert_eq!(sim.tick_counter, 1);
+    }
+
+    #[test]
+    fn test_tick_simulation_world_object_aoi_streaming() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let player = Guid::new(mmo_core::EntityType::Player, 1, 10);
+        sim.spawn_entity(player, (10.0, 0.0, 10.0));
+        sim.aoi.register_observer(
+            1,
+            player,
+            ObserverConfig {
+                base_radius: 100.0,
+                ..Default::default()
+            },
+        );
+
+        // Insert a world object in the player's vicinity
+        let obj_guid = Guid::new(mmo_core::EntityType::DynamicObject, 1, 999);
+        let obj = mmo_core::world::WorldObject::new(
+            obj_guid,
+            1,
+            mmo_core::world::Transform3D::new(
+                (15.0, 0.0, 15.0),
+                (0.0, 0.0, 0.0, 1.0),
+                (1.0, 1.0, 1.0),
+            ),
+            BoundingBox3D::new((14.0, -1.0, 14.0), (16.0, 1.0, 16.0)),
+            mmo_core::container::ContainerOwner::Character(10),
+        );
+        sim.insert_world_object(obj);
+
+        assert!(sim.pending_broadcast_jobs.is_empty());
+
+        // Step simulation tick: world object AoI jobs should be queued!
+        sim.step(0.05);
+
+        assert!(!sim.pending_broadcast_jobs.is_empty());
+        let has_world_obj_spawn = sim.pending_broadcast_jobs.iter().any(|job| {
+            job.packets
+                .iter()
+                .any(|pkt| matches!(pkt, mmo_schema::client::ClientPacket::WorldObjectSpawn(_)))
+        });
+        assert!(
+            has_world_obj_spawn,
+            "WorldObjectSpawn packet must be queued in AoI broadcast jobs"
+        );
+    }
+
+    #[test]
+    fn test_despawn_entity_cleans_up_all_tracking_stores() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let guid = Guid::new(mmo_core::EntityType::Player, 1, 55);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+        sim.aoi
+            .register_observer(100, guid, ObserverConfig::default());
+        sim.last_migration_ticks.insert(guid, 10);
+        sim.session_epochs.insert(guid, 3);
+        sim.sectors.check_rate_limit(guid);
+
+        assert!(sim.entity_store.contains_guid(guid));
+        assert!(sim.aoi.get_observer(100).is_some());
+        assert!(sim.session_epochs.contains_key(&guid));
+        assert!(sim.last_migration_ticks.contains_key(&guid));
+
+        // Despawn entity
+        assert!(sim.despawn_entity(guid));
+
+        assert!(!sim.entity_store.contains_guid(guid));
+        assert!(
+            sim.aoi.get_observer(100).is_none(),
+            "AoI observer must be unregistered"
+        );
+        assert!(
+            !sim.session_epochs.contains_key(&guid),
+            "session epoch must be removed"
+        );
+        assert!(
+            !sim.last_migration_ticks.contains_key(&guid),
+            "last migration tick must be removed"
+        );
+    }
+
+    #[test]
+    fn test_handle_interact_object_hooks_and_veto() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let player = Guid::new(mmo_core::EntityType::Player, 1, 10);
+        sim.spawn_entity(player, (0.0, 0.0, 0.0));
+
+        let obj_guid = Guid::new(mmo_core::EntityType::DynamicObject, 1, 200);
+        let mut obj = mmo_core::world::WorldObject::new(
+            obj_guid,
+            1,
+            mmo_core::world::Transform3D::new(
+                (2.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+                (1.0, 1.0, 1.0),
+            ),
+            BoundingBox3D::new((1.5, -0.5, -0.5), (2.5, 0.5, 0.5)),
+            mmo_core::container::ContainerOwner::Character(10),
+        );
+        obj.state_flags |= mmo_core::world::world_object_flags::INTERACTIVE;
+        sim.insert_world_object(obj);
+
+        let pkt = mmo_schema::client::InteractObjectPacket {
+            object_id: obj_guid.raw(),
+            action_type: 1,
+        };
+
+        // Without veto, interaction succeeds
+        assert!(sim.handle_interact_object(player, &pkt));
+
+        // Register a veto hook
+        sim.hooks.register_fn(|event, ctx| {
+            if let mmo_core::Event::BeforeInteract { .. } = event {
+                ctx.cancel("forbidden");
+            }
+        });
+
+        // Now interaction is vetoed
+        assert!(!sim.handle_interact_object(player, &pkt));
     }
 }

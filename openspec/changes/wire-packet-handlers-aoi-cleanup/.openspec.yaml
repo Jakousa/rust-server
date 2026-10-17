@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: wire-packet-handlers-aoi-cleanup
+  title: Wire Missing Packet Handlers, World Object AoI Replication, and Observer Cleanup in TickSimulation
+  status: proposed
+  created: 2026-10-17
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: simulation
+  specs:
+    - specs/simulation/wire-packet-handlers-aoi-cleanup/spec.md
