@@ -1,6 +1,6 @@
 //! Container storage repository for managing arbitrary storage containers.
 
-use crate::db::{sql_for_dialect, Database, DbBackend, StorageError};
+use crate::db::{current_time_secs, Database, DbBackend, StorageError};
 use crate::models::{ContainerRecord, ItemRecord};
 use sqlx::Row;
 
@@ -47,7 +47,7 @@ impl ContainerRepository {
             INSERT INTO containers (container_id, owner_type, owner_id, name, capacity, access_policy, version, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#;
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -89,7 +89,7 @@ impl ContainerRepository {
         container_id: u64,
     ) -> Result<Option<ContainerRecord>, StorageError> {
         let query = "SELECT container_id, owner_type, owner_id, name, capacity, access_policy, version, created_at, updated_at FROM containers WHERE container_id = ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -123,7 +123,7 @@ impl ContainerRepository {
         container_id: u64,
     ) -> Result<Vec<ItemRecord>, StorageError> {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE container_id = ? ORDER BY slot ASC";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -160,7 +160,7 @@ impl ContainerRepository {
         slot: u32,
     ) -> Result<Option<ItemRecord>, StorageError> {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE container_id = ? AND slot = ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -196,7 +196,7 @@ impl ContainerRepository {
         item_instance_id: &str,
     ) -> Result<Option<ItemRecord>, StorageError> {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -230,13 +230,10 @@ impl ContainerRepository {
         container_id: u64,
         new_capacity: u32,
     ) -> Result<(), StorageError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = current_time_secs();
 
         let query = "UPDATE containers SET capacity = ?, updated_at = ? WHERE container_id = ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -263,7 +260,7 @@ impl ContainerRepository {
     /// Deletes a container and cascades to reservations and escrows.
     pub async fn delete_container(&self, container_id: u64) -> Result<bool, StorageError> {
         let query = "DELETE FROM containers WHERE container_id = ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         let rows_affected = match self.db.backend() {
             DbBackend::Sqlite(pool) => sqlx::query(&query_str)

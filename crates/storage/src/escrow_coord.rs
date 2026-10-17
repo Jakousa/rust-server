@@ -1,24 +1,39 @@
 //! Generic Asynchronous Escrow State Machine for conditional container exchanges.
 
-use crate::db::{sql_for_dialect, Database, DbBackend, StorageError};
+use crate::db::{
+    compute_free_slots, current_time_ms, current_time_secs, Database, DbBackend, StorageError,
+};
 use crate::models::{EscrowRecord, EscrowStatus};
+use crate::with_dialect_tx;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+macro_rules! parse_escrow_record {
+    ($r:expr) => {{
+        let status_str: String = $r.try_get("status")?;
+        let status = status_str
+            .parse::<EscrowStatus>()
+            .map_err(StorageError::TradeError)?;
+        let dep_id: i64 = $r.try_get("depositor_container_id")?;
+        let ben_id: i64 = $r.try_get("beneficiary_container_id")?;
+        let esc_id: i64 = $r.try_get("escrow_container_id")?;
+        let expires: i64 = $r.try_get("expires_at_epoch_ms")?;
+        let created: i64 = $r.try_get("created_at_epoch_ms")?;
+        let updated: i64 = $r.try_get("updated_at_epoch_ms")?;
 
-fn current_time_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+        EscrowRecord {
+            escrow_id: $r.try_get("escrow_id")?,
+            depositor_container_id: dep_id as u64,
+            beneficiary_container_id: ben_id as u64,
+            escrow_container_id: esc_id as u64,
+            status,
+            secret_hash: $r.try_get("secret_hash")?,
+            expires_at_epoch_ms: expires,
+            created_at_epoch_ms: created,
+            updated_at_epoch_ms: updated,
+        }
+    }};
 }
 
 /// Computes hex-encoded SHA-256 hash of a secret string.
@@ -62,133 +77,120 @@ impl EscrowCoordinator {
             ));
         }
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Verify depositor and escrow containers exist
+            let c_dep_sql = format!(
+                "SELECT container_id FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_dep = sqlx::query(&q!(&c_dep_sql))
+                .bind(depositor_container_id as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+            let c_esc_sql = format!(
+                "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_esc = sqlx::query(&q!(&c_esc_sql))
+                .bind(escrow_container_id as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-                let res: Result<EscrowRecord, StorageError> = async {
-                    // 1. Verify depositor and escrow containers exist
-                    let c_dep = sqlx::query("SELECT container_id FROM containers WHERE container_id = ?")
-                        .bind(depositor_container_id as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    let c_esc = sqlx::query("SELECT container_id, capacity FROM containers WHERE container_id = ?")
-                        .bind(escrow_container_id as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?;
+            if c_dep.is_none() {
+                return Err(StorageError::ContainerNotFound(depositor_container_id));
+            }
+            let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
+            let esc_cap: i32 = esc_row.try_get("capacity")?;
 
-                    if c_dep.is_none() {
-                        return Err(StorageError::ContainerNotFound(depositor_container_id));
-                    }
-                    let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
-                    let esc_cap: i32 = esc_row.try_get("capacity")?;
+            // 2. Fetch occupied slots in escrow container
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(escrow_container_id as i64)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
 
-                    // 2. Fetch occupied slots in escrow container
-                    let occupied_rows = sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                        .bind(escrow_container_id as i64)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
+            let free_slots = compute_free_slots(&occupied_slots, esc_cap as u32);
 
-                    let mut free_slots = Vec::new();
-                    for s in 0..(esc_cap as u32) {
-                        if !occupied_slots.contains(&s) {
-                            free_slots.push(s);
-                        }
-                    }
+            if free_slots.len() < item_instance_ids.len() {
+                return Err(StorageError::ContainerFull(
+                    escrow_container_id,
+                    esc_cap as u32,
+                ));
+            }
 
-                    if free_slots.len() < item_instance_ids.len() {
-                        return Err(StorageError::ContainerFull(escrow_container_id, esc_cap as u32));
-                    }
-
-                    // 3. Move items into escrow container
-                    for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                        let item_row = sqlx::query("SELECT container_id FROM items WHERE item_instance_id = ?")
-                            .bind(item_id)
-                            .fetch_optional(&mut *conn)
-                            .await?;
-
-                        match item_row {
-                            Some(r) => {
-                                let cid: i64 = r.try_get("container_id")?;
-                                if cid as u64 != depositor_container_id {
-                                    return Err(StorageError::ItemNotFound(item_id.clone(), depositor_container_id));
-                                }
-                            }
-                            None => return Err(StorageError::ItemNotFound(item_id.clone(), depositor_container_id)),
-                        }
-
-                        sqlx::query("UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?")
-                            .bind(escrow_container_id as i64)
-                            .bind(*target_slot as i32)
-                            .bind(now_secs)
-                            .bind(item_id)
-                            .execute(&mut *conn)
-                            .await?;
-                    }
-
-                    // 4. Insert escrow record
-                    sqlx::query(
-                        r#"
-                        INSERT INTO escrows (escrow_id, depositor_container_id, beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms, created_at_epoch_ms, updated_at_epoch_ms)
-                        VALUES (?, ?, ?, ?, 'held', ?, ?, ?, ?)
-                        "#
-                    )
-                    .bind(escrow_id)
-                    .bind(depositor_container_id as i64)
-                    .bind(beneficiary_container_id as i64)
-                    .bind(escrow_container_id as i64)
-                    .bind(&secret_hash)
-                    .bind(expires_at_ms)
-                    .bind(now_ms)
-                    .bind(now_ms)
-                    .execute(&mut *conn)
+            // 3. Move items into escrow container
+            for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                let item_sql = format!(
+                    "SELECT container_id FROM items WHERE item_instance_id = ?{}",
+                    lock_suffix!()
+                );
+                let item_row = sqlx::query(&q!(&item_sql))
+                    .bind(item_id)
+                    .fetch_optional(&mut *conn)
                     .await?;
 
-                    Ok(EscrowRecord {
-                        escrow_id: escrow_id.to_string(),
-                        depositor_container_id,
-                        beneficiary_container_id,
-                        escrow_container_id,
-                        status: EscrowStatus::Held,
-                        secret_hash,
-                        expires_at_epoch_ms: expires_at_ms,
-                        created_at_epoch_ms: now_ms,
-                        updated_at_epoch_ms: now_ms,
-                    })
-                }.await;
-
-                match res {
-                    Ok(rec) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(rec)
+                match item_row {
+                    Some(r) => {
+                        let cid: i64 = r.try_get("container_id")?;
+                        if cid as u64 != depositor_container_id {
+                            return Err(StorageError::ItemNotFound(
+                                item_id.clone(),
+                                depositor_container_id,
+                            ));
+                        }
                     }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
+                    None => {
+                        return Err(StorageError::ItemNotFound(
+                            item_id.clone(),
+                            depositor_container_id,
+                        ));
                     }
                 }
+
+                sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(escrow_container_id as i64)
+                .bind(*target_slot as i32)
+                .bind(now_secs)
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
             }
-            DbBackend::Postgres(pool) => {
-                Self::create_escrow_postgres(
-                    pool,
-                    escrow_id,
-                    depositor_container_id,
-                    beneficiary_container_id,
-                    escrow_container_id,
-                    item_instance_ids,
-                    secret_hash,
-                    expires_at_ms,
-                    now_ms,
-                    now_secs,
-                )
-                .await
-            }
-        }
+
+            // 4. Insert escrow record
+            sqlx::query(&q!(
+                r#"
+                INSERT INTO escrows (escrow_id, depositor_container_id, beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms, created_at_epoch_ms, updated_at_epoch_ms)
+                VALUES (?, ?, ?, ?, 'held', ?, ?, ?, ?)
+                "#
+            ))
+            .bind(escrow_id)
+            .bind(depositor_container_id as i64)
+            .bind(beneficiary_container_id as i64)
+            .bind(escrow_container_id as i64)
+            .bind(&secret_hash)
+            .bind(expires_at_ms)
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(EscrowRecord {
+                escrow_id: escrow_id.to_string(),
+                depositor_container_id,
+                beneficiary_container_id,
+                escrow_container_id,
+                status: EscrowStatus::Held,
+                secret_hash: secret_hash.clone(),
+                expires_at_epoch_ms: expires_at_ms,
+                created_at_epoch_ms: now_ms,
+                updated_at_epoch_ms: now_ms,
+            })
+        })
     }
 
     /// Releases escrowed items to the beneficiary after verifying the authorization secret in constant time.
@@ -201,108 +203,98 @@ impl EscrowCoordinator {
         let now_secs = current_time_secs();
         let candidate_hash = hash_secret(secret);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            let row_sql = format!(
+                "SELECT beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms FROM escrows WHERE escrow_id = ?{}",
+                lock_suffix!()
+            );
+            let row = sqlx::query(&q!(&row_sql))
+                .bind(escrow_id)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-                let res: Result<bool, StorageError> = async {
-                    let row = sqlx::query(
-                        "SELECT beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms FROM escrows WHERE escrow_id = ?"
-                    )
-                    .bind(escrow_id)
-                    .fetch_optional(&mut *conn)
-                    .await?;
+            let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
+            let status: String = r.try_get("status")?;
+            let stored_hash: String = r.try_get("secret_hash")?;
+            let expires_at: i64 = r.try_get("expires_at_epoch_ms")?;
+            let ben_cid: i64 = r.try_get("beneficiary_container_id")?;
+            let esc_cid: i64 = r.try_get("escrow_container_id")?;
 
-                    let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
-                    let status: String = r.try_get("status")?;
-                    let stored_hash: String = r.try_get("secret_hash")?;
-                    let expires_at: i64 = r.try_get("expires_at_epoch_ms")?;
-                    let ben_cid: i64 = r.try_get("beneficiary_container_id")?;
-                    let esc_cid: i64 = r.try_get("escrow_container_id")?;
-
-                    if status != "held" {
-                        return Err(StorageError::EscrowAlreadySettled(escrow_id.to_string()));
-                    }
-                    if now_ms >= expires_at {
-                        return Err(StorageError::EscrowExpired(escrow_id.to_string()));
-                    }
-
-                    // Constant-time comparison preventing timing attacks
-                    if candidate_hash.as_bytes().ct_eq(stored_hash.as_bytes()).unwrap_u8() != 1 {
-                        return Err(StorageError::EscrowSecretMismatch(escrow_id.to_string()));
-                    }
-
-                    // Fetch beneficiary capacity
-                    let ben_row = sqlx::query("SELECT capacity FROM containers WHERE container_id = ?")
-                        .bind(ben_cid)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    let ben_cap: i32 = ben_row
-                        .ok_or(StorageError::ContainerNotFound(ben_cid as u64))?
-                        .try_get("capacity")?;
-
-                    let ben_occupied = sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                        .bind(ben_cid)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = ben_occupied
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
-
-                    let mut free_slots = Vec::new();
-                    for s in 0..(ben_cap as u32) {
-                        if !occupied_slots.contains(&s) {
-                            free_slots.push(s);
-                        }
-                    }
-
-                    let escrow_items = sqlx::query("SELECT item_instance_id FROM items WHERE container_id = ?")
-                        .bind(esc_cid)
-                        .fetch_all(&mut *conn)
-                        .await?;
-
-                    if free_slots.len() < escrow_items.len() {
-                        return Err(StorageError::ContainerFull(ben_cid as u64, ben_cap as u32));
-                    }
-
-                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-                        let item_id: String = item_row.try_get("item_instance_id")?;
-                        sqlx::query("UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?")
-                            .bind(ben_cid)
-                            .bind(*target_slot as i32)
-                            .bind(now_secs)
-                            .bind(&item_id)
-                            .execute(&mut *conn)
-                            .await?;
-                    }
-
-                    sqlx::query("UPDATE escrows SET status = 'settled', updated_at_epoch_ms = ? WHERE escrow_id = ?")
-                        .bind(now_ms)
-                        .bind(escrow_id)
-                        .execute(&mut *conn)
-                        .await?;
-
-                    Ok(true)
-                }.await;
-
-                match res {
-                    Ok(b) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(b)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
-                }
+            if status != "held" {
+                return Err(StorageError::EscrowAlreadySettled(escrow_id.to_string()));
             }
-            DbBackend::Postgres(pool) => {
-                Self::release_escrow_postgres(pool, escrow_id, &candidate_hash, now_ms, now_secs)
-                    .await
+            if now_ms >= expires_at {
+                return Err(StorageError::EscrowExpired(escrow_id.to_string()));
             }
-        }
+
+            // Constant-time comparison preventing timing attacks
+            if candidate_hash
+                .as_bytes()
+                .ct_eq(stored_hash.as_bytes())
+                .unwrap_u8()
+                != 1
+            {
+                return Err(StorageError::EscrowSecretMismatch(escrow_id.to_string()));
+            }
+
+            // Fetch beneficiary capacity
+            let ben_sql = format!(
+                "SELECT capacity FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let ben_row = sqlx::query(&q!(&ben_sql))
+                .bind(ben_cid)
+                .fetch_optional(&mut *conn)
+                .await?;
+            let ben_cap: i32 = ben_row
+                .ok_or(StorageError::ContainerNotFound(ben_cid as u64))?
+                .try_get("capacity")?;
+
+            let ben_occupied = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(ben_cid)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = ben_occupied
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
+
+            let free_slots = compute_free_slots(&occupied_slots, ben_cap as u32);
+
+            let escrow_items = sqlx::query(&q!(
+                "SELECT item_instance_id FROM items WHERE container_id = ?"
+            ))
+            .bind(esc_cid)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            if free_slots.len() < escrow_items.len() {
+                return Err(StorageError::ContainerFull(ben_cid as u64, ben_cap as u32));
+            }
+
+            for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                let item_id: String = item_row.try_get("item_instance_id")?;
+                sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(ben_cid)
+                .bind(*target_slot as i32)
+                .bind(now_secs)
+                .bind(&item_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            sqlx::query(&q!(
+                "UPDATE escrows SET status = 'settled', updated_at_epoch_ms = ? WHERE escrow_id = ?"
+            ))
+            .bind(now_ms)
+            .bind(escrow_id)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(true)
+        })
     }
 
     /// Refunds all escrowed items back to the depositor upon cancellation or timeout.
@@ -310,105 +302,91 @@ impl EscrowCoordinator {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            let row_sql = format!(
+                "SELECT depositor_container_id, escrow_container_id, status FROM escrows WHERE escrow_id = ?{}",
+                lock_suffix!()
+            );
+            let row = sqlx::query(&q!(&row_sql))
+                .bind(escrow_id)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-                let res: Result<bool, StorageError> = async {
-                    let row = sqlx::query(
-                        "SELECT depositor_container_id, escrow_container_id, status FROM escrows WHERE escrow_id = ?"
-                    )
-                    .bind(escrow_id)
-                    .fetch_optional(&mut *conn)
-                    .await?;
+            let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
+            let status: String = r.try_get("status")?;
+            let dep_cid: i64 = r.try_get("depositor_container_id")?;
+            let esc_cid: i64 = r.try_get("escrow_container_id")?;
 
-                    let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
-                    let status: String = r.try_get("status")?;
-                    let dep_cid: i64 = r.try_get("depositor_container_id")?;
-                    let esc_cid: i64 = r.try_get("escrow_container_id")?;
-
-                    if status != "held" {
-                        return Ok(false);
-                    }
-
-                    // Move items back to depositor
-                    let dep_row = sqlx::query("SELECT capacity FROM containers WHERE container_id = ?")
-                        .bind(dep_cid)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    let dep_cap: i32 = dep_row
-                        .ok_or(StorageError::ContainerNotFound(dep_cid as u64))?
-                        .try_get("capacity")?;
-
-                    let dep_occupied = sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                        .bind(dep_cid)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = dep_occupied
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
-
-                    let mut free_slots = Vec::new();
-                    for s in 0..(dep_cap as u32) {
-                        if !occupied_slots.contains(&s) {
-                            free_slots.push(s);
-                        }
-                    }
-
-                    let escrow_items = sqlx::query("SELECT item_instance_id FROM items WHERE container_id = ?")
-                        .bind(esc_cid)
-                        .fetch_all(&mut *conn)
-                        .await?;
-
-                    if free_slots.len() < escrow_items.len() {
-                        return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
-                    }
-
-                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-                        let item_id: String = item_row.try_get("item_instance_id")?;
-                        sqlx::query("UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?")
-                            .bind(dep_cid)
-                            .bind(*target_slot as i32)
-                            .bind(now_secs)
-                            .bind(&item_id)
-                            .execute(&mut *conn)
-                            .await?;
-                    }
-
-                    sqlx::query("UPDATE escrows SET status = 'refunded', updated_at_epoch_ms = ? WHERE escrow_id = ?")
-                        .bind(now_ms)
-                        .bind(escrow_id)
-                        .execute(&mut *conn)
-                        .await?;
-
-                    Ok(true)
-                }.await;
-
-                match res {
-                    Ok(b) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(b)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
-                }
+            if status != "held" {
+                return Ok(false);
             }
-            DbBackend::Postgres(pool) => {
-                Self::refund_escrow_postgres(pool, escrow_id, now_ms, now_secs).await
+
+            // Move items back to depositor
+            let dep_sql = format!(
+                "SELECT capacity FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let dep_row = sqlx::query(&q!(&dep_sql))
+                .bind(dep_cid)
+                .fetch_optional(&mut *conn)
+                .await?;
+            let dep_cap: i32 = dep_row
+                .ok_or(StorageError::ContainerNotFound(dep_cid as u64))?
+                .try_get("capacity")?;
+
+            let dep_occupied = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(dep_cid)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = dep_occupied
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
+
+            let free_slots = compute_free_slots(&occupied_slots, dep_cap as u32);
+
+            let escrow_items = sqlx::query(&q!(
+                "SELECT item_instance_id FROM items WHERE container_id = ?"
+            ))
+            .bind(esc_cid)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            if free_slots.len() < escrow_items.len() {
+                return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
             }
-        }
+
+            for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                let item_id: String = item_row.try_get("item_instance_id")?;
+                sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(dep_cid)
+                .bind(*target_slot as i32)
+                .bind(now_secs)
+                .bind(&item_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            sqlx::query(&q!(
+                "UPDATE escrows SET status = 'refunded', updated_at_epoch_ms = ? WHERE escrow_id = ?"
+            ))
+            .bind(now_ms)
+            .bind(escrow_id)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(true)
+        })
     }
 
     /// Background reaper: finds expired escrows in 'held' status and refunds them.
     pub async fn reap_expired_escrows(&self) -> Result<usize, StorageError> {
         let now_ms = current_time_ms();
-        let query =
-            "SELECT escrow_id FROM escrows WHERE status = 'held' AND expires_at_epoch_ms <= ?";
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(
+            "SELECT escrow_id FROM escrows WHERE status = 'held' AND expires_at_epoch_ms <= ?",
+        );
 
         let escrow_ids: Vec<String> = match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -418,7 +396,10 @@ impl EscrowCoordinator {
                     .collect()
             }
             DbBackend::Postgres(pool) => {
-                Self::reap_expired_escrows_postgres(pool, &query_str, now_ms).await?
+                let rows = sqlx::query(&query_str).bind(now_ms).fetch_all(pool).await?;
+                rows.into_iter()
+                    .filter_map(|r| r.try_get("escrow_id").ok())
+                    .collect()
             }
         };
 
@@ -447,8 +428,9 @@ impl EscrowCoordinator {
 
     /// Retrieves an escrow record by ID.
     pub async fn get_escrow(&self, escrow_id: &str) -> Result<Option<EscrowRecord>, StorageError> {
-        let query = "SELECT escrow_id, depositor_container_id, beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms, created_at_epoch_ms, updated_at_epoch_ms FROM escrows WHERE escrow_id = ?";
-        let query_sql = sql_for_dialect(query, self.db.is_postgres());
+        let query_sql = self.db.sql(
+            "SELECT escrow_id, depositor_container_id, beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms, created_at_epoch_ms, updated_at_epoch_ms FROM escrows WHERE escrow_id = ?",
+        );
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -457,420 +439,20 @@ impl EscrowCoordinator {
                     .fetch_optional(pool)
                     .await?;
                 match row {
-                    Some(r) => {
-                        let status_str: String = r.try_get("status")?;
-                        let status = match status_str.as_str() {
-                            "held" => EscrowStatus::Held,
-                            "settled" => EscrowStatus::Settled,
-                            "refunded" => EscrowStatus::Refunded,
-                            _ => {
-                                return Err(StorageError::TradeError(format!(
-                                    "Unknown escrow status: {}",
-                                    status_str
-                                )))
-                            }
-                        };
-                        let dep_id: i64 = r.try_get("depositor_container_id")?;
-                        let ben_id: i64 = r.try_get("beneficiary_container_id")?;
-                        let esc_id: i64 = r.try_get("escrow_container_id")?;
-                        let expires: i64 = r.try_get("expires_at_epoch_ms")?;
-                        let created: i64 = r.try_get("created_at_epoch_ms")?;
-                        let updated: i64 = r.try_get("updated_at_epoch_ms")?;
-
-                        Ok(Some(EscrowRecord {
-                            escrow_id: r.try_get("escrow_id")?,
-                            depositor_container_id: dep_id as u64,
-                            beneficiary_container_id: ben_id as u64,
-                            escrow_container_id: esc_id as u64,
-                            status,
-                            secret_hash: r.try_get("secret_hash")?,
-                            expires_at_epoch_ms: expires,
-                            created_at_epoch_ms: created,
-                            updated_at_epoch_ms: updated,
-                        }))
-                    }
+                    Some(r) => Ok(Some(parse_escrow_record!(r))),
                     None => Ok(None),
                 }
             }
             DbBackend::Postgres(pool) => {
-                Self::get_escrow_postgres(pool, &query_sql, escrow_id).await
-            }
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    async fn create_escrow_postgres(
-        pool: &sqlx::PgPool,
-        escrow_id: &str,
-        depositor_container_id: u64,
-        beneficiary_container_id: u64,
-        escrow_container_id: u64,
-        item_instance_ids: &[String],
-        secret_hash: String,
-        expires_at_ms: i64,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<EscrowRecord, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let c_dep = sqlx::query::<sqlx::Postgres>(
-            "SELECT container_id FROM containers WHERE container_id = $1 FOR UPDATE",
-        )
-        .bind(depositor_container_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let c_esc = sqlx::query::<sqlx::Postgres>(
-            "SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE",
-        )
-        .bind(escrow_container_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if c_dep.is_none() {
-            return Err(StorageError::ContainerNotFound(depositor_container_id));
-        }
-        let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
-        let esc_cap: i32 = esc_row.try_get("capacity")?;
-
-        let occupied_rows =
-            sqlx::query::<sqlx::Postgres>("SELECT slot FROM items WHERE container_id = $1")
-                .bind(escrow_container_id as i64)
-                .fetch_all(&mut *tx)
-                .await?;
-        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let mut free_slots = Vec::new();
-        for s in 0..(esc_cap as u32) {
-            if !occupied_slots.contains(&s) {
-                free_slots.push(s);
-            }
-        }
-
-        if free_slots.len() < item_instance_ids.len() {
-            return Err(StorageError::ContainerFull(
-                escrow_container_id,
-                esc_cap as u32,
-            ));
-        }
-
-        for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-            let item_row = sqlx::query::<sqlx::Postgres>(
-                "SELECT container_id FROM items WHERE item_instance_id = $1",
-            )
-            .bind(item_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            match item_row {
-                Some(r) => {
-                    let cid: i64 = r.try_get("container_id")?;
-                    if cid as u64 != depositor_container_id {
-                        return Err(StorageError::ItemNotFound(
-                            item_id.clone(),
-                            depositor_container_id,
-                        ));
-                    }
-                }
-                None => {
-                    return Err(StorageError::ItemNotFound(
-                        item_id.clone(),
-                        depositor_container_id,
-                    ))
+                let row = sqlx::query(&query_sql)
+                    .bind(escrow_id)
+                    .fetch_optional(pool)
+                    .await?;
+                match row {
+                    Some(r) => Ok(Some(parse_escrow_record!(r))),
+                    None => Ok(None),
                 }
             }
-
-            sqlx::query::<sqlx::Postgres>(
-                "UPDATE items SET container_id = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4",
-            )
-            .bind(escrow_container_id as i64)
-            .bind(*target_slot as i32)
-            .bind(now_secs)
-            .bind(item_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query::<sqlx::Postgres>(
-            r#"
-            INSERT INTO escrows (escrow_id, depositor_container_id, beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms, created_at_epoch_ms, updated_at_epoch_ms)
-            VALUES ($1, $2, $3, $4, 'held', $5, $6, $7, $8)
-            "#,
-        )
-        .bind(escrow_id)
-        .bind(depositor_container_id as i64)
-        .bind(beneficiary_container_id as i64)
-        .bind(escrow_container_id as i64)
-        .bind(&secret_hash)
-        .bind(expires_at_ms)
-        .bind(now_ms)
-        .bind(now_ms)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(EscrowRecord {
-            escrow_id: escrow_id.to_string(),
-            depositor_container_id,
-            beneficiary_container_id,
-            escrow_container_id,
-            status: EscrowStatus::Held,
-            secret_hash,
-            expires_at_epoch_ms: expires_at_ms,
-            created_at_epoch_ms: now_ms,
-            updated_at_epoch_ms: now_ms,
-        })
-    }
-
-    async fn release_escrow_postgres(
-        pool: &sqlx::PgPool,
-        escrow_id: &str,
-        candidate_hash: &str,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<bool, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let row = sqlx::query::<sqlx::Postgres>(
-            "SELECT beneficiary_container_id, escrow_container_id, status, secret_hash, expires_at_epoch_ms FROM escrows WHERE escrow_id = $1 FOR UPDATE",
-        )
-        .bind(escrow_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
-        let status: String = r.try_get("status")?;
-        let stored_hash: String = r.try_get("secret_hash")?;
-        let expires_at: i64 = r.try_get("expires_at_epoch_ms")?;
-        let ben_cid: i64 = r.try_get("beneficiary_container_id")?;
-        let esc_cid: i64 = r.try_get("escrow_container_id")?;
-
-        if status != "held" {
-            return Err(StorageError::EscrowAlreadySettled(escrow_id.to_string()));
-        }
-        if now_ms >= expires_at {
-            return Err(StorageError::EscrowExpired(escrow_id.to_string()));
-        }
-
-        if candidate_hash
-            .as_bytes()
-            .ct_eq(stored_hash.as_bytes())
-            .unwrap_u8()
-            != 1
-        {
-            return Err(StorageError::EscrowSecretMismatch(escrow_id.to_string()));
-        }
-
-        let ben_row = sqlx::query::<sqlx::Postgres>(
-            "SELECT capacity FROM containers WHERE container_id = $1 FOR UPDATE",
-        )
-        .bind(ben_cid)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let ben_cap: i32 = ben_row
-            .ok_or(StorageError::ContainerNotFound(ben_cid as u64))?
-            .try_get("capacity")?;
-
-        let ben_occupied =
-            sqlx::query::<sqlx::Postgres>("SELECT slot FROM items WHERE container_id = $1")
-                .bind(ben_cid)
-                .fetch_all(&mut *tx)
-                .await?;
-        let occupied_slots: std::collections::HashSet<u32> = ben_occupied
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let mut free_slots = Vec::new();
-        for s in 0..(ben_cap as u32) {
-            if !occupied_slots.contains(&s) {
-                free_slots.push(s);
-            }
-        }
-
-        let escrow_items = sqlx::query::<sqlx::Postgres>(
-            "SELECT item_instance_id FROM items WHERE container_id = $1",
-        )
-        .bind(esc_cid)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if free_slots.len() < escrow_items.len() {
-            return Err(StorageError::ContainerFull(ben_cid as u64, ben_cap as u32));
-        }
-
-        for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-            let item_id: String = item_row.try_get("item_instance_id")?;
-            sqlx::query::<sqlx::Postgres>(
-                "UPDATE items SET container_id = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4",
-            )
-            .bind(ben_cid)
-            .bind(*target_slot as i32)
-            .bind(now_secs)
-            .bind(&item_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query::<sqlx::Postgres>(
-            "UPDATE escrows SET status = 'settled', updated_at_epoch_ms = $1 WHERE escrow_id = $2",
-        )
-        .bind(now_ms)
-        .bind(escrow_id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    async fn refund_escrow_postgres(
-        pool: &sqlx::PgPool,
-        escrow_id: &str,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<bool, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let row = sqlx::query::<sqlx::Postgres>(
-            "SELECT depositor_container_id, escrow_container_id, status FROM escrows WHERE escrow_id = $1 FOR UPDATE",
-        )
-        .bind(escrow_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let r = row.ok_or_else(|| StorageError::EscrowNotFound(escrow_id.to_string()))?;
-        let status: String = r.try_get("status")?;
-        let dep_cid: i64 = r.try_get("depositor_container_id")?;
-        let esc_cid: i64 = r.try_get("escrow_container_id")?;
-
-        if status != "held" {
-            return Ok(false);
-        }
-
-        let dep_row = sqlx::query::<sqlx::Postgres>(
-            "SELECT capacity FROM containers WHERE container_id = $1 FOR UPDATE",
-        )
-        .bind(dep_cid)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let dep_cap: i32 = dep_row
-            .ok_or(StorageError::ContainerNotFound(dep_cid as u64))?
-            .try_get("capacity")?;
-
-        let dep_occupied =
-            sqlx::query::<sqlx::Postgres>("SELECT slot FROM items WHERE container_id = $1")
-                .bind(dep_cid)
-                .fetch_all(&mut *tx)
-                .await?;
-        let occupied_slots: std::collections::HashSet<u32> = dep_occupied
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let mut free_slots = Vec::new();
-        for s in 0..(dep_cap as u32) {
-            if !occupied_slots.contains(&s) {
-                free_slots.push(s);
-            }
-        }
-
-        let escrow_items = sqlx::query::<sqlx::Postgres>(
-            "SELECT item_instance_id FROM items WHERE container_id = $1",
-        )
-        .bind(esc_cid)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if free_slots.len() < escrow_items.len() {
-            return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
-        }
-
-        for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-            let item_id: String = item_row.try_get("item_instance_id")?;
-            sqlx::query::<sqlx::Postgres>(
-                "UPDATE items SET container_id = $1, slot = $2, updated_at = $3 WHERE item_instance_id = $4",
-            )
-            .bind(dep_cid)
-            .bind(*target_slot as i32)
-            .bind(now_secs)
-            .bind(&item_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query::<sqlx::Postgres>(
-            "UPDATE escrows SET status = 'refunded', updated_at_epoch_ms = $1 WHERE escrow_id = $2",
-        )
-        .bind(now_ms)
-        .bind(escrow_id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    async fn reap_expired_escrows_postgres(
-        pool: &sqlx::PgPool,
-        query_str: &str,
-        now_ms: i64,
-    ) -> Result<Vec<String>, StorageError> {
-        let rows = sqlx::query::<sqlx::Postgres>(query_str)
-            .bind(now_ms)
-            .fetch_all(pool)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.try_get("escrow_id").ok())
-            .collect())
-    }
-
-    async fn get_escrow_postgres(
-        pool: &sqlx::PgPool,
-        query_sql: &str,
-        escrow_id: &str,
-    ) -> Result<Option<EscrowRecord>, StorageError> {
-        let row = sqlx::query::<sqlx::Postgres>(query_sql)
-            .bind(escrow_id)
-            .fetch_optional(pool)
-            .await?;
-        match row {
-            Some(r) => {
-                let status_str: String = r.try_get("status")?;
-                let status = match status_str.as_str() {
-                    "held" => EscrowStatus::Held,
-                    "settled" => EscrowStatus::Settled,
-                    "refunded" => EscrowStatus::Refunded,
-                    _ => {
-                        return Err(StorageError::TradeError(format!(
-                            "Unknown escrow status: {}",
-                            status_str
-                        )))
-                    }
-                };
-                let dep_id: i64 = r.try_get("depositor_container_id")?;
-                let ben_id: i64 = r.try_get("beneficiary_container_id")?;
-                let esc_id: i64 = r.try_get("escrow_container_id")?;
-                let expires: i64 = r.try_get("expires_at_epoch_ms")?;
-                let created: i64 = r.try_get("created_at_epoch_ms")?;
-                let updated: i64 = r.try_get("updated_at_epoch_ms")?;
-
-                Ok(Some(EscrowRecord {
-                    escrow_id: r.try_get("escrow_id")?,
-                    depositor_container_id: dep_id as u64,
-                    beneficiary_container_id: ben_id as u64,
-                    escrow_container_id: esc_id as u64,
-                    status,
-                    secret_hash: r.try_get("secret_hash")?,
-                    expires_at_epoch_ms: expires,
-                    created_at_epoch_ms: created,
-                    updated_at_epoch_ms: updated,
-                }))
-            }
-            None => Ok(None),
         }
     }
 }

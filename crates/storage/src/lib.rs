@@ -11,6 +11,7 @@ pub mod marketplace;
 pub mod models;
 pub mod repository;
 pub mod social;
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 pub mod transaction_coord;
 pub mod world_repo;
@@ -22,15 +23,15 @@ pub use db::{sql_for_dialect, Database, DbBackend, StorageError};
 pub use escrow_coord::{hash_secret, EscrowCoordinator};
 pub use marketplace::MarketplaceRepository;
 pub use models::{
-    AccountRecord, CharacterRecord, ContainerRecord, ContainerTransactionRecord, EntitySnapshot,
-    EscrowRecord, EscrowStatus, InventoryRecord, ItemRecord, ListingStatus, MarketListingRecord,
-    ReservationRecord, TradeRecord, TradeStatus, WorldObjectRecord,
+    AccountRecord, CharacterRecord, ContainerRecord, ContainerRecordBuilder,
+    ContainerTransactionRecord, EntitySnapshot, EscrowRecord, EscrowStatus, InventoryRecord,
+    ItemRecord, ItemRecordBuilder, ListingStatus, MarketListingRecord, ReservationRecord,
+    TradeRecord, TradeStatus, WorldObjectRecord,
 };
 pub use repository::CharacterRepository;
 pub use social::{
     ChatChannel, ChatMessage, ContainerSyncAction, GuildSyncAction, MemorySocialBus, PartyAction,
     RedisSocialBus, SocialBus, SocialBusError, SocialEnvelope,
 };
-pub use test_helpers::{ContainerRecordBuilder, ItemRecordBuilder};
 pub use transaction_coord::TransactionCoordinator;
 pub use world_repo::WorldObjectRepository;

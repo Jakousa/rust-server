@@ -4,12 +4,15 @@
 //! expiration reaping, and paginated queries completely outside spatial simulation loops.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use sqlx::Row;
 
-use crate::db::{sql_for_dialect, Database, DbBackend, StorageError};
+use crate::db::{
+    current_time_ms, current_time_secs, find_first_free_slot, Database, DbBackend, StorageError,
+};
 pub use crate::models::{ListingStatus, MarketListingRecord};
+use crate::with_dialect_tx;
 
 macro_rules! parse_market_listing {
     ($r:expr) => {{
@@ -39,20 +42,6 @@ macro_rules! parse_market_listing {
             updated_at_epoch_ms: $r.try_get("updated_at_epoch_ms")?,
         }
     }};
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-fn current_time_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 struct ExpiredCandidate {
@@ -93,150 +82,114 @@ impl MarketplaceRepository {
         let expires_at_epoch_ms = now_ms + (duration_secs as i64 * 1000);
         let listing_id = format!("list-{}-{}-{}", seller_guid, src_slot, now_ms);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Verify seller ownership of source container
+            let c_src_sql = format!(
+                "SELECT container_id, owner_id FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_src = sqlx::query(&q!(&c_src_sql))
+                .bind(src_container_id as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-                let res: Result<MarketListingRecord, StorageError> = async {
-                    // 1. Verify seller ownership of source container
-                    let c_src = sqlx::query(
-                        "SELECT container_id, owner_id FROM containers WHERE container_id = ?",
-                    )
-                    .bind(src_container_id as i64)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-
-                    let c_src_row = c_src
-                        .ok_or(StorageError::ContainerNotFound(src_container_id))?;
-                    let owner_id: String = c_src_row.try_get("owner_id")?;
-                    if owner_id != seller_guid.to_string() {
-                        return Err(StorageError::UnauthorizedContainerAccess(src_container_id));
-                    }
-
-                    // 2. Verify escrow container exists and find free slot
-                    let c_esc = sqlx::query(
-                        "SELECT container_id, capacity FROM containers WHERE container_id = ?",
-                    )
-                    .bind(escrow_container_id as i64)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-
-                    let esc_row = c_esc
-                        .ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
-                    let esc_cap: i32 = esc_row.try_get("capacity")?;
-
-                    let occupied_rows =
-                        sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                            .bind(escrow_container_id as i64)
-                            .fetch_all(&mut *conn)
-                            .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
-
-                    let free_slot = (0..(esc_cap as u32))
-                        .find(|s| !occupied_slots.contains(s))
-                        .ok_or(StorageError::ContainerFull(
-                            escrow_container_id,
-                            esc_cap as u32,
-                        ))?;
-
-                    // 3. Verify item exists in seller container at slot
-                    let item_row = sqlx::query(
-                        "SELECT item_instance_id, item_def_id FROM items WHERE container_id = ? AND slot = ?",
-                    )
-                    .bind(src_container_id as i64)
-                    .bind(src_slot as i32)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                    .ok_or_else(|| {
-                        StorageError::ItemNotFound(format!("slot {src_slot}"), src_container_id)
-                    })?;
-
-                    let item_instance_id: String = item_row.try_get("item_instance_id")?;
-                    let item_def_id: i32 = item_row.try_get("item_def_id")?;
-
-                    // 4. Move item to escrow container
-                    sqlx::query(
-                        "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                    )
-                    .bind(escrow_container_id as i64)
-                    .bind(free_slot as i32)
-                    .bind(now_secs)
-                    .bind(&item_instance_id)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    // 5. Insert listing row
-                    sqlx::query(
-                        r#"
-                        INSERT INTO market_listings (
-                            listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                            price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                            expires_at_epoch_ms, updated_at_epoch_ms
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
-                        "#,
-                    )
-                    .bind(&listing_id)
-                    .bind(seller_guid as i64)
-                    .bind(src_container_id as i64)
-                    .bind(&item_instance_id)
-                    .bind(item_def_id)
-                    .bind(price as i64)
-                    .bind(escrow_container_id as i64)
-                    .bind(free_slot as i32)
-                    .bind(now_ms)
-                    .bind(expires_at_epoch_ms)
-                    .bind(now_ms)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    Ok(MarketListingRecord {
-                        listing_id,
-                        seller_guid,
-                        seller_container_id: src_container_id,
-                        item_instance_id,
-                        item_def_id: item_def_id as u32,
-                        price,
-                        escrow_container_id,
-                        escrow_slot: free_slot,
-                        status: ListingStatus::Active,
-                        created_at_epoch_ms: now_ms,
-                        expires_at_epoch_ms,
-                        updated_at_epoch_ms: now_ms,
-                    })
-                }
-                .await;
-
-                match res {
-                    Ok(rec) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(rec)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
-                }
+            let c_src_row = c_src.ok_or(StorageError::ContainerNotFound(src_container_id))?;
+            let owner_id: String = c_src_row.try_get("owner_id")?;
+            if owner_id != seller_guid.to_string() {
+                return Err(StorageError::UnauthorizedContainerAccess(src_container_id));
             }
-            DbBackend::Postgres(pool) => {
-                Self::create_listing_postgres(
-                    pool,
-                    listing_id,
-                    seller_guid,
-                    src_container_id,
-                    src_slot,
-                    price,
-                    expires_at_epoch_ms,
-                    escrow_container_id,
-                    now_ms,
-                    now_secs,
-                )
-                .await
-            }
-        }
+
+            // 2. Verify escrow container exists and find free slot
+            let c_esc_sql = format!(
+                "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_esc = sqlx::query(&q!(&c_esc_sql))
+                .bind(escrow_container_id as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+            let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
+            let esc_cap: i32 = esc_row.try_get("capacity")?;
+
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(escrow_container_id as i64)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
+
+            let free_slot = find_first_free_slot(&occupied_slots, esc_cap as u32).ok_or(
+                StorageError::ContainerFull(escrow_container_id, esc_cap as u32),
+            )?;
+
+            // 3. Verify item exists in seller container at slot
+            let item_sql = format!(
+                "SELECT item_instance_id, item_def_id FROM items WHERE container_id = ? AND slot = ?{}",
+                lock_suffix!()
+            );
+            let item_row = sqlx::query(&q!(&item_sql))
+                .bind(src_container_id as i64)
+                .bind(src_slot as i32)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(|| {
+                    StorageError::ItemNotFound(format!("slot {src_slot}"), src_container_id)
+                })?;
+
+            let item_instance_id: String = item_row.try_get("item_instance_id")?;
+            let item_def_id: i32 = item_row.try_get("item_def_id")?;
+
+            // 4. Move item to escrow container
+            sqlx::query(&q!(
+                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+            ))
+            .bind(escrow_container_id as i64)
+            .bind(free_slot as i32)
+            .bind(now_secs)
+            .bind(&item_instance_id)
+            .execute(&mut *conn)
+            .await?;
+
+            // 5. Insert listing row
+            sqlx::query(&q!(r#"
+                INSERT INTO market_listings (
+                    listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
+                    price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
+                    expires_at_epoch_ms, updated_at_epoch_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
+                "#))
+            .bind(&listing_id)
+            .bind(seller_guid as i64)
+            .bind(src_container_id as i64)
+            .bind(&item_instance_id)
+            .bind(item_def_id)
+            .bind(price as i64)
+            .bind(escrow_container_id as i64)
+            .bind(free_slot as i32)
+            .bind(now_ms)
+            .bind(expires_at_epoch_ms)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(MarketListingRecord {
+                listing_id: listing_id.clone(),
+                seller_guid,
+                seller_container_id: src_container_id,
+                item_instance_id,
+                item_def_id: item_def_id as u32,
+                price,
+                escrow_container_id,
+                escrow_slot: free_slot,
+                status: ListingStatus::Active,
+                created_at_epoch_ms: now_ms,
+                expires_at_epoch_ms,
+                updated_at_epoch_ms: now_ms,
+            })
+        })
     }
 
     /// Atomically purchases an active listing: transfers payment, delivers the item from escrow
@@ -252,207 +205,180 @@ impl MarketplaceRepository {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Verify buyer ownership of target and payment containers
+            let mut cids = vec![buyer_container_id, payment_container_id];
+            cids.sort_unstable();
+            cids.dedup();
 
-                let res: Result<MarketListingRecord, StorageError> = async {
-                    // 1. Verify buyer ownership of target and payment containers
-                    let mut cids = vec![buyer_container_id, payment_container_id];
-                    cids.sort_unstable();
-                    cids.dedup();
+            let placeholders = vec!["?"; cids.len()].join(", ");
+            let query_str = format!(
+                "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}){}",
+                placeholders,
+                lock_suffix!()
+            );
 
-                    let placeholders = vec!["?"; cids.len()].join(", ");
-                    let query_str = format!("SELECT container_id, owner_id FROM containers WHERE container_id IN ({})", placeholders);
+            let sql_str = q!(&query_str);
+            let mut q = sqlx::query(&sql_str);
+            for cid in &cids {
+                q = q.bind(*cid as i64);
+            }
 
-                    let mut q = sqlx::query(&query_str);
-                    for cid in &cids {
-                        q = q.bind(*cid as i64);
-                    }
-
-                    let rows = q.fetch_all(&mut *conn).await?;
-                    if rows.len() != cids.len() {
-                        let mut found_cids = Vec::with_capacity(rows.len());
-                        for r in &rows {
-                            found_cids.push(r.try_get::<i64, _>("container_id")?);
-                        }
-                        let missing = cids
-                            .into_iter()
-                            .find(|cid| !found_cids.contains(&(*cid as i64)))
-                            .unwrap_or(buyer_container_id);
-                        return Err(StorageError::ContainerNotFound(missing));
-                    }
-
-                    let buyer_guid_str = buyer_guid.to_string();
-                    for row in rows {
-                        let owner_id: String = row.try_get("owner_id")?;
-                        let cid_i64: i64 = row.try_get("container_id")?;
-                        if owner_id != buyer_guid_str {
-                            return Err(StorageError::UnauthorizedContainerAccess(cid_i64 as u64));
-                        }
-                    }
-
-                    // 2. Fetch and lock active listing
-                    let list_row = sqlx::query(
-                        r#"
-                        SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                               price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                               expires_at_epoch_ms, updated_at_epoch_ms
-                        FROM market_listings WHERE listing_id = ?
-                        "#,
-                    )
-                    .bind(listing_id)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                    .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
-
-                    let status_str: String = list_row.try_get("status")?;
-                    if status_str != "Active" {
-                        return Err(StorageError::ListingNotActive(
-                            listing_id.to_string(),
-                            status_str,
-                        ));
-                    }
-
-                    let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
-                    if expires_at <= now_ms {
-                        return Err(StorageError::ListingNotActive(
-                            listing_id.to_string(),
-                            "Expired".to_string(),
-                        ));
-                    }
-
-                    let price: i64 = list_row.try_get("price")?;
-                    if payment_price < price as u64 {
-                        return Err(StorageError::TradeError(format!(
-                            "Insufficient payment: offered {}, required {}",
-                            payment_price, price
-                        )));
-                    }
-
-                    let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
-                    let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
-                    let item_instance_id: String = list_row.try_get("item_instance_id")?;
-                    let item_def_id: i32 = list_row.try_get("item_def_id")?;
-                    let seller_guid: i64 = list_row.try_get("seller_guid")?;
-                    let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
-                    let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
-
-                    // 3. Find free slot in buyer's destination container
-                    let c_buyer = sqlx::query(
-                        "SELECT capacity FROM containers WHERE container_id = ?",
-                    )
-                    .bind(buyer_container_id as i64)
-                    .fetch_one(&mut *conn)
-                    .await?;
-                    let buyer_cap: i32 = c_buyer.try_get("capacity")?;
-
-                    let occupied_rows =
-                        sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                            .bind(buyer_container_id as i64)
-                            .fetch_all(&mut *conn)
-                            .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
-
-                    let free_slot = (0..(buyer_cap as u32))
-                        .find(|s| !occupied_slots.contains(s))
-                        .ok_or(StorageError::ContainerFull(
-                            buyer_container_id,
-                            buyer_cap as u32,
-                        ))?;
-
-                    // 4. Transfer item from escrow to buyer container
-                    sqlx::query(
-                        "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                    )
-                    .bind(buyer_container_id as i64)
-                    .bind(free_slot as i32)
-                    .bind(now_secs)
-                    .bind(&item_instance_id)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    // 5. Update listing status to 'Sold'
-                    sqlx::query(
-                        "UPDATE market_listings SET status = 'Sold', updated_at_epoch_ms = ? WHERE listing_id = ?",
-                    )
-                    .bind(now_ms)
-                    .bind(listing_id)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    // 6. Record audit logging into container_transactions
-                    let item_tx_id = format!("mkt_item_{}", listing_id);
-                    sqlx::query(
-                        "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
-                    )
-                    .bind(&item_tx_id)
-                    .bind(escrow_container_id)
-                    .bind(buyer_container_id as i64)
-                    .bind(&item_instance_id)
-                    .bind(now_ms)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    let pay_tx_id = format!("mkt_pay_{}", listing_id);
-                    let pay_item_desc = format!("price:{}", price);
-                    sqlx::query(
-                        "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
-                    )
-                    .bind(&pay_tx_id)
-                    .bind(payment_container_id as i64)
-                    .bind(seller_container_id)
-                    .bind(&pay_item_desc)
-                    .bind(now_ms)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    Ok(MarketListingRecord {
-                        listing_id: listing_id.to_string(),
-                        seller_guid: seller_guid as u64,
-                        seller_container_id: seller_container_id as u64,
-                        item_instance_id,
-                        item_def_id: item_def_id as u32,
-                        price: price as u64,
-                        escrow_container_id: escrow_container_id as u64,
-                        escrow_slot: escrow_slot as u32,
-                        status: ListingStatus::Sold,
-                        created_at_epoch_ms: created_at,
-                        expires_at_epoch_ms: expires_at,
-                        updated_at_epoch_ms: now_ms,
-                    })
+            let rows = q.fetch_all(&mut *conn).await?;
+            if rows.len() != cids.len() {
+                let mut found_cids = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    found_cids.push(r.try_get::<i64, _>("container_id")?);
                 }
-                .await;
+                let missing = cids
+                    .into_iter()
+                    .find(|cid| !found_cids.contains(&(*cid as i64)))
+                    .unwrap_or(buyer_container_id);
+                return Err(StorageError::ContainerNotFound(missing));
+            }
 
-                match res {
-                    Ok(rec) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(rec)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
+            let buyer_guid_str = buyer_guid.to_string();
+            for row in rows {
+                let owner_id: String = row.try_get("owner_id")?;
+                let cid_i64: i64 = row.try_get("container_id")?;
+                if owner_id != buyer_guid_str {
+                    return Err(StorageError::UnauthorizedContainerAccess(cid_i64 as u64));
                 }
             }
-            DbBackend::Postgres(pool) => {
-                Self::purchase_listing_postgres(
-                    pool,
-                    listing_id,
-                    buyer_guid,
-                    buyer_container_id,
-                    payment_container_id,
-                    payment_price,
-                    now_ms,
-                    now_secs,
-                )
-                .await
+
+            // 2. Fetch and lock active listing
+            let list_sql = format!(
+                r#"
+                SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
+                       price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
+                       expires_at_epoch_ms, updated_at_epoch_ms
+                FROM market_listings WHERE listing_id = ?{}
+                "#,
+                lock_suffix!()
+            );
+            let list_row = sqlx::query(&q!(&list_sql))
+                .bind(listing_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
+
+            let status_str: String = list_row.try_get("status")?;
+            if status_str != "Active" {
+                return Err(StorageError::ListingNotActive(
+                    listing_id.to_string(),
+                    status_str,
+                ));
             }
-        }
+
+            let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
+            if expires_at <= now_ms {
+                return Err(StorageError::ListingNotActive(
+                    listing_id.to_string(),
+                    "Expired".to_string(),
+                ));
+            }
+
+            let price: i64 = list_row.try_get("price")?;
+            if payment_price < price as u64 {
+                return Err(StorageError::TradeError(format!(
+                    "Insufficient payment: offered {}, required {}",
+                    payment_price, price
+                )));
+            }
+
+            let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
+            let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
+            let item_instance_id: String = list_row.try_get("item_instance_id")?;
+            let item_def_id: i32 = list_row.try_get("item_def_id")?;
+            let seller_guid: i64 = list_row.try_get("seller_guid")?;
+            let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
+            let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
+
+            // 3. Find free slot in buyer's destination container
+            let c_buyer_sql = format!(
+                "SELECT capacity FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_buyer = sqlx::query(&q!(&c_buyer_sql))
+                .bind(buyer_container_id as i64)
+                .fetch_one(&mut *conn)
+                .await?;
+            let buyer_cap: i32 = c_buyer.try_get("capacity")?;
+
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(buyer_container_id as i64)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
+
+            let free_slot = find_first_free_slot(&occupied_slots, buyer_cap as u32).ok_or(
+                StorageError::ContainerFull(buyer_container_id, buyer_cap as u32),
+            )?;
+
+            // 4. Transfer item from escrow to buyer container
+            sqlx::query(&q!(
+                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+            ))
+            .bind(buyer_container_id as i64)
+            .bind(free_slot as i32)
+            .bind(now_secs)
+            .bind(&item_instance_id)
+            .execute(&mut *conn)
+            .await?;
+
+            // 5. Update listing status to 'Sold'
+            sqlx::query(&q!(
+                "UPDATE market_listings SET status = 'Sold', updated_at_epoch_ms = ? WHERE listing_id = ?"
+            ))
+            .bind(now_ms)
+            .bind(listing_id)
+            .execute(&mut *conn)
+            .await?;
+
+            // 6. Record audit logging into container_transactions
+            let item_tx_id = format!("mkt_item_{}", listing_id);
+            sqlx::query(&q!(
+                "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)"
+            ))
+            .bind(&item_tx_id)
+            .bind(escrow_container_id)
+            .bind(buyer_container_id as i64)
+            .bind(&item_instance_id)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await?;
+
+            let pay_tx_id = format!("mkt_pay_{}", listing_id);
+            let pay_item_desc = format!("price:{}", price);
+            sqlx::query(&q!(
+                "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)"
+            ))
+            .bind(&pay_tx_id)
+            .bind(payment_container_id as i64)
+            .bind(seller_container_id)
+            .bind(&pay_item_desc)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(MarketListingRecord {
+                listing_id: listing_id.to_string(),
+                seller_guid: seller_guid as u64,
+                seller_container_id: seller_container_id as u64,
+                item_instance_id,
+                item_def_id: item_def_id as u32,
+                price: price as u64,
+                escrow_container_id: escrow_container_id as u64,
+                escrow_slot: escrow_slot as u32,
+                status: ListingStatus::Sold,
+                created_at_epoch_ms: created_at,
+                expires_at_epoch_ms: expires_at,
+                updated_at_epoch_ms: now_ms,
+            })
+        })
     }
 
     /// Atomically cancels an active listing: returns the escrowed item back to the seller's container
@@ -466,142 +392,112 @@ impl MarketplaceRepository {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-
-                let res: Result<MarketListingRecord, StorageError> = async {
-                    // 1. Verify seller ownership of destination container
-                    let c_dst = sqlx::query(
-                        "SELECT capacity, owner_id FROM containers WHERE container_id = ?",
-                    )
-                    .bind(dst_container_id as i64)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                    .ok_or(StorageError::ContainerNotFound(dst_container_id))?;
-                    let owner_id: String = c_dst.try_get("owner_id")?;
-                    if owner_id != seller_guid.to_string() {
-                        return Err(StorageError::UnauthorizedContainerAccess(dst_container_id));
-                    }
-                    let dst_cap: i32 = c_dst.try_get("capacity")?;
-
-                    // 2. Fetch listing
-                    let list_row = sqlx::query(
-                        r#"
-                        SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                               price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                               expires_at_epoch_ms, updated_at_epoch_ms
-                        FROM market_listings WHERE listing_id = ?
-                        "#,
-                    )
-                    .bind(listing_id)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                    .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
-
-                    let s_guid: i64 = list_row.try_get("seller_guid")?;
-                    if s_guid as u64 != seller_guid {
-                        return Err(StorageError::UnauthorizedMarketAction(
-                            listing_id.to_string(),
-                        ));
-                    }
-
-                    let status_str: String = list_row.try_get("status")?;
-                    if status_str != "Active" {
-                        return Err(StorageError::ListingNotActive(
-                            listing_id.to_string(),
-                            status_str,
-                        ));
-                    }
-
-                    let item_instance_id: String = list_row.try_get("item_instance_id")?;
-                    let item_def_id: i32 = list_row.try_get("item_def_id")?;
-                    let price: i64 = list_row.try_get("price")?;
-                    let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
-                    let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
-                    let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
-                    let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
-                    let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
-
-                    // 3. Find free slot in destination container
-                    let occupied_rows =
-                        sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                            .bind(dst_container_id as i64)
-                            .fetch_all(&mut *conn)
-                            .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
-
-                    let free_slot = (0..(dst_cap as u32))
-                        .find(|s| !occupied_slots.contains(s))
-                        .ok_or(StorageError::ContainerFull(
-                            dst_container_id,
-                            dst_cap as u32,
-                        ))?;
-
-                    // 4. Move item back to seller container
-                    sqlx::query(
-                        "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                    )
-                    .bind(dst_container_id as i64)
-                    .bind(free_slot as i32)
-                    .bind(now_secs)
-                    .bind(&item_instance_id)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    // 5. Mark listing as Cancelled
-                    sqlx::query(
-                        "UPDATE market_listings SET status = 'Cancelled', updated_at_epoch_ms = ? WHERE listing_id = ?",
-                    )
-                    .bind(now_ms)
-                    .bind(listing_id)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    Ok(MarketListingRecord {
-                        listing_id: listing_id.to_string(),
-                        seller_guid,
-                        seller_container_id: seller_container_id as u64,
-                        item_instance_id,
-                        item_def_id: item_def_id as u32,
-                        price: price as u64,
-                        escrow_container_id: escrow_container_id as u64,
-                        escrow_slot: escrow_slot as u32,
-                        status: ListingStatus::Cancelled,
-                        created_at_epoch_ms: created_at,
-                        expires_at_epoch_ms: expires_at,
-                        updated_at_epoch_ms: now_ms,
-                    })
-                }
-                .await;
-
-                match res {
-                    Ok(rec) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(rec)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
-                }
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Verify seller ownership of destination container
+            let c_dst_sql = format!(
+                "SELECT capacity, owner_id FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let c_dst = sqlx::query(&q!(&c_dst_sql))
+                .bind(dst_container_id as i64)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(StorageError::ContainerNotFound(dst_container_id))?;
+            let owner_id: String = c_dst.try_get("owner_id")?;
+            if owner_id != seller_guid.to_string() {
+                return Err(StorageError::UnauthorizedContainerAccess(dst_container_id));
             }
-            DbBackend::Postgres(pool) => {
-                Self::cancel_listing_postgres(
-                    pool,
-                    listing_id,
-                    seller_guid,
-                    dst_container_id,
-                    now_ms,
-                    now_secs,
-                )
-                .await
+            let dst_cap: i32 = c_dst.try_get("capacity")?;
+
+            // 2. Fetch listing
+            let list_sql = format!(
+                r#"
+                SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
+                       price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
+                       expires_at_epoch_ms, updated_at_epoch_ms
+                FROM market_listings WHERE listing_id = ?{}
+                "#,
+                lock_suffix!()
+            );
+            let list_row = sqlx::query(&q!(&list_sql))
+                .bind(listing_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
+
+            let s_guid: i64 = list_row.try_get("seller_guid")?;
+            if s_guid as u64 != seller_guid {
+                return Err(StorageError::UnauthorizedMarketAction(
+                    listing_id.to_string(),
+                ));
             }
-        }
+
+            let status_str: String = list_row.try_get("status")?;
+            if status_str != "Active" {
+                return Err(StorageError::ListingNotActive(
+                    listing_id.to_string(),
+                    status_str,
+                ));
+            }
+
+            let item_instance_id: String = list_row.try_get("item_instance_id")?;
+            let item_def_id: i32 = list_row.try_get("item_def_id")?;
+            let price: i64 = list_row.try_get("price")?;
+            let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
+            let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
+            let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
+            let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
+            let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
+
+            // 3. Find free slot in destination container
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                .bind(dst_container_id as i64)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
+
+            let free_slot = find_first_free_slot(&occupied_slots, dst_cap as u32).ok_or(
+                StorageError::ContainerFull(dst_container_id, dst_cap as u32),
+            )?;
+
+            // 4. Move item back to seller container
+            sqlx::query(&q!(
+                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+            ))
+            .bind(dst_container_id as i64)
+            .bind(free_slot as i32)
+            .bind(now_secs)
+            .bind(&item_instance_id)
+            .execute(&mut *conn)
+            .await?;
+
+            // 5. Mark listing as Cancelled
+            sqlx::query(&q!(
+                "UPDATE market_listings SET status = 'Cancelled', updated_at_epoch_ms = ? WHERE listing_id = ?"
+            ))
+            .bind(now_ms)
+            .bind(listing_id)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(MarketListingRecord {
+                listing_id: listing_id.to_string(),
+                seller_guid,
+                seller_container_id: seller_container_id as u64,
+                item_instance_id,
+                item_def_id: item_def_id as u32,
+                price: price as u64,
+                escrow_container_id: escrow_container_id as u64,
+                escrow_slot: escrow_slot as u32,
+                status: ListingStatus::Cancelled,
+                created_at_epoch_ms: created_at,
+                expires_at_epoch_ms: expires_at,
+                updated_at_epoch_ms: now_ms,
+            })
+        })
     }
 
     /// Queries a single listing by its ID.
@@ -615,7 +511,7 @@ impl MarketplaceRepository {
                    expires_at_epoch_ms, updated_at_epoch_ms
             FROM market_listings WHERE listing_id = ?
         "#;
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -629,7 +525,14 @@ impl MarketplaceRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                Self::get_listing_postgres(pool, &query_str, listing_id).await
+                let row = sqlx::query(&query_str)
+                    .bind(listing_id)
+                    .fetch_optional(pool)
+                    .await?;
+                match row {
+                    Some(r) => Ok(Some(parse_market_listing!(r))),
+                    None => Ok(None),
+                }
             }
         }
     }
@@ -665,7 +568,7 @@ impl MarketplaceRepository {
         }
 
         query.push_str(" ORDER BY created_at_epoch_ms DESC LIMIT ? OFFSET ?");
-        let query_str = sql_for_dialect(&query, self.db.is_postgres());
+        let query_str = self.db.sql(&query);
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
@@ -688,17 +591,23 @@ impl MarketplaceRepository {
                 Ok(results)
             }
             DbBackend::Postgres(pool) => {
-                Self::query_listings_postgres(
-                    pool,
-                    &query_str,
-                    item_def_id,
-                    min_price,
-                    max_price,
-                    offset,
-                    limit,
-                    now_ms,
-                )
-                .await
+                let mut q = sqlx::query(&query_str).bind(now_ms);
+                if let Some(def_id) = item_def_id {
+                    q = q.bind(def_id as i32);
+                }
+                if let Some(min_p) = min_price {
+                    q = q.bind(min_p as i64);
+                }
+                if let Some(max_p) = max_price {
+                    q = q.bind(max_p as i64);
+                }
+                q = q.bind(limit as i32).bind(offset as i32);
+                let rows = q.fetch_all(pool).await?;
+                let mut results = Vec::with_capacity(rows.len());
+                for r in rows {
+                    results.push(parse_market_listing!(r));
+                }
+                Ok(results)
             }
         }
     }
@@ -714,9 +623,9 @@ impl MarketplaceRepository {
             WHERE status = 'Active' AND expires_at_epoch_ms <= ?
             LIMIT ?
         "#;
-        let query_str = sql_for_dialect(query, self.db.is_postgres());
+        let query_str = self.db.sql(query);
 
-        match self.db.backend() {
+        let candidates = match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 let rows = sqlx::query(&query_str)
                     .bind(now_ms)
@@ -731,83 +640,94 @@ impl MarketplaceRepository {
                         item_instance_id: r.try_get("item_instance_id")?,
                     });
                 }
-
-                let mut reaped = 0;
-                for r in list {
-                    let listing_id = r.listing_id;
-                    let seller_container_id = r.seller_container_id;
-                    let item_instance_id = r.item_instance_id;
-
-                    let mut conn = pool.acquire().await?;
-                    let _ = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await;
-
-                    let c_seller =
-                        sqlx::query("SELECT capacity FROM containers WHERE container_id = ?")
-                            .bind(seller_container_id)
-                            .fetch_optional(&mut *conn)
-                            .await?;
-
-                    let mut item_returned = false;
-                    if let Some(c_row) = c_seller {
-                        let cap: i32 = c_row.try_get("capacity")?;
-                        let occupied_rows =
-                            sqlx::query("SELECT slot FROM items WHERE container_id = ?")
-                                .bind(seller_container_id)
-                                .fetch_all(&mut *conn)
-                                .await?;
-                        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                            .into_iter()
-                            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                            .collect();
-
-                        if let Some(free_slot) =
-                            (0..(cap as u32)).find(|s| !occupied_slots.contains(s))
-                        {
-                            let item_res = sqlx::query(
-                                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                            )
-                            .bind(seller_container_id)
-                            .bind(free_slot as i32)
-                            .bind(now_secs)
-                            .bind(&item_instance_id)
-                            .execute(&mut *conn)
-                            .await;
-                            if item_res.is_ok() {
-                                item_returned = true;
-                            }
-                        }
-                    }
-
-                    if !item_returned {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        continue;
-                    }
-
-                    let res = sqlx::query(
-                        "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'",
-                    )
-                    .bind(now_ms)
-                    .bind(&listing_id)
-                    .execute(&mut *conn)
-                    .await;
-
-                    if let Ok(affected) = res {
-                        if affected.rows_affected() == 1 {
-                            let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
-                            reaped += 1;
-                        } else {
-                            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        }
-                    } else {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    }
-                }
-                Ok(reaped)
+                list
             }
             DbBackend::Postgres(pool) => {
-                Self::reap_expired_listings_postgres(pool, max_batch, now_ms, now_secs).await
+                let rows = sqlx::query(&query_str)
+                    .bind(now_ms)
+                    .bind(max_batch as i32)
+                    .fetch_all(pool)
+                    .await?;
+                let mut list = Vec::with_capacity(rows.len());
+                for r in rows {
+                    list.push(ExpiredCandidate {
+                        listing_id: r.try_get("listing_id")?,
+                        seller_container_id: r.try_get("seller_container_id")?,
+                        item_instance_id: r.try_get("item_instance_id")?,
+                    });
+                }
+                list
+            }
+        };
+
+        let mut reaped = 0;
+        for r in candidates {
+            let res: Result<bool, StorageError> = with_dialect_tx!(
+                &self.db,
+                |conn, is_pg| async move {
+                    let c_seller_sql = format!(
+                        "SELECT capacity FROM containers WHERE container_id = ?{}",
+                        lock_suffix!()
+                    );
+                    let c_seller = sqlx::query(&q!(&c_seller_sql))
+                        .bind(r.seller_container_id)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+
+                    let Some(c_row) = c_seller else {
+                        return Ok(false);
+                    };
+                    let cap: i32 = c_row.try_get("capacity")?;
+
+                    let occupied_rows =
+                        sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
+                            .bind(r.seller_container_id)
+                            .fetch_all(&mut *conn)
+                            .await?;
+                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                        .into_iter()
+                        .filter_map(|row| row.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                        .collect();
+
+                    let Some(free_slot) = find_first_free_slot(&occupied_slots, cap as u32) else {
+                        return Ok(false);
+                    };
+
+                    sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(r.seller_container_id)
+                .bind(free_slot as i32)
+                .bind(now_secs)
+                .bind(&r.item_instance_id)
+                .execute(&mut *conn)
+                .await?;
+
+                    let res = sqlx::query(&q!(
+                    "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'"
+                ))
+                .bind(now_ms)
+                .bind(&r.listing_id)
+                .execute(&mut *conn)
+                .await?;
+
+                    if res.rows_affected() == 1 {
+                        Ok(true)
+                    } else {
+                        Err(StorageError::ListingNotActive(
+                            r.listing_id.clone(),
+                            "Already processed".to_string(),
+                        ))
+                    }
+                }
+            );
+
+            if let Ok(true) = res {
+                reaped += 1;
             }
         }
+
+        Ok(reaped)
     }
 
     /// Spawns a background task that periodically sweeps expired active listings and refunds them.
@@ -818,598 +738,6 @@ impl MarketplaceRepository {
                 let _ = repo.reap_expired_listings(50).await;
             }
         })
-    }
-    #[allow(clippy::too_many_arguments)]
-    async fn create_listing_postgres(
-        pool: &sqlx::PgPool,
-        listing_id: String,
-        seller_guid: u64,
-        src_container_id: u64,
-        src_slot: u32,
-        price: u64,
-        expires_at_epoch_ms: i64,
-        escrow_container_id: u64,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<MarketListingRecord, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let c_src_sql = sql_for_dialect(
-            "SELECT container_id, owner_id FROM containers WHERE container_id = ? FOR UPDATE",
-            true,
-        );
-        let c_src_row = sqlx::query::<sqlx::Postgres>(&c_src_sql)
-            .bind(src_container_id as i64)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StorageError::ContainerNotFound(src_container_id))?;
-        let owner_id: String = c_src_row.try_get("owner_id")?;
-        if owner_id != seller_guid.to_string() {
-            return Err(StorageError::UnauthorizedContainerAccess(src_container_id));
-        }
-
-        let c_esc_sql = sql_for_dialect(
-            "SELECT container_id, capacity FROM containers WHERE container_id = ? FOR UPDATE",
-            true,
-        );
-        let esc_row = sqlx::query::<sqlx::Postgres>(&c_esc_sql)
-            .bind(escrow_container_id as i64)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
-        let esc_cap: i32 = esc_row.try_get("capacity")?;
-
-        let occ_sql = sql_for_dialect("SELECT slot FROM items WHERE container_id = ?", true);
-        let occupied_rows = sqlx::query::<sqlx::Postgres>(&occ_sql)
-            .bind(escrow_container_id as i64)
-            .fetch_all(&mut *tx)
-            .await?;
-        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let free_slot = (0..(esc_cap as u32))
-            .find(|s| !occupied_slots.contains(s))
-            .ok_or(StorageError::ContainerFull(
-                escrow_container_id,
-                esc_cap as u32,
-            ))?;
-
-        let item_sql = sql_for_dialect(
-            "SELECT item_instance_id, item_def_id FROM items WHERE container_id = ? AND slot = ? FOR UPDATE",
-            true,
-        );
-        let item_row = sqlx::query::<sqlx::Postgres>(&item_sql)
-            .bind(src_container_id as i64)
-            .bind(src_slot as i32)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                StorageError::ItemNotFound(format!("slot {src_slot}"), src_container_id)
-            })?;
-        let item_instance_id: String = item_row.try_get("item_instance_id")?;
-        let item_def_id: i32 = item_row.try_get("item_def_id")?;
-
-        let upd_item_sql = sql_for_dialect(
-            "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&upd_item_sql)
-            .bind(escrow_container_id as i64)
-            .bind(free_slot as i32)
-            .bind(now_secs)
-            .bind(&item_instance_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let ins_sql = sql_for_dialect(
-            r#"
-            INSERT INTO market_listings (
-                listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                expires_at_epoch_ms, updated_at_epoch_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
-            "#,
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&ins_sql)
-            .bind(&listing_id)
-            .bind(seller_guid as i64)
-            .bind(src_container_id as i64)
-            .bind(&item_instance_id)
-            .bind(item_def_id)
-            .bind(price as i64)
-            .bind(escrow_container_id as i64)
-            .bind(free_slot as i32)
-            .bind(now_ms)
-            .bind(expires_at_epoch_ms)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(MarketListingRecord {
-            listing_id,
-            seller_guid,
-            seller_container_id: src_container_id,
-            item_instance_id,
-            item_def_id: item_def_id as u32,
-            price,
-            escrow_container_id,
-            escrow_slot: free_slot,
-            status: ListingStatus::Active,
-            created_at_epoch_ms: now_ms,
-            expires_at_epoch_ms,
-            updated_at_epoch_ms: now_ms,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn purchase_listing_postgres(
-        pool: &sqlx::PgPool,
-        listing_id: &str,
-        buyer_guid: u64,
-        buyer_container_id: u64,
-        payment_container_id: u64,
-        payment_price: u64,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<MarketListingRecord, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let mut cids = vec![buyer_container_id, payment_container_id];
-        cids.sort_unstable();
-        cids.dedup();
-
-        let mut placeholders = Vec::new();
-        for i in 1..=cids.len() {
-            placeholders.push(format!("${}", i));
-        }
-        let in_clause = placeholders.join(", ");
-        let query_str = format!(
-            "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) ORDER BY container_id ASC FOR UPDATE",
-            in_clause
-        );
-
-        let mut q = sqlx::query::<sqlx::Postgres>(&query_str);
-        for cid in &cids {
-            q = q.bind(*cid as i64);
-        }
-
-        let rows = q.fetch_all(&mut *tx).await?;
-        if rows.len() != cids.len() {
-            let mut found_cids = Vec::with_capacity(rows.len());
-            for r in &rows {
-                found_cids.push(r.try_get::<i64, _>("container_id")?);
-            }
-            let missing = cids
-                .into_iter()
-                .find(|cid| !found_cids.contains(&(*cid as i64)))
-                .unwrap_or(buyer_container_id);
-            return Err(StorageError::ContainerNotFound(missing));
-        }
-
-        let buyer_guid_str = buyer_guid.to_string();
-        for row in rows {
-            let owner_id: String = row.try_get("owner_id")?;
-            let cid_i64: i64 = row.try_get("container_id")?;
-            if owner_id != buyer_guid_str {
-                return Err(StorageError::UnauthorizedContainerAccess(cid_i64 as u64));
-            }
-        }
-
-        let list_sql = sql_for_dialect(
-            r#"
-            SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                   price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                   expires_at_epoch_ms, updated_at_epoch_ms
-            FROM market_listings WHERE listing_id = ? FOR UPDATE
-            "#,
-            true,
-        );
-        let list_row = sqlx::query::<sqlx::Postgres>(&list_sql)
-            .bind(listing_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
-
-        let status_str: String = list_row.try_get("status")?;
-        if status_str != "Active" {
-            return Err(StorageError::ListingNotActive(
-                listing_id.to_string(),
-                status_str,
-            ));
-        }
-
-        let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
-        if expires_at <= now_ms {
-            return Err(StorageError::ListingNotActive(
-                listing_id.to_string(),
-                "Expired".to_string(),
-            ));
-        }
-
-        let price: i64 = list_row.try_get("price")?;
-        if payment_price < price as u64 {
-            return Err(StorageError::TradeError(format!(
-                "Insufficient payment: offered {}, required {}",
-                payment_price, price
-            )));
-        }
-
-        let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
-        let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
-        let item_instance_id: String = list_row.try_get("item_instance_id")?;
-        let item_def_id: i32 = list_row.try_get("item_def_id")?;
-        let seller_guid: i64 = list_row.try_get("seller_guid")?;
-        let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
-        let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
-
-        let c_buyer_sql = sql_for_dialect(
-            "SELECT capacity FROM containers WHERE container_id = ? FOR UPDATE",
-            true,
-        );
-        let c_buyer = sqlx::query::<sqlx::Postgres>(&c_buyer_sql)
-            .bind(buyer_container_id as i64)
-            .fetch_one(&mut *tx)
-            .await?;
-        let buyer_cap: i32 = c_buyer.try_get("capacity")?;
-
-        let occ_sql = sql_for_dialect("SELECT slot FROM items WHERE container_id = ?", true);
-        let occupied_rows = sqlx::query::<sqlx::Postgres>(&occ_sql)
-            .bind(buyer_container_id as i64)
-            .fetch_all(&mut *tx)
-            .await?;
-        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let free_slot = (0..(buyer_cap as u32))
-            .find(|s| !occupied_slots.contains(s))
-            .ok_or(StorageError::ContainerFull(
-                buyer_container_id,
-                buyer_cap as u32,
-            ))?;
-
-        let upd_item_sql = sql_for_dialect(
-            "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&upd_item_sql)
-            .bind(buyer_container_id as i64)
-            .bind(free_slot as i32)
-            .bind(now_secs)
-            .bind(&item_instance_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let upd_list_sql = sql_for_dialect(
-            "UPDATE market_listings SET status = 'Sold', updated_at_epoch_ms = ? WHERE listing_id = ?",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&upd_list_sql)
-            .bind(now_ms)
-            .bind(listing_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let item_tx_id = format!("mkt_item_{}", listing_id);
-        let ins_item_tx = sql_for_dialect(
-            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&ins_item_tx)
-            .bind(&item_tx_id)
-            .bind(escrow_container_id)
-            .bind(buyer_container_id as i64)
-            .bind(&item_instance_id)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
-
-        let pay_tx_id = format!("mkt_pay_{}", listing_id);
-        let pay_item_desc = format!("price:{}", price);
-        let ins_pay_tx = sql_for_dialect(
-            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&ins_pay_tx)
-            .bind(&pay_tx_id)
-            .bind(payment_container_id as i64)
-            .bind(seller_container_id)
-            .bind(&pay_item_desc)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(MarketListingRecord {
-            listing_id: listing_id.to_string(),
-            seller_guid: seller_guid as u64,
-            seller_container_id: seller_container_id as u64,
-            item_instance_id,
-            item_def_id: item_def_id as u32,
-            price: price as u64,
-            escrow_container_id: escrow_container_id as u64,
-            escrow_slot: escrow_slot as u32,
-            status: ListingStatus::Sold,
-            created_at_epoch_ms: created_at,
-            expires_at_epoch_ms: expires_at,
-            updated_at_epoch_ms: now_ms,
-        })
-    }
-
-    async fn cancel_listing_postgres(
-        pool: &sqlx::PgPool,
-        listing_id: &str,
-        seller_guid: u64,
-        dst_container_id: u64,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<MarketListingRecord, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        let c_dst_sql = sql_for_dialect(
-            "SELECT capacity, owner_id FROM containers WHERE container_id = ? FOR UPDATE",
-            true,
-        );
-        let c_dst = sqlx::query::<sqlx::Postgres>(&c_dst_sql)
-            .bind(dst_container_id as i64)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StorageError::ContainerNotFound(dst_container_id))?;
-        let owner_id: String = c_dst.try_get("owner_id")?;
-        if owner_id != seller_guid.to_string() {
-            return Err(StorageError::UnauthorizedContainerAccess(dst_container_id));
-        }
-        let dst_cap: i32 = c_dst.try_get("capacity")?;
-
-        let list_sql = sql_for_dialect(
-            r#"
-            SELECT listing_id, seller_guid, seller_container_id, item_instance_id, item_def_id,
-                   price, escrow_container_id, escrow_slot, status, created_at_epoch_ms,
-                   expires_at_epoch_ms, updated_at_epoch_ms
-            FROM market_listings WHERE listing_id = ? FOR UPDATE
-            "#,
-            true,
-        );
-        let list_row = sqlx::query::<sqlx::Postgres>(&list_sql)
-            .bind(listing_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
-
-        let s_guid: i64 = list_row.try_get("seller_guid")?;
-        if s_guid as u64 != seller_guid {
-            return Err(StorageError::UnauthorizedMarketAction(
-                listing_id.to_string(),
-            ));
-        }
-
-        let status_str: String = list_row.try_get("status")?;
-        if status_str != "Active" {
-            return Err(StorageError::ListingNotActive(
-                listing_id.to_string(),
-                status_str,
-            ));
-        }
-
-        let item_instance_id: String = list_row.try_get("item_instance_id")?;
-        let item_def_id: i32 = list_row.try_get("item_def_id")?;
-        let price: i64 = list_row.try_get("price")?;
-        let escrow_container_id: i64 = list_row.try_get("escrow_container_id")?;
-        let escrow_slot: i32 = list_row.try_get("escrow_slot")?;
-        let seller_container_id: i64 = list_row.try_get("seller_container_id")?;
-        let created_at: i64 = list_row.try_get("created_at_epoch_ms")?;
-        let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
-
-        let occ_sql = sql_for_dialect("SELECT slot FROM items WHERE container_id = ?", true);
-        let occupied_rows = sqlx::query::<sqlx::Postgres>(&occ_sql)
-            .bind(dst_container_id as i64)
-            .fetch_all(&mut *tx)
-            .await?;
-        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let free_slot = (0..(dst_cap as u32))
-            .find(|s| !occupied_slots.contains(s))
-            .ok_or(StorageError::ContainerFull(
-                dst_container_id,
-                dst_cap as u32,
-            ))?;
-
-        let upd_item_sql = sql_for_dialect(
-            "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&upd_item_sql)
-            .bind(dst_container_id as i64)
-            .bind(free_slot as i32)
-            .bind(now_secs)
-            .bind(&item_instance_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let upd_list_sql = sql_for_dialect(
-            "UPDATE market_listings SET status = 'Cancelled', updated_at_epoch_ms = ? WHERE listing_id = ?",
-            true,
-        );
-        sqlx::query::<sqlx::Postgres>(&upd_list_sql)
-            .bind(now_ms)
-            .bind(listing_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(MarketListingRecord {
-            listing_id: listing_id.to_string(),
-            seller_guid,
-            seller_container_id: seller_container_id as u64,
-            item_instance_id,
-            item_def_id: item_def_id as u32,
-            price: price as u64,
-            escrow_container_id: escrow_container_id as u64,
-            escrow_slot: escrow_slot as u32,
-            status: ListingStatus::Cancelled,
-            created_at_epoch_ms: created_at,
-            expires_at_epoch_ms: expires_at,
-            updated_at_epoch_ms: now_ms,
-        })
-    }
-
-    async fn get_listing_postgres(
-        pool: &sqlx::PgPool,
-        query_str: &str,
-        listing_id: &str,
-    ) -> Result<Option<MarketListingRecord>, StorageError> {
-        let row = sqlx::query::<sqlx::Postgres>(query_str)
-            .bind(listing_id)
-            .fetch_optional(pool)
-            .await?;
-        match row {
-            Some(r) => Ok(Some(parse_market_listing!(r))),
-            None => Ok(None),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn query_listings_postgres(
-        pool: &sqlx::PgPool,
-        query_str: &str,
-        item_def_id: Option<u32>,
-        min_price: Option<u64>,
-        max_price: Option<u64>,
-        offset: u32,
-        limit: u32,
-        now_ms: i64,
-    ) -> Result<Vec<MarketListingRecord>, StorageError> {
-        let mut q = sqlx::query::<sqlx::Postgres>(query_str).bind(now_ms);
-        if let Some(def_id) = item_def_id {
-            q = q.bind(def_id as i32);
-        }
-        if let Some(min_p) = min_price {
-            q = q.bind(min_p as i64);
-        }
-        if let Some(max_p) = max_price {
-            q = q.bind(max_p as i64);
-        }
-        q = q.bind(limit as i32).bind(offset as i32);
-        let rows = q.fetch_all(pool).await?;
-        let mut results = Vec::with_capacity(rows.len());
-        for r in rows {
-            results.push(parse_market_listing!(r));
-        }
-        Ok(results)
-    }
-
-    async fn reap_expired_listings_postgres(
-        pool: &sqlx::PgPool,
-        max_batch: u32,
-        now_ms: i64,
-        now_secs: i64,
-    ) -> Result<u32, StorageError> {
-        let query = r#"
-            SELECT listing_id, seller_guid, seller_container_id, item_instance_id, escrow_container_id
-            FROM market_listings
-            WHERE status = 'Active' AND expires_at_epoch_ms <= ?
-            LIMIT ?
-        "#;
-        let query_str = sql_for_dialect(query, true);
-        let rows = sqlx::query::<sqlx::Postgres>(&query_str)
-            .bind(now_ms)
-            .bind(max_batch as i32)
-            .fetch_all(pool)
-            .await?;
-        let mut list = Vec::with_capacity(rows.len());
-        for r in rows {
-            list.push(ExpiredCandidate {
-                listing_id: r.try_get::<String, _>("listing_id")?,
-                seller_container_id: r.try_get::<i64, _>("seller_container_id")?,
-                item_instance_id: r.try_get::<String, _>("item_instance_id")?,
-            });
-        }
-
-        let mut reaped = 0;
-        for r in list {
-            let listing_id = r.listing_id;
-            let seller_container_id = r.seller_container_id;
-            let item_instance_id = r.item_instance_id;
-
-            if let Ok(mut tx) = pool.begin().await {
-                let c_seller_sql = sql_for_dialect(
-                    "SELECT capacity FROM containers WHERE container_id = ? FOR UPDATE",
-                    true,
-                );
-                let mut item_returned = false;
-                if let Ok(Some(c_row)) = sqlx::query::<sqlx::Postgres>(&c_seller_sql)
-                    .bind(seller_container_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                {
-                    let cap: i32 = c_row.try_get("capacity")?;
-                    let occ_sql =
-                        sql_for_dialect("SELECT slot FROM items WHERE container_id = ?", true);
-                    if let Ok(occupied_rows) = sqlx::query::<sqlx::Postgres>(&occ_sql)
-                        .bind(seller_container_id)
-                        .fetch_all(&mut *tx)
-                        .await
-                    {
-                        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                            .into_iter()
-                            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                            .collect();
-
-                        if let Some(free_slot) =
-                            (0..(cap as u32)).find(|s| !occupied_slots.contains(s))
-                        {
-                            let upd_item = sql_for_dialect(
-                                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                                true,
-                            );
-                            if sqlx::query::<sqlx::Postgres>(&upd_item)
-                                .bind(seller_container_id)
-                                .bind(free_slot as i32)
-                                .bind(now_secs)
-                                .bind(&item_instance_id)
-                                .execute(&mut *tx)
-                                .await
-                                .is_ok()
-                            {
-                                item_returned = true;
-                            }
-                        }
-                    }
-                }
-
-                if !item_returned {
-                    continue;
-                }
-
-                let upd_sql = sql_for_dialect(
-                    "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'",
-                    true,
-                );
-                if let Ok(affected) = sqlx::query::<sqlx::Postgres>(&upd_sql)
-                    .bind(now_ms)
-                    .bind(&listing_id)
-                    .execute(&mut *tx)
-                    .await
-                {
-                    if affected.rows_affected() == 1 && tx.commit().await.is_ok() {
-                        reaped += 1;
-                    }
-                }
-            }
-        }
-
-        Ok(reaped)
     }
 }
 

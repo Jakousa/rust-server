@@ -1,11 +1,12 @@
 //! Character, Inventory, and Entity repository providing CRUD, inventory management,
 //! ACID player-to-player trading, and snapshot persistence operations.
 
-use crate::db::{Database, DbBackend, StorageError};
+use crate::db::{compute_free_slots, current_time_secs, Database, DbBackend, StorageError};
 use crate::models::{
     AccountRecord, CharacterRecord, EntitySnapshot, InventoryRecord, ItemRecord, TradeRecord,
     TradeStatus,
 };
+use crate::with_dialect_tx;
 use sqlx::Row;
 
 macro_rules! parse_character_record {
@@ -86,31 +87,27 @@ impl CharacterRepository {
         account_id: &str,
         username: &str,
     ) -> Result<AccountRecord, StorageError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = current_time_secs();
+        let query_str = self
+            .db
+            .sql("INSERT INTO accounts (account_id, username, created_at) VALUES (?, ?, ?)");
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    "INSERT INTO accounts (account_id, username, created_at) VALUES (?, ?, ?)",
-                )
-                .bind(account_id)
-                .bind(username)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&query_str)
+                    .bind(account_id)
+                    .bind(username)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
             DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    "INSERT INTO accounts (account_id, username, created_at) VALUES ($1, $2, $3)",
-                )
-                .bind(account_id)
-                .bind(username)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&query_str)
+                    .bind(account_id)
+                    .bind(username)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
         }
 
@@ -129,79 +126,67 @@ impl CharacterRepository {
         name: &str,
         pos: (f32, f32, f32),
     ) -> Result<CharacterRecord, StorageError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
+        let now = current_time_secs();
         let empty_json = "{}".to_string();
+
+        let q1 = self.db.sql(
+            r#"
+            INSERT INTO characters (guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        );
+        let q2 = self.db.sql(
+            r#"
+            INSERT INTO inventories (character_guid, capacity, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(character_guid) DO NOTHING
+            "#,
+        );
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO characters (guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    "#,
-                )
-                .bind(guid as i64)
-                .bind(account_id)
-                .bind(name)
-                .bind(1i32)
-                .bind(pos.0)
-                .bind(pos.1)
-                .bind(pos.2)
-                .bind(0.0f32)
-                .bind(&empty_json)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q1)
+                    .bind(guid as i64)
+                    .bind(account_id)
+                    .bind(name)
+                    .bind(1i32)
+                    .bind(pos.0)
+                    .bind(pos.1)
+                    .bind(pos.2)
+                    .bind(0.0f32)
+                    .bind(&empty_json)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
 
-                sqlx::query(
-                    r#"
-                    INSERT INTO inventories (character_guid, capacity, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(character_guid) DO NOTHING
-                    "#,
-                )
-                .bind(guid as i64)
-                .bind(30i32)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q2)
+                    .bind(guid as i64)
+                    .bind(30i32)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
             DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO characters (guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                    "#,
-                )
-                .bind(guid as i64)
-                .bind(account_id)
-                .bind(name)
-                .bind(1i32)
-                .bind(pos.0)
-                .bind(pos.1)
-                .bind(pos.2)
-                .bind(0.0f32)
-                .bind(&empty_json)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q1)
+                    .bind(guid as i64)
+                    .bind(account_id)
+                    .bind(name)
+                    .bind(1i32)
+                    .bind(pos.0)
+                    .bind(pos.1)
+                    .bind(pos.2)
+                    .bind(0.0f32)
+                    .bind(&empty_json)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
 
-                sqlx::query(
-                    r#"
-                    INSERT INTO inventories (character_guid, capacity, updated_at)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT(character_guid) DO NOTHING
-                    "#,
-                )
-                .bind(guid as i64)
-                .bind(30i32)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q2)
+                    .bind(guid as i64)
+                    .bind(30i32)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
         }
 
@@ -219,14 +204,16 @@ impl CharacterRepository {
 
     /// Loads a character record by GUID.
     pub async fn get_character(&self, guid: u64) -> Result<Option<CharacterRecord>, StorageError> {
+        let q = self.db.sql(
+            "SELECT guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at FROM characters WHERE guid = ?",
+        );
+
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "SELECT guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at FROM characters WHERE guid = ?",
-                )
-                .bind(guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     Ok(Some(parse_character_record!(r)))
@@ -235,12 +222,10 @@ impl CharacterRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let row = sqlx::query(
-                    "SELECT guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at FROM characters WHERE guid = $1",
-                )
-                .bind(guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     Ok(Some(parse_character_record!(r)))
@@ -258,16 +243,13 @@ impl CharacterRepository {
         pos: (f32, f32, f32),
         rotation: f32,
     ) -> Result<bool, StorageError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = current_time_secs();
+        let q = self.db.sql(
+            "UPDATE characters SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ? WHERE guid = ?",
+        );
 
         let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    "UPDATE characters SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ? WHERE guid = ?",
-                )
+            DbBackend::Sqlite(pool) => sqlx::query(&q)
                 .bind(pos.0)
                 .bind(pos.1)
                 .bind(pos.2)
@@ -276,12 +258,8 @@ impl CharacterRepository {
                 .bind(guid as i64)
                 .execute(pool)
                 .await?
-                .rows_affected()
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    "UPDATE characters SET pos_x = $1, pos_y = $2, pos_z = $3, rotation = $4, updated_at = $5 WHERE guid = $6",
-                )
+                .rows_affected(),
+            DbBackend::Postgres(pool) => sqlx::query(&q)
                 .bind(pos.0)
                 .bind(pos.1)
                 .bind(pos.2)
@@ -290,8 +268,7 @@ impl CharacterRepository {
                 .bind(guid as i64)
                 .execute(pool)
                 .await?
-                .rows_affected()
-            }
+                .rows_affected(),
         };
 
         Ok(rows_affected > 0)
@@ -299,101 +276,8 @@ impl CharacterRepository {
 
     /// Saves or updates an entity snapshot in the database.
     pub async fn save_snapshot(&self, snapshot: &EntitySnapshot) -> Result<(), StorageError> {
-        let attrs_str = serde_json::to_string(&snapshot.attributes)?;
-
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(guid) DO UPDATE SET
-                        pos_x = excluded.pos_x,
-                        pos_y = excluded.pos_y,
-                        pos_z = excluded.pos_z,
-                        rotation = excluded.rotation,
-                        attributes_json = excluded.attributes_json,
-                        state_blob = excluded.state_blob,
-                        version = excluded.version,
-                        timestamp = excluded.timestamp
-                    WHERE excluded.version >= entity_snapshots.version
-                    "#,
-                )
-                .bind(snapshot.guid as i64)
-                .bind(snapshot.position.0)
-                .bind(snapshot.position.1)
-                .bind(snapshot.position.2)
-                .bind(snapshot.rotation)
-                .bind(&attrs_str)
-                .bind(snapshot.state_blob.as_deref())
-                .bind(snapshot.version as i64)
-                .bind(snapshot.timestamp as i64)
-                .execute(pool)
-                .await?;
-
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE characters
-                    SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
-                    WHERE guid = ?
-                    "#,
-                )
-                .bind(snapshot.position.0)
-                .bind(snapshot.position.1)
-                .bind(snapshot.position.2)
-                .bind(snapshot.rotation)
-                .bind(snapshot.timestamp as i64)
-                .bind(snapshot.guid as i64)
-                .execute(pool)
-                .await;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT(guid) DO UPDATE SET
-                        pos_x = excluded.pos_x,
-                        pos_y = excluded.pos_y,
-                        pos_z = excluded.pos_z,
-                        rotation = excluded.rotation,
-                        attributes_json = excluded.attributes_json,
-                        state_blob = excluded.state_blob,
-                        version = excluded.version,
-                        timestamp = excluded.timestamp
-                    WHERE excluded.version >= entity_snapshots.version
-                    "#,
-                )
-                .bind(snapshot.guid as i64)
-                .bind(snapshot.position.0)
-                .bind(snapshot.position.1)
-                .bind(snapshot.position.2)
-                .bind(snapshot.rotation)
-                .bind(&attrs_str)
-                .bind(snapshot.state_blob.as_deref())
-                .bind(snapshot.version as i64)
-                .bind(snapshot.timestamp as i64)
-                .execute(pool)
-                .await?;
-
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE characters
-                    SET pos_x = $1, pos_y = $2, pos_z = $3, rotation = $4, updated_at = $5
-                    WHERE guid = $6
-                    "#,
-                )
-                .bind(snapshot.position.0)
-                .bind(snapshot.position.1)
-                .bind(snapshot.position.2)
-                .bind(snapshot.rotation)
-                .bind(snapshot.timestamp as i64)
-                .bind(snapshot.guid as i64)
-                .execute(pool)
-                .await;
-            }
-        }
-
+        self.save_snapshot_batch(std::slice::from_ref(snapshot))
+            .await?;
         Ok(())
     }
 
@@ -406,28 +290,31 @@ impl CharacterRepository {
             return Ok(0);
         }
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut tx = pool.begin().await?;
-                for chunk in snapshots.chunks(50) {
-                    for snap in chunk {
-                        let attrs_str = serde_json::to_string(&snap.attributes)?;
-                        sqlx::query(
-                            r#"
-                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(guid) DO UPDATE SET
-                                pos_x = excluded.pos_x,
-                                pos_y = excluded.pos_y,
-                                pos_z = excluded.pos_z,
-                                rotation = excluded.rotation,
-                                attributes_json = excluded.attributes_json,
-                                state_blob = excluded.state_blob,
-                                version = excluded.version,
-                                timestamp = excluded.timestamp
-                            WHERE excluded.version >= entity_snapshots.version
-                            "#,
-                        )
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            let snap_query = q!(r#"
+                INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guid) DO UPDATE SET
+                    pos_x = excluded.pos_x,
+                    pos_y = excluded.pos_y,
+                    pos_z = excluded.pos_z,
+                    rotation = excluded.rotation,
+                    attributes_json = excluded.attributes_json,
+                    state_blob = excluded.state_blob,
+                    version = excluded.version,
+                    timestamp = excluded.timestamp
+                WHERE excluded.version >= entity_snapshots.version
+                "#);
+            let char_query = q!(r#"
+                UPDATE characters
+                SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
+                WHERE guid = ?
+                "#);
+
+            for chunk in snapshots.chunks(50) {
+                for snap in chunk {
+                    let attrs_str = serde_json::to_string(&snap.attributes)?;
+                    sqlx::query(&snap_query)
                         .bind(snap.guid as i64)
                         .bind(snap.position.0)
                         .bind(snap.position.1)
@@ -437,96 +324,38 @@ impl CharacterRepository {
                         .bind(snap.state_blob.as_deref())
                         .bind(snap.version as i64)
                         .bind(snap.timestamp as i64)
-                        .execute(&mut *tx)
+                        .execute(&mut *conn)
                         .await?;
 
-                        let _ = sqlx::query(
-                            r#"
-                            UPDATE characters
-                            SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
-                            WHERE guid = ?
-                            "#,
-                        )
+                    sqlx::query(&char_query)
                         .bind(snap.position.0)
                         .bind(snap.position.1)
                         .bind(snap.position.2)
                         .bind(snap.rotation)
                         .bind(snap.timestamp as i64)
                         .bind(snap.guid as i64)
-                        .execute(&mut *tx)
-                        .await;
-                    }
-                }
-                tx.commit().await?;
-            }
-            DbBackend::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-                for chunk in snapshots.chunks(50) {
-                    for snap in chunk {
-                        let attrs_str = serde_json::to_string(&snap.attributes)?;
-                        sqlx::query(
-                            r#"
-                            INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                            ON CONFLICT(guid) DO UPDATE SET
-                                pos_x = excluded.pos_x,
-                                pos_y = excluded.pos_y,
-                                pos_z = excluded.pos_z,
-                                rotation = excluded.rotation,
-                                attributes_json = excluded.attributes_json,
-                                state_blob = excluded.state_blob,
-                                version = excluded.version,
-                                timestamp = excluded.timestamp
-                            WHERE excluded.version >= entity_snapshots.version
-                            "#,
-                        )
-                        .bind(snap.guid as i64)
-                        .bind(snap.position.0)
-                        .bind(snap.position.1)
-                        .bind(snap.position.2)
-                        .bind(snap.rotation)
-                        .bind(&attrs_str)
-                        .bind(snap.state_blob.as_deref())
-                        .bind(snap.version as i64)
-                        .bind(snap.timestamp as i64)
-                        .execute(&mut *tx)
+                        .execute(&mut *conn)
                         .await?;
-
-                        let _ = sqlx::query(
-                            r#"
-                            UPDATE characters
-                            SET pos_x = $1, pos_y = $2, pos_z = $3, rotation = $4, updated_at = $5
-                            WHERE guid = $6
-                            "#,
-                        )
-                        .bind(snap.position.0)
-                        .bind(snap.position.1)
-                        .bind(snap.position.2)
-                        .bind(snap.rotation)
-                        .bind(snap.timestamp as i64)
-                        .bind(snap.guid as i64)
-                        .execute(&mut *tx)
-                        .await;
-                    }
                 }
-                tx.commit().await?;
             }
-        }
 
-        Ok(snapshots.len())
+            Ok(snapshots.len())
+        })
     }
 
     /// Retrieves an entity snapshot by GUID.
     pub async fn get_snapshot(&self, guid: u64) -> Result<Option<EntitySnapshot>, StorageError> {
+        let q = self.db.sql(
+            "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = ?",
+        );
+
         let (x, y, z, rotation, attrs_str, state_blob, version, timestamp) = match self.db.backend()
         {
             DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = ?",
-                )
-                .bind(guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     (
@@ -544,12 +373,10 @@ impl CharacterRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let row = sqlx::query(
-                    "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = $1",
-                )
-                .bind(guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     (
@@ -586,14 +413,16 @@ impl CharacterRepository {
         &self,
         character_guid: u64,
     ) -> Result<Option<InventoryRecord>, StorageError> {
+        let q = self.db.sql(
+            "SELECT character_guid, capacity, updated_at FROM inventories WHERE character_guid = ?",
+        );
+
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "SELECT character_guid, capacity, updated_at FROM inventories WHERE character_guid = ?",
-                )
-                .bind(character_guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     let guid: i64 = r.try_get("character_guid")?;
@@ -609,12 +438,10 @@ impl CharacterRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let row = sqlx::query(
-                    "SELECT character_guid, capacity, updated_at FROM inventories WHERE character_guid = $1",
-                )
-                .bind(character_guid as i64)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     let guid: i64 = r.try_get("character_guid")?;
@@ -638,43 +465,33 @@ impl CharacterRepository {
         character_guid: u64,
         capacity: u32,
     ) -> Result<(), StorageError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = current_time_secs();
+        let q = self.db.sql(
+            r#"
+            INSERT INTO inventories (character_guid, capacity, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(character_guid) DO UPDATE SET
+                capacity = excluded.capacity,
+                updated_at = excluded.updated_at
+            "#,
+        );
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO inventories (character_guid, capacity, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(character_guid) DO UPDATE SET
-                        capacity = excluded.capacity,
-                        updated_at = excluded.updated_at
-                    "#,
-                )
-                .bind(character_guid as i64)
-                .bind(capacity as i32)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .bind(capacity as i32)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
             DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO inventories (character_guid, capacity, updated_at)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT(character_guid) DO UPDATE SET
-                        capacity = excluded.capacity,
-                        updated_at = excluded.updated_at
-                    "#,
-                )
-                .bind(character_guid as i64)
-                .bind(capacity as i32)
-                .bind(now)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .bind(capacity as i32)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
             }
         }
 
@@ -689,47 +506,43 @@ impl CharacterRepository {
         } else {
             item.container_id
         };
+        let q = self.db.sql(
+            r#"
+            INSERT INTO items (item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        );
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO items (item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    "#,
-                )
-                .bind(&item.item_instance_id)
-                .bind(item.character_guid as i64)
-                .bind(container_id as i64)
-                .bind(item.item_def_id as i32)
-                .bind(item.slot as i32)
-                .bind(item.quantity as i32)
-                .bind(item.durability as i32)
-                .bind(&attrs_str)
-                .bind(item.created_at)
-                .bind(item.updated_at)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q)
+                    .bind(&item.item_instance_id)
+                    .bind(item.character_guid as i64)
+                    .bind(container_id as i64)
+                    .bind(item.item_def_id as i32)
+                    .bind(item.slot as i32)
+                    .bind(item.quantity as i32)
+                    .bind(item.durability as i32)
+                    .bind(&attrs_str)
+                    .bind(item.created_at)
+                    .bind(item.updated_at)
+                    .execute(pool)
+                    .await?;
             }
             DbBackend::Postgres(pool) => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO items (item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                    "#,
-                )
-                .bind(&item.item_instance_id)
-                .bind(item.character_guid as i64)
-                .bind(container_id as i64)
-                .bind(item.item_def_id as i32)
-                .bind(item.slot as i32)
-                .bind(item.quantity as i32)
-                .bind(item.durability as i32)
-                .bind(&attrs_str)
-                .bind(item.created_at)
-                .bind(item.updated_at)
-                .execute(pool)
-                .await?;
+                sqlx::query(&q)
+                    .bind(&item.item_instance_id)
+                    .bind(item.character_guid as i64)
+                    .bind(container_id as i64)
+                    .bind(item.item_def_id as i32)
+                    .bind(item.slot as i32)
+                    .bind(item.quantity as i32)
+                    .bind(item.durability as i32)
+                    .bind(&attrs_str)
+                    .bind(item.created_at)
+                    .bind(item.updated_at)
+                    .execute(pool)
+                    .await?;
             }
         }
 
@@ -741,14 +554,16 @@ impl CharacterRepository {
         &self,
         item_instance_id: &str,
     ) -> Result<Option<ItemRecord>, StorageError> {
+        let q = self.db.sql(
+            "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?",
+        );
+
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?",
-                )
-                .bind(item_instance_id)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(item_instance_id)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     Ok(Some(parse_item_record!(r)))
@@ -757,12 +572,10 @@ impl CharacterRepository {
                 }
             }
             DbBackend::Postgres(pool) => {
-                let row = sqlx::query(
-                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = $1",
-                )
-                .bind(item_instance_id)
-                .fetch_optional(pool)
-                .await?;
+                let row = sqlx::query(&q)
+                    .bind(item_instance_id)
+                    .fetch_optional(pool)
+                    .await?;
 
                 if let Some(r) = row {
                     Ok(Some(parse_item_record!(r)))
@@ -778,14 +591,16 @@ impl CharacterRepository {
         &self,
         character_guid: u64,
     ) -> Result<Vec<ItemRecord>, StorageError> {
+        let q = self.db.sql(
+            "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = ? ORDER BY slot ASC",
+        );
+
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
-                let rows = sqlx::query(
-                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = ? ORDER BY slot ASC",
-                )
-                .bind(character_guid as i64)
-                .fetch_all(pool)
-                .await?;
+                let rows = sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .fetch_all(pool)
+                    .await?;
 
                 let mut items = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -794,12 +609,10 @@ impl CharacterRepository {
                 Ok(items)
             }
             DbBackend::Postgres(pool) => {
-                let rows = sqlx::query(
-                    "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = $1 ORDER BY slot ASC",
-                )
-                .bind(character_guid as i64)
-                .fetch_all(pool)
-                .await?;
+                let rows = sqlx::query(&q)
+                    .bind(character_guid as i64)
+                    .fetch_all(pool)
+                    .await?;
 
                 let mut items = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -812,19 +625,19 @@ impl CharacterRepository {
 
     /// Removes an item instance from inventory.
     pub async fn remove_item(&self, item_instance_id: &str) -> Result<bool, StorageError> {
+        let q = self.db.sql("DELETE FROM items WHERE item_instance_id = ?");
+
         let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query("DELETE FROM items WHERE item_instance_id = ?")
+            DbBackend::Sqlite(pool) => sqlx::query(&q)
                 .bind(item_instance_id)
                 .execute(pool)
                 .await?
                 .rows_affected(),
-            DbBackend::Postgres(pool) => {
-                sqlx::query("DELETE FROM items WHERE item_instance_id = $1")
-                    .bind(item_instance_id)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            DbBackend::Postgres(pool) => sqlx::query(&q)
+                .bind(item_instance_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
         };
 
         Ok(rows_affected > 0)
@@ -862,268 +675,116 @@ impl CharacterRepository {
             sender_guid.max(recipient_guid),
         );
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = current_time_secs();
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let mut conn = pool.acquire().await?;
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Dialect-specific row locking in ascending numerical order
+            let q_c = format!(
+                "SELECT guid FROM characters WHERE guid = ?{}",
+                lock_suffix!()
+            );
+            let c1 = sqlx::query(&q!(&q_c))
+                .bind(first_guid as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+            let c2 = sqlx::query(&q!(&q_c))
+                .bind(second_guid as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+            if c1.is_none() || c2.is_none() {
+                return Err(StorageError::NotFound(
+                    "One or both trade participant characters not found".to_string(),
+                ));
+            }
 
-                let res: Result<TradeRecord, StorageError> = async {
-                    // 1. Verify characters exist in sorted order
-                    let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
-                        .bind(first_guid as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = ?")
-                        .bind(second_guid as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    if c1.is_none() || c2.is_none() {
-                        return Err(StorageError::NotFound(
-                            "One or both trade participant characters not found".to_string(),
-                        ));
-                    }
+            // 2. Fetch recipient inventory capacity
+            let inv_row = sqlx::query(&q!(
+                "SELECT capacity FROM inventories WHERE character_guid = ?"
+            ))
+            .bind(recipient_guid as i64)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let capacity = inv_row
+                .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
+                .unwrap_or(30) as u32;
 
-                    // 2. Fetch recipient inventory capacity
-                    let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = ?")
-                        .bind(recipient_guid as i64)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                    let capacity = inv_row.map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30)).unwrap_or(30) as u32;
+            // 3. Fetch recipient occupied slots
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE character_guid = ?"))
+                .bind(recipient_guid as i64)
+                .fetch_all(&mut *conn)
+                .await?;
+            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
+                .collect();
 
-                    // 3. Fetch recipient occupied slots
-                    let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = ?")
-                        .bind(recipient_guid as i64)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                    let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-                        .into_iter()
-                        .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-                        .collect();
+            let free_slots = compute_free_slots(&occupied_slots, capacity);
 
-                    let mut free_slots = Vec::new();
-                    for slot_idx in 0..capacity {
-                        if !occupied_slots.contains(&slot_idx) {
-                            free_slots.push(slot_idx);
+            if free_slots.len() < item_instance_ids.len() {
+                return Err(StorageError::InventoryFull(recipient_guid, capacity));
+            }
+
+            // 4. Verify sender owns each item
+            for item_id in item_instance_ids {
+                let item_row = sqlx::query(&q!(
+                    "SELECT character_guid FROM items WHERE item_instance_id = ?"
+                ))
+                .bind(item_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+                match item_row {
+                    Some(r) => {
+                        let owner: i64 = r.try_get("character_guid")?;
+                        if owner as u64 != sender_guid {
+                            return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                         }
                     }
-
-                    if free_slots.len() < item_instance_ids.len() {
-                        return Err(StorageError::InventoryFull(recipient_guid, capacity));
-                    }
-
-                    // 4. Verify sender owns each item
-                    for item_id in item_instance_ids {
-                        let item_row = sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = ?")
-                            .bind(item_id)
-                            .fetch_optional(&mut *conn)
-                            .await?;
-
-                        match item_row {
-                            Some(r) => {
-                                let owner: i64 = r.try_get("character_guid")?;
-                                if owner as u64 != sender_guid {
-                                    return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
-                                }
-                            }
-                            None => {
-                                return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
-                            }
-                        }
-                    }
-
-                    // 5. Transfer items to recipient free slots
-                    for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                        sqlx::query(
-                            "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
-                        )
-                        .bind(recipient_guid as i64)
-                        .bind(recipient_guid as i64)
-                        .bind(*target_slot as i32)
-                        .bind(now)
-                        .bind(item_id)
-                        .execute(&mut *conn)
-                        .await?;
-                    }
-
-                    // 6. Record audit trail
-                    let items_json = serde_json::to_string(item_instance_ids)?;
-                    sqlx::query(
-                        r#"
-                        INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        "#,
-                    )
-                    .bind(trade_id)
-                    .bind(sender_guid as i64)
-                    .bind(recipient_guid as i64)
-                    .bind(&items_json)
-                    .bind(TradeStatus::Committed.to_string())
-                    .bind(now)
-                    .execute(&mut *conn)
-                    .await?;
-
-                    Ok(TradeRecord {
-                        trade_id: trade_id.to_string(),
-                        sender_guid,
-                        recipient_guid,
-                        items_json,
-                        status: TradeStatus::Committed,
-                        created_at: now,
-                    })
-                }
-                .await;
-
-                match res {
-                    Ok(record) => {
-                        sqlx::query("COMMIT").execute(&mut *conn).await?;
-                        Ok(record)
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                        Err(e)
-                    }
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                self.execute_trade_postgres(
-                    pool,
-                    trade_id,
-                    sender_guid,
-                    recipient_guid,
-                    item_instance_ids,
-                    first_guid,
-                    second_guid,
-                    now,
-                )
-                .await
-            }
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_trade_postgres(
-        &self,
-        pool: &sqlx::Pool<sqlx::Postgres>,
-        trade_id: &str,
-        sender_guid: u64,
-        recipient_guid: u64,
-        item_instance_ids: &[String],
-        first_guid: u64,
-        second_guid: u64,
-        now: i64,
-    ) -> Result<TradeRecord, StorageError> {
-        let mut tx = pool.begin().await?;
-
-        // 1. Dialect-specific row locking in ascending numerical order
-        let c1 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
-            .bind(first_guid as i64)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let c2 = sqlx::query("SELECT guid FROM characters WHERE guid = $1 FOR UPDATE")
-            .bind(second_guid as i64)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if c1.is_none() || c2.is_none() {
-            return Err(StorageError::NotFound(
-                "One or both trade participant characters not found".to_string(),
-            ));
-        }
-
-        // 2. Fetch recipient inventory capacity
-        let inv_row = sqlx::query("SELECT capacity FROM inventories WHERE character_guid = $1")
-            .bind(recipient_guid as i64)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let capacity = inv_row
-            .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
-            .unwrap_or(30) as u32;
-
-        // 3. Fetch recipient occupied slots
-        let occupied_rows = sqlx::query("SELECT slot FROM items WHERE character_guid = $1")
-            .bind(recipient_guid as i64)
-            .fetch_all(&mut *tx)
-            .await?;
-        let occupied_slots: std::collections::HashSet<u32> = occupied_rows
-            .into_iter()
-            .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
-            .collect();
-
-        let mut free_slots = Vec::new();
-        for slot_idx in 0..capacity {
-            if !occupied_slots.contains(&slot_idx) {
-                free_slots.push(slot_idx);
-            }
-        }
-
-        if free_slots.len() < item_instance_ids.len() {
-            return Err(StorageError::InventoryFull(recipient_guid, capacity));
-        }
-
-        // 4. Verify sender owns each item
-        for item_id in item_instance_ids {
-            let item_row =
-                sqlx::query("SELECT character_guid FROM items WHERE item_instance_id = $1")
-                    .bind(item_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-
-            match item_row {
-                Some(r) => {
-                    let owner: i64 = r.try_get("character_guid")?;
-                    if owner as u64 != sender_guid {
+                    None => {
                         return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                     }
                 }
-                None => {
-                    return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
-                }
             }
-        }
 
-        // 5. Transfer items to recipient free slots
-        for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-            sqlx::query(
-                "UPDATE items SET character_guid = $1, container_id = $2, slot = $3, updated_at = $4 WHERE item_instance_id = $5",
-            )
+            // 5. Transfer items to recipient free slots
+            for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                sqlx::query(&q!(
+                    "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(recipient_guid as i64)
+                .bind(recipient_guid as i64)
+                .bind(*target_slot as i32)
+                .bind(now)
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            // 6. Record audit trail
+            let items_json = serde_json::to_string(item_instance_ids)?;
+            sqlx::query(&q!(
+                r#"
+                INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#
+            ))
+            .bind(trade_id)
+            .bind(sender_guid as i64)
             .bind(recipient_guid as i64)
-            .bind(recipient_guid as i64)
-            .bind(*target_slot as i32)
+            .bind(&items_json)
+            .bind(TradeStatus::Committed.to_string())
             .bind(now)
-            .bind(item_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
-        }
 
-        // 6. Record audit trail
-        let items_json = serde_json::to_string(item_instance_ids)?;
-        sqlx::query(
-            r#"
-            INSERT INTO trades (trade_id, sender_guid, recipient_guid, items_json, status, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(trade_id)
-        .bind(sender_guid as i64)
-        .bind(recipient_guid as i64)
-        .bind(&items_json)
-        .bind(TradeStatus::Committed.to_string())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(TradeRecord {
-            trade_id: trade_id.to_string(),
-            sender_guid,
-            recipient_guid,
-            items_json,
-            status: TradeStatus::Committed,
-            created_at: now,
+            Ok(TradeRecord {
+                trade_id: trade_id.to_string(),
+                sender_guid,
+                recipient_guid,
+                items_json,
+                status: TradeStatus::Committed,
+                created_at: now,
+            })
         })
     }
 }
