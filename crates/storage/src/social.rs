@@ -166,20 +166,56 @@ impl SocialBus for MemorySocialBus {
     }
 }
 
+/// Wire payload envelope exchanged over Redis PubSub to identify message origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisBusWireMessage {
+    pub origin_node_id: String,
+    pub envelope: SocialEnvelope,
+}
+
 /// Redis-backed social bus for distributed, multi-process clusters.
 pub struct RedisSocialBus {
     client: redis::Client,
+    node_id: String,
     memory_fallback: MemorySocialBus,
+    subscribed_channels: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl RedisSocialBus {
     pub fn new(redis_url: &str) -> Result<Self, SocialBusError> {
         let client =
             redis::Client::open(redis_url).map_err(|e| SocialBusError::Channel(e.to_string()))?;
+        let random_id: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let node_id = format!("node_{:x}", random_id);
         Ok(Self {
             client,
+            node_id,
             memory_fallback: MemorySocialBus::new(),
+            subscribed_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// Creates a new `RedisSocialBus` with an explicit node ID.
+    pub fn with_node_id(
+        redis_url: &str,
+        node_id: impl Into<String>,
+    ) -> Result<Self, SocialBusError> {
+        let client =
+            redis::Client::open(redis_url).map_err(|e| SocialBusError::Channel(e.to_string()))?;
+        Ok(Self {
+            client,
+            node_id: node_id.into(),
+            memory_fallback: MemorySocialBus::new(),
+            subscribed_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    /// Accessor for the bus's unique node ID.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 }
 
@@ -190,8 +226,12 @@ impl SocialBus for RedisSocialBus {
         channel: &str,
         envelope: &SocialEnvelope,
     ) -> Result<(), SocialBusError> {
+        let wire = RedisBusWireMessage {
+            origin_node_id: self.node_id.clone(),
+            envelope: envelope.clone(),
+        };
         if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
-            let json = serde_json::to_string(envelope)?;
+            let json = serde_json::to_string(&wire)?;
             let _: Result<(), _> = redis::AsyncCommands::publish(&mut conn, channel, json).await;
         }
         // Also broadcast into memory fallback for local cluster subscribers
@@ -202,6 +242,70 @@ impl SocialBus for RedisSocialBus {
         &self,
         channel: &str,
     ) -> Result<broadcast::Receiver<SocialEnvelope>, SocialBusError> {
+        let mut should_spawn = false;
+        {
+            let mut set = self.subscribed_channels.lock().unwrap();
+            if set.insert(channel.to_string()) {
+                should_spawn = true;
+            }
+        }
+
+        if should_spawn {
+            let client = self.client.clone();
+            let channel_name = channel.to_string();
+            let memory_fallback = self.memory_fallback.clone();
+            let my_node_id = self.node_id.clone();
+            let channels_set = self.subscribed_channels.clone();
+
+            tokio::spawn(async move {
+                use futures_util::StreamExt;
+                let mut retry_delay_ms = 100u64;
+                loop {
+                    match client.get_async_pubsub().await {
+                        Ok(mut pubsub) => {
+                            if pubsub.subscribe(&channel_name).await.is_ok() {
+                                retry_delay_ms = 100;
+                                let mut stream = pubsub.on_message();
+                                while let Some(msg) = stream.next().await {
+                                    let payload: String = match msg.get_payload() {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                    if let Ok(wire) =
+                                        serde_json::from_str::<RedisBusWireMessage>(&payload)
+                                    {
+                                        if wire.origin_node_id != my_node_id {
+                                            let _ = memory_fallback
+                                                .publish(&channel_name, &wire.envelope)
+                                                .await;
+                                        }
+                                    } else if let Ok(envelope) =
+                                        serde_json::from_str::<SocialEnvelope>(&payload)
+                                    {
+                                        let _ =
+                                            memory_fallback.publish(&channel_name, &envelope).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay_ms))
+                                .await;
+                            retry_delay_ms = (retry_delay_ms * 2).min(5000);
+                        }
+                    }
+
+                    let still_subscribed = {
+                        let set = channels_set.lock().unwrap();
+                        set.contains(&channel_name)
+                    };
+                    if !still_subscribed {
+                        break;
+                    }
+                }
+            });
+        }
+
         self.memory_fallback.subscribe(channel).await
     }
 }
@@ -289,5 +393,45 @@ mod tests {
         }
 
         assert!(RedisSocialBus::new("invalid_url").is_err());
+    }
+
+    #[test]
+    fn test_redis_wire_message_codec_and_node_id() {
+        let envelope = SocialEnvelope::Party(PartyAction::Disband { party_id: 42 });
+        let wire = RedisBusWireMessage {
+            origin_node_id: "node_alpha".to_string(),
+            envelope: envelope.clone(),
+        };
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let decoded: RedisBusWireMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire, decoded);
+        assert_eq!(decoded.origin_node_id, "node_alpha");
+        assert_eq!(decoded.envelope, envelope);
+
+        // Explicit node_id construction
+        let bus = RedisSocialBus::with_node_id("redis://127.0.0.1:6379", "test_node_42").unwrap();
+        assert_eq!(bus.node_id(), "test_node_42");
+    }
+
+    #[tokio::test]
+    async fn test_redis_social_bus_subscribe_offline_fallback() {
+        // Pointing to a dummy non-existent port
+        let bus = RedisSocialBus::new("redis://127.0.0.1:1").unwrap();
+        let mut rx = bus.subscribe("fallback_channel").await.unwrap();
+
+        let env = SocialEnvelope::Guild(GuildSyncAction::MemberLeft {
+            guild_id: 100,
+            member_guid: 200,
+        });
+
+        // Publish should deliver locally via fallback despite Redis being offline
+        bus.publish("fallback_channel", &env).await.unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for local fallback delivery")
+            .unwrap();
+        assert_eq!(received, env);
     }
 }

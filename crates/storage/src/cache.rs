@@ -155,12 +155,19 @@ impl SessionCacheBackend for RedisCache {
     async fn claim_handover(&self, guid: u64) -> Result<Option<HandoverData>, StorageError> {
         let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:handover:{}", guid);
-        let val: Option<String> = conn.get(&key).await?;
-        if let Some(s) = val {
-            let _: () = conn.del(&key).await?;
-            Ok(Some(serde_json::from_str(&s)?))
-        } else {
-            Ok(None)
+        let script = redis::Script::new(
+            r#"
+            local val = redis.call('GET', KEYS[1])
+            if val then
+                redis.call('DEL', KEYS[1])
+            end
+            return val
+            "#,
+        );
+        let val: Option<String> = script.key(&key).invoke_async(&mut conn).await?;
+        match val {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
         }
     }
 }
@@ -219,6 +226,50 @@ mod tests {
 
         // Atomic claim should remove entry
         assert!(cache.claim_handover(999).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_handover_claims_mutual_exclusion() {
+        let cache = std::sync::Arc::new(MemoryCache::new());
+
+        let handover = HandoverData {
+            guid: 777,
+            source_node: 1,
+            target_node: 2,
+            snapshot: EntitySnapshot {
+                guid: 777,
+                position: (1.0, 2.0, 3.0),
+                rotation: 0.0,
+                attributes: serde_json::json!({}),
+                state_blob: None,
+                version: 1,
+                timestamp: 1000,
+            },
+            staged_at: 1000,
+        };
+
+        cache.stage_handover(&handover, 30).await.unwrap();
+
+        // Spawn 10 concurrent tasks competing to claim the same handover
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(
+                async move { c.claim_handover(777).await.unwrap() },
+            ));
+        }
+
+        let mut successes = 0;
+        for handle in handles {
+            if let Some(claimed) = handle.await.unwrap() {
+                assert_eq!(claimed.guid, 777);
+                successes += 1;
+            }
+        }
+
+        // Exactly one task must successfully claim the handover
+        assert_eq!(successes, 1);
+        assert!(cache.claim_handover(777).await.unwrap().is_none());
     }
 
     #[tokio::test]

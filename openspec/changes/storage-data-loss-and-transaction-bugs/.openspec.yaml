@@ -1,0 +1,11 @@
+schemaVersion: "1"
+change:
+  name: storage-data-loss-and-transaction-bugs
+  title: Fix PostgreSQL Parameter Binding, Non-Atomic Redis Handover, and Escrow/Marketplace Item Loss
+  status: proposed
+  created: 2026-10-17
+  authors:
+    - Jami Kousa <jami.kousa@gmail.com>
+  domain: storage
+  specs:
+    - specs/storage/data-loss-and-transaction-bugs/spec.md

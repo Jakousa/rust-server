@@ -132,10 +132,10 @@ impl TransactionCoordinator {
                     }
 
                     // Clean up any stale expired reservations for these slots
-                    sqlx::query("DELETE FROM container_reservations WHERE container_id IN (?, ?) AND slot IN (?, ?) AND expires_at_epoch_ms <= ?")
+                    sqlx::query("DELETE FROM container_reservations WHERE ((container_id = ? AND slot = ?) OR (container_id = ? AND slot = ?)) AND expires_at_epoch_ms <= ?")
                         .bind(src_container_id as i64)
-                        .bind(dst_container_id as i64)
                         .bind(src_slot as i32)
+                        .bind(dst_container_id as i64)
                         .bind(dst_slot as i32)
                         .bind(now_ms)
                         .execute(&mut *conn)
@@ -569,7 +569,7 @@ impl TransactionCoordinator {
         .fetch_optional(&mut *tx)
         .await?;
         let c2 = sqlx::query(
-            "SELECT container_id, capacity FROM containers WHERE container_id = $2 FOR UPDATE",
+            "SELECT container_id, capacity FROM containers WHERE container_id = $1 FOR UPDATE",
         )
         .bind(second_id as i64)
         .fetch_optional(&mut *tx)
@@ -649,10 +649,10 @@ impl TransactionCoordinator {
         }
 
         // Clean up any stale expired reservations
-        sqlx::query("DELETE FROM container_reservations WHERE container_id IN ($1, $2) AND slot IN ($3, $4) AND expires_at_epoch_ms <= $5")
+        sqlx::query("DELETE FROM container_reservations WHERE ((container_id = $1 AND slot = $2) OR (container_id = $3 AND slot = $4)) AND expires_at_epoch_ms <= $5")
             .bind(src_container_id as i64)
-            .bind(dst_container_id as i64)
             .bind(src_slot as i32)
+            .bind(dst_container_id as i64)
             .bind(dst_slot as i32)
             .bind(now_ms)
             .execute(&mut *tx)
@@ -1422,6 +1422,90 @@ mod tests {
             .prepare_transfer("tx_asym_3", 7002, 0, 7001, 3, 5000)
             .await;
         assert!(res3.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_2pc_pairwise_reservation_cleanup() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c1, c2) = setup_test_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        // Place item in C1 slot 2
+        let item = ItemRecord {
+            item_instance_id: "pair_item".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 10,
+            slot: 2,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item).await.unwrap();
+
+        // Insert expired reservations on orthogonal slots: (C1, slot 5) and (C2, slot 2)
+        let now_ms = current_time_ms();
+        sqlx::query(
+            r#"
+            INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+            VALUES (?, 'tx_other_1', ?, 5, NULL, 'incoming', ?, ?)
+            "#,
+        )
+        .bind("res_orthogonal_c1_5")
+        .bind(c1 as i64)
+        .bind(now_ms - 10_000)
+        .bind(now_ms - 20_000)
+        .execute(db.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+            VALUES (?, 'tx_other_2', ?, 2, 'dummy_item', 'outgoing', ?, ?)
+            "#,
+        )
+        .bind("res_orthogonal_c2_2")
+        .bind(c2 as i64)
+        .bind(now_ms - 10_000)
+        .bind(now_ms - 20_000)
+        .execute(db.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+        // Prepare transfer for (C1, slot 2) -> (C2, slot 5)
+        let res = coord
+            .prepare_transfer("tx_pair_test", c1, 2, c2, 5, 5000)
+            .await;
+        assert!(
+            res.is_ok(),
+            "prepare_transfer should succeed, got {:?}",
+            res
+        );
+
+        // Verify that orthogonal reservations (C1, slot 5) and (C2, slot 2) were NOT deleted
+        let res_c1_5 = sqlx::query("SELECT 1 FROM container_reservations WHERE reservation_id = ?")
+            .bind("res_orthogonal_c1_5")
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            res_c1_5.is_some(),
+            "Orthogonal reservation on (C1, 5) must not be deleted"
+        );
+
+        let res_c2_2 = sqlx::query("SELECT 1 FROM container_reservations WHERE reservation_id = ?")
+            .bind("res_orthogonal_c2_2")
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            res_c2_2.is_some(),
+            "Orthogonal reservation on (C2, 2) must not be deleted"
+        );
     }
 
     #[test]
