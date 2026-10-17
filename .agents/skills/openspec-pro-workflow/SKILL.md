@@ -14,6 +14,8 @@ metadata:
 
 This skill codifies the standard engineering process used for major architectural changes, concurrency improvements, security hardening, and infrastructure upgrades in the MMO server codebase.
 
+> **Note for Implementation Agents**: If a change already has a pre-architected OpenSpec bundle listed in [`openspec/ROADMAP.md`](../../../openspec/ROADMAP.md) under `openspec/changes/<bundle-name>/`, use the [`openspec-bundle-executor`](../openspec-bundle-executor/SKILL.md) skill to proceed directly to Stage 4 & Stage 5 using the existing `design.md` and `tasks.md` blueprint.
+
 ---
 
 ## The 5-Stage Cadence

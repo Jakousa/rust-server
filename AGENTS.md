@@ -47,12 +47,17 @@ Keep the primary orchestrator focused on system architecture, OpenSpec planning,
 
 ## 3. Engineering Workflows & Quality Gates
 
-1. **OpenSpec Lifecycle**:
+1. **Master Roadmap & Pre-Architected OpenSpec Bundles (`openspec/ROADMAP.md`)**:
+   * The repository maintains an ordered Master Execution Roadmap in [`openspec/ROADMAP.md`](openspec/ROADMAP.md) backed by pre-architected, compiler-ready OpenSpec groundwork bundles under `openspec/changes/<bundle-name>/`.
+   * Before starting any implementation task, check [`openspec/ROADMAP.md`](openspec/ROADMAP.md) and read the [`openspec-bundle-executor`](.agents/skills/openspec-bundle-executor/SKILL.md) skill.
+   * **Do not stray from `design.md` and `tasks.md`**: Each bundle specifies exact file paths, line numbers, struct/trait definitions, concurrency invariants, and test scenarios so implementation agents can execute deterministically without architectural drift.
+
+2. **OpenSpec Lifecycle**:
    * All non-trivial changes must be planned via OpenSpec (`openspec/changes/<change-name>/`).
    * Pro model architectural review must validate concurrency, security, and edge cases before implementation.
-   * Completed changes must be synced to main specs and archived in `openspec/changes/archive/`.
+   * Completed changes must be synced to main specs (`openspec/specs/`) and archived in `openspec/changes/archive/`.
 
-2. **Strict CI Quality Gates**:
+3. **Strict CI Quality Gates**:
    * Code formatting: `cargo fmt --all -- --check`
    * Strict linter: `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings allowed)
    * Test suite: `cargo test --workspace`
