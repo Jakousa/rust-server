@@ -362,6 +362,10 @@ impl EscrowCoordinator {
                         .fetch_all(&mut *conn)
                         .await?;
 
+                    if free_slots.len() < escrow_items.len() {
+                        return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
+                    }
+
                     for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
                         let item_id: String = item_row.try_get("item_instance_id")?;
                         sqlx::query("UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?")
@@ -426,8 +430,15 @@ impl EscrowCoordinator {
             .buffer_unordered(10);
 
         while let Some(res) = stream.next().await {
-            if res? {
-                reaped += 1;
+            match res {
+                Ok(true) => {
+                    reaped += 1;
+                }
+                Ok(false) => {}
+                Err(StorageError::ContainerFull(..)) => {
+                    // Depositor container is currently full; skip this escrow refund without aborting the sweep
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -772,6 +783,10 @@ impl EscrowCoordinator {
         .bind(esc_cid)
         .fetch_all(&mut *tx)
         .await?;
+
+        if free_slots.len() < escrow_items.len() {
+            return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
+        }
 
         for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
             let item_id: String = item_row.try_get("item_instance_id")?;
@@ -1390,5 +1405,177 @@ mod tests {
             let err_parse = escrow_coord.get_escrow("escrow_status_held").await;
             assert!(matches!(err_parse, Err(StorageError::TradeError(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn test_escrow_refund_insufficient_capacity_error_and_no_item_loss() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c_dep, c_ben, c_esc) = setup_escrow_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+
+        // Create 2 items in c_dep
+        let item1 = ItemRecordBuilder::new("rf_item_1")
+            .container_id(c_dep)
+            .slot(0)
+            .build();
+        let item2 = ItemRecordBuilder::new("rf_item_2")
+            .container_id(c_dep)
+            .slot(1)
+            .build();
+        char_repo.add_item(&item1).await.unwrap();
+        char_repo.add_item(&item2).await.unwrap();
+
+        // Create escrow holding both items (now in c_esc)
+        escrow_coord
+            .create_escrow(
+                "escrow_full_test",
+                c_dep,
+                c_ben,
+                c_esc,
+                &["rf_item_1".to_string(), "rf_item_2".to_string()],
+                "secret_full",
+                60,
+            )
+            .await
+            .unwrap();
+
+        // Fill depositor container so it only has 1 free slot (c_dep capacity is 10)
+        // Fill slots 0..9 (9 items), leaving only slot 9 free (1 free slot < 2 escrow items needed)
+        for s in 0..9 {
+            let filler = ItemRecordBuilder::new(format!("filler_{}", s))
+                .container_id(c_dep)
+                .slot(s)
+                .build();
+            char_repo.add_item(&filler).await.unwrap();
+        }
+
+        // Attempt refund -> must fail with ContainerFull
+        let refund_err = escrow_coord
+            .refund_escrow("escrow_full_test")
+            .await
+            .unwrap_err();
+        match refund_err {
+            StorageError::ContainerFull(cid, cap) => {
+                assert_eq!(cid, c_dep);
+                assert_eq!(cap, 10);
+            }
+            other => panic!("Expected ContainerFull error, got {:?}", other),
+        }
+
+        // Verify escrow status is still 'held'
+        let rec = escrow_coord
+            .get_escrow("escrow_full_test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, EscrowStatus::Held);
+
+        // Verify BOTH items are still intact in escrow container
+        let crepo = ContainerRepository::new(db.clone());
+        let esc_items = crepo.get_container_items(c_esc).await.unwrap();
+        assert_eq!(
+            esc_items.len(),
+            2,
+            "Items must not be lost or partially refunded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_escrow_reaper_non_blocking_on_full_container() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c_dep, c_ben, c_esc) = setup_escrow_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let crepo = ContainerRepository::new(db.clone());
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+
+        // Create second depositor container c_dep2 with free capacity and dedicated escrow container c_esc2
+        let c_dep2 = 9005;
+        let c_rec2 = ContainerRecordBuilder::new(c_dep2)
+            .owner_id("1002")
+            .name("Bags2")
+            .capacity(10)
+            .build();
+        crepo.create_container(&c_rec2).await.unwrap();
+
+        let c_esc2 = 9006;
+        let c_esc_rec2 = ContainerRecordBuilder::new(c_esc2)
+            .owner_type("system")
+            .owner_id("escrow")
+            .name("System Escrow 2")
+            .capacity(10)
+            .build();
+        crepo.create_container(&c_esc_rec2).await.unwrap();
+
+        // Add item to c_dep and c_dep2
+        let item1 = ItemRecordBuilder::new("reap_item_1")
+            .container_id(c_dep)
+            .slot(0)
+            .build();
+        let item2 = ItemRecordBuilder::new("reap_item_2")
+            .container_id(c_dep2)
+            .slot(0)
+            .build();
+        char_repo.add_item(&item1).await.unwrap();
+        char_repo.add_item(&item2).await.unwrap();
+
+        // Create 2 expired escrows (duration 0)
+        escrow_coord
+            .create_escrow(
+                "escrow_reap_full",
+                c_dep,
+                c_ben,
+                c_esc,
+                &["reap_item_1".to_string()],
+                "secret_1",
+                0,
+            )
+            .await
+            .unwrap();
+
+        escrow_coord
+            .create_escrow(
+                "escrow_reap_ok",
+                c_dep2,
+                c_ben,
+                c_esc2,
+                &["reap_item_2".to_string()],
+                "secret_2",
+                0,
+            )
+            .await
+            .unwrap();
+
+        // Fill c_dep completely (all 10 slots)
+        for s in 0..10 {
+            let filler = ItemRecordBuilder::new(format!("dep1_filler_{}", s))
+                .container_id(c_dep)
+                .slot(s)
+                .build();
+            char_repo.add_item(&filler).await.unwrap();
+        }
+
+        // Small sleep so expires_at <= now
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Run reaper sweep
+        let reaped = escrow_coord.reap_expired_escrows().await.unwrap();
+        assert_eq!(reaped, 1, "Only escrow_reap_ok should have been refunded");
+
+        // Verify escrow_reap_full remains held
+        let rec1 = escrow_coord
+            .get_escrow("escrow_reap_full")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec1.status, EscrowStatus::Held);
+
+        // Verify escrow_reap_ok is refunded
+        let rec2 = escrow_coord
+            .get_escrow("escrow_reap_ok")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec2.status, EscrowStatus::Refunded);
     }
 }

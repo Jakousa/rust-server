@@ -385,6 +385,32 @@ impl MarketplaceRepository {
                     .execute(&mut *conn)
                     .await?;
 
+                    // 6. Record audit logging into container_transactions
+                    let item_tx_id = format!("mkt_item_{}", listing_id);
+                    sqlx::query(
+                        "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
+                    )
+                    .bind(&item_tx_id)
+                    .bind(escrow_container_id)
+                    .bind(buyer_container_id as i64)
+                    .bind(&item_instance_id)
+                    .bind(now_ms)
+                    .execute(&mut *conn)
+                    .await?;
+
+                    let pay_tx_id = format!("mkt_pay_{}", listing_id);
+                    let pay_item_desc = format!("price:{}", price);
+                    sqlx::query(
+                        "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
+                    )
+                    .bind(&pay_tx_id)
+                    .bind(payment_container_id as i64)
+                    .bind(seller_container_id)
+                    .bind(&pay_item_desc)
+                    .bind(now_ms)
+                    .execute(&mut *conn)
+                    .await?;
+
                     Ok(MarketListingRecord {
                         listing_id: listing_id.to_string(),
                         seller_guid: seller_guid as u64,
@@ -721,6 +747,7 @@ impl MarketplaceRepository {
                             .fetch_optional(&mut *conn)
                             .await?;
 
+                    let mut item_returned = false;
                     if let Some(c_row) = c_seller {
                         let cap: i32 = c_row.try_get("capacity")?;
                         let occupied_rows =
@@ -736,7 +763,7 @@ impl MarketplaceRepository {
                         if let Some(free_slot) =
                             (0..(cap as u32)).find(|s| !occupied_slots.contains(s))
                         {
-                            let _ = sqlx::query(
+                            let item_res = sqlx::query(
                                 "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
                             )
                             .bind(seller_container_id)
@@ -745,20 +772,32 @@ impl MarketplaceRepository {
                             .bind(&item_instance_id)
                             .execute(&mut *conn)
                             .await;
+                            if item_res.is_ok() {
+                                item_returned = true;
+                            }
                         }
                     }
 
+                    if !item_returned {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        continue;
+                    }
+
                     let res = sqlx::query(
-                        "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ?",
+                        "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'",
                     )
                     .bind(now_ms)
                     .bind(&listing_id)
                     .execute(&mut *conn)
                     .await;
 
-                    if res.is_ok() {
-                        let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
-                        reaped += 1;
+                    if let Ok(affected) = res {
+                        if affected.rows_affected() == 1 {
+                            let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+                            reaped += 1;
+                        } else {
+                            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        }
                     } else {
                         let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                     }
@@ -930,7 +969,7 @@ impl MarketplaceRepository {
         }
         let in_clause = placeholders.join(", ");
         let query_str = format!(
-            "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) FOR UPDATE",
+            "SELECT container_id, owner_id FROM containers WHERE container_id IN ({}) ORDER BY container_id ASC FOR UPDATE",
             in_clause
         );
 
@@ -1054,6 +1093,35 @@ impl MarketplaceRepository {
         sqlx::query::<sqlx::Postgres>(&upd_list_sql)
             .bind(now_ms)
             .bind(listing_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let item_tx_id = format!("mkt_item_{}", listing_id);
+        let ins_item_tx = sql_for_dialect(
+            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
+            true,
+        );
+        sqlx::query::<sqlx::Postgres>(&ins_item_tx)
+            .bind(&item_tx_id)
+            .bind(escrow_container_id)
+            .bind(buyer_container_id as i64)
+            .bind(&item_instance_id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+
+        let pay_tx_id = format!("mkt_pay_{}", listing_id);
+        let pay_item_desc = format!("price:{}", price);
+        let ins_pay_tx = sql_for_dialect(
+            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'committed', ?)",
+            true,
+        );
+        sqlx::query::<sqlx::Postgres>(&ins_pay_tx)
+            .bind(&pay_tx_id)
+            .bind(payment_container_id as i64)
+            .bind(seller_container_id)
+            .bind(&pay_item_desc)
+            .bind(now_ms)
             .execute(&mut *tx)
             .await?;
 
@@ -1279,6 +1347,7 @@ impl MarketplaceRepository {
                     "SELECT capacity FROM containers WHERE container_id = ? FOR UPDATE",
                     true,
                 );
+                let mut item_returned = false;
                 if let Ok(Some(c_row)) = sqlx::query::<sqlx::Postgres>(&c_seller_sql)
                     .bind(seller_container_id)
                     .fetch_optional(&mut *tx)
@@ -1304,30 +1373,38 @@ impl MarketplaceRepository {
                                 "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?",
                                 true,
                             );
-                            let _ = sqlx::query::<sqlx::Postgres>(&upd_item)
+                            if sqlx::query::<sqlx::Postgres>(&upd_item)
                                 .bind(seller_container_id)
                                 .bind(free_slot as i32)
                                 .bind(now_secs)
                                 .bind(&item_instance_id)
                                 .execute(&mut *tx)
-                                .await;
+                                .await
+                                .is_ok()
+                            {
+                                item_returned = true;
+                            }
                         }
                     }
                 }
 
+                if !item_returned {
+                    continue;
+                }
+
                 let upd_sql = sql_for_dialect(
-                    "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ?",
+                    "UPDATE market_listings SET status = 'Expired', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'",
                     true,
                 );
-                if sqlx::query::<sqlx::Postgres>(&upd_sql)
+                if let Ok(affected) = sqlx::query::<sqlx::Postgres>(&upd_sql)
                     .bind(now_ms)
                     .bind(&listing_id)
                     .execute(&mut *tx)
                     .await
-                    .is_ok()
-                    && tx.commit().await.is_ok()
                 {
-                    reaped += 1;
+                    if affected.rows_affected() == 1 && tx.commit().await.is_ok() {
+                        reaped += 1;
+                    }
                 }
             }
         }
@@ -1679,6 +1756,148 @@ mod tests {
         let items = crepo.get_container_items(seller_container).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item_instance_id, "item-expiring");
+    }
+
+    #[tokio::test]
+    async fn test_marketplace_reap_expired_listings_seller_inventory_full_safety() {
+        let (db, repo) = setup_test_db().await;
+
+        let seller_guid = 1001;
+        let seller_container = 10;
+        let escrow_container = 99;
+
+        create_container(&db, seller_container, "1001", 10).await;
+        create_container(&db, escrow_container, "system", 50).await;
+        create_item(&db, "item-exp-full", seller_container, 0, 700).await;
+
+        let listing = repo
+            .create_listing(seller_guid, seller_container, 0, 100, 0, escrow_container)
+            .await
+            .unwrap();
+
+        // Fill seller container completely (slots 0..10)
+        for s in 0..10 {
+            create_item(&db, &format!("seller-fill-{}", s), seller_container, s, 100).await;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let reaped = repo.reap_expired_listings(10).await.unwrap();
+        assert_eq!(
+            reaped, 0,
+            "Must not reap when seller container has no free slot"
+        );
+
+        // Listing status must still be Active
+        let fetched = repo
+            .get_listing(&listing.listing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.status, ListingStatus::Active);
+
+        // Item must remain safely in escrow
+        let crepo = crate::container_repo::ContainerRepository::new(db.clone());
+        let escrow_items = crepo.get_container_items(escrow_container).await.unwrap();
+        assert_eq!(escrow_items.len(), 1);
+        assert_eq!(escrow_items[0].item_instance_id, "item-exp-full");
+    }
+
+    #[tokio::test]
+    async fn test_marketplace_purchase_records_container_transactions_audit() {
+        let (db, repo) = setup_test_db().await;
+
+        let seller_guid = 1001;
+        let buyer_guid = 2002;
+        let seller_container = 10;
+        let escrow_container = 99;
+        let buyer_container = 20;
+        let payment_container = 21;
+
+        create_container(&db, seller_container, "1001", 10).await;
+        create_container(&db, escrow_container, "system", 50).await;
+        create_container(&db, buyer_container, "2002", 10).await;
+        create_container(&db, payment_container, "2002", 10).await;
+
+        create_item(&db, "item-audit-sword", seller_container, 0, 888).await;
+
+        let listing = repo
+            .create_listing(
+                seller_guid,
+                seller_container,
+                0,
+                500,
+                3600,
+                escrow_container,
+            )
+            .await
+            .unwrap();
+
+        let purchased = repo
+            .purchase_listing(
+                buyer_guid,
+                &listing.listing_id,
+                buyer_container,
+                payment_container,
+                500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(purchased.status, ListingStatus::Sold);
+
+        // Verify container_transactions has item transfer and payment records
+        let item_tx_id = format!("mkt_item_{}", listing.listing_id);
+        let pay_tx_id = format!("mkt_pay_{}", listing.listing_id);
+
+        let item_tx_row = sqlx::query("SELECT src_container_id, dst_container_id, item_instance_id, status FROM container_transactions WHERE tx_id = ?")
+            .bind(&item_tx_id)
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap()
+            .expect("item audit transaction row exists");
+
+        assert_eq!(
+            item_tx_row.try_get::<i64, _>("src_container_id").unwrap(),
+            escrow_container as i64
+        );
+        assert_eq!(
+            item_tx_row.try_get::<i64, _>("dst_container_id").unwrap(),
+            buyer_container as i64
+        );
+        assert_eq!(
+            item_tx_row
+                .try_get::<String, _>("item_instance_id")
+                .unwrap(),
+            "item-audit-sword"
+        );
+        assert_eq!(
+            item_tx_row.try_get::<String, _>("status").unwrap(),
+            "committed"
+        );
+
+        let pay_tx_row = sqlx::query("SELECT src_container_id, dst_container_id, item_instance_id, status FROM container_transactions WHERE tx_id = ?")
+            .bind(&pay_tx_id)
+            .fetch_optional(db.sqlite_pool().unwrap())
+            .await
+            .unwrap()
+            .expect("payment audit transaction row exists");
+
+        assert_eq!(
+            pay_tx_row.try_get::<i64, _>("src_container_id").unwrap(),
+            payment_container as i64
+        );
+        assert_eq!(
+            pay_tx_row.try_get::<i64, _>("dst_container_id").unwrap(),
+            seller_container as i64
+        );
+        assert_eq!(
+            pay_tx_row.try_get::<String, _>("item_instance_id").unwrap(),
+            "price:500"
+        );
+        assert_eq!(
+            pay_tx_row.try_get::<String, _>("status").unwrap(),
+            "committed"
+        );
     }
 
     #[test]
