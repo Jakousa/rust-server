@@ -87,6 +87,19 @@ impl ExcavationRateLimiter {
     pub fn remove_entity(&mut self, entity: Guid) {
         self.last_excavation.remove(&entity);
     }
+
+    pub fn prune(&mut self, entities: &mmo_core::entity::EntityStore) {
+        self.last_excavation
+            .retain(|guid, _| entities.get_by_guid(*guid).is_some());
+    }
+
+    pub fn len(&self) -> usize {
+        self.last_excavation.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last_excavation.is_empty()
+    }
 }
 
 /// Validates player reach, rate limits, and applies the voxel modification.

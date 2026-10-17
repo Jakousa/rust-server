@@ -27,52 +27,14 @@ pub enum VoxelCodecError {
     UnexpectedEof { span_index: usize },
 }
 
-/// Serializes a `PaletteChunk` into an RLE compressed byte stream.
-pub fn encode_rle(chunk: &PaletteChunk) -> Vec<u8> {
+/// Helper consolidating RLE span-encoding loop for both `PaletteChunk` and raw voxel arrays.
+fn encode_rle_with<F: Fn(usize) -> u16>(revision: u64, get_voxel: F) -> Vec<u8> {
     let mut spans: Vec<(u16, u16)> = Vec::new();
-    let mut current_voxel = chunk.get(0);
+    let mut current_voxel = get_voxel(0);
     let mut current_count: u16 = 1;
 
     for i in 1..CHUNK_VOXELS {
-        let v = chunk.get(i);
-        if v == current_voxel && current_count < u16::MAX {
-            current_count += 1;
-        } else {
-            spans.push((current_count, current_voxel));
-            current_voxel = v;
-            current_count = 1;
-        }
-    }
-    spans.push((current_count, current_voxel));
-
-    let mut buf = Vec::with_capacity(16 + spans.len() * 4);
-    buf.extend_from_slice(&MAGIC_VXR1);
-    buf.extend_from_slice(&chunk.revision().to_le_bytes());
-    buf.extend_from_slice(&(spans.len() as u32).to_le_bytes());
-
-    for (count, voxel_id) in spans {
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(&voxel_id.to_le_bytes());
-    }
-
-    buf
-}
-
-/// Decodes an RLE byte stream into a `PaletteChunk`, strictly enforcing that total voxels equal 4,096.
-pub fn decode_rle(bytes: &[u8]) -> Result<PaletteChunk, VoxelCodecError> {
-    let (voxels, revision) = decode_rle_raw(bytes)?;
-    let mut chunk = PaletteChunk::from_raw_voxels(&voxels);
-    chunk.revision = revision;
-    Ok(chunk)
-}
-
-/// Serializes raw 4,096 voxels into an RLE compressed byte stream.
-pub fn encode_rle_raw(voxels: &[u16; CHUNK_VOXELS], revision: u64) -> Vec<u8> {
-    let mut spans: Vec<(u16, u16)> = Vec::new();
-    let mut current_voxel = voxels[0];
-    let mut current_count: u16 = 1;
-
-    for &v in voxels.iter().skip(1) {
+        let v = get_voxel(i);
         if v == current_voxel && current_count < u16::MAX {
             current_count += 1;
         } else {
@@ -94,6 +56,24 @@ pub fn encode_rle_raw(voxels: &[u16; CHUNK_VOXELS], revision: u64) -> Vec<u8> {
     }
 
     buf
+}
+
+/// Serializes a `PaletteChunk` into an RLE compressed byte stream.
+pub fn encode_rle(chunk: &PaletteChunk) -> Vec<u8> {
+    encode_rle_with(chunk.revision(), |i| chunk.get(i))
+}
+
+/// Decodes an RLE byte stream into a `PaletteChunk`, strictly enforcing that total voxels equal 4,096.
+pub fn decode_rle(bytes: &[u8]) -> Result<PaletteChunk, VoxelCodecError> {
+    let (voxels, revision) = decode_rle_raw(bytes)?;
+    let mut chunk = PaletteChunk::from_raw_voxels(&voxels);
+    chunk.revision = revision;
+    Ok(chunk)
+}
+
+/// Serializes raw 4,096 voxels into an RLE compressed byte stream.
+pub fn encode_rle_raw(voxels: &[u16; CHUNK_VOXELS], revision: u64) -> Vec<u8> {
+    encode_rle_with(revision, |i| voxels[i])
 }
 
 /// Decodes an RLE byte stream into raw 4,096 voxels and revision counter.

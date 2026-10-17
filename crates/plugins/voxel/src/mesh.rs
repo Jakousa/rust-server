@@ -122,7 +122,14 @@ pub fn generate_chunk_mesh(chunk: &PaletteChunk, neighbors: &NeighborBoundarySli
         return VoxelMesh::new();
     }
 
-    let voxels = chunk.unpack_all();
+    generate_mesh_from_raw(&chunk.unpack_all(), neighbors)
+}
+
+/// Generates a culled boundary mesh from a raw array of 4,096 voxels.
+pub fn generate_mesh_from_raw(
+    voxels: &[u16; CHUNK_VOXELS],
+    neighbors: &NeighborBoundarySlices,
+) -> VoxelMesh {
     let mut mesh = VoxelMesh::with_capacity(256);
 
     for idx in 0..CHUNK_VOXELS {

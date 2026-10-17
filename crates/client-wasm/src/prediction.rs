@@ -78,6 +78,11 @@ impl PredictionBuffer {
         self.current_sim_pos = predicted_pos;
     }
 
+    /// Returns the number of currently unacknowledged client inputs.
+    pub fn pending_input_count(&self) -> usize {
+        self.unacknowledged_inputs.len()
+    }
+
     /// Reconciles the client's predicted position against an authoritative server state update
     /// acknowledging `ack_sequence`.
     ///

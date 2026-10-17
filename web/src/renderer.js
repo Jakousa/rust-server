@@ -112,30 +112,33 @@ export class WorldRenderer {
 
   /**
    * Synchronizes Three.js scene meshes from the flat WASM render buffer.
-   * Format per entity (8 floats):
-   * [guid_raw, x, y, z, yaw, hp_pct, cast_pct, entity_type]
+   * Format per entity (9 floats):
+   * [guid_lo, guid_hi, x, y, z, yaw, hp_pct, cast_pct, entity_type]
    */
   syncEntities(renderBuffer, localPlayerGuid = null) {
     const activeGuids = new Set();
-    const entityStride = 8;
+    const entityStride = 9;
     const count = Math.floor(renderBuffer.length / entityStride);
+    const localBigInt = localPlayerGuid !== null ? BigInt(localPlayerGuid) : null;
 
     for (let i = 0; i < count; i++) {
       const offset = i * entityStride;
-      const guid = Math.floor(renderBuffer[offset]);
-      const x = renderBuffer[offset + 1];
-      const y = renderBuffer[offset + 2];
-      const z = renderBuffer[offset + 3];
-      const yaw = renderBuffer[offset + 4];
-      const hpPct = renderBuffer[offset + 5];
-      const _castPct = renderBuffer[offset + 6];
-      const entityType = Math.floor(renderBuffer[offset + 7]);
+      const guidLo = BigInt(Math.round(renderBuffer[offset]));
+      const guidHi = BigInt(Math.round(renderBuffer[offset + 1]));
+      const guid = (guidHi << 32n) | guidLo;
+      const x = renderBuffer[offset + 2];
+      const y = renderBuffer[offset + 3];
+      const z = renderBuffer[offset + 4];
+      const yaw = renderBuffer[offset + 5];
+      const hpPct = renderBuffer[offset + 6];
+      const _castPct = renderBuffer[offset + 7];
+      const entityType = Math.floor(renderBuffer[offset + 8]);
 
       activeGuids.add(guid);
 
       let group = this.entities.get(guid);
       if (!group) {
-        group = this.createEntityMesh(entityType, guid === localPlayerGuid);
+        group = this.createEntityMesh(entityType, localBigInt !== null && guid === localBigInt);
         this.entities.set(guid, group);
         this.scene.add(group);
       }

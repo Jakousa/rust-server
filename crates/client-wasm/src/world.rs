@@ -144,11 +144,11 @@ impl WorldObjectStore {
     /// Generates a flat packed `Float32Array` render buffer for WebGL / Three.js instancing.
     ///
     /// Memory layout per world object (16 floats):
-    /// `[object_id_f32, prefab_id_f32, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, scale_x, scale_y, scale_z, state_flags_f32, hp_pct, revision_f32, 0.0]`
+    /// `[object_id_lo, prefab_id_f32, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, scale_x, scale_y, scale_z, state_flags_f32, hp_pct, revision_f32, object_id_hi]`
     pub fn get_render_buffer(&self) -> Vec<f32> {
         let mut buffer = Vec::with_capacity(self.objects.len() * 16);
         for obj in self.objects.values() {
-            buffer.push(obj.object_id as f32);
+            buffer.push((obj.object_id & 0xFFFF_FFFF) as f32);
             buffer.push(obj.prefab_id as f32);
             buffer.push(obj.position.0);
             buffer.push(obj.position.1);
@@ -163,7 +163,7 @@ impl WorldObjectStore {
             buffer.push(obj.state_flags as f32);
             buffer.push(obj.hp_percent());
             buffer.push(obj.revision as f32);
-            buffer.push(0.0);
+            buffer.push((obj.object_id >> 32) as f32);
         }
         buffer
     }
@@ -242,11 +242,33 @@ mod tests {
         assert_eq!(buf[12], 5.0);
         assert_eq!(buf[13], 0.5);
         assert_eq!(buf[14], 2.0);
+        assert_eq!(buf[15], 0.0);
 
         // Despawn
         let despawn = WorldObjectDespawnPacket { object_id: 1001 };
         assert!(store.remove(&despawn).is_some());
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_64bit_object_id_fidelity_in_render_buffer() {
+        let mut store = WorldObjectStore::new();
+        let id_a = (1u64 << 48) | (1u64 << 32) | 1u64;
+        let id_b = (1u64 << 48) | (1u64 << 32) | 2u64;
+
+        store.insert_or_update(&sample_spawn(id_a, 1));
+        store.insert_or_update(&sample_spawn(id_b, 1));
+
+        let buf = store.get_render_buffer();
+        assert_eq!(buf.len(), 32);
+
+        let reconstructed_0 = ((buf[15] as u64) << 32) | (buf[0] as u64);
+        let reconstructed_1 = ((buf[31] as u64) << 32) | (buf[16] as u64);
+
+        let mut ids = vec![reconstructed_0, reconstructed_1];
+        ids.sort_unstable();
+        assert_eq!(ids, vec![id_a, id_b]);
+        assert_ne!(buf[0], buf[16]);
     }
 }

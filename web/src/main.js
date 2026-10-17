@@ -64,12 +64,17 @@ class ClientWorldBridge {
   }
 
   getRenderBuffer(localPlayerPos, localPlayerYaw) {
-    // Layout: [guid, x, y, z, yaw, hp_pct, cast_pct, entity_type] * N
+    // Layout: [guid_lo, guid_hi, x, y, z, yaw, hp_pct, cast_pct, entity_type] * N
     const buffer = [];
+
+    const localGuidBigInt = BigInt(this.localPlayerGuid);
+    const localLo = Number(localGuidBigInt & 0xffffffffn);
+    const localHi = Number((localGuidBigInt >> 32n) & 0xffffffffn);
 
     // Local player entry
     buffer.push(
-      this.localPlayerGuid,
+      localLo,
+      localHi,
       localPlayerPos.x,
       localPlayerPos.y,
       localPlayerPos.z,
@@ -82,8 +87,12 @@ class ClientWorldBridge {
     // Remote entity entries
     for (const ent of this.entities.values()) {
       if (ent.id === this.localPlayerGuid) continue;
+      const entGuidBigInt = BigInt(ent.id);
+      const entLo = Number(entGuidBigInt & 0xffffffffn);
+      const entHi = Number((entGuidBigInt >> 32n) & 0xffffffffn);
       buffer.push(
-        ent.id,
+        entLo,
+        entHi,
         ent.x,
         ent.y,
         ent.z,
@@ -100,8 +109,11 @@ class ClientWorldBridge {
   getWorldObjectsRenderBuffer() {
     const buffer = [];
     for (const obj of this.worldObjects.values()) {
+      const objIdBigInt = BigInt(obj.id);
+      const objLo = Number(objIdBigInt & 0xffffffffn);
+      const objHi = Number((objIdBigInt >> 32n) & 0xffffffffn);
       buffer.push(
-        obj.id,
+        objLo,
         obj.prefabId,
         obj.x,
         obj.y,
@@ -116,7 +128,7 @@ class ClientWorldBridge {
         obj.stateFlags,
         obj.hpPct,
         obj.revision,
-        0.0
+        objHi
       );
     }
     return new Float32Array(buffer);

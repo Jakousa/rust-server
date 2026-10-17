@@ -107,12 +107,19 @@ impl WasmClientWorld {
     pub fn process_packet(&mut self, data: &[u8]) -> Result<(), String> {
         self.incoming_buffer.extend_from_slice(data);
 
-        while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut self.incoming_buffer) {
-            self.received_packets += 1;
-            self.handle_parsed_packet(packet);
+        loop {
+            match ClientPacket::decode_frame(&mut self.incoming_buffer) {
+                Ok(Some(packet)) => {
+                    self.received_packets += 1;
+                    self.handle_parsed_packet(packet);
+                }
+                Ok(None) => break Ok(()),
+                Err(err) => {
+                    self.incoming_buffer.clear();
+                    return Err(err.to_string());
+                }
+            }
         }
-
-        Ok(())
     }
 
     /// Internal handler dispatching parsed schema packets.
@@ -147,11 +154,32 @@ impl WasmClientWorld {
                     replica.apply_delta(&delta);
 
                     if Some(entity_id) == self.local_player_id {
-                        // Local player position is predicted, but if keyframe arrives, reconcile against it
-                        if delta.field_mask & delta_flags::MASK_KEYFRAME != 0 {
-                            let server_pos = replica.position;
-                            let reconciled = self.prediction_buffer.reconcile(0, server_pos);
-                            replica.position = self.prediction_buffer.visual_position(reconciled);
+                        let server_pos = replica.position;
+                        if self.prediction_buffer.pending_input_count() == 0 {
+                            if delta.field_mask & delta_flags::MASK_KEYFRAME != 0
+                                || delta.field_mask & delta_flags::MASK_DELTA_POS_X != 0
+                            {
+                                let reconciled = self.prediction_buffer.reconcile(0, server_pos);
+                                replica.position =
+                                    self.prediction_buffer.visual_position(reconciled);
+                            }
+                        } else {
+                            let (cx, cy, cz) = self.prediction_buffer.current_sim_pos;
+                            let (sx, sy, sz) = server_pos;
+                            let dx = cx - sx;
+                            let dy = cy - sy;
+                            let dz = cz - sz;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            let hard_snap_thresh = self.prediction_buffer.hard_snap_threshold;
+                            if dist_sq > hard_snap_thresh * hard_snap_thresh {
+                                let reconciled = self.prediction_buffer.reconcile(0, server_pos);
+                                replica.position =
+                                    self.prediction_buffer.visual_position(reconciled);
+                            } else {
+                                replica.position = self
+                                    .prediction_buffer
+                                    .visual_position(self.prediction_buffer.current_sim_pos);
+                            }
                         }
                     } else {
                         self.interp_buffer.push_snapshot(
@@ -348,13 +376,14 @@ impl WasmClientWorld {
 
     /// Returns a flat `Float32Array` render buffer for high-performance WebGL rendering.
     ///
-    /// Memory layout per entity (8 floats):
-    /// `[guid_raw_f32, x, y, z, yaw, hp_pct, cast_pct, entity_type_f32]`
+    /// Memory layout per entity (9 floats):
+    /// `[guid_lo_f32, guid_hi_f32, x, y, z, yaw, hp_pct, cast_pct, entity_type_f32]`
     pub fn get_render_buffer(&self) -> Vec<f32> {
-        let mut buffer = Vec::with_capacity(self.entities.len() * 8);
+        let mut buffer = Vec::with_capacity(self.entities.len() * 9);
 
         for replica in self.entities.values() {
-            buffer.push(replica.entity_id as f32);
+            buffer.push((replica.entity_id & 0xFFFF_FFFF) as f32);
+            buffer.push((replica.entity_id >> 32) as f32);
             buffer.push(replica.position.0);
             buffer.push(replica.position.1);
             buffer.push(replica.position.2);
@@ -365,6 +394,16 @@ impl WasmClientWorld {
         }
 
         buffer
+    }
+
+    /// Returns all entity 64-bit GUIDs currently active in client memory.
+    pub fn get_entity_guids(&self) -> Vec<u64> {
+        self.entities.keys().copied().collect()
+    }
+
+    /// Returns the number of currently active entities in client memory.
+    pub fn entities_count(&self) -> usize {
+        self.entities.len()
     }
 
     /// Returns the number of currently active world objects in client memory.
@@ -451,11 +490,6 @@ impl WasmClientWorld {
             packets.push(pkt.encode());
         }
         packets
-    }
-
-    /// Returns the number of currently queued unacknowledged server ticks.
-    pub fn pending_acks_count(&self) -> usize {
-        self.pending_acks.len()
     }
 
     /// Returns a reference to the client prediction buffer.
@@ -548,19 +582,20 @@ mod tests {
 
         // Check render buffer layout
         let render_buf = world.get_render_buffer();
-        assert_eq!(render_buf.len(), 8);
-        assert_eq!(render_buf[0], mob_guid as f32);
-        assert_eq!(render_buf[5], 0.75); // 75 / 100 HP
+        assert_eq!(render_buf.len(), 9);
+        assert_eq!(render_buf[0], (mob_guid & 0xFFFF_FFFF) as f32);
+        assert_eq!(render_buf[1], (mob_guid >> 32) as f32);
+        assert_eq!(render_buf[6], 0.75); // 75 / 100 HP
 
         // Check movement encoding
         let move_bytes = world.encode_movement(12.0, 0.0, 15.0, std::f32::consts::PI, 1);
         assert!(!move_bytes.is_empty());
 
         // Check ACK queue and encoding
-        assert_eq!(world.pending_acks_count(), 1);
+        assert_eq!(world.pending_acks_len(), 1);
         let drained_acks = world.drain_pending_acks();
         assert_eq!(drained_acks.len(), 1);
-        assert_eq!(world.pending_acks_count(), 0);
+        assert_eq!(world.pending_acks_len(), 0);
 
         let ack_bytes = world.encode_ack().expect("should encode ack");
         assert!(!ack_bytes.is_empty());
@@ -661,7 +696,6 @@ mod tests {
         let mut world = WasmClientWorld::new();
         world.set_session_id(777);
 
-        assert_eq!(world.pending_acks_count(), 0);
         assert_eq!(world.pending_acks_len(), 0);
 
         // Receive batch 1 at tick 10
@@ -696,7 +730,7 @@ mod tests {
             .process_packet(&batch1.encode())
             .expect("process batch 1");
 
-        assert_eq!(world.pending_acks_count(), 1);
+        assert_eq!(world.pending_acks_len(), 1);
         assert_eq!(world.get_entity_attribute(100, 5), Some(42));
         assert_eq!(world.get_entity_attribute(100, 0), Some(95));
         assert_eq!(world.get_entity_attribute(100, 99), None);
@@ -727,7 +761,7 @@ mod tests {
             .process_packet(&batch2.encode())
             .expect("process batch 2");
 
-        assert_eq!(world.pending_acks_count(), 2);
+        assert_eq!(world.pending_acks_len(), 2);
         assert_eq!(world.get_entity_attribute(100, 5), Some(84));
 
         // Drain first ack via drain_ack_packet
@@ -744,7 +778,7 @@ mod tests {
         // Drain remaining acks via drain_pending_acks
         let remaining_acks = world.drain_pending_acks();
         assert_eq!(remaining_acks.len(), 1);
-        assert_eq!(world.pending_acks_count(), 0);
+        assert_eq!(world.pending_acks_len(), 0);
 
         let mut buf2 = bytes::BytesMut::from(&remaining_acks[0][..]);
         if let Ok(Some(ClientPacket::ClientAck(ack2))) = ClientPacket::decode_frame(&mut buf2) {
@@ -857,5 +891,164 @@ mod tests {
         assert!(world.prediction_buffer.unacknowledged_inputs.is_empty());
         assert_eq!(world.prediction_buffer.visual_error_offset, (0.0, 0.0, 0.0));
         assert_eq!(world.get_entity_position(local_id), Some((100.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_64bit_guid_fidelity_in_render_buffer() {
+        let mut world = WasmClientWorld::new();
+        let guid_1 = (1u64 << 48) | (1u64 << 32) | 1u64;
+        let guid_2 = (1u64 << 48) | (1u64 << 32) | 2u64;
+
+        let state_1 = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: guid_1,
+            position: Vec3::new(1.0, 2.0, 3.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        let state_2 = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: guid_2,
+            position: Vec3::new(4.0, 5.0, 6.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+
+        world.process_packet(&state_1.encode()).unwrap();
+        world.process_packet(&state_2.encode()).unwrap();
+
+        let buf = world.get_render_buffer();
+        assert_eq!(buf.len(), 18); // 2 entities * 9 floats
+
+        let guids = world.get_entity_guids();
+        assert_eq!(guids.len(), 2);
+        assert!(guids.contains(&guid_1));
+        assert!(guids.contains(&guid_2));
+
+        // Reconstruct both 64-bit GUIDs from render buffer
+        let rec_0 = ((buf[1] as u64) << 32) | (buf[0] as u64);
+        let rec_1 = ((buf[10] as u64) << 32) | (buf[9] as u64);
+
+        let mut rec_ids = vec![rec_0, rec_1];
+        rec_ids.sort_unstable();
+        let mut expected_ids = vec![guid_1, guid_2];
+        expected_ids.sort_unstable();
+        assert_eq!(rec_ids, expected_ids);
+
+        // Lower halves in index 0 and 9 MUST NOT be equal (counter 1 vs 2)
+        assert_ne!(buf[0], buf[9]);
+    }
+
+    #[test]
+    fn test_malformed_packet_clears_buffer_and_returns_err() {
+        let mut world = WasmClientWorld::new();
+
+        // Feed corrupted packet bytes with valid magic but unknown opcode (8 bytes header)
+        let corrupted = vec![0x4D, 0x4D, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let res = world.process_packet(&corrupted);
+        assert!(res.is_err(), "Expected malformed packet to return Err");
+        assert!(
+            world.incoming_buffer.is_empty(),
+            "Buffer must be cleared on decode error"
+        );
+
+        // Subsequent valid packet should process cleanly without being blocked
+        let valid_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: 12345,
+            position: Vec3::new(10.0, 20.0, 30.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 1.0,
+            pitch: 0.0,
+            health: 50,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 100,
+        });
+        assert!(world.process_packet(&valid_state.encode()).is_ok());
+        assert_eq!(world.entities_count(), 1);
+    }
+
+    #[test]
+    fn test_keyframe_arrival_during_active_prediction() {
+        let mut world = WasmClientWorld::new();
+        let local_id = 999;
+        world.set_local_player_id(local_id);
+
+        let init_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: local_id,
+            position: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        world.process_packet(&init_state.encode()).unwrap();
+
+        // Push client predicted movement
+        let _ = world.encode_movement(5.0, 0.0, 0.0, 0.0, 1);
+        assert_eq!(world.prediction_buffer.pending_input_count(), 1);
+
+        // Keyframe arrives from server with slight latency lag: (4.0, 0.0, 0.0)
+        let keyframe_batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 5,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: local_id,
+                field_mask: delta_flags::MASK_KEYFRAME | delta_flags::MASK_DELTA_POS_X,
+                position: (4.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+
+        world.process_packet(&keyframe_batch.encode()).unwrap();
+
+        // Active prediction must NOT be wiped by unsequenced keyframe when pending inputs exist within hard snap threshold
+        assert_eq!(world.prediction_buffer.pending_input_count(), 1);
+        assert_eq!(world.get_entity_position(local_id), Some((5.0, 0.0, 0.0)));
+
+        // Now test keyframe exceeding hard snap threshold (20m): server teleports player to (50.0, 0.0, 0.0)
+        let snap_keyframe_batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 6,
+            baseline_tick: 5,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: local_id,
+                field_mask: delta_flags::MASK_KEYFRAME | delta_flags::MASK_DELTA_POS_X,
+                position: (50.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+
+        world.process_packet(&snap_keyframe_batch.encode()).unwrap();
+
+        // Hard snap threshold exceeded -> hard snap reconciled
+        assert_eq!(world.prediction_buffer.pending_input_count(), 0);
+        assert_eq!(world.get_entity_position(local_id), Some((50.0, 0.0, 0.0)));
     }
 }
