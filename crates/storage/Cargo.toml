@@ -26,3 +26,6 @@ tempfile = "3.14"
 
 [lints]
 workspace = true
+
+[features]
+test-helpers = []

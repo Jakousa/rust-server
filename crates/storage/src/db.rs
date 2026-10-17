@@ -113,6 +113,121 @@ pub fn sql_for_dialect(query: &str, is_postgres: bool) -> String {
     result
 }
 
+/// Current UTC timestamp in milliseconds since Unix epoch without panicking.
+pub fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Current UTC timestamp in seconds since Unix epoch without panicking.
+pub fn current_time_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Computes all free slots in ascending order for a container of given capacity.
+pub fn compute_free_slots(occupied: &std::collections::HashSet<u32>, capacity: u32) -> Vec<u32> {
+    (0..capacity).filter(|s| !occupied.contains(s)).collect()
+}
+
+/// Finds the first free slot index in ascending numerical order for a container of given capacity.
+pub fn find_first_free_slot(
+    occupied: &std::collections::HashSet<u32>,
+    capacity: u32,
+) -> Option<u32> {
+    (0..capacity).find(|s| !occupied.contains(s))
+}
+
+/// Macro for executing dialect-adapted transactional blocks across SQLite and PostgreSQL.
+#[macro_export]
+macro_rules! with_dialect_tx {
+    ($db:expr, |$conn:ident, $is_pg:ident| async move $body:block) => {
+        $crate::with_dialect_tx!($db, |$conn, $is_pg| $body)
+    };
+    ($db:expr, |$conn:ident, $is_pg:ident| async $body:block) => {
+        $crate::with_dialect_tx!($db, |$conn, $is_pg| $body)
+    };
+    ($db:expr, |$conn:ident| async move $body:block) => {
+        $crate::with_dialect_tx!($db, |$conn, _is_pg| $body)
+    };
+    ($db:expr, |$conn:ident| async $body:block) => {
+        $crate::with_dialect_tx!($db, |$conn, _is_pg| $body)
+    };
+    ($db:expr, |$conn:ident| $body:block) => {
+        $crate::with_dialect_tx!($db, |$conn, _is_pg| $body)
+    };
+    ($db:expr, |$conn:ident, $is_pg:ident| $body:block) => {
+        match $db.backend() {
+            $crate::db::DbBackend::Sqlite(pool) => {
+                let mut conn_holder = pool.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *conn_holder)
+                    .await?;
+                let res: Result<_, $crate::db::StorageError> = {
+                    let $conn = &mut *conn_holder;
+                    #[allow(unused_variables)]
+                    let $is_pg = false;
+                    #[allow(unused_macros)]
+                    macro_rules! q {
+                        ($sql:expr) => {
+                            $crate::db::sql_for_dialect($sql, false)
+                        };
+                    }
+                    #[allow(unused_macros)]
+                    macro_rules! lock_suffix {
+                        () => {
+                            ""
+                        };
+                    }
+                    async { $body }.await
+                };
+                match res {
+                    Ok(val) => {
+                        sqlx::query("COMMIT").execute(&mut *conn_holder).await?;
+                        Ok(val)
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn_holder).await;
+                        Err(e)
+                    }
+                }
+            }
+            $crate::db::DbBackend::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let res: Result<_, $crate::db::StorageError> = {
+                    let $conn = &mut *tx;
+                    #[allow(unused_variables)]
+                    let $is_pg = true;
+                    #[allow(unused_macros)]
+                    macro_rules! q {
+                        ($sql:expr) => {
+                            $crate::db::sql_for_dialect($sql, true)
+                        };
+                    }
+                    #[allow(unused_macros)]
+                    macro_rules! lock_suffix {
+                        () => {
+                            " FOR UPDATE"
+                        };
+                    }
+                    async { $body }.await
+                };
+                match res {
+                    Ok(val) => {
+                        tx.commit().await?;
+                        Ok(val)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    };
+}
+
 /// Central database manager backed by SQLite or PostgreSQL connection pool.
 #[derive(Clone)]
 pub struct Database {
@@ -120,6 +235,19 @@ pub struct Database {
 }
 
 impl Database {
+    /// Adapts the given SQL statement with `?` parameter placeholders to the active backend dialect.
+    pub fn sql(&self, query: &str) -> String {
+        sql_for_dialect(query, self.is_postgres())
+    }
+
+    /// Suffix for locking rows during transactions (` FOR UPDATE` on PostgreSQL, empty on SQLite).
+    pub fn for_update_suffix(&self) -> &'static str {
+        if self.is_postgres() {
+            " FOR UPDATE"
+        } else {
+            ""
+        }
+    }
     /// Connects to a database using the provided connection string.
     /// Auto-detects dialect:
     /// - `postgres://` or `postgresql://` -> PostgreSQL pool
@@ -588,5 +716,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.0.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn test_compute_free_slots_and_find_first() {
+        let mut occupied = std::collections::HashSet::new();
+        occupied.insert(0);
+        occupied.insert(2);
+        occupied.insert(3);
+
+        let free = compute_free_slots(&occupied, 5);
+        assert_eq!(free, vec![1, 4]);
+
+        assert_eq!(find_first_free_slot(&occupied, 5), Some(1));
+
+        occupied.insert(1);
+        occupied.insert(4);
+        assert_eq!(compute_free_slots(&occupied, 5), Vec::<u32>::new());
+        assert_eq!(find_first_free_slot(&occupied, 5), None);
+    }
+
+    #[tokio::test]
+    async fn test_database_sql_and_suffix() {
+        let db = Database::connect_memory().await.unwrap();
+        assert_eq!(
+            db.sql("SELECT * FROM items WHERE a = ? AND b = ?"),
+            "SELECT * FROM items WHERE a = ? AND b = ?"
+        );
+        assert_eq!(db.for_update_suffix(), "");
     }
 }
