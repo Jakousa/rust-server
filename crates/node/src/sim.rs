@@ -695,6 +695,129 @@ impl TickSimulation {
         }
     }
 
+    /// Updates and fences the session epoch for a player GUID.
+    ///
+    /// Returns `true` if `session_epoch` is greater than or equal to the current epoch.
+    pub fn update_session_epoch(&mut self, guid: Guid, session_epoch: u64) -> bool {
+        let current_epoch = *self.session_epochs.get(&guid).unwrap_or(&0);
+        if session_epoch >= current_epoch {
+            self.session_epochs.insert(guid, session_epoch);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hydrates or restores a player entity session upon authentication/login.
+    ///
+    /// Restores position, rotation, and serialized components from `saved_snapshot` if provided,
+    /// initializes kinematic tracking, registers AoI interest observer, and updates session epoch fencing.
+    ///
+    /// Returns the initial spawn/restored world position.
+    pub fn hydrate_player_session(
+        &mut self,
+        guid: Guid,
+        session_id: u64,
+        session_epoch: u64,
+        saved_snapshot: Option<&mmo_storage::EntitySnapshot>,
+        aoi_radius: f32,
+    ) -> (f32, f32, f32) {
+        if !self.update_session_epoch(guid, session_epoch) {
+            return self
+                .entity_store
+                .get_by_guid(guid)
+                .map(|e| e.position)
+                .unwrap_or((0.0, 0.0, 0.0));
+        }
+
+        let (pos, rot) = saved_snapshot
+            .map(|s| (s.position, s.rotation))
+            .unwrap_or(((0.0, 0.0, 0.0), 0.0));
+
+        let mut entity = mmo_core::Entity::new(guid, pos);
+        entity.rotation = rot;
+
+        if let Some(snap) = saved_snapshot {
+            if let Some(ref blob) = snap.state_blob {
+                if !blob.is_empty() {
+                    let _ = self
+                        .codecs
+                        .deserialize_binary_into(blob, &mut entity.components);
+                }
+            } else if !snap.attributes.is_null() {
+                let _ = self
+                    .codecs
+                    .deserialize_into(&snap.attributes, &mut entity.components);
+            }
+        }
+
+        self.octree.remove_by_guid(guid);
+        self.entity_store.insert_entity(entity);
+        self.octree.insert(guid, pos);
+
+        let mut k_state = EntityKinematicState::new(self.current_time).with_position(pos);
+        k_state.initialized = true;
+        self.kinematic_states.insert(guid, k_state);
+
+        let aoi_config = crate::aoi::ObserverConfig {
+            base_radius: aoi_radius,
+            ..Default::default()
+        };
+        self.aoi.register_observer(session_id, guid, aoi_config);
+        pos
+    }
+
+    /// Cleanly captures a final snapshot, enqueues to the snapshotter if configured,
+    /// and despawns the player entity upon disconnect/logout.
+    ///
+    /// Returns `Some(snapshot)` if the player existed and a valid session epoch was presented.
+    pub fn disconnect_player_session(
+        &mut self,
+        guid: Guid,
+        session_epoch: u64,
+    ) -> Option<mmo_storage::EntitySnapshot> {
+        if !self.is_valid_upstream_epoch(guid, session_epoch) {
+            return None;
+        }
+
+        let entity = self.entity_store.get_by_guid(guid)?;
+        let position = entity.position;
+        let rotation = entity.rotation;
+        let attributes = self.codecs.serialize_all(&entity.components);
+        let state_blob = self.codecs.serialize_all_binary(&entity.components).ok();
+
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let snapshot = mmo_storage::EntitySnapshot {
+            guid: guid.0,
+            position,
+            rotation,
+            attributes: attributes.clone(),
+            state_blob: state_blob.clone(),
+            version: self.tick_counter,
+            timestamp: now_sec,
+        };
+
+        if let Some(ref sender) = self.snapshot_sender {
+            let payload = crate::snapshotter::SnapshotPayload {
+                guid,
+                position,
+                rotation,
+                attributes,
+                state_blob,
+                version: self.tick_counter,
+                timestamp: now_sec,
+            };
+            let _ = sender.try_send(payload);
+        }
+
+        self.despawn_entity(guid);
+        Some(snapshot)
+    }
+
     /// Executes a single simulation step.
     ///
     /// Registers a gameplay plugin to be initialized in this simulation node.
@@ -2385,5 +2508,75 @@ mod tests {
         );
         let group = sim.collect_migration_group(ship_guid);
         assert_eq!(group, vec![ship_guid, passenger_guid]);
+    }
+
+    #[test]
+    fn test_player_session_hydration_disconnect_and_rehydration_roundtrip() {
+        let mut sim = TickSimulation::new(
+            1,
+            BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        sim.set_snapshot_sender(tx);
+
+        let player_guid = Guid::new(EntityType::Player, 1, 42);
+        let session_id = 1001;
+        let session_epoch = 1;
+
+        // 1. Initial login hydration without prior snapshot (fresh character spawn at origin)
+        let spawn_pos =
+            sim.hydrate_player_session(player_guid, session_id, session_epoch, None, 50.0);
+        assert_eq!(spawn_pos, (0.0, 0.0, 0.0));
+        assert!(sim.entity_store.get_by_guid(player_guid).is_some());
+        assert!(sim.kinematic_states.contains_key(&player_guid));
+        assert!(sim.aoi.get_observer(session_id).is_some());
+
+        // 2. Player moves and rotates
+        let move_res = sim.process_client_move_deterministic(player_guid, (10.0, 0.0, 5.0), 2.0);
+        assert!(move_res.is_ok());
+        sim.entity_store
+            .get_mut_by_guid(player_guid)
+            .unwrap()
+            .rotation = 1.57;
+
+        // 3. Player disconnects -> captures snapshot, enqueues to snapshotter, despawns entity
+        let snap = sim
+            .disconnect_player_session(player_guid, session_epoch)
+            .expect("should capture final snapshot on disconnect");
+        assert_eq!(snap.guid, player_guid.0);
+        assert_eq!(snap.position, (10.0, 0.0, 5.0));
+        assert_eq!(snap.rotation, 1.57);
+        assert!(sim.entity_store.get_by_guid(player_guid).is_none());
+        assert!(sim.aoi.get_observer(session_id).is_none());
+
+        let payload = rx
+            .try_recv()
+            .expect("should have enqueued snapshot payload to channel");
+        assert_eq!(payload.guid, player_guid);
+        assert_eq!(payload.position, (10.0, 0.0, 5.0));
+        assert_eq!(payload.rotation, 1.57);
+
+        // 4. Re-hydrate player with new session epoch = 2 using the captured snapshot
+        let new_session_id = 1002;
+        let new_session_epoch = 2;
+        let restored_pos = sim.hydrate_player_session(
+            player_guid,
+            new_session_id,
+            new_session_epoch,
+            Some(&snap),
+            50.0,
+        );
+        assert_eq!(restored_pos, (10.0, 0.0, 5.0));
+        let rehydrated_ent = sim.entity_store.get_by_guid(player_guid).unwrap();
+        assert_eq!(rehydrated_ent.position, (10.0, 0.0, 5.0));
+        assert_eq!(rehydrated_ent.rotation, 1.57);
+        assert!(sim.aoi.get_observer(new_session_id).is_some());
+        assert!(sim.aoi.get_observer(session_id).is_none());
+
+        // 5. Stale session epoch disconnect must be rejected
+        assert!(
+            sim.disconnect_player_session(player_guid, 1).is_none(),
+            "stale session epoch disconnect must be rejected"
+        );
     }
 }

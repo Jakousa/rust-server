@@ -191,6 +191,25 @@ impl BotSession {
         });
         self.send_packet(&packet).await
     }
+
+    /// Disconnects the session by dropping the TCP stream.
+    pub fn disconnect(&mut self) {
+        self.stream = None;
+    }
+
+    /// Reads incoming bytes with a timeout, returning an empty packet vector if the timeout elapses.
+    pub async fn poll_incoming_timeout(
+        &mut self,
+        duration: std::time::Duration,
+    ) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
+        if self.stream.is_none() {
+            return Err(SessionError::NotConnected);
+        }
+        match tokio::time::timeout(duration, self.poll_incoming()).await {
+            Ok(res) => res,
+            Err(_) => Ok((Vec::new(), None)),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,25 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mmo-node-pdb
+  namespace: mmo
+  labels:
+    app: mmo-node
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mmo-node
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mmo-gateway-pdb
+  namespace: mmo
+  labels:
+    app: mmo-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mmo-gateway

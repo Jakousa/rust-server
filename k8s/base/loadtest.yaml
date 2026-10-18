@@ -15,11 +15,23 @@ spec:
       labels:
         app: mmo-loadtest
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: loadtest
           image: mmo-server:local
           imagePullPolicy: IfNotPresent
           command: ["mmo-loadtest"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: GATEWAY_ADDR
               value: "mmo-gateway:8080"
@@ -36,3 +48,9 @@ spec:
             limits:
               cpu: "1000m"
               memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

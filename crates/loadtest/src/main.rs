@@ -1,9 +1,11 @@
 //! MMO Bot Load Test CLI Runner.
 
 use clap::Parser;
+use mmo_loadtest::scenario::ScenarioRunner;
 use mmo_loadtest::swarm::{SwarmConfig, SwarmManager};
 use mmo_loadtest::trajectory::{BehaviorProfile, WorldBounds};
 use mmo_schema::client::Vec3;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -12,6 +14,10 @@ use std::time::Duration;
     about = "Headless Bot Swarm Load Tester for Distributed MMO Engine"
 )]
 struct Cli {
+    /// Path to a declarative scenario manifest JSON file to execute
+    #[arg(long)]
+    scenario: Option<PathBuf>,
+
     /// Gateway network address to target
     #[arg(long, env = "GATEWAY_ADDR", default_value = "127.0.0.1:8080")]
     gateway_addr: String,
@@ -62,6 +68,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    if let Some(ref scenario_path) = cli.scenario {
+        println!("============================================================");
+        println!("        MMO Engine Declarative Scenario Runner             ");
+        println!("============================================================");
+        println!("Scenario File : {:?}", scenario_path);
+        println!("------------------------------------------------------------");
+
+        match ScenarioRunner::run_from_file(scenario_path).await {
+            Ok(report) => {
+                println!("\n============================================================");
+                println!("                 SCENARIO EXECUTION PASSED                  ");
+                println!("============================================================");
+                println!("Scenario Name    : {}", report.scenario_name);
+                println!("Steps Executed   : {}", report.steps_executed);
+                println!("Duration         : {} ms", report.total_duration_ms);
+                println!("p50 RTT          : {:.2} ms", report.p50_rtt_ms);
+                println!("p99 RTT          : {:.2} ms", report.p99_rtt_ms);
+                println!("============================================================");
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("\n============================================================");
+                eprintln!("                 SCENARIO EXECUTION FAILED                  ");
+                eprintln!("============================================================");
+                eprintln!("Error: {}", err);
+                eprintln!("============================================================");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let profile: BehaviorProfile = cli.behavior.parse().unwrap_or(BehaviorProfile::RandomWalk);
 
     println!("============================================================");

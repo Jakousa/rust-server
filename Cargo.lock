@@ -2032,10 +2032,16 @@ dependencies = [
  "clap",
  "hdrhistogram",
  "mmo-core",
+ "mmo-gateway",
+ "mmo-node",
  "mmo-schema",
+ "mmo-storage",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
  "tracing-subscriber",
 ]
 
