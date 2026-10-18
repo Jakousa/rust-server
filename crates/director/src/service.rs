@@ -1143,13 +1143,19 @@ mod tests {
     #[tokio::test]
     async fn test_service_realm_transfer_claim_rpc() {
         let service = DirectorServiceImpl::default_service();
+        let realm_id = service
+            .federation_authority
+            .read()
+            .await
+            .realm_id()
+            .to_string();
 
         // 1. Issue claim
         let issue_resp = service
             .issue_realm_transfer_claim(Request::new(IssueRealmTransferClaimRequest {
                 guid: 12345,
-                source_realm_id: "realm-default".to_string(),
-                target_realm_id: "realm-default".to_string(),
+                source_realm_id: realm_id.clone(),
+                target_realm_id: realm_id.clone(),
                 session_epoch: 1,
                 ttl_ms: 10_000,
             }))
@@ -1165,8 +1171,8 @@ mod tests {
         let verify_resp = service
             .verify_realm_transfer_claim(Request::new(VerifyRealmTransferClaimRequest {
                 guid: 12345,
-                source_realm_id: "realm-default".to_string(),
-                target_realm_id: "realm-default".to_string(),
+                source_realm_id: realm_id.clone(),
+                target_realm_id: realm_id.clone(),
                 session_epoch: 1,
                 nonce: issue_resp.nonce,
                 expires_at_epoch_ms: issue_resp.expires_at_epoch_ms,
@@ -1182,8 +1188,8 @@ mod tests {
         let replay_resp = service
             .verify_realm_transfer_claim(Request::new(VerifyRealmTransferClaimRequest {
                 guid: 12345,
-                source_realm_id: "realm-default".to_string(),
-                target_realm_id: "realm-default".to_string(),
+                source_realm_id: realm_id.clone(),
+                target_realm_id: realm_id,
                 session_epoch: 1,
                 nonce: issue_resp.nonce,
                 expires_at_epoch_ms: issue_resp.expires_at_epoch_ms,

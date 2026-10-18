@@ -27,7 +27,9 @@ pub use history::{
 };
 pub use instance::{InstanceDomainManager, LocalInstanceDomain, NodeInstanceError};
 pub use kinematics::{
-    EntityKinematicState, KinematicValidator, KinematicViolation, KinematicViolationReason,
+    DiscreteKinematicIntegrator, EntityKinematicState, ImpulseAllowance, KinematicConfig,
+    KinematicValidator, KinematicViolation, KinematicViolationReason, MotionIntegrator, MotionMode,
+    Newtonian6DoFIntegrator,
 };
 
 pub use network::{

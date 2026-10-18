@@ -31,7 +31,7 @@ pub use attribute::{
 pub use container::{
     ContainerAccessPolicy, ContainerError, ContainerId, ContainerOwner, ContainerSlot,
 };
-pub use entity::{ComponentStore, Entity, EntityKey, EntityStore};
+pub use entity::{ComponentStore, Entity, EntityKey, EntityStore, HierarchyTransformUpdate};
 pub use guid::{EntityType, Guid};
 pub use hook::{Event, EventContext, HookDispatcher, HookHandler};
 pub use octree::{BoundingBox3D, Octree};
