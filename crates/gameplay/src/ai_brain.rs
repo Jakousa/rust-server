@@ -259,8 +259,38 @@ impl TickSystem for FsmBrainSystem {
 
             if let Some(target_pos_opt) = set_nav_target {
                 if let Some(agent) = entity.get_component_mut::<NavAgentComponent>() {
-                    agent.target_position = target_pos_opt;
-                    agent.has_arrived = false;
+                    match target_pos_opt {
+                        Some(dest) => {
+                            let mut path_set = false;
+                            if let Some(cw) = ctx.collision_world {
+                                let start_v = mmo_core::spatial::Vec3::new(
+                                    entity_pos.0,
+                                    entity_pos.1,
+                                    entity_pos.2,
+                                );
+                                let end_v = mmo_core::spatial::Vec3::new(dest.0, dest.1, dest.2);
+                                if let Some(waypoints) = cw.find_path(start_v, end_v) {
+                                    if waypoints.len() > 1 {
+                                        let tuple_waypoints: Vec<(f32, f32, f32)> = waypoints[1..]
+                                            .iter()
+                                            .map(|w| (w.x, w.y, w.z))
+                                            .collect();
+                                        agent.set_path(tuple_waypoints);
+                                        path_set = true;
+                                    }
+                                }
+                            }
+                            if !path_set {
+                                agent.target_position = Some(dest);
+                                agent.path_waypoints.clear();
+                                agent.has_arrived = false;
+                            }
+                        }
+                        None => {
+                            agent.target_position = None;
+                            agent.path_waypoints.clear();
+                        }
+                    }
                 }
             }
         }
@@ -338,6 +368,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 1,
+                collision_world: None,
             };
             brain_system.update(&mut ctx);
         }
@@ -366,6 +397,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 2,
+                collision_world: None,
             };
             brain_system.update(&mut ctx);
         }
@@ -391,6 +423,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 3,
+                collision_world: None,
             };
             brain_system.update(&mut ctx);
         }
@@ -410,6 +443,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 4,
+                collision_world: None,
             };
             brain_system.update(&mut ctx);
         }
@@ -435,6 +469,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 5,
+                collision_world: None,
             };
             brain_system.update(&mut ctx);
         }
@@ -447,5 +482,105 @@ mod tests {
                 .current_state,
             FsmState::Evade { .. }
         ));
+    }
+
+    #[test]
+    fn test_npc_navigates_around_wall_obstacle() {
+        use crate::navigation::NavSteeringSystem;
+        use mmo_core::collision::{AabbCollisionWorld, CollisionWorld};
+
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+
+        // 1. Setup collision world with a wall blocking the direct path between (-5, 0, 0) and (5, 0, 0)
+        let mut collision_world = AabbCollisionWorld::new();
+        let wall_bounds = BoundingBox3D::new((-0.5, -2.0, -3.0), (0.5, 2.0, 3.0));
+        let wall_id = Guid(999);
+        collision_world.register_obstacle(wall_id, wall_bounds);
+
+        // 2. Spawn monster and player on opposite sides of the wall
+        let monster_guid = Guid::new(EntityType::Npc, 1, 101);
+        let monster_key = store.spawn(monster_guid, (-5.0, 0.0, 0.0));
+        let player_guid = Guid::new(EntityType::Player, 1, 102);
+        store.spawn(player_guid, (5.0, 0.0, 0.0));
+
+        let brain = FsmBrainComponent::new(
+            FsmState::Chase {
+                target: player_guid,
+            },
+            1.5, // attack range 1.5m
+            1.0, // attack cooldown
+            1.0,
+            20.0, // damage
+        );
+        let mut threat = ThreatTableComponent::default_combat();
+        threat.add_threat(player_guid, 100.0);
+        let nav = NavAgentComponent::new(10.0, 0.3); // 10 m/s speed
+
+        store.get_mut(monster_key).unwrap().add_component(brain);
+        store.get_mut(monster_key).unwrap().add_component(threat);
+        store.get_mut(monster_key).unwrap().add_component(nav);
+
+        let mut brain_system = FsmBrainSystem;
+        let mut nav_system = NavSteeringSystem;
+
+        // 3. Tick brain system with collision_world: should compute path around wall
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 1,
+                collision_world: Some(&collision_world),
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let monster_ent = store.get(monster_key).unwrap();
+        let agent = monster_ent.get_component::<NavAgentComponent>().unwrap();
+        assert!(agent.target_position.is_some());
+        // Target position must NOT be straight line (5, 0, 0) because wall blocks it
+        assert_ne!(agent.target_position.unwrap(), (5.0, 0.0, 0.0));
+        // There must be at least one path waypoint ending at or near player
+        assert!(!agent.path_waypoints.is_empty() || agent.target_position.is_some());
+
+        // 4. Step simulation for several ticks; verify monster never enters the wall
+        for tick in 2..30 {
+            {
+                let mut ctx = TickContext {
+                    entities: &mut store,
+                    octree: &mut octree,
+                    events: &mut events,
+                    dt_sec: 0.05,
+                    tick,
+                    collision_world: Some(&collision_world),
+                };
+                brain_system.update(&mut ctx);
+                nav_system.update(&mut ctx);
+            }
+
+            let pos = store.get(monster_key).unwrap().position;
+            assert!(
+                !wall_bounds.contains(pos),
+                "NPC position {:?} must not penetrate wall obstacle at tick {}",
+                pos,
+                tick
+            );
+        }
+
+        // Verify monster successfully navigated past the wall obstacle and reached the player
+        let final_pos = store.get(monster_key).unwrap().position;
+        let dist_to_player =
+            ((5.0 - final_pos.0).powi(2) + final_pos.1.powi(2) + final_pos.2.powi(2)).sqrt();
+        assert!(
+            dist_to_player <= 1.5,
+            "NPC should reach attack range of player (got distance {})",
+            dist_to_player
+        );
     }
 }

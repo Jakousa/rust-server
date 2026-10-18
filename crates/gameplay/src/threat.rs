@@ -310,6 +310,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 1,
+                collision_world: None,
             };
             threat_system.update(&mut ctx);
         }
@@ -335,6 +336,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.1,
                 tick: 2,
+                collision_world: None,
             };
             threat_system.update(&mut ctx);
         }

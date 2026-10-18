@@ -269,6 +269,7 @@ mod tests {
             events: &mut events,
             dt_sec: 0.5,
             tick: 1,
+            collision_world: None,
         };
 
         let mut regen_system = HealthRegenSystem;
@@ -458,6 +459,7 @@ mod tests {
             entities: &mut store,
             events: &mut queue,
             octree: &mut octree,
+            collision_world: None,
         };
         sys.update(&mut ctx);
 

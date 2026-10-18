@@ -358,6 +358,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.5,
                 tick: 1,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
@@ -383,6 +384,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.5,
                 tick: 2,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
@@ -415,6 +417,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 1.0, // Moves 10 units: 10 + 10 = 20.0 (> 15 leash)
                 tick: 3,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
@@ -456,6 +459,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.5,
                 tick: 1,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
@@ -474,6 +478,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.5,
                 tick: 2,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
@@ -492,6 +497,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.5,
                 tick: 3,
+                collision_world: None,
             };
             steering_system.update(&mut ctx);
         }
