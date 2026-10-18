@@ -94,12 +94,20 @@ impl fmt::Debug for ComponentStore {
     }
 }
 
+pub mod state_flags {
+    pub const INCAPACITATED: u32 = 1 << 0;
+    pub const MOVEMENT_LOCKED: u32 = 1 << 1;
+    pub const COMBAT_ACTIVE: u32 = 1 << 2;
+    pub const INVULNERABLE: u32 = 1 << 3;
+}
+
 /// Representation of an in-world simulation entity.
 #[derive(Debug)]
 pub struct Entity {
     pub guid: Guid,
     pub position: (f32, f32, f32),
     pub rotation: f32,
+    pub state_flags: u32,
     pub properties: DynamicProperties,
     pub components: ComponentStore,
 }
@@ -111,9 +119,22 @@ impl Entity {
             guid,
             position,
             rotation: 0.0,
+            state_flags: 0,
             properties: DynamicProperties::new(),
             components: ComponentStore::new(),
         }
+    }
+
+    /// Returns `true` if the entity has the `INCAPACITATED` state flag set.
+    #[inline]
+    pub fn is_incapacitated(&self) -> bool {
+        (self.state_flags & state_flags::INCAPACITATED) != 0
+    }
+
+    /// Returns `true` if the entity has the `MOVEMENT_LOCKED` state flag set.
+    #[inline]
+    pub fn is_movement_locked(&self) -> bool {
+        (self.state_flags & state_flags::MOVEMENT_LOCKED) != 0
     }
 
     /// Sets the rotation of the entity.

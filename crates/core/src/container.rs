@@ -40,6 +40,7 @@ impl fmt::Display for ContainerId {
 pub enum ContainerOwner {
     Character(u64),
     Guild(u64),
+    Group(u64),
     WorldEntity(u64),
     System(String),
 }
@@ -50,6 +51,7 @@ impl ContainerOwner {
         match self {
             Self::Character(_) => "character",
             Self::Guild(_) => "guild",
+            Self::Group(_) => "group",
             Self::WorldEntity(_) => "world_entity",
             Self::System(_) => "system",
         }
@@ -58,7 +60,9 @@ impl ContainerOwner {
     /// Returns the database-persisted owner identifier string.
     pub fn owner_id(&self) -> String {
         match self {
-            Self::Character(id) | Self::Guild(id) | Self::WorldEntity(id) => id.to_string(),
+            Self::Character(id) | Self::Guild(id) | Self::Group(id) | Self::WorldEntity(id) => {
+                id.to_string()
+            }
             Self::System(s) => s.clone(),
         }
     }
@@ -77,6 +81,12 @@ impl ContainerOwner {
                     ContainerError::InvalidOwner(owner_type.to_string(), owner_id.to_string())
                 })?;
                 Ok(Self::Guild(id))
+            }
+            "group" => {
+                let id = owner_id.parse::<u64>().map_err(|_| {
+                    ContainerError::InvalidOwner(owner_type.to_string(), owner_id.to_string())
+                })?;
+                Ok(Self::Group(id))
             }
             "world_entity" => {
                 let id = owner_id.parse::<u64>().map_err(|_| {
@@ -254,6 +264,14 @@ mod tests {
         assert_eq!(
             ContainerOwner::from_parts("guild", "50").unwrap(),
             guild_owner
+        );
+
+        let group_owner = ContainerOwner::Group(75);
+        assert_eq!(group_owner.owner_type(), "group");
+        assert_eq!(group_owner.owner_id(), "75");
+        assert_eq!(
+            ContainerOwner::from_parts("group", "75").unwrap(),
+            group_owner
         );
 
         let sys_owner = ContainerOwner::System("escrow_pool".to_string());

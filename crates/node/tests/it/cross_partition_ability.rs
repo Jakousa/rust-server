@@ -41,6 +41,13 @@ async fn wait_for_health(node: &tokio::sync::RwLock<TickSimulation>, guid: Guid,
         {
             let sim = node.read().await;
             if let Some(ent) = sim.entity_store.get_by_guid(guid) {
+                if let Some(attrs) = ent.get_component::<AttributeSet>() {
+                    if let Some(current) = attrs.get_current("health") {
+                        if (current - expected_hp).abs() < f32::EPSILON {
+                            return;
+                        }
+                    }
+                }
                 if let Some(health) = ent.get_component::<HealthComponent>() {
                     if (health.current_hp - expected_hp).abs() < f32::EPSILON {
                         return;
@@ -144,7 +151,9 @@ async fn test_e2e_cross_partition_targeted_ability() {
         let mut sim2 = node2_sim.write().await;
         sim2.spawn_entity(target, (55.0, 10.0, 10.0));
         let ent = sim2.entity_store.get_mut_by_guid(target).unwrap();
-        ent.add_component(HealthComponent::new(100.0, 0.0));
+        let mut target_attrs = AttributeSet::new();
+        target_attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        ent.add_component(target_attrs);
     }
 
     let mut dispatcher = CrossNodeDispatcher::new(1);
@@ -202,8 +211,12 @@ async fn test_e2e_cross_partition_targeted_ability() {
     {
         let sim2 = node2_sim.read().await;
         let ent = sim2.entity_store.get_by_guid(target).unwrap();
-        let health = ent.get_component::<HealthComponent>().unwrap();
-        assert_eq!(health.current_hp, 60.0);
+        let hp = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap();
+        assert_eq!(hp, 60.0);
     }
 }
 
@@ -233,7 +246,9 @@ async fn test_e2e_cross_partition_boundary_aoe() {
 
         sim1.spawn_entity(local_enemy, (46.0, 20.0, 20.0));
         let ent_enemy = sim1.entity_store.get_mut_by_guid(local_enemy).unwrap();
-        ent_enemy.add_component(HealthComponent::new(100.0, 0.0));
+        let mut local_attrs = AttributeSet::new();
+        local_attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        ent_enemy.add_component(local_attrs);
 
         // Ghost of remote enemy at (52, 20, 20)
         sim1.ghost_store.insert_or_update(GhostRecord {
@@ -253,7 +268,9 @@ async fn test_e2e_cross_partition_boundary_aoe() {
         let mut sim2 = node2_sim.write().await;
         sim2.spawn_entity(remote_enemy, (52.0, 20.0, 20.0));
         let ent = sim2.entity_store.get_mut_by_guid(remote_enemy).unwrap();
-        ent.add_component(HealthComponent::new(100.0, 0.0));
+        let mut remote_attrs = AttributeSet::new();
+        remote_attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        ent.add_component(remote_attrs);
     }
 
     let mut dispatcher = CrossNodeDispatcher::new(1);
@@ -293,7 +310,11 @@ async fn test_e2e_cross_partition_boundary_aoe() {
     {
         let sim1 = node1_sim.read().await;
         let ent = sim1.entity_store.get_by_guid(local_enemy).unwrap();
-        let hp = ent.get_component::<HealthComponent>().unwrap().current_hp;
+        let hp = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap();
         assert_eq!(hp, 65.0);
     }
 
@@ -304,7 +325,11 @@ async fn test_e2e_cross_partition_boundary_aoe() {
     {
         let sim2 = node2_sim.read().await;
         let ent = sim2.entity_store.get_by_guid(remote_enemy).unwrap();
-        let hp = ent.get_component::<HealthComponent>().unwrap().current_hp;
+        let hp = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("health")
+            .unwrap();
         assert_eq!(hp, 65.0);
     }
 }

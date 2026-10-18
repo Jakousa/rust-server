@@ -917,7 +917,9 @@ mod tests {
             .unwrap();
 
             let ent = s.entity_store.get_mut_by_guid(target_guid).unwrap();
-            ent.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+            let mut attrs = mmo_core::AttributeSet::new();
+            attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+            ent.add_component(attrs);
             ent.add_component(q);
         }
 
@@ -970,7 +972,9 @@ mod tests {
             let mut s = sim.write().await;
             s.spawn_entity(target_guid, (50.0, 0.0, 0.0));
             let ent = s.entity_store.get_mut_by_guid(target_guid).unwrap();
-            ent.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+            let mut attrs = mmo_core::AttributeSet::new();
+            attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+            ent.add_component(attrs);
         }
 
         let service = NodeServiceImpl::new(Arc::clone(&sim));
@@ -1016,13 +1020,16 @@ mod tests {
             let mut s = sim.write().await;
             s.spawn_entity(dead_guid, (5.0, 0.0, 0.0));
             let ent_dead = s.entity_store.get_mut_by_guid(dead_guid).unwrap();
-            let mut health = mmo_gameplay::HealthComponent::new(100.0, 0.0);
-            health.take_damage(100.0); // is_dead = true
-            ent_dead.add_component(health);
+            let mut dead_attrs = mmo_core::AttributeSet::new();
+            dead_attrs.add_attribute("health", 0.0, 0.0, 100.0, 0.0);
+            ent_dead.add_component(dead_attrs);
+            ent_dead.state_flags |= mmo_core::entity::state_flags::INCAPACITATED;
 
             s.spawn_entity(migrating_guid, (6.0, 0.0, 0.0));
             let ent_mig = s.entity_store.get_mut_by_guid(migrating_guid).unwrap();
-            ent_mig.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+            let mut mig_attrs = mmo_core::AttributeSet::new();
+            mig_attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+            ent_mig.add_component(mig_attrs);
             assert!(s.acquire_migration_lease(migrating_guid));
         }
 
@@ -1098,16 +1105,20 @@ mod tests {
         {
             let mut s = sim.write().await;
             s.spawn_entity(t1, (2.0, 0.0, 0.0));
+            let mut a1 = mmo_core::AttributeSet::new();
+            a1.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
             s.entity_store
                 .get_mut_by_guid(t1)
                 .unwrap()
-                .add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+                .add_component(a1);
 
             s.spawn_entity(t2, (3.0, 0.0, 0.0));
+            let mut a2 = mmo_core::AttributeSet::new();
+            a2.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
             s.entity_store
                 .get_mut_by_guid(t2)
                 .unwrap()
-                .add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+                .add_component(a2);
         }
 
         let service = NodeServiceImpl::new(Arc::clone(&sim));

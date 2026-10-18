@@ -58,7 +58,7 @@ pub struct TickSimulation {
     pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
     pub snapshot_interval_ticks: u64,
     pub history: crate::history::SpatialHistoryBuffer,
-    pub script_reloader: Option<Arc<mmo_gameplay::ScriptHotReloader>>,
+    pub script_reloader: Option<Arc<dyn mmo_core::script::ScriptReloadable>>,
 }
 
 /// Ingress packet queued from a gateway client session, drained at tick boundaries.
@@ -112,12 +112,12 @@ impl TickSimulation {
         let mut codecs = ComponentCodecRegistry::new();
         codecs.register::<mmo_core::ActionQueue>("action_queue");
         codecs.register::<mmo_core::AttributeSet>("attribute_set");
-        codecs.register::<mmo_gameplay::CooldownTracker>("cooldown_tracker");
+        codecs.register::<mmo_core::action::CooldownTracker>("cooldown_tracker");
 
         let tick_systems: Vec<Box<dyn mmo_core::TickSystem>> = vec![
             Box::new(mmo_core::ActionTickSystem),
             Box::new(mmo_core::AttributeTickSystem),
-            Box::new(mmo_gameplay::AbilityTickSystem),
+            Box::new(mmo_core::action::ActionCooldownSystem),
         ];
 
         let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -703,7 +703,7 @@ impl TickSimulation {
     }
 
     /// Attaches a script hot-reloader coordinator to this simulation node.
-    pub fn set_script_reloader(&mut self, reloader: Arc<mmo_gameplay::ScriptHotReloader>) {
+    pub fn set_script_reloader(&mut self, reloader: Arc<dyn mmo_core::script::ScriptReloadable>) {
         self.script_reloader = Some(reloader);
     }
 
@@ -714,7 +714,10 @@ impl TickSimulation {
         wasm_bytes: &[u8],
     ) -> Result<(), mmo_core::ScriptError> {
         if let Some(reloader) = &self.script_reloader {
-            reloader.reload_module(module_id, wasm_bytes)
+            reloader
+                .reload_module(module_id, wasm_bytes)
+                .map(|_| ())
+                .map_err(mmo_core::ScriptError::CompilationError)
         } else {
             Err(mmo_core::ScriptError::ModuleNotFound(
                 "No script reloader attached to simulation node".to_string(),
@@ -723,7 +726,7 @@ impl TickSimulation {
     }
 
     /// Returns a reference to the active script reloader, if attached.
-    pub fn script_reloader(&self) -> Option<&Arc<mmo_gameplay::ScriptHotReloader>> {
+    pub fn script_reloader(&self) -> Option<&Arc<dyn mmo_core::script::ScriptReloadable>> {
         self.script_reloader.as_ref()
     }
 
@@ -750,7 +753,7 @@ impl TickSimulation {
         // 0.1 Drain pending cross-partition ability compensation refunds
         while let Ok(comp) = self.ability_compensation_receiver.try_recv() {
             if let Some(entity) = self.entity_store.get_mut_by_guid(comp.caster_guid) {
-                if let Some(cd) = entity.get_component_mut::<mmo_gameplay::CooldownTracker>() {
+                if let Some(cd) = entity.get_component_mut::<mmo_core::action::CooldownTracker>() {
                     cd.reset_cooldown(comp.ability_id);
                     cd.reset_gcd();
                 }
@@ -1169,15 +1172,10 @@ impl TickSimulation {
             return Err(current_pos);
         }
 
-        // 5.5. Component movement checks (encumbrance and death status)
+        // 5.5. Entity state check (incapacitated or movement locked)
         if let Some(entity) = self.entity_store.get_by_guid(guid) {
-            if mmo_gameplay::check_encumbrance(&entity.components) {
+            if entity.is_incapacitated() || entity.is_movement_locked() {
                 return Err(current_pos);
-            }
-            if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
-                if health.is_dead {
-                    return Err(current_pos);
-                }
             }
         }
 
@@ -1289,13 +1287,8 @@ impl TickSimulation {
         }
 
         if let Some(entity) = self.entity_store.get_by_guid(guid) {
-            if mmo_gameplay::check_encumbrance(&entity.components) {
+            if entity.is_incapacitated() || entity.is_movement_locked() {
                 return Err(current_pos);
-            }
-            if let Some(health) = entity.get_component::<mmo_gameplay::HealthComponent>() {
-                if health.is_dead {
-                    return Err(current_pos);
-                }
             }
         }
 

@@ -13,6 +13,34 @@ use serde::{Deserialize, Serialize};
 use crate::guid::Guid;
 use crate::plugin::{DomainEvent, EventQueue, TickContext, TickSystem};
 
+/// Compact, deterministic 8-bit identifier for core simulation attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AttributeId(pub u8);
+
+impl AttributeId {
+    pub const PRIMARY_VITALITY: Self = Self(1);
+    pub const MAX_PRIMARY_VITALITY: Self = Self(2);
+    pub const SECONDARY_RESOURCE: Self = Self(3);
+    pub const MAX_SECONDARY_RESOURCE: Self = Self(4);
+    pub const MOVE_SPEED_SCALE: Self = Self(5);
+    pub const MITIGATION: Self = Self(6);
+}
+
+/// Maps canonical attribute names to compact [`AttributeId`]s.
+pub fn canonical_id_for_name(name: &str) -> Option<AttributeId> {
+    match name {
+        "health" | "vitality" | "hull" => Some(AttributeId::PRIMARY_VITALITY),
+        "max_health" | "max_vitality" | "max_hull" => Some(AttributeId::MAX_PRIMARY_VITALITY),
+        "mana" | "energy" | "capacitor" | "stamina" => Some(AttributeId::SECONDARY_RESOURCE),
+        "max_mana" | "max_energy" | "max_capacitor" | "max_stamina" => {
+            Some(AttributeId::MAX_SECONDARY_RESOURCE)
+        }
+        "move_speed_scale" => Some(AttributeId::MOVE_SPEED_SCALE),
+        "armor" | "mitigation" | "resistance" => Some(AttributeId::MITIGATION),
+        _ => None,
+    }
+}
+
 /// Representation of a single numerical attribute with bounds and regeneration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttributeValue {
@@ -152,6 +180,51 @@ impl AttributeSet {
 
         attr.current = value.clamp(attr.min, effective_max);
         Ok(attr.current)
+    }
+
+    /// Finds the raw [`AttributeValue`] matching a canonical [`AttributeId`].
+    pub fn get_by_id(&self, id: AttributeId) -> Option<&AttributeValue> {
+        self.attributes
+            .iter()
+            .find(|(k, _)| canonical_id_for_name(k) == Some(id))
+            .map(|(_, v)| v)
+    }
+
+    /// Returns the effective maximum value for the attribute matching the given [`AttributeId`].
+    pub fn get_effective_max_by_id(&self, id: AttributeId) -> Option<f32> {
+        let (name, attr) = self
+            .attributes
+            .iter()
+            .find(|(k, _)| canonical_id_for_name(k) == Some(id))?;
+        Some(compute_effective_max_for(name, attr, &self.modifiers))
+    }
+
+    /// Returns the current value for the attribute matching the given [`AttributeId`].
+    pub fn get_current_by_id(&self, id: AttributeId) -> Option<f32> {
+        let (name, attr) = self
+            .attributes
+            .iter()
+            .find(|(k, _)| canonical_id_for_name(k) == Some(id))?;
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
+        Some(attr.current.clamp(attr.min, effective_max))
+    }
+
+    /// Directly sets the current value for the attribute matching the given [`AttributeId`].
+    pub fn set_current_by_id(&mut self, id: AttributeId, value: f32) -> Result<f32, &'static str> {
+        let name = self
+            .attributes
+            .keys()
+            .find(|k| canonical_id_for_name(k) == Some(id))
+            .cloned()
+            .ok_or("Attribute not found in AttributeSet")?;
+        self.set_current(&name, value)
+    }
+
+    /// Iterates over all registered attributes that map to a canonical [`AttributeId`].
+    pub fn iter_indexed(&self) -> impl Iterator<Item = (AttributeId, &str, &AttributeValue)> {
+        self.attributes.iter().filter_map(|(name, val)| {
+            canonical_id_for_name(name).map(|id| (id, name.as_str(), val))
+        })
     }
 
     /// Attaches a timed modifier.
@@ -365,5 +438,46 @@ mod tests {
         let attrs = ent.get_component::<AttributeSet>().unwrap();
         assert!((attrs.get_current("energy").unwrap() - 51.0).abs() < 1e-4);
         assert_eq!(attrs.modifiers.len(), 0);
+    }
+
+    #[test]
+    fn test_attribute_id_indexed_access() {
+        let mut set = AttributeSet::new();
+        set.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        set.add_attribute("mana", 50.0, 0.0, 100.0, 0.0);
+        set.add_attribute("custom_stat", 42.0, 0.0, 100.0, 0.0);
+
+        assert_eq!(
+            set.get_by_id(AttributeId::PRIMARY_VITALITY)
+                .unwrap()
+                .current,
+            100.0
+        );
+        assert_eq!(
+            set.get_by_id(AttributeId::SECONDARY_RESOURCE)
+                .unwrap()
+                .current,
+            50.0
+        );
+        assert!(set.get_by_id(AttributeId::MOVE_SPEED_SCALE).is_none());
+
+        assert_eq!(
+            set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(100.0)
+        );
+        assert_eq!(
+            set.get_effective_max_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(100.0)
+        );
+
+        set.set_current_by_id(AttributeId::PRIMARY_VITALITY, 75.0)
+            .unwrap();
+        assert_eq!(
+            set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(75.0)
+        );
+
+        let indexed: Vec<_> = set.iter_indexed().collect();
+        assert_eq!(indexed.len(), 2);
     }
 }

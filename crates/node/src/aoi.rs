@@ -9,8 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use mmo_core::guid::Guid;
 use mmo_core::octree::calculate_throttled_aoi;
 use mmo_core::world::SectorCoord3D;
-use mmo_core::{EntityStore, Octree};
-use mmo_gameplay::combat::HealthComponent;
+use mmo_core::{AttributeId, EntityStore, Octree};
 use mmo_schema::client::{
     delta_flags, ClientPacket, EntityDeltaBatchPacket, EntityDeltaState, EntityDespawnPacket,
     EntityStatePacket, ScalarAttributeDelta, Vec3, WorldObjectDeltaPacket,
@@ -190,7 +189,7 @@ fn owner_type_code(owner: &mmo_core::container::ContainerOwner) -> u8 {
     use mmo_core::container::ContainerOwner;
     match owner {
         ContainerOwner::Character(_) => 0,
-        ContainerOwner::Guild(_) => 1,
+        ContainerOwner::Guild(_) | ContainerOwner::Group(_) => 1,
         ContainerOwner::WorldEntity(_) => 2,
         ContainerOwner::System(_) => 3,
     }
@@ -316,18 +315,34 @@ fn extract_entity_attributes(ent: &mmo_core::Entity) -> (u32, u32, u32, Vec<Scal
         .get("max_health")
         .and_then(|v| v.as_i64())
         .map(|v| v as u32);
-    let state_flags = ent
-        .properties
-        .get("state_flags")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as u32)
-        .unwrap_or(0);
+    let mut state_flags = ent.state_flags;
+    if state_flags == 0 {
+        if let Some(flags) = ent.properties.get("state_flags").and_then(|v| v.as_i64()) {
+            state_flags = flags as u32;
+        }
+    }
 
-    // Fallback to combat HealthComponent if attached to entity
-    if health.is_none() || max_health.is_none() {
-        if let Some(h) = ent.components.get_component::<HealthComponent>() {
-            health = Some(h.current_hp as u32);
-            max_health = Some(h.max_hp as u32);
+    // Check core AttributeSet component
+    if let Some(attr_set) = ent.components.get_component::<mmo_core::AttributeSet>() {
+        if health.is_none() {
+            if let Some(val) = attr_set.get_current_by_id(AttributeId::PRIMARY_VITALITY) {
+                health = Some(val as u32);
+            }
+        }
+        if max_health.is_none() {
+            if let Some(val) = attr_set.get_effective_max_by_id(AttributeId::PRIMARY_VITALITY) {
+                max_health = Some(val as u32);
+            }
+        }
+
+        // Add any additional indexed attributes from AttributeSet
+        for (attr_id, _name, val) in attr_set.iter_indexed() {
+            if attr_id.0 != 1 && attr_id.0 != 2 {
+                attrs.push(ScalarAttributeDelta {
+                    attribute_id: attr_id.0 as u16,
+                    value: val.current as u32,
+                });
+            }
         }
     }
 

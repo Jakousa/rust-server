@@ -19,12 +19,14 @@ pub use collision::{
 };
 
 pub use action::{
-    ActionCompletedEvent, ActionInterruptFlags, ActionInterruptedEvent, ActionProgressEvent,
-    ActionQueue, ActionStartedEvent, ActionTickSystem, InterruptReason, QueuePolicy, TimedAction,
+    resolve_boundary_sphere_aoe, AbilityDefinition, AbilityTickSystem, ActionCompletedEvent,
+    ActionCooldownSystem, ActionDefinition, ActionInterruptFlags, ActionInterruptedEvent,
+    ActionProgressEvent, ActionQueue, ActionStartedEvent, ActionTickSystem, BoundaryAoeTargeting,
+    CooldownTracker, InterruptReason, QueuePolicy, TimedAction,
 };
 pub use attribute::{
-    AttributeSet, AttributeTickSystem, AttributeValue, AuraExpiredEvent, ModifierType,
-    TimedModifier,
+    canonical_id_for_name, AttributeId, AttributeSet, AttributeTickSystem, AttributeValue,
+    AuraExpiredEvent, ModifierType, TimedModifier,
 };
 pub use container::{
     ContainerAccessPolicy, ContainerError, ContainerId, ContainerOwner, ContainerSlot,
@@ -39,7 +41,9 @@ pub use plugin::{
     PluginContext, PluginManager, TickContext, TickSystem, TypedComponentCodec,
 };
 pub use property::{DynamicProperties, PropertyValue};
-pub use script::{FuelMeteredExecutor, ScriptError, ScriptFuelConfig, ScriptValue};
+pub use script::{
+    FuelMeteredExecutor, ScriptError, ScriptFuelConfig, ScriptReloadable, ScriptValue,
+};
 pub use social::{SocialChannel, SocialEvent};
 pub use spatial::{
     query_sphere_targets, ray_intersects_aabb, validate_cone_target, validate_point_range,

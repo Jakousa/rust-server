@@ -3,89 +3,21 @@
 //! Provides modular ability handling, cooldown tracking, resource validation,
 //! and integration with core [`mmo_core::ActionQueue`] and [`mmo_core::AttributeSet`] primitives.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use mmo_core::collision::{CollisionWorld, SpatialQueryFilter};
 use mmo_core::spatial::{
-    gather_cone_candidates, gather_sphere_candidates, partition_candidates_by_node,
-    SpatialTargetCandidate, Vec3,
+    gather_cone_candidates, partition_candidates_by_node, SpatialTargetCandidate, Vec3,
 };
 use mmo_core::{
-    ActionInterruptFlags, ActionQueue, AttributeSet, DomainEvent, EntityStore, EventQueue,
-    GameplayPlugin, Guid, PluginContext, QueuePolicy, TickContext, TickSystem, TimedAction,
+    ActionQueue, AttributeSet, DomainEvent, EntityStore, EventQueue, GameplayPlugin, Guid,
+    PluginContext, QueuePolicy, TimedAction,
 };
 
-/// Component tracking ability cooldowns and the shared Global Cooldown (GCD).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CooldownTracker {
-    pub ability_cooldowns: HashMap<u32, f32>,
-    pub gcd_remaining_sec: f32,
-}
-
-impl CooldownTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Checks if a specific ability or the global cooldown is currently active.
-    pub fn is_on_cooldown(&self, ability_id: u32) -> bool {
-        if self.gcd_remaining_sec > 1e-4 {
-            return true;
-        }
-        self.ability_cooldowns
-            .get(&ability_id)
-            .copied()
-            .unwrap_or(0.0)
-            > 1e-4
-    }
-
-    /// Triggers cooldowns for the ability and sets the shared GCD timer.
-    pub fn start_cooldown(&mut self, ability_id: u32, duration_sec: f32, gcd_sec: f32) {
-        if duration_sec > 0.0 {
-            self.ability_cooldowns.insert(ability_id, duration_sec);
-        }
-        if gcd_sec > 0.0 {
-            self.gcd_remaining_sec = self.gcd_remaining_sec.max(gcd_sec);
-        }
-    }
-
-    /// Resets the cooldown for a specific ability (e.g. on compensation refund).
-    pub fn reset_cooldown(&mut self, ability_id: u32) {
-        self.ability_cooldowns.remove(&ability_id);
-    }
-
-    /// Resets the global cooldown timer.
-    pub fn reset_gcd(&mut self) {
-        self.gcd_remaining_sec = 0.0;
-    }
-
-    /// Advances cooldown timers by `dt_sec`, removing expired entries.
-    pub fn tick(&mut self, dt_sec: f32) {
-        if self.gcd_remaining_sec > 0.0 {
-            self.gcd_remaining_sec = (self.gcd_remaining_sec - dt_sec).max(0.0);
-        }
-
-        self.ability_cooldowns.retain(|_, remaining| {
-            *remaining -= dt_sec;
-            *remaining > 0.0
-        });
-    }
-}
-
-/// Definition of a pluggable ability.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AbilityDefinition {
-    pub id: u32,
-    pub name: String,
-    pub cast_time_sec: f32,
-    pub cooldown_sec: f32,
-    pub gcd_sec: f32,
-    pub range: f32,
-    pub resource_cost: Option<(String, f32)>,
-    pub interrupt_flags: ActionInterruptFlags,
-}
+pub use mmo_core::action::{
+    resolve_boundary_sphere_aoe, AbilityDefinition, AbilityTickSystem, ActionCooldownSystem,
+    ActionDefinition, BoundaryAoeTargeting, CooldownTracker,
+};
 
 /// Event dispatched when an ability completes its execution or triggers instantly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,30 +200,6 @@ pub fn execute_or_start_ability_with_collision(
     execute_or_start_ability(entity_guid, ability, target_guid, entities, events)
 }
 
-/// Result of resolving candidate targets for a boundary-crossing AoE ability.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BoundaryAoeTargeting {
-    pub local_targets: Vec<SpatialTargetCandidate>,
-    pub remote_batches: std::collections::BTreeMap<u32, Vec<SpatialTargetCandidate>>,
-}
-
-/// Gathers candidates within a radial sphere and partitions them by node.
-pub fn resolve_boundary_sphere_aoe(
-    candidates: &[SpatialTargetCandidate],
-    center: Vec3,
-    radius: f32,
-    max_targets: usize,
-    require_alive: bool,
-    local_node_id: u32,
-) -> BoundaryAoeTargeting {
-    let gathered = gather_sphere_candidates(candidates, center, radius, max_targets, require_alive);
-    let (local_targets, remote_batches) = partition_candidates_by_node(&gathered, local_node_id);
-    BoundaryAoeTargeting {
-        local_targets,
-        remote_batches,
-    }
-}
-
 /// Gathers candidates within a cone arc and partitions them by node.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_boundary_cone_aoe(
@@ -320,24 +228,6 @@ pub fn resolve_boundary_cone_aoe(
     }
 }
 
-/// Batch tick system advancing entity cooldowns.
-#[derive(Default)]
-pub struct AbilityTickSystem;
-
-impl TickSystem for AbilityTickSystem {
-    fn name(&self) -> &'static str {
-        "AbilityTickSystem"
-    }
-
-    fn update(&mut self, ctx: &mut TickContext) {
-        for (_key, entity) in ctx.entities.iter_mut() {
-            if let Some(cd) = entity.get_component_mut::<CooldownTracker>() {
-                cd.tick(ctx.dt_sec);
-            }
-        }
-    }
-}
-
 /// Gameplay plugin registering ability codecs and tick systems.
 pub struct AbilityPlugin;
 
@@ -356,6 +246,7 @@ impl GameplayPlugin for AbilityPlugin {
 mod tests {
     use super::*;
     use mmo_core::guid::EntityType;
+    use mmo_core::ActionInterruptFlags;
 
     #[test]
     fn test_cooldown_tracker_gcd_and_ability_cooldown() {

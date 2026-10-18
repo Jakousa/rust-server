@@ -246,6 +246,15 @@ pub struct EntityDespawnEvent {
 
 impl DomainEvent for EntityDespawnEvent {}
 
+/// Domain event emitted when an entity is incapacitated or destroyed in simulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityIncapacitatedEvent {
+    pub entity: Guid,
+    pub instigator: Option<Guid>,
+}
+
+impl DomainEvent for EntityIncapacitatedEvent {}
+
 /// Type-erased event queue for deferred domain events bucketed by [`TypeId`].
 #[derive(Default)]
 pub struct EventQueue {
