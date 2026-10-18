@@ -447,6 +447,11 @@ impl AoiManager {
         self.observers.get(&session_id)
     }
 
+    /// Retrieves a mutable reference to an observer by session ID.
+    pub fn get_observer_mut(&mut self, session_id: u64) -> Option<&mut ObserverState> {
+        self.observers.get_mut(&session_id)
+    }
+
     /// Retrieves an observer by player GUID.
     pub fn get_observer_by_guid(&self, player_guid: Guid) -> Option<&ObserverState> {
         let session_id = self.guid_to_session.get(&player_guid)?;
@@ -521,6 +526,17 @@ impl AoiManager {
             if !observer.config.include_self {
                 self.scratch_query
                     .retain(|&(g, _, _)| g != observer.player_guid);
+            }
+
+            // 2.2 Bitwise visibility, phasing, and stealth culling
+            if let Some(obs) = entity_store.get_by_guid(observer.player_guid) {
+                self.scratch_query.retain(|&(guid, _, _)| {
+                    if let Some(tgt) = entity_store.get_by_guid(guid) {
+                        obs.can_observe(tgt)
+                    } else {
+                        false
+                    }
+                });
             }
 
             // 2.5 Frustum Culling (if enabled)
@@ -910,10 +926,11 @@ impl AoiManager {
                 None => continue,
             };
 
-            let observer_pos = match entity_store.get_by_guid(observer.player_guid) {
-                Some(ent) => ent.position,
-                None => continue,
-            };
+            let (observer_pos, observer_phase) =
+                match entity_store.get_by_guid(observer.player_guid) {
+                    Some(ent) => (ent.position, ent.phase_mask),
+                    None => continue,
+                };
 
             let current_visible_sectors =
                 compute_visible_sectors(observer_pos, observer.effective_radius);
@@ -948,6 +965,9 @@ impl AoiManager {
                 if !observer.observed_sectors.contains(sector) {
                     if let Some(sector_map) = sector_manager.query_sector(*sector) {
                         for obj in sector_map.values() {
+                            if (observer_phase & obj.phase_mask) == 0 {
+                                continue;
+                            }
                             if !observer.known_world_objects.contains_key(&obj.object_id)
                                 && !observer
                                     .pending_world_objects_egress
@@ -980,6 +1000,9 @@ impl AoiManager {
             let to_stream = egress_vec.len().min(MAX_PACED_WORLD_OBJECTS_PER_TICK);
             for (obj_id, _, _) in egress_vec.drain(..to_stream) {
                 if let Some(obj) = sector_manager.get_object(obj_id) {
+                    if (observer_phase & obj.phase_mask) == 0 {
+                        continue;
+                    }
                     packets.push(ClientPacket::WorldObjectSpawn(build_spawn_packet(obj)));
                     observer
                         .known_world_objects
@@ -992,7 +1015,9 @@ impl AoiManager {
             let mut despawned_guids = Vec::new();
             for (&obj_id, last_rev) in observer.known_world_objects.iter_mut() {
                 if let Some(obj) = sector_manager.get_object(obj_id) {
-                    if obj.dirty_revision > *last_rev {
+                    if (observer_phase & obj.phase_mask) == 0 {
+                        despawned_guids.push(obj_id);
+                    } else if obj.dirty_revision > *last_rev {
                         *last_rev = obj.dirty_revision;
                         packets.push(ClientPacket::WorldObjectDelta(WorldObjectDeltaPacket {
                             object_id: obj.object_id.0,
@@ -1746,5 +1771,245 @@ mod tests {
             "New session 20 must be active"
         );
         assert_eq!(aoi.guid_to_session.get(&player_guid), Some(&20));
+    }
+
+    #[test]
+    fn test_aoi_stealth_and_detection_filtering() {
+        let mut aoi = AoiManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut store = EntityStore::new();
+
+        let obs_guid = make_guid(1);
+        let tgt_guid = make_guid(2);
+
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        store.spawn(tgt_guid, (10.0, 0.0, 0.0));
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(tgt_guid, (10.0, 0.0, 0.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: false,
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        // Target has stealth level 5, observer has detection level 0
+        store.get_mut_by_guid(tgt_guid).unwrap().stealth_level = 5;
+        store.get_mut_by_guid(obs_guid).unwrap().detection_level = 0;
+
+        let jobs1 = aoi.update_observers(&store, &octree, 1, 1000);
+        assert!(
+            jobs1.is_empty(),
+            "Stealthed entity must not be visible to low-detection observer"
+        );
+
+        // Increase detection level to 4 (still below 5)
+        store.get_mut_by_guid(obs_guid).unwrap().detection_level = 4;
+        let jobs2 = aoi.update_observers(&store, &octree, 2, 1050);
+        assert!(
+            jobs2.is_empty(),
+            "Detection level 4 must not reveal stealth level 5"
+        );
+
+        // Increase detection level to 5 (equal to stealth)
+        store.get_mut_by_guid(obs_guid).unwrap().detection_level = 5;
+        let jobs3 = aoi.update_observers(&store, &octree, 3, 1100);
+        assert_eq!(
+            jobs3.len(),
+            1,
+            "Detection level 5 must reveal stealth level 5"
+        );
+        assert_eq!(jobs3[0].packets.len(), 1);
+    }
+
+    #[test]
+    fn test_aoi_stealth_or_phase_change_emits_immediate_despawn() {
+        let mut aoi = AoiManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut store = EntityStore::new();
+
+        let obs_guid = make_guid(10);
+        let tgt_guid = make_guid(20);
+
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        store.spawn(tgt_guid, (15.0, 0.0, 0.0));
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(tgt_guid, (15.0, 0.0, 0.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: true,
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        // Tick 1: Target visible -> delta batch with enters
+        let jobs1 = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs1.len(), 1);
+        let obs = aoi.get_observer(1).unwrap();
+        assert!(obs.observed_entities.contains_key(&tgt_guid));
+
+        // Tick 2: Target activates stealth -> immediate despawn emitted!
+        store.get_mut_by_guid(tgt_guid).unwrap().stealth_level = 10;
+        let jobs2 = aoi.update_observers(&store, &octree, 2, 1050);
+        assert_eq!(jobs2.len(), 1);
+
+        match &jobs2[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert_eq!(batch.despawns, vec![tgt_guid.raw()]);
+            }
+            other => panic!("Expected EntityDeltaBatch with despawns, got {:?}", other),
+        }
+
+        let obs = aoi.get_observer(1).unwrap();
+        assert!(!obs.observed_entities.contains_key(&tgt_guid));
+    }
+
+    #[test]
+    fn test_aoi_phase_shift_emits_immediate_despawn() {
+        let mut aoi = AoiManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut store = EntityStore::new();
+
+        let obs_guid = make_guid(30);
+        let tgt_guid = make_guid(40);
+
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        store.spawn(tgt_guid, (15.0, 0.0, 0.0));
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(tgt_guid, (15.0, 0.0, 0.0));
+
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            enable_delta_compression: false,
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        // Tick 1: Both in phase 1 -> visible
+        let jobs1 = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs1.len(), 1);
+
+        // Tick 2: Target shifts to phase 2 -> immediate EntityDespawn
+        store.get_mut_by_guid(tgt_guid).unwrap().phase_mask = 2;
+        let jobs2 = aoi.update_observers(&store, &octree, 2, 1050);
+        assert_eq!(jobs2.len(), 1);
+        match &jobs2[0].packets[0] {
+            ClientPacket::EntityDespawn(d) => {
+                assert_eq!(d.entity_id, tgt_guid.raw());
+            }
+            other => panic!("Expected EntityDespawn on phase shift, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_aoi_stealthed_entities_do_not_consume_density_throttling_budget() {
+        let mut aoi = AoiManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut store = EntityStore::new();
+
+        let obs_guid = make_guid(100);
+        let stealthed_tgt = make_guid(101);
+        let visible_tgt = make_guid(102);
+
+        store.spawn(obs_guid, (0.0, 0.0, 0.0));
+        store.spawn(stealthed_tgt, (5.0, 0.0, 0.0)); // closer
+        store.spawn(visible_tgt, (10.0, 0.0, 0.0)); // farther
+        octree.insert(obs_guid, (0.0, 0.0, 0.0));
+        octree.insert(stealthed_tgt, (5.0, 0.0, 0.0));
+        octree.insert(visible_tgt, (10.0, 0.0, 0.0));
+
+        store.get_mut_by_guid(stealthed_tgt).unwrap().stealth_level = 5;
+
+        // Observer only has budget for 1 entity!
+        let config = ObserverConfig {
+            base_radius: 50.0,
+            max_entities: 1,
+            enable_delta_compression: false,
+            ..Default::default()
+        };
+        aoi.register_observer(1, obs_guid, config);
+
+        let jobs = aoi.update_observers(&store, &octree, 1, 1000);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].packets.len(), 1);
+
+        // The visible target (at distance 10) must be observed, not dropped due to closer stealthed entity!
+        match &jobs[0].packets[0] {
+            ClientPacket::EntityState(state) => {
+                assert_eq!(state.entity_id, visible_tgt.raw());
+            }
+            other => panic!("Expected EntityState for visible_tgt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_aoi_world_object_phase_culling() {
+        use mmo_core::container::ContainerOwner;
+        use mmo_core::world::{Transform3D, WorldObject};
+
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut sectors = SectorManager::new();
+
+        let obs_guid = make_guid(500);
+        store.spawn(obs_guid, (5.0, 5.0, 0.0));
+
+        let obj_guid = make_guid(600);
+        let mut obj = WorldObject::new(
+            obj_guid,
+            1,
+            Transform3D::from_position((10.0, 10.0, 0.0)),
+            BoundingBox3D::new((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)),
+            ContainerOwner::Character(1),
+        );
+        obj.phase_mask = 2; // Object is in phase 2!
+        sectors.insert_object(obj);
+
+        aoi.register_observer(
+            1,
+            obs_guid,
+            ObserverConfig {
+                base_radius: 50.0,
+                ..Default::default()
+            },
+        );
+
+        // Observer in default phase 1: should NOT see object in phase 2
+        let jobs1 = aoi.update_world_object_observers(&store, &sectors);
+        assert!(
+            jobs1.is_empty(),
+            "Observer in phase 1 must not see object in phase 2"
+        );
+
+        // Observer switches to phase 2: should see object
+        store.get_mut_by_guid(obs_guid).unwrap().phase_mask = 2;
+        // Reset observer observed sectors to re-evaluate entry
+        aoi.get_observer_mut(1).unwrap().observed_sectors.clear();
+
+        let jobs2 = aoi.update_world_object_observers(&store, &sectors);
+        assert_eq!(jobs2.len(), 1);
+        match &jobs2[0].packets[0] {
+            ClientPacket::WorldObjectSpawn(s) => {
+                assert_eq!(s.object_id, obj_guid.raw());
+            }
+            other => panic!("Expected WorldObjectSpawn, got {:?}", other),
+        }
+
+        // Observer switches back to phase 1: delta updates should detect phase mismatch and despawn
+        store.get_mut_by_guid(obs_guid).unwrap().phase_mask = 1;
+        let jobs3 = aoi.update_world_object_observers(&store, &sectors);
+        assert_eq!(jobs3.len(), 1);
+        match &jobs3[0].packets[0] {
+            ClientPacket::WorldObjectDespawn(d) => {
+                assert_eq!(d.object_id, obj_guid.raw());
+            }
+            other => panic!("Expected WorldObjectDespawn on phase loss, got {:?}", other),
+        }
     }
 }

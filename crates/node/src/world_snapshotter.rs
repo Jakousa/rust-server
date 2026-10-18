@@ -78,6 +78,7 @@ pub fn record_to_world_object(r: &WorldObjectRecord) -> Option<WorldObject> {
             (r.bounds_max_x, r.bounds_max_y, r.bounds_max_z),
         ),
         state_flags: r.state_flags,
+        phase_mask: 1,
         owner,
         health,
         properties,
