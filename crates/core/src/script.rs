@@ -150,6 +150,21 @@ pub trait FuelMeteredExecutor: Send + Sync {
     ) -> Result<(Vec<ScriptValue>, u64), ScriptError>;
 }
 
+/// Abstract interface for script execution engines supporting runtime byte hot-reloading.
+pub trait ScriptReloadable: Send + Sync {
+    /// Hot-reloads the active script bytecode, returning the updated monotonic version on success.
+    fn reload_script_bytes(&self, wasm_bytes: &[u8]) -> Result<u64, String>;
+
+    /// Hot-reloads a named script module, returning the updated monotonic version on success.
+    fn reload_module(&self, module_id: &str, wasm_bytes: &[u8]) -> Result<u64, String> {
+        let _ = module_id;
+        self.reload_script_bytes(wasm_bytes)
+    }
+
+    /// Returns the currently active script version.
+    fn active_version(&self) -> u64;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

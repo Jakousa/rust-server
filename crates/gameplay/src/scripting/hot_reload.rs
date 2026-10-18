@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use mmo_core::script::ScriptReloadable;
 use mmo_core::ScriptError;
 
 use super::engine::WasmScriptEngine;
@@ -12,12 +14,16 @@ use super::runtime::WasmRuntime;
 /// Coordinator managing atomic hot-reloading of WebAssembly modules at runtime.
 pub struct ScriptHotReloader {
     runtime: Arc<WasmRuntime>,
+    version: AtomicU64,
 }
 
 impl ScriptHotReloader {
     /// Creates a new `ScriptHotReloader` wrapping the specified WASM runtime.
     pub fn new(runtime: Arc<WasmRuntime>) -> Self {
-        ScriptHotReloader { runtime }
+        ScriptHotReloader {
+            runtime,
+            version: AtomicU64::new(1),
+        }
     }
 
     /// Returns a reference to the active `WasmRuntime`.
@@ -56,6 +62,24 @@ impl ScriptHotReloader {
     /// Returns a list of all currently loaded module IDs.
     pub fn loaded_modules(&self) -> Vec<String> {
         self.engine().module_ids()
+    }
+}
+
+impl ScriptReloadable for ScriptHotReloader {
+    fn reload_script_bytes(&self, wasm_bytes: &[u8]) -> Result<u64, String> {
+        self.reload_module("main", wasm_bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(self.version.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn reload_module(&self, module_id: &str, wasm_bytes: &[u8]) -> Result<u64, String> {
+        self.reload_module(module_id, wasm_bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(self.version.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn active_version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
     }
 }
 

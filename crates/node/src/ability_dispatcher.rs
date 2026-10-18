@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use mmo_core::action::{resolve_boundary_sphere_aoe, AbilityDefinition, CooldownTracker};
 use mmo_core::guid::Guid;
 use mmo_core::AttributeSet;
-use mmo_gameplay::ability::{AbilityDefinition, CooldownTracker};
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::{BatchRemoteAbilityRequest, RemoteAbilityRequest, Vector3};
 
@@ -183,10 +183,8 @@ pub fn cast_cross_partition_ability(
             .entity_store
             .get_by_guid(target_guid)
             .ok_or("Target not found")?;
-        if let Some(health) = target_ent.get_component::<mmo_gameplay::HealthComponent>() {
-            if health.is_dead {
-                return Err("Target entity is dead");
-            }
+        if target_ent.is_incapacitated() {
+            return Err("Target entity is dead");
         }
 
         let caster = sim
@@ -343,10 +341,7 @@ pub fn cast_boundary_sphere_aoe(
         if entity.guid == caster_guid {
             continue; // Caster excluded from harmful cleave
         }
-        let is_alive = entity
-            .get_component::<mmo_gameplay::HealthComponent>()
-            .map(|h| !h.is_dead)
-            .unwrap_or(true);
+        let is_alive = !entity.is_incapacitated();
         candidates.push(mmo_core::spatial::SpatialTargetCandidate::new(
             entity.guid,
             sim.node_id as u32,
@@ -372,7 +367,7 @@ pub fn cast_boundary_sphere_aoe(
     }
 
     // 2. Resolve candidates & partition by node
-    let targeting = mmo_gameplay::ability::resolve_boundary_sphere_aoe(
+    let targeting = resolve_boundary_sphere_aoe(
         &candidates,
         center,
         radius,
@@ -610,7 +605,9 @@ mod tests {
 
         sim.spawn_entity(local_target, (2.0, 0.0, 0.0));
         let ent_local = sim.entity_store.get_mut_by_guid(local_target).unwrap();
-        ent_local.add_component(mmo_gameplay::HealthComponent::new(100.0, 0.0));
+        let mut target_attrs = AttributeSet::new();
+        target_attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+        ent_local.add_component(target_attrs);
 
         sim.ghost_store.insert_or_update(GhostRecord {
             guid: ghost_target,
@@ -656,9 +653,10 @@ mod tests {
         // Local target took damage immediately
         let ent_local = sim.entity_store.get_by_guid(local_target).unwrap();
         let hp = ent_local
-            .get_component::<mmo_gameplay::HealthComponent>()
+            .get_component::<AttributeSet>()
             .unwrap()
-            .current_hp;
+            .get_current("health")
+            .unwrap();
         assert_eq!(hp, 60.0);
 
         // Caster paid energy
@@ -686,10 +684,7 @@ mod tests {
 
         sim.spawn_entity(dead_target, (5.0, 0.0, 0.0));
         let ent_t = sim.entity_store.get_mut_by_guid(dead_target).unwrap();
-        let mut health = mmo_gameplay::HealthComponent::new(100.0, 0.0);
-        health.take_damage(100.0); // kills it
-        assert!(health.is_dead);
-        ent_t.add_component(health);
+        ent_t.state_flags |= mmo_core::entity::state_flags::INCAPACITATED;
 
         let dispatcher = CrossNodeDispatcher::new(1);
         let ability = AbilityDefinition {
@@ -742,9 +737,10 @@ mod tests {
 
         sim.spawn_entity(target, (5.0, 0.0, 0.0));
         let ent_t = sim.entity_store.get_mut_by_guid(target).unwrap();
-        ent_t.add_component(mmo_gameplay::HealthComponent::new(20.0, 0.0));
-        let stats = mmo_gameplay::combat::StatsComponent::new(10, 50); // 33.3% mitigation
-        ent_t.add_component(stats);
+        let mut target_attrs = AttributeSet::new();
+        target_attrs.add_attribute("health", 20.0, 0.0, 20.0, 0.0);
+        target_attrs.add_attribute("armor", 50.0, 0.0, 1000.0, 0.0); // 33.3% mitigation
+        ent_t.add_component(target_attrs);
 
         let dispatcher = CrossNodeDispatcher::new(1);
         let ability = AbilityDefinition {
@@ -766,17 +762,14 @@ mod tests {
         assert_eq!(outcome, CastOutcome::LocalExecuted);
 
         let ent_t = sim.entity_store.get_by_guid(target).unwrap();
-        let health = ent_t
-            .get_component::<mmo_gameplay::HealthComponent>()
-            .unwrap();
-        assert!(health.is_dead);
+        assert!(ent_t.is_incapacitated());
 
-        // Verify EntityDiedEvent in sim.event_queue
+        // Verify EntityIncapacitatedEvent in sim.event_queue
         let death_events = sim
             .event_queue
-            .drain::<mmo_gameplay::combat::EntityDiedEvent>();
+            .drain::<mmo_core::plugin::EntityIncapacitatedEvent>();
         assert_eq!(death_events.len(), 1);
         assert_eq!(death_events[0].entity, target);
-        assert_eq!(death_events[0].killer, Some(caster));
+        assert_eq!(death_events[0].instigator, Some(caster));
     }
 }

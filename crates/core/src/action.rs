@@ -4,10 +4,15 @@
 //! to complete (e.g., cast bars, weapon reload, lockpicking, warp-drive spooling),
 //! with deterministic interruption guards and lifecycle event notifications.
 
+use std::collections::{BTreeMap, HashMap};
+
 use serde::{Deserialize, Serialize};
 
 use crate::guid::Guid;
 use crate::plugin::{DomainEvent, EventQueue, TickContext, TickSystem};
+use crate::spatial::{
+    gather_sphere_candidates, partition_candidates_by_node, SpatialTargetCandidate, Vec3,
+};
 
 /// Flags defining which environmental changes abort an active action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +261,124 @@ impl TickSystem for ActionTickSystem {
                 extra_data: action.extra_data,
             });
         }
+    }
+}
+
+/// Component tracking action cooldowns and the shared Global Cooldown (GCD).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CooldownTracker {
+    pub ability_cooldowns: HashMap<u32, f32>,
+    pub gcd_remaining_sec: f32,
+}
+
+impl CooldownTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks if a specific action or the global cooldown is currently active.
+    pub fn is_on_cooldown(&self, ability_id: u32) -> bool {
+        if self.gcd_remaining_sec > 1e-4 {
+            return true;
+        }
+        self.ability_cooldowns
+            .get(&ability_id)
+            .copied()
+            .unwrap_or(0.0)
+            > 1e-4
+    }
+
+    /// Triggers cooldowns for the action and sets the shared GCD timer.
+    pub fn start_cooldown(&mut self, ability_id: u32, duration_sec: f32, gcd_sec: f32) {
+        if duration_sec > 0.0 {
+            self.ability_cooldowns.insert(ability_id, duration_sec);
+        }
+        if gcd_sec > 0.0 {
+            self.gcd_remaining_sec = self.gcd_remaining_sec.max(gcd_sec);
+        }
+    }
+
+    /// Resets the cooldown for a specific action (e.g. on compensation refund).
+    pub fn reset_cooldown(&mut self, ability_id: u32) {
+        self.ability_cooldowns.remove(&ability_id);
+    }
+
+    /// Resets the global cooldown timer.
+    pub fn reset_gcd(&mut self) {
+        self.gcd_remaining_sec = 0.0;
+    }
+
+    /// Advances cooldown timers by `dt_sec`, removing expired entries.
+    pub fn tick(&mut self, dt_sec: f32) {
+        if self.gcd_remaining_sec > 0.0 {
+            self.gcd_remaining_sec = (self.gcd_remaining_sec - dt_sec).max(0.0);
+        }
+
+        self.ability_cooldowns.retain(|_, remaining| {
+            *remaining -= dt_sec;
+            *remaining > 0.0
+        });
+    }
+}
+
+/// Definition of a pluggable timed action or ability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionDefinition {
+    pub id: u32,
+    pub name: String,
+    pub cast_time_sec: f32,
+    pub cooldown_sec: f32,
+    pub gcd_sec: f32,
+    pub range: f32,
+    pub resource_cost: Option<(String, f32)>,
+    pub interrupt_flags: ActionInterruptFlags,
+}
+
+/// Backward compatibility alias for `ActionDefinition`.
+pub use ActionDefinition as AbilityDefinition;
+
+/// Batch tick system advancing entity action cooldowns.
+#[derive(Default)]
+pub struct ActionCooldownSystem;
+
+impl TickSystem for ActionCooldownSystem {
+    fn name(&self) -> &'static str {
+        "ActionCooldownSystem"
+    }
+
+    fn update(&mut self, ctx: &mut TickContext) {
+        for (_key, entity) in ctx.entities.iter_mut() {
+            if let Some(cd) = entity.get_component_mut::<CooldownTracker>() {
+                cd.tick(ctx.dt_sec);
+            }
+        }
+    }
+}
+
+/// Backward compatibility alias for `ActionCooldownSystem`.
+pub use ActionCooldownSystem as AbilityTickSystem;
+
+/// Result of resolving candidate targets for a boundary-crossing AoE action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryAoeTargeting {
+    pub local_targets: Vec<SpatialTargetCandidate>,
+    pub remote_batches: BTreeMap<u32, Vec<SpatialTargetCandidate>>,
+}
+
+/// Gathers candidates within a radial sphere and partitions them by node.
+pub fn resolve_boundary_sphere_aoe(
+    candidates: &[SpatialTargetCandidate],
+    center: Vec3,
+    radius: f32,
+    max_targets: usize,
+    require_alive: bool,
+    local_node_id: u32,
+) -> BoundaryAoeTargeting {
+    let gathered = gather_sphere_candidates(candidates, center, radius, max_targets, require_alive);
+    let (local_targets, remote_batches) = partition_candidates_by_node(&gathered, local_node_id);
+    BoundaryAoeTargeting {
+        local_targets,
+        remote_batches,
     }
 }
 

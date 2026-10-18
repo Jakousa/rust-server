@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 
 use mmo_core::guid::EntityType;
 use mmo_core::{BoundingBox3D, Guid};
-use mmo_gameplay::combat::HealthComponent;
 use mmo_gateway::router::SessionRouter;
 use mmo_gateway::server::GatewayServer;
 use mmo_node::aoi::ObserverConfig;
@@ -192,15 +191,15 @@ async fn test_end_to_end_aoi_broadcasting_lifecycle() {
         other => panic!("Expected EntityDespawn on leave, got {:?}", other),
     }
 
-    // --- PHASE 5: NPC Spawns, takes damage -> HealthComponent change broadcast ---
+    // --- PHASE 5: NPC Spawns, takes damage -> AttributeSet change broadcast ---
     let npc_guid = Guid::new(EntityType::Npc, 1, 555);
     sim.spawn_entity(npc_guid, (10.0, 10.0, 0.0));
-    let mut health_comp = HealthComponent::new(100.0, 0.0);
-    health_comp.take_damage(40.0); // HP is now 60.0
+    let mut attrs = mmo_core::AttributeSet::new();
+    attrs.add_attribute("health", 60.0, 0.0, 100.0, 0.0);
     sim.entity_store
         .get_mut_by_guid(npc_guid)
         .unwrap()
-        .add_component(health_comp);
+        .add_component(attrs);
 
     forward_aoi_broadcasts(&mut sim, &gateway).await;
 
