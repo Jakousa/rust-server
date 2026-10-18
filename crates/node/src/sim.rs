@@ -494,10 +494,21 @@ impl TickSimulation {
         margin: f32,
         cooldown_ticks: u64,
     ) -> bool {
+        // Child entities attached to a parent platform never trigger independent boundary migration
+        if let Some(entity) = self.entity_store.get_by_guid(guid) {
+            if entity.parent_guid.is_some() {
+                return false;
+            }
+        }
         if self.is_migrating(guid) || self.is_in_migration_cooldown(guid, cooldown_ticks) {
             return false;
         }
         self.octree.bounds.distance_to_point(new_pos) >= margin
+    }
+
+    /// Collects an entity and all its transitive hierarchy descendants as an atomic migration group.
+    pub fn collect_migration_group(&self, root_guid: Guid) -> Vec<Guid> {
+        self.entity_store.collect_hierarchy_group(root_guid)
     }
 
     /// Collects all entity GUIDs currently residing inside the specified bounding box volume.
@@ -1153,6 +1164,7 @@ impl TickSimulation {
         let dt_sec = self.compute_server_dt_with_seq(guid, seq_delta);
 
         // 4. Kinematic & Collision validation (speed caps, teleport threshold, NaN/Inf, dt bounds, obstacle collision)
+        let kin_state = self.kinematic_states.get_mut(&guid);
         if let Ok(collision_guard) = self.collision_world.read() {
             if let Err(violation) = self.kinematics.validate_move_with_collision(
                 current_pos,
@@ -1160,6 +1172,8 @@ impl TickSimulation {
                 dt_sec,
                 &*collision_guard,
                 Some(guid),
+                kin_state,
+                self.tick_counter,
             ) {
                 return Err(violation.snap_back);
             }
@@ -1233,6 +1247,41 @@ impl TickSimulation {
             }
         }
 
+        // 9.5. Update parent-child hierarchy
+        let parent_transform = self
+            .entity_store
+            .get_by_guid(guid)
+            .and_then(|c| c.parent_guid)
+            .and_then(|p_guid| {
+                self.entity_store
+                    .get_by_guid(p_guid)
+                    .map(|p| (p.position, p.rotation))
+            });
+        if let Some((parent_pos, parent_rot)) = parent_transform {
+            if let Some(child) = self.entity_store.get_mut_by_guid(guid) {
+                child.local_position =
+                    mmo_core::entity::world_to_local(parent_pos, parent_rot, new_pos);
+            }
+        }
+
+        let has_children = self
+            .entity_store
+            .get_by_guid(guid)
+            .map(|e| !e.children.is_empty())
+            .unwrap_or(false);
+        if has_children {
+            let moved_children = self.entity_store.propagate_hierarchy_transforms(guid);
+            for (child_guid, old_pos, child_new_pos) in moved_children {
+                if !self.octree.remove(child_guid, old_pos) {
+                    self.octree.remove_by_guid(child_guid);
+                }
+                self.octree.insert(child_guid, child_new_pos);
+                if let Some(child_k_state) = self.kinematic_states.get_mut(&child_guid) {
+                    child_k_state.last_position = child_new_pos;
+                }
+            }
+        }
+
         // 10. Dispatch OnMove hook
         self.hooks.dispatch(&Event::OnMove {
             entity: guid,
@@ -1268,6 +1317,7 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
+        let kin_state = self.kinematic_states.get_mut(&guid);
         if let Ok(collision_guard) = self.collision_world.read() {
             if let Err(violation) = self.kinematics.validate_move_with_collision(
                 current_pos,
@@ -1275,6 +1325,8 @@ impl TickSimulation {
                 dt_sec,
                 &*collision_guard,
                 Some(guid),
+                kin_state,
+                self.tick_counter,
             ) {
                 return Err(violation.snap_back);
             }
@@ -1312,6 +1364,41 @@ impl TickSimulation {
             self.octree.remove_by_guid(guid);
         }
         self.octree.insert(guid, new_pos);
+
+        // Update parent-child hierarchy
+        let parent_transform = self
+            .entity_store
+            .get_by_guid(guid)
+            .and_then(|c| c.parent_guid)
+            .and_then(|p_guid| {
+                self.entity_store
+                    .get_by_guid(p_guid)
+                    .map(|p| (p.position, p.rotation))
+            });
+        if let Some((parent_pos, parent_rot)) = parent_transform {
+            if let Some(child) = self.entity_store.get_mut_by_guid(guid) {
+                child.local_position =
+                    mmo_core::entity::world_to_local(parent_pos, parent_rot, new_pos);
+            }
+        }
+
+        let has_children = self
+            .entity_store
+            .get_by_guid(guid)
+            .map(|e| !e.children.is_empty())
+            .unwrap_or(false);
+        if has_children {
+            let moved_children = self.entity_store.propagate_hierarchy_transforms(guid);
+            for (child_guid, old_pos, child_new_pos) in moved_children {
+                if !self.octree.remove(child_guid, old_pos) {
+                    self.octree.remove_by_guid(child_guid);
+                }
+                self.octree.insert(child_guid, child_new_pos);
+                if let Some(child_k_state) = self.kinematic_states.get_mut(&child_guid) {
+                    child_k_state.last_position = child_new_pos;
+                }
+            }
+        }
 
         self.hooks.dispatch(&Event::OnMove {
             entity: guid,
@@ -2212,5 +2299,86 @@ mod tests {
 
         // Now interaction is vetoed
         assert!(!sim.handle_interact_object(player, &pkt));
+    }
+
+    #[test]
+    fn test_passenger_walking_on_fast_moving_ship_and_atomic_migration_group() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        sim.kinematics = KinematicValidator::new(7.0); // 7.0 m/s base speed cap
+
+        let ship_guid = Guid::new(mmo_core::EntityType::DynamicObject, 1, 100);
+        let passenger_guid = Guid::new(mmo_core::EntityType::Player, 1, 101);
+
+        sim.spawn_entity(ship_guid, (0.0, 0.0, 0.0));
+        sim.spawn_entity(passenger_guid, (0.0, 0.0, 0.0));
+
+        let now = std::time::Instant::now();
+        sim.kinematic_states.insert(
+            ship_guid,
+            EntityKinematicState::new(now).with_position((0.0, 0.0, 0.0)),
+        );
+        sim.kinematic_states.insert(
+            passenger_guid,
+            EntityKinematicState::new(now).with_position((0.0, 0.0, 0.0)),
+        );
+
+        // Attach passenger to ship at local position (1.0, 0.0, 0.0)
+        assert!(sim
+            .entity_store
+            .attach_child(passenger_guid, ship_guid, (1.0, 0.0, 0.0), 0.0));
+        sim.kinematic_states
+            .get_mut(&passenger_guid)
+            .unwrap()
+            .last_position = (1.0, 0.0, 0.0);
+
+        // Grant impulse allowance to the ship for high-speed travel (50 m/s)
+        sim.kinematics.grant_impulse(
+            sim.kinematic_states.get_mut(&ship_guid).unwrap(),
+            50.0,
+            10,
+            sim.tick_counter,
+        );
+
+        // Ship advances 2.5m in a 50ms tick (50 m/s)
+        let ship_new_pos = (2.5, 0.0, 0.0);
+        let res_ship = sim.process_client_move_deterministic(ship_guid, ship_new_pos, 0.05);
+        assert!(
+            res_ship.is_ok(),
+            "Ship movement within impulse allowance must pass"
+        );
+
+        // Hierarchy transform propagation should have automatically updated passenger world pos and kinematic last_position
+        let passenger = sim.entity_store.get_by_guid(passenger_guid).unwrap();
+        assert_eq!(passenger.position, (3.5, 0.0, 0.0)); // 2.5 + 1.0 = 3.5
+        let passenger_k_state = sim.kinematic_states.get(&passenger_guid).unwrap();
+        assert_eq!(passenger_k_state.last_position, (3.5, 0.0, 0.0));
+
+        // Passenger walks locally 0.3m on deck in 50ms (from local 1.0 to 1.3 -> world 3.5 to 3.8)
+        // Local speed: 0.3 / 0.05 = 6.0 m/s <= 7.0 m/s
+        let passenger_new_world_pos = (3.8, 0.0, 0.0);
+        let res_passenger =
+            sim.process_client_move_deterministic(passenger_guid, passenger_new_world_pos, 0.05);
+        assert!(
+            res_passenger.is_ok(),
+            "Passenger walking 0.3m locally on moving ship must pass kinematic validation"
+        );
+
+        let passenger = sim.entity_store.get_by_guid(passenger_guid).unwrap();
+        assert!((passenger.local_position.0 - 1.3).abs() < 1e-4);
+
+        // Boundary Migration: passenger must NEVER migrate independently
+        assert!(
+            !sim.check_boundary_migration(passenger_guid, (600.0, 0.0, 0.0), 1.0, 20),
+            "Child entity must not trigger independent boundary migration"
+        );
+
+        // Ship crossing boundary triggers migration and collects atomic group [ship, passenger]
+        assert!(
+            sim.check_boundary_migration(ship_guid, (600.0, 0.0, 0.0), 1.0, 20),
+            "Parent ship qualifies for boundary migration"
+        );
+        let group = sim.collect_migration_group(ship_guid);
+        assert_eq!(group, vec![ship_guid, passenger_guid]);
     }
 }

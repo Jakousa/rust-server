@@ -8,6 +8,7 @@ use std::fmt;
 
 use mmo_core::collision::{CollisionWorld, SpatialQueryFilter};
 use mmo_core::guid::Guid;
+use mmo_core::octree::BoundingBox3D;
 use mmo_core::spatial::Vec3;
 
 /// Specific reason for a kinematic movement violation.
@@ -27,6 +28,16 @@ pub enum KinematicViolationReason {
     ObstacleCollision {
         hit_point: (f32, f32, f32),
         entity_id: Option<Guid>,
+    },
+    /// Volumetric collision sweep detected penetration or clipping into solid collision geometry.
+    WallClipping {
+        hit_point: (f32, f32, f32),
+        entity_id: Option<Guid>,
+    },
+    /// Rate of velocity change exceeded allowable acceleration limit.
+    AccelerationCapExceeded {
+        acceleration: f32,
+        max_acceleration: f32,
     },
 }
 
@@ -70,6 +81,64 @@ impl fmt::Display for KinematicViolationReason {
                     hit_point.0, hit_point.1, hit_point.2, entity_id
                 )
             }
+            Self::WallClipping {
+                hit_point,
+                entity_id,
+            } => {
+                write!(
+                    f,
+                    "wall clipping detected at ({:.2}, {:.2}, {:.2}) with entity {:?}",
+                    hit_point.0, hit_point.1, hit_point.2, entity_id
+                )
+            }
+            Self::AccelerationCapExceeded {
+                acceleration,
+                max_acceleration,
+            } => {
+                write!(
+                    f,
+                    "acceleration cap exceeded: acceleration {acceleration:.2} > max {max_acceleration:.2}"
+                )
+            }
+        }
+    }
+}
+
+/// Server-authorized temporary movement allowance granting additional displacement budget
+/// to exempt knockbacks, dashes, and teleports from anti-cheat speed violations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImpulseAllowance {
+    pub bonus_distance: f32,
+    pub expires_at_tick: u64,
+}
+
+/// Kinematic motion model applied during entity movement simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MotionMode {
+    /// Discrete ground/character movement with direct position updates and AABB collision sweeps.
+    #[default]
+    DiscreteGround,
+    /// 6-DoF Newtonian physics model with velocity, acceleration caps, and linear damping.
+    Newtonian6DoF {
+        max_acceleration: f32,
+        linear_damping: f32,
+    },
+}
+
+/// Configuration settings for kinematic motion validation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KinematicConfig {
+    pub max_speed: f32,
+    pub max_teleport_distance: Option<f32>,
+    pub tolerance_multiplier: f32,
+}
+
+impl Default for KinematicConfig {
+    fn default() -> Self {
+        Self {
+            max_speed: KinematicValidator::DEFAULT_MAX_SPEED,
+            max_teleport_distance: None,
+            tolerance_multiplier: 1.1,
         }
     }
 }
@@ -80,6 +149,12 @@ pub struct EntityKinematicState {
     pub last_move_time: std::time::Instant,
     pub last_sequence: u32,
     pub initialized: bool,
+    pub last_position: (f32, f32, f32),
+    pub velocity: (f32, f32, f32),
+    pub collider_half_extents: (f32, f32, f32),
+    pub motion_mode: MotionMode,
+    pub impulse_allowance: Option<ImpulseAllowance>,
+    pub last_dt: f32,
 }
 
 impl EntityKinematicState {
@@ -89,7 +164,351 @@ impl EntityKinematicState {
             last_move_time: initial_time,
             last_sequence: 0,
             initialized: false,
+            last_position: (0.0, 0.0, 0.0),
+            velocity: (0.0, 0.0, 0.0),
+            collider_half_extents: (0.4, 0.9, 0.4),
+            motion_mode: MotionMode::DiscreteGround,
+            impulse_allowance: None,
+            last_dt: 0.05,
         }
+    }
+
+    /// Sets the initial or updated last known position of the entity.
+    pub fn with_position(mut self, pos: (f32, f32, f32)) -> Self {
+        self.last_position = pos;
+        self
+    }
+
+    /// Grants an authorized server impulse allowance.
+    pub fn grant_impulse(&mut self, bonus_distance: f32, duration_ticks: u64, current_tick: u64) {
+        self.impulse_allowance = Some(ImpulseAllowance {
+            bonus_distance,
+            expires_at_tick: current_tick + duration_ticks,
+        });
+    }
+}
+
+/// Pluggable motion integration strategy for validating physical movement steps.
+pub trait MotionIntegrator: Send + Sync {
+    fn validate_step(
+        &self,
+        config: &KinematicConfig,
+        state: &mut EntityKinematicState,
+        proposed_pos: (f32, f32, f32),
+        current_tick: u64,
+        collision: Option<&dyn CollisionWorld>,
+        mover_guid: Option<Guid>,
+    ) -> Result<(f32, f32, f32), KinematicViolation>;
+}
+
+/// Discrete ground movement integrator with AABB volumetric sweep testing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscreteKinematicIntegrator;
+
+impl MotionIntegrator for DiscreteKinematicIntegrator {
+    fn validate_step(
+        &self,
+        config: &KinematicConfig,
+        state: &mut EntityKinematicState,
+        proposed_pos: (f32, f32, f32),
+        current_tick: u64,
+        collision: Option<&dyn CollisionWorld>,
+        mover_guid: Option<Guid>,
+    ) -> Result<(f32, f32, f32), KinematicViolation> {
+        let current_pos = state.last_position;
+        if !proposed_pos.0.is_finite() || !proposed_pos.1.is_finite() || !proposed_pos.2.is_finite()
+        {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::NonFiniteCoordinates,
+            ));
+        }
+
+        let dt_sec = if state.last_dt > 0.0 {
+            state.last_dt
+        } else {
+            0.05
+        };
+
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::InvalidDeltaTime { dt: dt_sec },
+            ));
+        }
+
+        let dx = proposed_pos.0 - current_pos.0;
+        let dy = proposed_pos.1 - current_pos.1;
+        let dz = proposed_pos.2 - current_pos.2;
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        let mut bonus_dist = 0.0;
+        if let Some(allowance) = state.impulse_allowance {
+            if allowance.expires_at_tick >= current_tick {
+                bonus_dist = allowance.bonus_distance;
+            }
+            state.impulse_allowance = None;
+        }
+
+        if let Some(base_max_teleport) = config.max_teleport_distance {
+            let effective_max_teleport = base_max_teleport + bonus_dist;
+            if distance > effective_max_teleport + 1e-4 {
+                return Err(KinematicViolation::new(
+                    current_pos,
+                    KinematicViolationReason::TeleportDetected {
+                        distance,
+                        max_distance: effective_max_teleport,
+                    },
+                ));
+            }
+        }
+
+        let effective_max_speed = config.max_speed + (bonus_dist / dt_sec);
+        let speed = distance / dt_sec;
+        if speed > effective_max_speed + 1e-4 {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::SpeedCapExceeded {
+                    speed,
+                    max_speed: effective_max_speed,
+                },
+            ));
+        }
+
+        if distance > 1e-4 {
+            if let Some(cw) = collision {
+                let from_vec = Vec3::new(current_pos.0, current_pos.1, current_pos.2);
+                let dir = Vec3::new(dx / distance, dy / distance, dz / distance);
+                let filter = SpatialQueryFilter {
+                    ignore_id: mover_guid,
+                    collision_layers: u32::MAX,
+                };
+
+                let check_dist = (distance - 0.05).max(0.0);
+                if check_dist > 0.0 {
+                    if let Some(hit) = cw.raycast(from_vec, dir, check_dist, filter) {
+                        if hit.distance < check_dist {
+                            return Err(KinematicViolation::new(
+                                current_pos,
+                                KinematicViolationReason::ObstacleCollision {
+                                    hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                                    entity_id: hit.entity_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                if state.collider_half_extents.0 > 0.0 {
+                    let half = state.collider_half_extents;
+                    let aabb = BoundingBox3D::new(
+                        (
+                            current_pos.0 - half.0,
+                            current_pos.1 - half.1,
+                            current_pos.2 - half.2,
+                        ),
+                        (
+                            current_pos.0 + half.0,
+                            current_pos.1 + half.1,
+                            current_pos.2 + half.2,
+                        ),
+                    );
+                    let translation = Vec3::new(dx, dy, dz);
+                    if let Some(hit) = cw.sweep_test(&aabb, translation, filter) {
+                        if hit.hit_fraction < 1.0 {
+                            return Err(KinematicViolation::new(
+                                current_pos,
+                                KinematicViolationReason::WallClipping {
+                                    hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                                    entity_id: hit.entity_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                let dest_vec = Vec3::new(proposed_pos.0, proposed_pos.1, proposed_pos.2);
+                if !cw.is_point_traversable(dest_vec) {
+                    return Err(KinematicViolation::new(
+                        current_pos,
+                        KinematicViolationReason::ObstacleCollision {
+                            hit_point: proposed_pos,
+                            entity_id: None,
+                        },
+                    ));
+                }
+            }
+        }
+
+        state.velocity = (dx / dt_sec, dy / dt_sec, dz / dt_sec);
+        state.last_position = proposed_pos;
+        Ok(proposed_pos)
+    }
+}
+
+/// 6-DoF Newtonian physics integrator checking acceleration and damping limits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Newtonian6DoFIntegrator;
+
+impl MotionIntegrator for Newtonian6DoFIntegrator {
+    fn validate_step(
+        &self,
+        config: &KinematicConfig,
+        state: &mut EntityKinematicState,
+        proposed_pos: (f32, f32, f32),
+        current_tick: u64,
+        collision: Option<&dyn CollisionWorld>,
+        mover_guid: Option<Guid>,
+    ) -> Result<(f32, f32, f32), KinematicViolation> {
+        let current_pos = state.last_position;
+        if !proposed_pos.0.is_finite() || !proposed_pos.1.is_finite() || !proposed_pos.2.is_finite()
+        {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::NonFiniteCoordinates,
+            ));
+        }
+
+        let dt_sec = if state.last_dt > 0.0 {
+            state.last_dt
+        } else {
+            0.05
+        };
+
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::InvalidDeltaTime { dt: dt_sec },
+            ));
+        }
+
+        let dx = proposed_pos.0 - current_pos.0;
+        let dy = proposed_pos.1 - current_pos.1;
+        let dz = proposed_pos.2 - current_pos.2;
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        let mut bonus_dist = 0.0;
+        if let Some(allowance) = state.impulse_allowance {
+            if allowance.expires_at_tick >= current_tick {
+                bonus_dist = allowance.bonus_distance;
+            }
+            state.impulse_allowance = None;
+        }
+
+        let effective_max_speed = config.max_speed + (bonus_dist / dt_sec);
+        let speed = distance / dt_sec;
+        if speed > effective_max_speed + 1e-4 {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::SpeedCapExceeded {
+                    speed,
+                    max_speed: effective_max_speed,
+                },
+            ));
+        }
+
+        let v_new = (dx / dt_sec, dy / dt_sec, dz / dt_sec);
+        let dv = (
+            v_new.0 - state.velocity.0,
+            v_new.1 - state.velocity.1,
+            v_new.2 - state.velocity.2,
+        );
+        let dv_mag = (dv.0 * dv.0 + dv.1 * dv.1 + dv.2 * dv.2).sqrt();
+        let acceleration = dv_mag / dt_sec;
+
+        let (max_acceleration, linear_damping) = match state.motion_mode {
+            MotionMode::Newtonian6DoF {
+                max_acceleration,
+                linear_damping,
+            } => (max_acceleration, linear_damping),
+            _ => (50.0, 0.0),
+        };
+
+        let allowed_accel = max_acceleration * config.tolerance_multiplier;
+        if acceleration > allowed_accel + 1e-4 {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::AccelerationCapExceeded {
+                    acceleration,
+                    max_acceleration,
+                },
+            ));
+        }
+
+        if distance > 1e-4 {
+            if let Some(cw) = collision {
+                let from_vec = Vec3::new(current_pos.0, current_pos.1, current_pos.2);
+                let dir = Vec3::new(dx / distance, dy / distance, dz / distance);
+                let filter = SpatialQueryFilter {
+                    ignore_id: mover_guid,
+                    collision_layers: u32::MAX,
+                };
+
+                let check_dist = (distance - 0.05).max(0.0);
+                if check_dist > 0.0 {
+                    if let Some(hit) = cw.raycast(from_vec, dir, check_dist, filter) {
+                        if hit.distance < check_dist {
+                            return Err(KinematicViolation::new(
+                                current_pos,
+                                KinematicViolationReason::ObstacleCollision {
+                                    hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                                    entity_id: hit.entity_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                if state.collider_half_extents.0 > 0.0 {
+                    let half = state.collider_half_extents;
+                    let aabb = BoundingBox3D::new(
+                        (
+                            current_pos.0 - half.0,
+                            current_pos.1 - half.1,
+                            current_pos.2 - half.2,
+                        ),
+                        (
+                            current_pos.0 + half.0,
+                            current_pos.1 + half.1,
+                            current_pos.2 + half.2,
+                        ),
+                    );
+                    let translation = Vec3::new(dx, dy, dz);
+                    if let Some(hit) = cw.sweep_test(&aabb, translation, filter) {
+                        if hit.hit_fraction < 1.0 {
+                            return Err(KinematicViolation::new(
+                                current_pos,
+                                KinematicViolationReason::WallClipping {
+                                    hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                                    entity_id: hit.entity_id,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                let dest_vec = Vec3::new(proposed_pos.0, proposed_pos.1, proposed_pos.2);
+                if !cw.is_point_traversable(dest_vec) {
+                    return Err(KinematicViolation::new(
+                        current_pos,
+                        KinematicViolationReason::ObstacleCollision {
+                            hit_point: proposed_pos,
+                            entity_id: None,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if linear_damping > 0.0 {
+            let factor = (1.0 - linear_damping * dt_sec).max(0.0);
+            state.velocity = (v_new.0 * factor, v_new.1 * factor, v_new.2 * factor);
+        } else {
+            state.velocity = v_new;
+        }
+
+        state.last_position = proposed_pos;
+        Ok(proposed_pos)
     }
 }
 
@@ -104,6 +523,36 @@ impl KinematicViolation {
     /// Creates a new `KinematicViolation`.
     pub fn new(snap_back: (f32, f32, f32), reason: KinematicViolationReason) -> Self {
         Self { snap_back, reason }
+    }
+
+    /// Creates a new `WallClipping` kinematic violation.
+    pub fn wall_clipping(
+        snap_back: (f32, f32, f32),
+        hit_point: (f32, f32, f32),
+        entity_id: Option<Guid>,
+    ) -> Self {
+        Self::new(
+            snap_back,
+            KinematicViolationReason::WallClipping {
+                hit_point,
+                entity_id,
+            },
+        )
+    }
+
+    /// Creates a new `AccelerationCapExceeded` kinematic violation.
+    pub fn acceleration_cap_exceeded(
+        snap_back: (f32, f32, f32),
+        acceleration: f32,
+        max_acceleration: f32,
+    ) -> Self {
+        Self::new(
+            snap_back,
+            KinematicViolationReason::AccelerationCapExceeded {
+                acceleration,
+                max_acceleration,
+            },
+        )
     }
 
     /// Returns the snap-back destination coordinates.
@@ -154,6 +603,17 @@ impl KinematicValidator {
     pub fn with_teleport_distance(mut self, max_distance: f32) -> Self {
         self.max_teleport_distance = Some(max_distance);
         self
+    }
+
+    /// Grants a server-authorized impulse allowance to an entity kinematic state.
+    pub fn grant_impulse(
+        &self,
+        state: &mut EntityKinematicState,
+        bonus_distance: f32,
+        duration_ticks: u64,
+        current_tick: u64,
+    ) {
+        state.grant_impulse(bonus_distance, duration_ticks, current_tick);
     }
 
     /// Validates a proposed movement from `current_pos` to `new_pos` across `dt_sec`.
@@ -215,11 +675,12 @@ impl KinematicValidator {
         Ok(())
     }
 
-    /// Validates a proposed movement against both kinematic speed/distance bounds and
-    /// abstract collision geometry provided by `CollisionWorld`.
+    /// Validates a proposed movement against both kinematic speed/distance bounds,
+    /// impulse allowances, volumetric sweep tests, and abstract collision geometry.
     ///
     /// Returns `Ok(())` if the trajectory is unobstructed and meets all kinematic constraints.
     /// Returns `Err(KinematicViolation)` snapping back to `current_pos` if an obstacle is struck.
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_move_with_collision(
         &self,
         current_pos: (f32, f32, f32),
@@ -227,29 +688,121 @@ impl KinematicValidator {
         dt_sec: f32,
         collision: &dyn CollisionWorld,
         mover_guid: Option<Guid>,
+        mut state: Option<&mut EntityKinematicState>,
+        current_tick: u64,
     ) -> Result<(), KinematicViolation> {
-        // 1. Basic kinematic checks (speed, dt, NaN, teleport)
-        self.validate_move(current_pos, new_pos, dt_sec)?;
+        // 1. Guard against NaN / Infinite coordinates
+        if !new_pos.0.is_finite() || !new_pos.1.is_finite() || !new_pos.2.is_finite() {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::NonFiniteCoordinates,
+            ));
+        }
 
-        // 2. Translation vector
+        // 2. Guard against non-positive or non-finite delta time
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::InvalidDeltaTime { dt: dt_sec },
+            ));
+        }
+
         let dx = new_pos.0 - current_pos.0;
         let dy = new_pos.1 - current_pos.1;
         let dz = new_pos.2 - current_pos.2;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-        if dist < 1e-4 {
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        // 3. Check and consume impulse allowance if active
+        let mut bonus_dist = 0.0;
+        if let Some(ref mut s) = state {
+            if let Some(allowance) = s.impulse_allowance {
+                if allowance.expires_at_tick >= current_tick {
+                    bonus_dist = allowance.bonus_distance;
+                }
+                s.impulse_allowance = None;
+            }
+        }
+
+        // 4. Check teleport distance threshold if enabled
+        if let Some(base_max_teleport) = self.max_teleport_distance {
+            let effective_max_teleport = base_max_teleport + bonus_dist;
+            if distance > effective_max_teleport + Self::EPSILON {
+                return Err(KinematicViolation::new(
+                    current_pos,
+                    KinematicViolationReason::TeleportDetected {
+                        distance,
+                        max_distance: effective_max_teleport,
+                    },
+                ));
+            }
+        }
+
+        // 5. Check effective speed cap
+        let effective_max_speed = self.max_speed + (bonus_dist / dt_sec);
+        let speed = distance / dt_sec;
+        if speed > effective_max_speed + Self::EPSILON {
+            return Err(KinematicViolation::new(
+                current_pos,
+                KinematicViolationReason::SpeedCapExceeded {
+                    speed,
+                    max_speed: effective_max_speed,
+                },
+            ));
+        }
+
+        // 6. Check Newtonian acceleration limits if Newtonian6DoF mode is active
+        if let Some(ref mut s) = state {
+            if let MotionMode::Newtonian6DoF {
+                max_acceleration,
+                linear_damping,
+            } = s.motion_mode
+            {
+                let v_new = (dx / dt_sec, dy / dt_sec, dz / dt_sec);
+                let dv = (
+                    v_new.0 - s.velocity.0,
+                    v_new.1 - s.velocity.1,
+                    v_new.2 - s.velocity.2,
+                );
+                let dv_mag = (dv.0 * dv.0 + dv.1 * dv.1 + dv.2 * dv.2).sqrt();
+                let acceleration = dv_mag / dt_sec;
+                let allowed_accel = max_acceleration * 1.1; // 10% tolerance multiplier
+                if acceleration > allowed_accel + Self::EPSILON {
+                    return Err(KinematicViolation::new(
+                        current_pos,
+                        KinematicViolationReason::AccelerationCapExceeded {
+                            acceleration,
+                            max_acceleration,
+                        },
+                    ));
+                }
+
+                if linear_damping > 0.0 {
+                    let factor = (1.0 - linear_damping * dt_sec).max(0.0);
+                    s.velocity = (v_new.0 * factor, v_new.1 * factor, v_new.2 * factor);
+                } else {
+                    s.velocity = v_new;
+                }
+            } else {
+                s.velocity = (dx / dt_sec, dy / dt_sec, dz / dt_sec);
+            }
+        }
+
+        if distance < 1e-4 {
+            if let Some(ref mut s) = state {
+                s.last_position = new_pos;
+            }
             return Ok(());
         }
 
-        // 3. Collision check along trajectory
+        // 7. Raycast collision check along trajectory
         let from_vec = Vec3::new(current_pos.0, current_pos.1, current_pos.2);
-        let dir = Vec3::new(dx / dist, dy / dist, dz / dist);
+        let dir = Vec3::new(dx / distance, dy / distance, dz / distance);
         let filter = SpatialQueryFilter {
             ignore_id: mover_guid,
             collision_layers: u32::MAX,
         };
 
-        // Small clearance margin (0.05m) to avoid false-positives when skimming edges
-        let check_dist = (dist - 0.05).max(0.0);
+        let check_dist = (distance - 0.05).max(0.0);
         if check_dist > 0.0 {
             if let Some(hit) = collision.raycast(from_vec, dir, check_dist, filter) {
                 if hit.distance < check_dist {
@@ -264,7 +817,39 @@ impl KinematicValidator {
             }
         }
 
-        // 4. Validate destination point traversability
+        // 8. Volumetric AABB sweep test using collider_half_extents
+        let half_extents = state
+            .as_ref()
+            .map(|s| s.collider_half_extents)
+            .unwrap_or((0.4, 0.9, 0.4));
+        if half_extents.0 > 0.0 {
+            let start_aabb = BoundingBox3D::new(
+                (
+                    current_pos.0 - half_extents.0,
+                    current_pos.1 - half_extents.1,
+                    current_pos.2 - half_extents.2,
+                ),
+                (
+                    current_pos.0 + half_extents.0,
+                    current_pos.1 + half_extents.1,
+                    current_pos.2 + half_extents.2,
+                ),
+            );
+            let translation = Vec3::new(dx, dy, dz);
+            if let Some(hit) = collision.sweep_test(&start_aabb, translation, filter) {
+                if hit.hit_fraction < 1.0 {
+                    return Err(KinematicViolation::new(
+                        current_pos,
+                        KinematicViolationReason::WallClipping {
+                            hit_point: (hit.point.x, hit.point.y, hit.point.z),
+                            entity_id: hit.entity_id,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // 9. Destination traversability check
         let dest_vec = Vec3::new(new_pos.0, new_pos.1, new_pos.2);
         if !collision.is_point_traversable(dest_vec) {
             return Err(KinematicViolation::new(
@@ -276,7 +861,32 @@ impl KinematicValidator {
             ));
         }
 
+        if let Some(ref mut s) = state {
+            s.last_position = new_pos;
+        }
+
         Ok(())
+    }
+
+    /// Convenience 5-argument helper omitting tracking state for callers that only require
+    /// basic obstacle collision and speed validation.
+    pub fn validate_move_with_collision_simple(
+        &self,
+        current_pos: (f32, f32, f32),
+        new_pos: (f32, f32, f32),
+        dt_sec: f32,
+        collision: &dyn CollisionWorld,
+        mover_guid: Option<Guid>,
+    ) -> Result<(), KinematicViolation> {
+        self.validate_move_with_collision(
+            current_pos,
+            new_pos,
+            dt_sec,
+            collision,
+            mover_guid,
+            None,
+            0,
+        )
     }
 }
 
@@ -401,14 +1011,24 @@ mod tests {
         let start = (-3.0, 0.0, 0.0);
         // Clear move to (-2.0, 0, 0)
         let clear_target = (-2.0, 0.0, 0.0);
-        let res_clear =
-            validator.validate_move_with_collision(start, clear_target, 0.5, &collision, None);
+        let res_clear = validator.validate_move_with_collision_simple(
+            start,
+            clear_target,
+            0.5,
+            &collision,
+            None,
+        );
         assert!(res_clear.is_ok());
 
         // Obstructed move straight through the box from -3.0 to +3.0
         let obstructed_target = (3.0, 0.0, 0.0);
-        let res_obstructed =
-            validator.validate_move_with_collision(start, obstructed_target, 1.0, &collision, None);
+        let res_obstructed = validator.validate_move_with_collision_simple(
+            start,
+            obstructed_target,
+            1.0,
+            &collision,
+            None,
+        );
         assert!(res_obstructed.is_err());
         let violation = res_obstructed.unwrap_err();
         assert_eq!(violation.snap_back(), start);
@@ -425,8 +1045,155 @@ mod tests {
 
         // Destination inside box
         let inside_target = (0.0, 0.0, 0.0);
-        let res_inside =
-            validator.validate_move_with_collision(start, inside_target, 0.5, &collision, None);
+        let res_inside = validator.validate_move_with_collision_simple(
+            start,
+            inside_target,
+            0.5,
+            &collision,
+            None,
+        );
         assert!(res_inside.is_err());
+    }
+
+    #[test]
+    fn test_impulse_allowance_knockback_exemption() {
+        use mmo_core::collision::AabbCollisionWorld;
+
+        let validator = KinematicValidator::new(7.0).with_teleport_distance(15.0);
+        let collision = AabbCollisionWorld::new();
+        let mut state = EntityKinematicState::new(std::time::Instant::now());
+
+        // Grant impulse allowance of 25m for 5 ticks
+        validator.grant_impulse(&mut state, 25.0, 5, 100);
+        assert!(state.impulse_allowance.is_some());
+
+        let start = (0.0, 0.0, 0.0);
+        let knockback_dest = (30.0, 0.0, 0.0); // 30m displacement in 1 second
+
+        // Movement with active impulse allowance should succeed
+        let res = validator.validate_move_with_collision(
+            start,
+            knockback_dest,
+            1.0,
+            &collision,
+            None,
+            Some(&mut state),
+            101, // Tick within 100 + 5
+        );
+        assert!(res.is_ok(), "Knockback within impulse allowance must pass");
+        assert_eq!(state.last_position, knockback_dest);
+        assert!(
+            state.impulse_allowance.is_none(),
+            "Impulse allowance must be consumed"
+        );
+
+        // Subsequent 30m move without allowance must be rejected
+        let res_subsequent = validator.validate_move_with_collision(
+            knockback_dest,
+            (60.0, 0.0, 0.0),
+            1.0,
+            &collision,
+            None,
+            Some(&mut state),
+            102,
+        );
+        assert!(
+            res_subsequent.is_err(),
+            "Displacement without impulse allowance must fail"
+        );
+    }
+
+    #[test]
+    fn test_newtonian_6dof_acceleration_validation() {
+        use mmo_core::collision::AabbCollisionWorld;
+
+        let validator = KinematicValidator::new(100.0);
+        let collision = AabbCollisionWorld::new();
+        let mut state = EntityKinematicState::new(std::time::Instant::now());
+        state.motion_mode = MotionMode::Newtonian6DoF {
+            max_acceleration: 20.0,
+            linear_damping: 0.0,
+        };
+
+        let start = (0.0, 0.0, 0.0);
+        // Step 1: Accelerate from rest (velocity = 0) to 15 m/s in 1.0s (accel = 15 <= 20 * 1.1)
+        let step1 = (15.0, 0.0, 0.0);
+        let res1 = validator.validate_move_with_collision(
+            start,
+            step1,
+            1.0,
+            &collision,
+            None,
+            Some(&mut state),
+            1,
+        );
+        assert!(res1.is_ok(), "Acceleration 15 m/s^2 <= 20 m/s^2 must pass");
+        assert_eq!(state.velocity, (15.0, 0.0, 0.0));
+
+        // Step 2: Accelerate from 15 m/s to 50 m/s in 1.0s (dv = 35 m/s / 1.0s = 35 > 22.0)
+        let step2 = (65.0, 0.0, 0.0); // 15 + 50 = 65
+        let res2 = validator.validate_move_with_collision(
+            step1,
+            step2,
+            1.0,
+            &collision,
+            None,
+            Some(&mut state),
+            2,
+        );
+        assert!(
+            res2.is_err(),
+            "Acceleration 35 m/s^2 > 22 m/s^2 must be rejected"
+        );
+        match res2.unwrap_err().reason() {
+            KinematicViolationReason::AccelerationCapExceeded {
+                acceleration,
+                max_acceleration,
+            } => {
+                assert!((*acceleration - 35.0).abs() < 1e-4);
+                assert_eq!(*max_acceleration, 20.0);
+            }
+            other => panic!("expected AccelerationCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_volumetric_sweep_test_wall_clipping_rejection() {
+        use mmo_core::collision::AabbCollisionWorld;
+        use mmo_core::octree::BoundingBox3D;
+
+        let validator = KinematicValidator::new(10.0);
+        let mut collision = AabbCollisionWorld::new();
+        // Obstacle from (-1, -1, -1) to (1, 1, 1)
+        let obstacle = BoundingBox3D::new((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0));
+        collision.register_obstacle(Guid(10), obstacle);
+
+        let mut state = EntityKinematicState::new(std::time::Instant::now());
+        // Character height 1.8m (half_extent Y = 0.9m)
+        state.collider_half_extents = (0.4, 0.9, 0.4);
+
+        // Center ray at Y=1.5 moves from X=-3 to X=3 above the obstacle (obstacle top is Y=1.0)
+        // Raycast alone would NOT hit because Y=1.5 > 1.0!
+        // BUT character bounds extend down to Y = 1.5 - 0.9 = 0.6 <= 1.0, clipping into obstacle!
+        let start = (-3.0, 1.5, 0.0);
+        let target = (3.0, 1.5, 0.0);
+
+        let res = validator.validate_move_with_collision(
+            start,
+            target,
+            1.0,
+            &collision,
+            None,
+            Some(&mut state),
+            1,
+        );
+        assert!(res.is_err(), "Volumetric sweep test must catch clipping");
+        let violation = res.unwrap_err();
+        match violation.reason() {
+            KinematicViolationReason::WallClipping { hit_point, .. } => {
+                assert!(hit_point.0 <= 1.0 && hit_point.0 >= -1.5);
+            }
+            other => panic!("expected WallClipping, got {other:?}"),
+        }
     }
 }
