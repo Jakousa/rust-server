@@ -1015,11 +1015,23 @@ impl EntityDeltaBatchPacket {
         let server_tick = get_varint_u64(src)?;
         let baseline_tick = get_varint_u64(src)?;
         let despawn_len = get_varint_u32(src)? as usize;
+        if despawn_len > src.remaining() {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: despawn_len,
+                got: src.remaining(),
+            });
+        }
         let mut despawns = Vec::with_capacity(despawn_len.min(1024));
         for _ in 0..despawn_len {
             despawns.push(get_varint_u64(src)?);
         }
         let delta_len = get_varint_u32(src)? as usize;
+        if delta_len > src.remaining() / 3 {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: delta_len * 3,
+                got: src.remaining(),
+            });
+        }
         let mut deltas = Vec::with_capacity(delta_len.min(1024));
         for _ in 0..delta_len {
             deltas.push(EntityDeltaState::decode(src)?);
@@ -1031,6 +1043,17 @@ impl EntityDeltaBatchPacket {
             deltas,
         })
     }
+}
+
+/// Helper encoding a string with a 16-bit little-endian byte length, clamped to `<= u16::MAX` on UTF-8 boundaries.
+pub(crate) fn put_u16_str(dst: &mut BytesMut, s: &str) {
+    let mut len = s.len().min(u16::MAX as usize);
+    while !s.is_char_boundary(len) {
+        len -= 1;
+    }
+    let bytes = &s.as_bytes()[..len];
+    dst.put_u16_le(len as u16);
+    dst.extend_from_slice(bytes);
 }
 
 /// Client acknowledgement carrying the latest observed server tick and a 32-tick loss recovery mask.
@@ -1094,6 +1117,12 @@ fn put_property_map(dst: &mut BytesMut, map: &HashMap<String, String>) {
 
 fn get_property_map(src: &mut impl Buf) -> Result<HashMap<String, String>, ClientCodecError> {
     let count = get_varint_u32(src)? as usize;
+    if count > src.remaining() / 2 {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: count * 2,
+            got: src.remaining(),
+        });
+    }
     let mut map = HashMap::with_capacity(count.min(1024));
     for _ in 0..count {
         let k = get_string(src)?;
@@ -1447,9 +1476,7 @@ pub struct AuthRequestPacket {
 
 impl AuthRequestPacket {
     pub fn encode(&self, dst: &mut BytesMut) {
-        let token_bytes = self.token.as_bytes();
-        dst.put_u16_le(token_bytes.len() as u16);
-        dst.put_slice(token_bytes);
+        put_u16_str(dst, &self.token);
         dst.put_u32_le(self.client_version);
     }
 
@@ -1495,12 +1522,8 @@ impl AuthResponsePacket {
         dst.put_u32_le(self.error_code);
         dst.put_u64_le(self.session_id);
         dst.put_u64_le(self.player_guid);
-        let node_bytes = self.assigned_node.as_bytes();
-        dst.put_u16_le(node_bytes.len() as u16);
-        dst.put_slice(node_bytes);
-        let msg_bytes = self.error_message.as_bytes();
-        dst.put_u16_le(msg_bytes.len() as u16);
-        dst.put_slice(msg_bytes);
+        put_u16_str(dst, &self.assigned_node);
+        put_u16_str(dst, &self.error_message);
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
@@ -1572,12 +1595,8 @@ impl SocialMessagePacket {
         dst.put_u8(self.channel_type);
         dst.put_u64_le(self.target_id);
         dst.put_u64_le(self.sender_guid);
-        let name_bytes = self.sender_name.as_bytes();
-        dst.put_u16_le(name_bytes.len() as u16);
-        dst.put_slice(name_bytes);
-        let content_bytes = self.content.as_bytes();
-        dst.put_u16_le(content_bytes.len() as u16);
-        dst.put_slice(content_bytes);
+        put_u16_str(dst, &self.sender_name);
+        put_u16_str(dst, &self.content);
         dst.put_u64_le(self.timestamp);
     }
 
@@ -1644,9 +1663,7 @@ impl SocialSubscribePacket {
     pub fn encode(&self, dst: &mut BytesMut) {
         dst.put_u8(self.channel_type);
         dst.put_u64_le(self.target_id);
-        let name_bytes = self.channel_name.as_bytes();
-        dst.put_u16_le(name_bytes.len() as u16);
-        dst.put_slice(name_bytes);
+        put_u16_str(dst, &self.channel_name);
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
@@ -1688,9 +1705,7 @@ impl SocialUnsubscribePacket {
     pub fn encode(&self, dst: &mut BytesMut) {
         dst.put_u8(self.channel_type);
         dst.put_u64_le(self.target_id);
-        let name_bytes = self.channel_name.as_bytes();
-        dst.put_u16_le(name_bytes.len() as u16);
-        dst.put_slice(name_bytes);
+        put_u16_str(dst, &self.channel_name);
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
@@ -1747,13 +1762,9 @@ pub struct MarketListingWire {
 
 impl MarketListingWire {
     pub fn encode(&self, dst: &mut BytesMut) {
-        let lid_bytes = self.listing_id.as_bytes();
-        dst.put_u16_le(lid_bytes.len() as u16);
-        dst.put_slice(lid_bytes);
+        put_u16_str(dst, &self.listing_id);
         dst.put_u64_le(self.seller_guid);
-        let iid_bytes = self.item_instance_id.as_bytes();
-        dst.put_u16_le(iid_bytes.len() as u16);
-        dst.put_slice(iid_bytes);
+        put_u16_str(dst, &self.item_instance_id);
         dst.put_u32_le(self.item_def_id);
         dst.put_u64_le(self.price);
         dst.put_u64_le(self.created_at);
@@ -1817,9 +1828,7 @@ pub struct MarketListRequestPacket {
 
 impl MarketListRequestPacket {
     pub fn encode(&self, dst: &mut BytesMut) {
-        let iid_bytes = self.item_instance_id.as_bytes();
-        dst.put_u16_le(iid_bytes.len() as u16);
-        dst.put_slice(iid_bytes);
+        put_u16_str(dst, &self.item_instance_id);
         dst.put_u64_le(self.src_container_id);
         dst.put_u32_le(self.src_slot);
         dst.put_u64_le(self.price);
@@ -1869,9 +1878,7 @@ pub struct MarketBuyRequestPacket {
 
 impl MarketBuyRequestPacket {
     pub fn encode(&self, dst: &mut BytesMut) {
-        let lid_bytes = self.listing_id.as_bytes();
-        dst.put_u16_le(lid_bytes.len() as u16);
-        dst.put_slice(lid_bytes);
+        put_u16_str(dst, &self.listing_id);
         dst.put_u64_le(self.buyer_container_id);
         dst.put_u64_le(self.payment_container_id);
         dst.put_u64_le(self.price);
@@ -1916,9 +1923,7 @@ pub struct MarketCancelRequestPacket {
 
 impl MarketCancelRequestPacket {
     pub fn encode(&self, dst: &mut BytesMut) {
-        let lid_bytes = self.listing_id.as_bytes();
-        dst.put_u16_le(lid_bytes.len() as u16);
-        dst.put_slice(lid_bytes);
+        put_u16_str(dst, &self.listing_id);
         dst.put_u64_le(self.dst_container_id);
     }
 
@@ -2005,9 +2010,7 @@ impl MarketResponsePacket {
         dst.put_u8(self.request_type);
         dst.put_u8(if self.success { 1 } else { 0 });
         dst.put_u32_le(self.error_code);
-        let msg_bytes = self.error_message.as_bytes();
-        dst.put_u16_le(msg_bytes.len() as u16);
-        dst.put_slice(msg_bytes);
+        put_u16_str(dst, &self.error_message);
         dst.put_u16_le(self.listings.len() as u16);
         for item in &self.listings {
             item.encode(dst);
@@ -5050,5 +5053,56 @@ mod tests {
                 got: 0
             }
         );
+    }
+
+    #[test]
+    fn test_client_delta_batch_oversized_despawn_len() {
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1); // server_tick
+        put_varint_u64(&mut buf, 0); // baseline_tick
+        put_varint_u32(&mut buf, 1000); // despawn_len = 1000
+        buf.put_slice(&[0u8; 10]);
+
+        let err = EntityDeltaBatchPacket::decode(&mut buf.freeze())
+            .expect_err("should reject oversized despawn_len without allocating Vec<u64>");
+        match err {
+            ClientCodecError::BufferTooShort { expected, got } => {
+                assert_eq!(expected, 1000);
+                assert_eq!(got, 10);
+            }
+            other => panic!("expected BufferTooShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_client_delta_batch_oversized_delta_len() {
+        let mut buf = BytesMut::new();
+        put_varint_u64(&mut buf, 1); // server_tick
+        put_varint_u64(&mut buf, 0); // baseline_tick
+        put_varint_u32(&mut buf, 0); // despawn_len = 0
+        put_varint_u32(&mut buf, 1000); // delta_len = 1000
+        buf.put_slice(&[0u8; 10]);
+
+        let err = EntityDeltaBatchPacket::decode(&mut buf.freeze())
+            .expect_err("should reject oversized delta_len");
+        match err {
+            ClientCodecError::BufferTooShort { expected, got } => {
+                assert_eq!(expected, 3000);
+                assert_eq!(got, 10);
+            }
+            other => panic!("expected BufferTooShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_put_u16_str_clamping() {
+        let mut buf = BytesMut::new();
+        let long_str = "a".repeat(70000);
+        put_u16_str(&mut buf, &long_str);
+
+        assert_eq!(buf.len(), 2 + u16::MAX as usize);
+        let mut reader = buf.freeze();
+        let written_len = reader.get_u16_le();
+        assert_eq!(written_len, u16::MAX);
     }
 }

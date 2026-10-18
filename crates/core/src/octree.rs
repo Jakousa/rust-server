@@ -80,6 +80,140 @@ impl BoundingBox3D {
         )
     }
 
+    /// Tests ray intersection against this AABB using the slab method, returning distance and outward surface normal.
+    /// Returns `Some((t, normal))` where `t >= 0.0 && t <= max_dist` is the distance along the ray to the first hit.
+    pub fn intersect_ray_with_normal(
+        &self,
+        origin: (f32, f32, f32),
+        dir: (f32, f32, f32),
+        max_dist: f32,
+    ) -> Option<(f32, (f32, f32, f32))> {
+        if !origin.0.is_finite()
+            || !origin.1.is_finite()
+            || !origin.2.is_finite()
+            || !dir.0.is_finite()
+            || !dir.1.is_finite()
+            || !dir.2.is_finite()
+            || !max_dist.is_finite()
+            || max_dist < 0.0
+        {
+            return None;
+        }
+
+        let dir_len_sq = dir.0 * dir.0 + dir.1 * dir.1 + dir.2 * dir.2;
+        if dir_len_sq < 1e-12 {
+            return None;
+        }
+        let inv_len = 1.0 / dir_len_sq.sqrt();
+        let norm_dir = (dir.0 * inv_len, dir.1 * inv_len, dir.2 * inv_len);
+
+        let mut t_min = 0.0f32;
+        let mut t_max = max_dist;
+        let mut normal = (0.0f32, 0.0f32, 0.0f32);
+
+        let inside = self.contains(origin);
+
+        // X slab
+        if norm_dir.0.abs() > 1e-6 {
+            let inv_d = 1.0 / norm_dir.0;
+            let mut t1 = (self.min.0 - origin.0) * inv_d;
+            let mut t2 = (self.max.0 - origin.0) * inv_d;
+            let mut n1 = (-1.0f32, 0.0f32, 0.0f32);
+            if inv_d < 0.0 {
+                std::mem::swap(&mut t1, &mut t2);
+                n1 = (1.0f32, 0.0f32, 0.0f32);
+            }
+            if t1 > t_min {
+                t_min = t1;
+                normal = n1;
+            }
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return None;
+            }
+        } else if origin.0 < self.min.0 || origin.0 > self.max.0 {
+            return None;
+        }
+
+        // Y slab
+        if norm_dir.1.abs() > 1e-6 {
+            let inv_d = 1.0 / norm_dir.1;
+            let mut t1 = (self.min.1 - origin.1) * inv_d;
+            let mut t2 = (self.max.1 - origin.1) * inv_d;
+            let mut n1 = (0.0f32, -1.0f32, 0.0f32);
+            if inv_d < 0.0 {
+                std::mem::swap(&mut t1, &mut t2);
+                n1 = (0.0f32, 1.0f32, 0.0f32);
+            }
+            if t1 > t_min {
+                t_min = t1;
+                normal = n1;
+            }
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return None;
+            }
+        } else if origin.1 < self.min.1 || origin.1 > self.max.1 {
+            return None;
+        }
+
+        // Z slab
+        if norm_dir.2.abs() > 1e-6 {
+            let inv_d = 1.0 / norm_dir.2;
+            let mut t1 = (self.min.2 - origin.2) * inv_d;
+            let mut t2 = (self.max.2 - origin.2) * inv_d;
+            let mut n1 = (0.0f32, 0.0f32, -1.0f32);
+            if inv_d < 0.0 {
+                std::mem::swap(&mut t1, &mut t2);
+                n1 = (0.0f32, 0.0f32, 1.0f32);
+            }
+            if t1 > t_min {
+                t_min = t1;
+                normal = n1;
+            }
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return None;
+            }
+        } else if origin.2 < self.min.2 || origin.2 > self.max.2 {
+            return None;
+        }
+
+        if inside {
+            let d_min_x = (origin.0 - self.min.0).abs();
+            let d_max_x = (self.max.0 - origin.0).abs();
+            let d_min_y = (origin.1 - self.min.1).abs();
+            let d_max_y = (self.max.1 - origin.1).abs();
+            let d_min_z = (origin.2 - self.min.2).abs();
+            let d_max_z = (self.max.2 - origin.2).abs();
+
+            let mut min_d = d_min_x;
+            normal = (-1.0, 0.0, 0.0);
+            if d_max_x < min_d {
+                min_d = d_max_x;
+                normal = (1.0, 0.0, 0.0);
+            }
+            if d_min_y < min_d {
+                min_d = d_min_y;
+                normal = (0.0, -1.0, 0.0);
+            }
+            if d_max_y < min_d {
+                min_d = d_max_y;
+                normal = (0.0, 1.0, 0.0);
+            }
+            if d_min_z < min_d {
+                min_d = d_min_z;
+                normal = (0.0, 0.0, -1.0);
+            }
+            if d_max_z < min_d {
+                normal = (0.0, 0.0, 1.0);
+            }
+            t_min = 0.0;
+        }
+
+        Some((t_min, normal))
+    }
+
     /// Tests ray intersection against this AABB using the slab method.
     /// Returns `Some(t)` where `t >= 0.0 && t <= max_dist` is the distance along the ray to the first hit.
     pub fn intersects_ray(
@@ -88,67 +222,8 @@ impl BoundingBox3D {
         dir: (f32, f32, f32),
         max_dist: f32,
     ) -> Option<f32> {
-        let mut tmin = 0.0f32;
-        let mut tmax = max_dist;
-
-        // X slab
-        if dir.0.abs() < 1e-8 {
-            if origin.0 < self.min.0 || origin.0 > self.max.0 {
-                return None;
-            }
-        } else {
-            let inv_d = 1.0 / dir.0;
-            let mut t1 = (self.min.0 - origin.0) * inv_d;
-            let mut t2 = (self.max.0 - origin.0) * inv_d;
-            if t1 > t2 {
-                std::mem::swap(&mut t1, &mut t2);
-            }
-            tmin = tmin.max(t1);
-            tmax = tmax.min(t2);
-            if tmin > tmax {
-                return None;
-            }
-        }
-
-        // Y slab
-        if dir.1.abs() < 1e-8 {
-            if origin.1 < self.min.1 || origin.1 > self.max.1 {
-                return None;
-            }
-        } else {
-            let inv_d = 1.0 / dir.1;
-            let mut t1 = (self.min.1 - origin.1) * inv_d;
-            let mut t2 = (self.max.1 - origin.1) * inv_d;
-            if t1 > t2 {
-                std::mem::swap(&mut t1, &mut t2);
-            }
-            tmin = tmin.max(t1);
-            tmax = tmax.min(t2);
-            if tmin > tmax {
-                return None;
-            }
-        }
-
-        // Z slab
-        if dir.2.abs() < 1e-8 {
-            if origin.2 < self.min.2 || origin.2 > self.max.2 {
-                return None;
-            }
-        } else {
-            let inv_d = 1.0 / dir.2;
-            let mut t1 = (self.min.2 - origin.2) * inv_d;
-            let mut t2 = (self.max.2 - origin.2) * inv_d;
-            if t1 > t2 {
-                std::mem::swap(&mut t1, &mut t2);
-            }
-            tmin = tmin.max(t1);
-            tmax = tmax.min(t2);
-            if tmin > tmax {
-                return None;
-            }
-        }
-
-        Some(tmin)
+        self.intersect_ray_with_normal(origin, dir, max_dist)
+            .map(|(t, _)| t)
     }
 
     /// Clamps an arbitrary point to lie on or within the bounding box volume.

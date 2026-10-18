@@ -115,21 +115,7 @@ impl AttributeSet {
     /// `Effective = (Base + Sum(Flat)) * (1.0 + Sum(Percent))`
     pub fn get_effective_max(&self, name: &str) -> Option<f32> {
         let attr = self.attributes.get(name)?;
-
-        let mut sum_flat = 0.0;
-        let mut sum_percent = 0.0;
-
-        for modifier in &self.modifiers {
-            if modifier.attribute_name == name {
-                match modifier.modifier {
-                    ModifierType::Flat(val) => sum_flat += val,
-                    ModifierType::Percent(val) => sum_percent += val,
-                }
-            }
-        }
-
-        let effective = (attr.max + sum_flat) * (1.0 + sum_percent);
-        Some(effective.max(attr.min))
+        Some(compute_effective_max_for(name, attr, &self.modifiers))
     }
 
     /// Returns the current value of the attribute, clamped to its effective maximum.
@@ -183,14 +169,11 @@ impl AttributeSet {
     /// Ticks attribute regeneration and advances modifier expiration.
     pub fn tick(&mut self, entity: Guid, dt_sec: f32, events: &mut EventQueue) {
         // 1. Advance passive regeneration/decay
-        let names: Vec<String> = self.attributes.keys().cloned().collect();
-        for name in names {
-            let effective_max = self.get_effective_max(&name).unwrap_or(f32::MAX);
-            if let Some(attr) = self.attributes.get_mut(&name) {
-                if attr.regen_per_sec != 0.0 {
-                    let delta = attr.regen_per_sec * dt_sec;
-                    attr.current = (attr.current + delta).clamp(attr.min, effective_max);
-                }
+        for (name, attr) in &mut self.attributes {
+            if attr.regen_per_sec != 0.0 {
+                let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
+                let delta = attr.regen_per_sec * dt_sec;
+                attr.current = (attr.current + delta).clamp(attr.min, effective_max);
             }
         }
 
@@ -215,6 +198,29 @@ impl AttributeSet {
             });
         }
     }
+}
+
+/// Computes the effective maximum for an attribute given active modifiers without allocating.
+#[inline]
+fn compute_effective_max_for(
+    name: &str,
+    attr: &AttributeValue,
+    modifiers: &[TimedModifier],
+) -> f32 {
+    let mut sum_flat = 0.0;
+    let mut sum_percent = 0.0;
+
+    for modifier in modifiers {
+        if modifier.attribute_name == name {
+            match modifier.modifier {
+                ModifierType::Flat(val) => sum_flat += val,
+                ModifierType::Percent(val) => sum_percent += val,
+            }
+        }
+    }
+
+    let effective = (attr.max + sum_flat) * (1.0 + sum_percent);
+    effective.max(attr.min)
 }
 
 /// Batch system executed during the simulation tick to advance attributes and auras.

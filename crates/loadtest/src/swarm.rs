@@ -3,7 +3,8 @@ use crate::trajectory::{BehaviorProfile, TrajectoryController, WorldBounds};
 use bytes::BytesMut;
 use mmo_core::guid::{EntityType, Guid};
 use mmo_schema::client::{
-    ClientPacket, InteractionPacket, InteractionType, MovementPacket, PingPacket, Vec3,
+    ClientAckPacket, ClientPacket, InteractionPacket, InteractionType, MovementPacket, PingPacket,
+    Vec3,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,7 +75,8 @@ impl SwarmManager {
             self.config.bot_count, self.config.gateway_addr, self.config.duration
         );
 
-        let dt = 1.0 / self.config.tick_rate_hz as f32;
+        let tick_rate_hz = self.config.tick_rate_hz.max(1);
+        let dt = 1.0 / tick_rate_hz as f32;
         let tick_interval = Duration::from_secs_f32(dt);
 
         for i in 0..self.config.bot_count {
@@ -148,6 +150,17 @@ impl SwarmManager {
                                                 metrics.record_snapback();
                                                 traj.position = corr.corrected_position;
                                                 traj.velocity = Vec3::ZERO;
+                                            }
+                                            ClientPacket::EntityDeltaBatch(batch) => {
+                                                let ack_pkt = ClientPacket::ClientAck(ClientAckPacket {
+                                                    session_id: 0,
+                                                    observed_tick: batch.server_tick,
+                                                    ack_mask: 0,
+                                                });
+                                                let encoded_ack = ack_pkt.encode();
+                                                if writer.write_all(&encoded_ack).await.is_ok() {
+                                                    metrics.record_packet_sent();
+                                                }
                                             }
                                             _ => {}
                                         }

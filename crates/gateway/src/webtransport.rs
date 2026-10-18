@@ -353,74 +353,27 @@ impl WebTransportServer {
 
                         match first_pkt {
                             mmo_schema::client::ClientPacket::AuthRequest(auth_req) => {
-                                match auth.authenticate(&auth_req.token) {
-                                    Ok(auth_res) => {
-                                        let initial_node = router_stream
-                                            .get_route_by_guid(auth_res.guid)
-                                            .or_else(|| default_node_opt.clone());
-
-                                        let initial_node = match initial_node {
-                                            Some(node) => node,
-                                            None => {
-                                                let resp = mmo_schema::client::ClientPacket::AuthResponse(mmo_schema::client::AuthResponsePacket {
-                                                    success: false,
-                                                    error_code: mmo_schema::client::auth_error_codes::CLUSTER_UNAVAILABLE,
-                                                    session_id: 0,
-                                                    player_guid: 0,
-                                                    assigned_node: String::new(),
-                                                    error_message: "Cluster unavailable".to_string(),
-                                                });
-                                                let _ = send_stream.write_all(&resp.encode()).await;
-                                                return;
-                                            }
-                                        };
-
-                                        router_stream.register_session(
-                                            session_id,
-                                            auth_res.guid,
-                                            initial_node.clone(),
-                                        );
-                                        if let Some(ref handler) = intercept_stream {
-                                            handler
-                                                .subscribe_session_topic(
-                                                    session_id,
-                                                    "chat:global".to_string(),
-                                                )
-                                                .await;
-                                            handler
-                                                .subscribe_session_topic(
-                                                    session_id,
-                                                    format!("whisper:{}", auth_res.guid.raw()),
-                                                )
-                                                .await;
-                                        }
-                                        // Memory ordering: register route before releasing authenticated state
+                                match crate::server::auth_handshake::authenticate_and_register_session(
+                                    auth,
+                                    &auth_req.token,
+                                    session_id,
+                                    &router_stream,
+                                    default_node_opt.as_deref(),
+                                    None,
+                                    intercept_stream.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(auth_sess) => {
                                         is_auth_stream.store(true, Ordering::Release);
-
                                         let resp = mmo_schema::client::ClientPacket::AuthResponse(
-                                            mmo_schema::client::AuthResponsePacket {
-                                                success: true,
-                                                error_code:
-                                                    mmo_schema::client::auth_error_codes::SUCCESS,
-                                                session_id,
-                                                player_guid: auth_res.guid.raw(),
-                                                assigned_node: initial_node,
-                                                error_message: String::new(),
-                                            },
+                                            auth_sess.auth_response,
                                         );
                                         let _ = send_stream.write_all(&resp.encode()).await;
                                     }
-                                    Err(e) => {
-                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
-                                            mmo_schema::client::AuthResponsePacket {
-                                                success: false,
-                                                error_code: e.to_error_code(),
-                                                session_id: 0,
-                                                player_guid: 0,
-                                                assigned_node: String::new(),
-                                                error_message: e.to_string(),
-                                            },
-                                        );
+                                    Err((_err, err_resp)) => {
+                                        let resp =
+                                            mmo_schema::client::ClientPacket::AuthResponse(err_resp);
                                         let _ = send_stream.write_all(&resp.encode()).await;
                                         return;
                                     }

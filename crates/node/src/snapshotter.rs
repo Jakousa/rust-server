@@ -124,10 +124,7 @@ impl WriteBehindSnapshotter {
     /// Returns `true` if enqueued, or `false` if dropped due to channel capacity limits.
     pub fn enqueue_snapshot(&self, payload: SnapshotPayload) -> bool {
         match self.channel_tx.try_send(payload) {
-            Ok(()) => {
-                self.notify.notify_one();
-                true
-            }
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 metrics::counter!("mmo_node_snapshot_dropped_channel_full").increment(1);
                 false
@@ -136,17 +133,12 @@ impl WriteBehindSnapshotter {
         }
     }
 
-    /// Marks an entity as dirty by staging its snapshot in the coalescing dirty map.
-    ///
-    /// This operation acquires an instantaneous in-memory mutex ($< 1\,\mu\text{s}$)
-    /// and ensures monotonic version ordering (`snapshot.version >= existing.version`).
-    /// Returns `true` if staged/coalesced, or `false` if dropped or superseded.
-    pub fn mark_dirty(&self, guid: Guid, snapshot: EntitySnapshot) -> bool {
+    /// Stages a dirty snapshot in the coalescing dirty map without notifying the background worker.
+    fn stage_dirty_without_notify(&self, guid: Guid, snapshot: EntitySnapshot) -> bool {
         let mut map = self.dirty_map.lock().unwrap();
         if let Some(existing) = map.get_mut(&guid) {
             if snapshot.version >= existing.version {
                 *existing = snapshot;
-                self.notify.notify_one();
                 return true;
             }
             return false;
@@ -157,7 +149,6 @@ impl WriteBehindSnapshotter {
             if snapshot.version <= 1 {
                 map.insert(guid, snapshot);
                 metrics::gauge!("mmo_node_snapshot_dirty_queue").set(map.len() as f64);
-                self.notify.notify_one();
                 return true;
             }
             metrics::counter!("mmo_node_snapshot_dropped_capacity").increment(1);
@@ -172,8 +163,21 @@ impl WriteBehindSnapshotter {
 
         map.insert(guid, snapshot);
         metrics::gauge!("mmo_node_snapshot_dirty_queue").set(map.len() as f64);
-        self.notify.notify_one();
         true
+    }
+
+    /// Marks an entity as dirty by staging its snapshot in the coalescing dirty map.
+    ///
+    /// This operation acquires an instantaneous in-memory mutex ($< 1\,\mu\text{s}$)
+    /// and ensures monotonic version ordering (`snapshot.version >= existing.version`).
+    /// Returns `true` if staged/coalesced, or `false` if dropped or superseded.
+    pub fn mark_dirty(&self, guid: Guid, snapshot: EntitySnapshot) -> bool {
+        if self.stage_dirty_without_notify(guid, snapshot) {
+            self.notify.notify_one();
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns the number of currently queued dirty entities.
@@ -226,14 +230,14 @@ impl WriteBehindSnapshotter {
                             Some(payload) => {
                                 let guid = payload.guid;
                                 let snapshot = EntitySnapshot::from(payload);
-                                self.mark_dirty(guid, snapshot);
+                                self.stage_dirty_without_notify(guid, snapshot);
 
                                 // Drain any immediately available payloads in batch
                                 if let Some(ref mut channel) = rx {
                                     while let Ok(p) = channel.try_recv() {
                                         let g = p.guid;
                                         let s = EntitySnapshot::from(p);
-                                        self.mark_dirty(g, s);
+                                        self.stage_dirty_without_notify(g, s);
                                     }
                                 }
 
@@ -248,7 +252,7 @@ impl WriteBehindSnapshotter {
                                     while let Ok(p) = channel.try_recv() {
                                         let g = p.guid;
                                         let s = EntitySnapshot::from(p);
-                                        self.mark_dirty(g, s);
+                                        self.stage_dirty_without_notify(g, s);
                                     }
                                 }
 

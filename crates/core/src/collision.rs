@@ -93,6 +93,11 @@ pub trait CollisionWorld: Send + Sync {
     /// Tests whether a discrete 3D position is free of collision and traversable.
     fn is_point_traversable(&self, point: Vec3) -> bool;
 
+    /// Tests whether a discrete 3D position is free of collision and traversable with a query filter.
+    fn is_point_traversable_with_filter(&self, point: Vec3, _filter: SpatialQueryFilter) -> bool {
+        self.is_point_traversable(point)
+    }
+
     /// Dynamically registers or updates an obstacle bounding box (e.g. placed prefab).
     fn register_obstacle(&mut self, id: Guid, bounds: BoundingBox3D);
 
@@ -131,6 +136,10 @@ impl CollisionWorld for EmptyCollisionWorld {
         true
     }
 
+    fn is_point_traversable_with_filter(&self, _point: Vec3, _filter: SpatialQueryFilter) -> bool {
+        true
+    }
+
     fn register_obstacle(&mut self, _id: Guid, _bounds: BoundingBox3D) {}
 
     fn unregister_obstacle(&mut self, _id: Guid) {}
@@ -140,10 +149,17 @@ impl CollisionWorld for EmptyCollisionWorld {
     }
 }
 
+/// Record storing an obstacle's bounding box and collision layer bitmask.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObstacleRecord {
+    pub bounds: BoundingBox3D,
+    pub layer_mask: u32,
+}
+
 /// High-performance reference collision world based on dynamic Axis-Aligned Bounding Boxes.
 #[derive(Debug, Default, Clone)]
 pub struct AabbCollisionWorld {
-    obstacles: HashMap<Guid, BoundingBox3D>,
+    obstacles: HashMap<Guid, ObstacleRecord>,
 }
 
 impl AabbCollisionWorld {
@@ -166,7 +182,43 @@ impl AabbCollisionWorld {
 
     /// Retrieves the bounding box of a registered obstacle.
     pub fn get_obstacle(&self, id: Guid) -> Option<&BoundingBox3D> {
+        self.obstacles.get(&id).map(|r| &r.bounds)
+    }
+
+    /// Retrieves the obstacle record of a registered obstacle.
+    pub fn get_obstacle_record(&self, id: Guid) -> Option<&ObstacleRecord> {
         self.obstacles.get(&id)
+    }
+
+    /// Dynamically registers or updates an obstacle bounding box with an explicit collision layer bitmask.
+    pub fn register_obstacle_with_layers(
+        &mut self,
+        id: Guid,
+        bounds: BoundingBox3D,
+        layer_mask: u32,
+    ) {
+        self.obstacles
+            .insert(id, ObstacleRecord { bounds, layer_mask });
+    }
+
+    /// Tests whether a discrete 3D position is free of collision and traversable with a query filter.
+    pub fn is_point_traversable_with_filter(
+        &self,
+        point: Vec3,
+        filter: SpatialQueryFilter,
+    ) -> bool {
+        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+            return false;
+        }
+
+        let p_tuple = (point.x, point.y, point.z);
+        for record in self.obstacles.values() {
+            if (filter.collision_layers & record.layer_mask) != 0 && record.bounds.contains(p_tuple)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Helper computing analytical ray intersection against an AABB with surface normal.
@@ -176,81 +228,12 @@ impl AabbCollisionWorld {
         max_dist: f32,
         aabb: &BoundingBox3D,
     ) -> Option<(f32, Vec3)> {
-        let mut t_min = 0.0f32;
-        let mut t_max = max_dist;
-        let mut normal = Vec3::new(0.0, 0.0, 0.0);
-
-        // X slab
-        if dir.x.abs() > 1e-6 {
-            let inv_d = 1.0 / dir.x;
-            let mut t1 = (aabb.min.0 - origin.x) * inv_d;
-            let mut t2 = (aabb.max.0 - origin.x) * inv_d;
-            let mut n1 = Vec3::new(-1.0, 0.0, 0.0);
-            if inv_d < 0.0 {
-                std::mem::swap(&mut t1, &mut t2);
-                n1 = Vec3::new(1.0, 0.0, 0.0);
-            }
-            if t1 > t_min {
-                t_min = t1;
-                normal = n1;
-            }
-            t_max = t_max.min(t2);
-            if t_min > t_max {
-                return None;
-            }
-        } else if origin.x < aabb.min.0 || origin.x > aabb.max.0 {
-            return None;
-        }
-
-        // Y slab
-        if dir.y.abs() > 1e-6 {
-            let inv_d = 1.0 / dir.y;
-            let mut t1 = (aabb.min.1 - origin.y) * inv_d;
-            let mut t2 = (aabb.max.1 - origin.y) * inv_d;
-            let mut n1 = Vec3::new(0.0, -1.0, 0.0);
-            if inv_d < 0.0 {
-                std::mem::swap(&mut t1, &mut t2);
-                n1 = Vec3::new(0.0, 1.0, 0.0);
-            }
-            if t1 > t_min {
-                t_min = t1;
-                normal = n1;
-            }
-            t_max = t_max.min(t2);
-            if t_min > t_max {
-                return None;
-            }
-        } else if origin.y < aabb.min.1 || origin.y > aabb.max.1 {
-            return None;
-        }
-
-        // Z slab
-        if dir.z.abs() > 1e-6 {
-            let inv_d = 1.0 / dir.z;
-            let mut t1 = (aabb.min.2 - origin.z) * inv_d;
-            let mut t2 = (aabb.max.2 - origin.z) * inv_d;
-            let mut n1 = Vec3::new(0.0, 0.0, -1.0);
-            if inv_d < 0.0 {
-                std::mem::swap(&mut t1, &mut t2);
-                n1 = Vec3::new(0.0, 0.0, 1.0);
-            }
-            if t1 > t_min {
-                t_min = t1;
-                normal = n1;
-            }
-            t_max = t_max.min(t2);
-            if t_min > t_max {
-                return None;
-            }
-        } else if origin.z < aabb.min.2 || origin.z > aabb.max.2 {
-            return None;
-        }
-
-        if t_min >= 0.0 && t_min <= max_dist {
-            Some((t_min, normal))
-        } else {
-            None
-        }
+        aabb.intersect_ray_with_normal(
+            (origin.x, origin.y, origin.z),
+            (dir.x, dir.y, dir.z),
+            max_dist,
+        )
+        .map(|(dist, normal)| (dist, Vec3::new(normal.0, normal.1, normal.2)))
     }
 }
 
@@ -277,13 +260,16 @@ impl CollisionWorld for AabbCollisionWorld {
         let norm_dir = direction.normalized()?;
         let mut closest_hit: Option<RayHit> = None;
 
-        for (&id, bounds) in &self.obstacles {
+        for (&id, record) in &self.obstacles {
             if filter.ignore_id == Some(id) {
+                continue;
+            }
+            if (filter.collision_layers & record.layer_mask) == 0 {
                 continue;
             }
 
             if let Some((dist, normal)) =
-                Self::ray_intersect_box(origin, norm_dir, max_distance, bounds)
+                Self::ray_intersect_box(origin, norm_dir, max_distance, &record.bounds)
             {
                 let is_closer = match &closest_hit {
                     Some(prev) => dist < prev.distance,
@@ -338,12 +324,16 @@ impl CollisionWorld for AabbCollisionWorld {
 
         let mut earliest_hit: Option<SweepHit> = None;
 
-        for (&id, bounds) in &self.obstacles {
+        for (&id, record) in &self.obstacles {
             if filter.ignore_id == Some(id) {
+                continue;
+            }
+            if (filter.collision_layers & record.layer_mask) == 0 {
                 continue;
             }
 
             // Minkowski sum: expand the obstacle AABB by the moving AABB's half extents
+            let bounds = &record.bounds;
             let expanded_box = BoundingBox3D::new(
                 (
                     bounds.min.0 - half_x,
@@ -386,21 +376,15 @@ impl CollisionWorld for AabbCollisionWorld {
     }
 
     fn is_point_traversable(&self, point: Vec3) -> bool {
-        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-            return false;
-        }
+        self.is_point_traversable_with_filter(point, SpatialQueryFilter::all())
+    }
 
-        let p_tuple = (point.x, point.y, point.z);
-        for bounds in self.obstacles.values() {
-            if bounds.contains(p_tuple) {
-                return false;
-            }
-        }
-        true
+    fn is_point_traversable_with_filter(&self, point: Vec3, filter: SpatialQueryFilter) -> bool {
+        AabbCollisionWorld::is_point_traversable_with_filter(self, point, filter)
     }
 
     fn register_obstacle(&mut self, id: Guid, bounds: BoundingBox3D) {
-        self.obstacles.insert(id, bounds);
+        self.register_obstacle_with_layers(id, bounds, u32::MAX);
     }
 
     fn unregister_obstacle(&mut self, id: Guid) {
@@ -623,5 +607,45 @@ mod tests {
         let start = Vec3::new(0.0, 0.0, 0.0);
         let end = Vec3::new(1.0, 1.0, 1.0);
         assert_eq!(world.find_path(start, end), Some(vec![start, end]));
+    }
+
+    #[test]
+    fn test_collision_layers_filtering() {
+        let mut world = AabbCollisionWorld::new();
+        let obstacle_id = Guid(100);
+        let obstacle_aabb = create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        // Register obstacle with layer mask 0b0010 (layer 2)
+        world.register_obstacle_with_layers(obstacle_id, obstacle_aabb, 0b0010);
+
+        let ray_origin = Vec3::new(-5.0, 0.0, 0.0);
+        let ray_dir = Vec3::new(1.0, 0.0, 0.0);
+
+        // Query with layer 0b0001 (layer 1) -> ignores obstacle
+        let filter_mismatch = SpatialQueryFilter {
+            ignore_id: None,
+            collision_layers: 0b0001,
+        };
+        assert!(world
+            .raycast(ray_origin, ray_dir, 10.0, filter_mismatch)
+            .is_none());
+        assert!(world.is_point_traversable_with_filter(Vec3::new(0.0, 0.0, 0.0), filter_mismatch));
+
+        let small_box = create_test_aabb(Vec3::new(-5.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        assert!(world
+            .sweep_test(&small_box, Vec3::new(10.0, 0.0, 0.0), filter_mismatch)
+            .is_none());
+
+        // Query with layer 0b0010 -> hits obstacle
+        let filter_match = SpatialQueryFilter {
+            ignore_id: None,
+            collision_layers: 0b0010,
+        };
+        assert!(world
+            .raycast(ray_origin, ray_dir, 10.0, filter_match)
+            .is_some());
+        assert!(!world.is_point_traversable_with_filter(Vec3::new(0.0, 0.0, 0.0), filter_match));
+        assert!(world
+            .sweep_test(&small_box, Vec3::new(10.0, 0.0, 0.0), filter_match)
+            .is_some());
     }
 }

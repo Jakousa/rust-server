@@ -13,7 +13,7 @@ use axum::Router;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use thiserror::Error;
 
-static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static RECORDER_HANDLE: OnceLock<Result<PrometheusHandle, String>> = OnceLock::new();
 
 /// Telemetry initialization or runtime errors.
 #[derive(Error, Debug)]
@@ -43,14 +43,19 @@ impl TelemetryServer {
     /// Thread-safe and re-entrant: caches the `PrometheusHandle` across parallel unit tests
     /// to avoid `SetRecorderError` collisions.
     pub fn init() -> Result<Self, TelemetryError> {
-        let handle = RECORDER_HANDLE.get_or_init(|| {
+        let handle_res = RECORDER_HANDLE.get_or_init(|| {
             PrometheusBuilder::new()
                 .install_recorder()
-                .expect("Failed to install Prometheus recorder")
+                .map_err(|e| e.to_string())
         });
 
+        let handle = handle_res
+            .as_ref()
+            .map_err(|e| TelemetryError::RecorderInit(e.clone()))?
+            .clone();
+
         Ok(Self {
-            handle: handle.clone(),
+            handle,
             ready: Arc::new(AtomicBool::new(false)),
         })
     }

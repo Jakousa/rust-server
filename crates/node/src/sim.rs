@@ -47,6 +47,8 @@ pub struct TickSimulation {
     pub last_tick_duration: Duration,
     pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
     pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
+    pub input_sender: tokio::sync::mpsc::UnboundedSender<QueuedClientInput>,
+    pub input_receiver: tokio::sync::mpsc::UnboundedReceiver<QueuedClientInput>,
     pub ability_compensation_sender: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
     pub ability_compensation_receiver: tokio::sync::mpsc::UnboundedReceiver<AbilityCompensation>,
     pub container_transfer_sender:
@@ -57,6 +59,15 @@ pub struct TickSimulation {
     pub snapshot_interval_ticks: u64,
     pub history: crate::history::SpatialHistoryBuffer,
     pub script_reloader: Option<Arc<mmo_gameplay::ScriptHotReloader>>,
+}
+
+/// Ingress packet queued from a gateway client session, drained at tick boundaries.
+#[derive(Debug, Clone)]
+pub struct QueuedClientInput {
+    pub session_id: u64,
+    pub entity_guid: u64,
+    pub session_epoch: u64,
+    pub packet: mmo_schema::client::ClientPacket,
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -110,6 +121,7 @@ impl TickSimulation {
         ];
 
         let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (input_sender, input_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ability_compensation_sender, ability_compensation_receiver) =
             tokio::sync::mpsc::unbounded_channel();
         let (container_transfer_sender, container_transfer_receiver) =
@@ -144,6 +156,8 @@ impl TickSimulation {
             last_tick_duration: Duration::from_millis(0),
             ack_sender,
             ack_receiver,
+            input_sender,
+            input_receiver,
             ability_compensation_sender,
             ability_compensation_receiver,
             container_transfer_sender,
@@ -152,6 +166,151 @@ impl TickSimulation {
             snapshot_interval_ticks: 20,
             history: crate::history::SpatialHistoryBuffer::default(),
             script_reloader: None,
+        }
+    }
+
+    /// Returns a cloned sender for pushing client input packets into the simulation ingress queue.
+    pub fn input_sender(&self) -> tokio::sync::mpsc::UnboundedSender<QueuedClientInput> {
+        self.input_sender.clone()
+    }
+
+    /// Enqueues an inbound client packet for processing on the next simulation tick.
+    #[allow(clippy::result_large_err)]
+    pub fn queue_client_input(
+        &self,
+        input: QueuedClientInput,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<QueuedClientInput>> {
+        self.input_sender.send(input)
+    }
+
+    /// Drains and processes all queued client input packets.
+    pub fn drain_client_inputs(&mut self) {
+        while let Ok(input) = self.input_receiver.try_recv() {
+            let guid = Guid::from_raw(input.entity_guid);
+            if !self.is_valid_upstream_epoch(guid, input.session_epoch) {
+                metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+                continue;
+            }
+            if !self.entity_store.contains_guid(guid) {
+                continue;
+            }
+            if self.is_migrating(guid) {
+                continue;
+            }
+
+            match input.packet {
+                mmo_schema::client::ClientPacket::ClientAck(ack) => {
+                    self.aoi.process_ack(
+                        ack.session_id,
+                        ack.observed_tick,
+                        ack.ack_mask,
+                        self.tick_counter,
+                    );
+                }
+                mmo_schema::client::ClientPacket::Movement(m) => {
+                    if input.entity_guid != 0 && m.entity_id != input.entity_guid {
+                        tracing::warn!("Spoofed movement entity_id rejected");
+                        metrics::counter!("mmo_node_spoofed_packets_dropped_total").increment(1);
+                        continue;
+                    }
+                    match self.process_client_move_with_seq(
+                        guid,
+                        (m.position.x, m.position.y, m.position.z),
+                        m.sequence,
+                    ) {
+                        Ok(_) => {
+                            metrics::counter!("mmo_node_client_movements_processed_total")
+                                .increment(1);
+                        }
+                        Err(snap_back) => {
+                            let correction = mmo_schema::client::MovementCorrectionPacket {
+                                entity_id: guid.raw(),
+                                corrected_position: mmo_schema::client::Vec3::new(
+                                    snap_back.0,
+                                    snap_back.1,
+                                    snap_back.2,
+                                ),
+                                corrected_velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                                sequence: m.sequence,
+                                reason:
+                                    mmo_schema::client::MovementCorrectionReason::KinematicViolation
+                                        .into(),
+                            };
+                            self.pending_broadcast_jobs
+                                .push(crate::aoi::AoiBroadcastJob {
+                                    session_id: input.session_id,
+                                    player_guid: guid,
+                                    packets: vec![
+                                        mmo_schema::client::ClientPacket::MovementCorrection(
+                                            correction,
+                                        ),
+                                    ],
+                                });
+                            metrics::counter!("mmo_node_movement_corrections_total").increment(1);
+                        }
+                    }
+                }
+                mmo_schema::client::ClientPacket::PlaceObject(po) => {
+                    let _ = self.handle_place_object(guid, &po);
+                }
+                mmo_schema::client::ClientPacket::InteractObject(io) => {
+                    let _ = self.handle_interact_object(guid, &io);
+                }
+                mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
+                    if let Some(spawn) = self.handle_world_object_resync(guid, &resync) {
+                        self.pending_broadcast_jobs
+                            .push(crate::aoi::AoiBroadcastJob {
+                                session_id: input.session_id,
+                                player_guid: guid,
+                                packets: vec![mmo_schema::client::ClientPacket::WorldObjectSpawn(
+                                    spawn,
+                                )],
+                            });
+                    }
+                }
+                mmo_schema::client::ClientPacket::Interaction(interact) => {
+                    let (module_id, sub_opcode) = if interact.action_id > 0xFFFF {
+                        (
+                            (interact.action_id >> 16) as u16,
+                            (interact.action_id & 0xFFFF) as u16,
+                        )
+                    } else {
+                        (
+                            interact.action_id as u16,
+                            match interact.interaction_type {
+                                mmo_schema::client::InteractionType::Custom(sub) => sub as u16,
+                                _ => 0,
+                            },
+                        )
+                    };
+                    if self.packets.has_module(module_id) {
+                        if let Ok(Some(payload)) = self.packets.dispatch(
+                            module_id,
+                            sub_opcode,
+                            guid,
+                            &interact.payload,
+                            &mut self.entity_store,
+                        ) {
+                            self.pending_broadcast_jobs
+                                .push(crate::aoi::AoiBroadcastJob {
+                                    session_id: input.session_id,
+                                    player_guid: guid,
+                                    packets: vec![
+                                        mmo_schema::client::ClientPacket::InteractionResult(
+                                            mmo_schema::client::InteractionResultPacket {
+                                                action_id: interact.action_id,
+                                                success: true,
+                                                error_code: 0,
+                                                payload,
+                                            },
+                                        ),
+                                    ],
+                                });
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -575,7 +734,10 @@ impl TickSimulation {
         self.tick_counter += 1;
         self.advance_time(Duration::from_secs_f32(dt_sec));
 
-        // 0. Drain pending client baseline ACKs in batch without lock contention
+        // 0. Drain queued inbound client packets
+        self.drain_client_inputs();
+
+        // 0.1 Drain pending client baseline ACKs in batch without lock contention
         while let Ok(ack) = self.ack_receiver.try_recv() {
             self.aoi.process_ack(
                 ack.session_id,
@@ -699,42 +861,42 @@ impl TickSimulation {
         }
 
         // 3.6. Record historical spatial tick frame in zero-allocation ring buffer
-        let entity_records: Vec<_> = self
-            .entity_store
-            .iter()
-            .filter_map(|(_key, entity)| {
-                if self.migrating_leases.contains_key(&entity.guid) {
-                    return None;
-                }
-                let half = 0.5f32;
-                let bounds = BoundingBox3D::new(
-                    (
-                        entity.position.0 - half,
-                        entity.position.1 - half,
-                        entity.position.2 - half,
-                    ),
-                    (
-                        entity.position.0 + half,
-                        entity.position.1 + half,
-                        entity.position.2 + half,
-                    ),
-                );
-                Some(crate::history::HistoricalEntityRecord {
-                    guid: entity.guid,
-                    position: entity.position,
-                    bounds,
-                    velocity: (0.0, 0.0, 0.0),
-                    yaw: entity.rotation,
-                    pitch: 0.0,
-                })
+        let Self {
+            ref entity_store,
+            ref migrating_leases,
+            ref mut history,
+            tick_counter,
+            current_time,
+            ..
+        } = *self;
+
+        let entity_records = entity_store.iter().filter_map(|(_key, entity)| {
+            if migrating_leases.contains_key(&entity.guid) {
+                return None;
+            }
+            let half = 0.5f32;
+            let bounds = BoundingBox3D::new(
+                (
+                    entity.position.0 - half,
+                    entity.position.1 - half,
+                    entity.position.2 - half,
+                ),
+                (
+                    entity.position.0 + half,
+                    entity.position.1 + half,
+                    entity.position.2 + half,
+                ),
+            );
+            Some(crate::history::HistoricalEntityRecord {
+                guid: entity.guid,
+                position: entity.position,
+                bounds,
+                velocity: (0.0, 0.0, 0.0),
+                yaw: entity.rotation,
+                pitch: 0.0,
             })
-            .collect();
-        self.history.push_frame(
-            self.tick_counter,
-            self.current_time,
-            now_ms,
-            entity_records.into_iter(),
-        );
+        });
+        history.push_frame(tick_counter, current_time, now_ms, entity_records);
 
         // 4. Record simulation loop metrics
         let duration = start.elapsed();

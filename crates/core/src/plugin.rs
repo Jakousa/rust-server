@@ -154,8 +154,17 @@ impl ComponentCodecRegistry {
         let mut map = serde_json::Map::new();
         for (type_id, boxed) in store.iter() {
             if let Some(codec) = self.by_type_id.get(type_id) {
-                if let Ok(json) = codec.serialize(boxed.as_ref()) {
-                    map.insert(codec.type_name().to_string(), json);
+                match codec.serialize(boxed.as_ref()) {
+                    Ok(json) => {
+                        map.insert(codec.type_name().to_string(), json);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            component = codec.type_name(),
+                            error = %err,
+                            "Failed to serialize component"
+                        );
+                    }
                 }
             }
         }
@@ -176,9 +185,20 @@ impl ComponentCodecRegistry {
         let mut restored = 0;
         for (name, val) in map {
             if let Some(codec) = self.by_name.get(name) {
-                let boxed = codec.deserialize(val.clone())?;
-                store.insert_raw(codec.component_type_id(), boxed);
-                restored += 1;
+                match codec.deserialize(val.clone()) {
+                    Ok(boxed) => {
+                        store.insert_raw(codec.component_type_id(), boxed);
+                        restored += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            component = name.as_str(),
+                            error = %err,
+                            "Failed to deserialize component"
+                        );
+                        return Err(err);
+                    }
+                }
             }
         }
         Ok(restored)
@@ -226,10 +246,10 @@ pub struct EntityDespawnEvent {
 
 impl DomainEvent for EntityDespawnEvent {}
 
-/// Type-erased event queue for deferred domain events.
+/// Type-erased event queue for deferred domain events bucketed by [`TypeId`].
 #[derive(Default)]
 pub struct EventQueue {
-    queue: Vec<Box<dyn Any + Send + Sync>>,
+    queues: HashMap<TypeId, Vec<Box<dyn Any + Send + Sync>>>,
 }
 
 impl EventQueue {
@@ -239,40 +259,40 @@ impl EventQueue {
 
     /// Enqueues a domain event.
     pub fn push<E: DomainEvent>(&mut self, event: E) {
-        self.queue.push(Box::new(event));
+        self.queues
+            .entry(TypeId::of::<E>())
+            .or_default()
+            .push(Box::new(event));
     }
 
     /// Drains all queued events of the specified type `E`.
     pub fn drain<E: DomainEvent>(&mut self) -> Vec<E> {
-        let mut matched = Vec::new();
-        let mut remaining = Vec::new();
+        let Some(items) = self.queues.remove(&TypeId::of::<E>()) else {
+            return Vec::new();
+        };
 
-        for item in self.queue.drain(..) {
-            if item.is::<E>() {
-                if let Ok(concrete) = item.downcast::<E>() {
-                    matched.push(*concrete);
-                }
-            } else {
-                remaining.push(item);
+        let mut matched = Vec::with_capacity(items.len());
+        for item in items {
+            if let Ok(concrete) = item.downcast::<E>() {
+                matched.push(*concrete);
             }
         }
-        self.queue = remaining;
         matched
     }
 
     /// Returns `true` if the queue has no events.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queues.values().all(|v| v.is_empty())
     }
 
     /// Total number of events currently queued.
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.queues.values().map(|v| v.len()).sum()
     }
 
     /// Clears all queued events.
     pub fn clear(&mut self) {
-        self.queue.clear();
+        self.queues.clear();
     }
 }
 
@@ -463,6 +483,40 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].amount, 25);
         assert_eq!(drained[1].amount, 50);
+        assert!(queue.is_empty());
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockHealEvent {
+        target: Guid,
+        amount: u32,
+    }
+    impl DomainEvent for MockHealEvent {}
+
+    #[test]
+    fn test_event_queue_type_id_bucket_isolation() {
+        let mut queue = EventQueue::new();
+        let g1 = Guid::new(EntityType::Player, 1, 10);
+        let g2 = Guid::new(EntityType::Player, 1, 20);
+
+        queue.push(MockDamageEvent {
+            target: g1,
+            amount: 25,
+        });
+        queue.push(MockHealEvent {
+            target: g2,
+            amount: 40,
+        });
+
+        assert_eq!(queue.len(), 2);
+        let damage_events = queue.drain::<MockDamageEvent>();
+        assert_eq!(damage_events.len(), 1);
+        assert_eq!(damage_events[0].amount, 25);
+        assert_eq!(queue.len(), 1);
+
+        let heal_events = queue.drain::<MockHealEvent>();
+        assert_eq!(heal_events.len(), 1);
+        assert_eq!(heal_events[0].amount, 40);
         assert!(queue.is_empty());
     }
 
