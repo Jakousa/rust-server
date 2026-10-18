@@ -108,6 +108,10 @@ pub struct Entity {
     pub position: (f32, f32, f32),
     pub rotation: f32,
     pub state_flags: u32,
+    pub phase_mask: u64,
+    pub visibility_mask: u64,
+    pub stealth_level: u8,
+    pub detection_level: u8,
     pub properties: DynamicProperties,
     pub components: ComponentStore,
 }
@@ -120,9 +124,24 @@ impl Entity {
             position,
             rotation: 0.0,
             state_flags: 0,
+            phase_mask: 1,
+            visibility_mask: u64::MAX,
+            stealth_level: 0,
+            detection_level: 0,
             properties: DynamicProperties::new(),
             components: ComponentStore::new(),
         }
+    }
+
+    /// Returns `true` if this entity can observe `target`, taking into account:
+    /// 1. Phase alignment (`self.phase_mask & target.phase_mask != 0`),
+    /// 2. Visibility group overlap (`self.visibility_mask & target.visibility_mask != 0`),
+    /// 3. Stealth vs. detection rating (`target.stealth_level == 0 || self.detection_level >= target.stealth_level`).
+    #[inline]
+    pub fn can_observe(&self, target: &Entity) -> bool {
+        (self.phase_mask & target.phase_mask) != 0
+            && (self.visibility_mask & target.visibility_mask) != 0
+            && (target.stealth_level == 0 || self.detection_level >= target.stealth_level)
     }
 
     /// Returns `true` if the entity has the `INCAPACITATED` state flag set.
@@ -634,5 +653,54 @@ mod tests {
         assert_eq!(entity.get_property_f64("scale"), Some(1.5));
         assert_eq!(entity.get_property_bool("is_boss"), Some(true));
         assert_eq!(entity.get_property("missing"), None);
+    }
+
+    #[test]
+    fn test_entity_can_observe_phasing_visibility_and_stealth() {
+        let mut obs = Entity::new(Guid::new(EntityType::Player, 1, 1), (0.0, 0.0, 0.0));
+        let mut tgt = Entity::new(Guid::new(EntityType::Player, 1, 2), (0.0, 0.0, 0.0));
+
+        // 1. Default settings: both in phase 1, full visibility mask, 0 stealth/detection -> can observe
+        assert!(obs.can_observe(&tgt));
+
+        // 2. Disjoint phase masks -> cannot observe
+        obs.phase_mask = 0b01;
+        tgt.phase_mask = 0b10;
+        assert!(!obs.can_observe(&tgt));
+
+        // Overlapping phase masks -> can observe
+        tgt.phase_mask = 0b11;
+        assert!(obs.can_observe(&tgt));
+
+        // Reset phase masks
+        obs.phase_mask = 1;
+        tgt.phase_mask = 1;
+
+        // 3. Disjoint visibility masks -> cannot observe
+        obs.visibility_mask = 0b0010;
+        tgt.visibility_mask = 0b0100;
+        assert!(!obs.can_observe(&tgt));
+
+        // Overlapping visibility masks -> can observe
+        tgt.visibility_mask = 0b0110;
+        assert!(obs.can_observe(&tgt));
+
+        // Reset visibility masks
+        obs.visibility_mask = u64::MAX;
+        tgt.visibility_mask = u64::MAX;
+
+        // 4. Stealth vs Detection
+        tgt.stealth_level = 5;
+        obs.detection_level = 0;
+        assert!(!obs.can_observe(&tgt));
+
+        obs.detection_level = 4;
+        assert!(!obs.can_observe(&tgt));
+
+        obs.detection_level = 5;
+        assert!(obs.can_observe(&tgt));
+
+        obs.detection_level = 10;
+        assert!(obs.can_observe(&tgt));
     }
 }

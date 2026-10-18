@@ -140,6 +140,10 @@ pub mod world_object_flags {
     pub const HIDDEN: u32 = 1 << 7;
 }
 
+fn default_phase_mask() -> u64 {
+    1
+}
+
 /// Generalized persistent world object or constructible prefab instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldObject {
@@ -148,6 +152,8 @@ pub struct WorldObject {
     pub transform: Transform3D,
     pub bounds: BoundingBox3D,
     pub state_flags: u32,
+    #[serde(default = "default_phase_mask")]
+    pub phase_mask: u64,
     pub owner: ContainerOwner,
     pub health: Option<ObjectHealth>,
     pub properties: HashMap<String, String>,
@@ -155,7 +161,7 @@ pub struct WorldObject {
 }
 
 impl WorldObject {
-    /// Creates a new `WorldObject` with default active flags and revision 1.
+    /// Creates a new `WorldObject` with default active flags, default phase mask (1), and revision 1.
     pub fn new(
         object_id: Guid,
         prefab_id: u32,
@@ -169,6 +175,7 @@ impl WorldObject {
             transform,
             bounds,
             state_flags: world_object_flags::ACTIVE | world_object_flags::INTERACTIVE,
+            phase_mask: 1,
             owner,
             health: None,
             properties: HashMap::new(),
