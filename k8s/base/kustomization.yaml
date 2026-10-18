@@ -8,3 +8,4 @@ resources:
   - node-statefulset.yaml
   - gateway.yaml
   - loadtest.yaml
+  - pdb.yaml

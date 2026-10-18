@@ -803,6 +803,7 @@ impl GatewayServer {
                         Err((err, err_resp)) => {
                             let resp = ClientPacket::AuthResponse(err_resp);
                             let _ = self.send_packet_to_session(session_id, &resp).await;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
                             return Err(err);
                         }
                     }
