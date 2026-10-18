@@ -12,6 +12,7 @@ use mmo_gameplay::ability::{AbilityDefinition, CooldownTracker};
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::{BatchRemoteAbilityRequest, RemoteAbilityRequest, Vector3};
 
+use crate::network::GrpcClientPool;
 use crate::sim::{AbilityCompensation, TickSimulation};
 
 /// Default network timeout for remote ability dispatch ($100\text{ms}$).
@@ -32,6 +33,7 @@ pub struct CrossNodeDispatcher {
     pub local_node_id: u32,
     pub peer_endpoints: HashMap<u32, String>,
     pub timeout: Duration,
+    pub pool: GrpcClientPool,
 }
 
 impl CrossNodeDispatcher {
@@ -41,6 +43,7 @@ impl CrossNodeDispatcher {
             local_node_id,
             peer_endpoints: HashMap::new(),
             timeout: DEFAULT_DISPATCH_TIMEOUT,
+            pool: GrpcClientPool::default(),
         }
     }
 
@@ -50,7 +53,14 @@ impl CrossNodeDispatcher {
             local_node_id,
             peer_endpoints,
             timeout: DEFAULT_DISPATCH_TIMEOUT,
+            pool: GrpcClientPool::default(),
         }
+    }
+
+    /// Attaches a custom [`GrpcClientPool`] to this dispatcher.
+    pub fn with_pool(mut self, pool: GrpcClientPool) -> Self {
+        self.pool = pool;
+        self
     }
 
     /// Registers or updates a peer simulation node's endpoint.
@@ -81,17 +91,11 @@ impl CrossNodeDispatcher {
         resource_refund: Option<(String, f32)>,
     ) {
         let timeout = self.timeout;
+        let pool = self.pool.clone();
         tokio::spawn(async move {
-            let endpoint_str = if endpoint.starts_with("http") {
-                endpoint
-            } else {
-                format!("http://{}", endpoint)
-            };
-
             let res = tokio::time::timeout(timeout, async {
-                let mut client = NodeServiceClient::connect(endpoint_str)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let channel = pool.get_channel(&endpoint).map_err(|e| e.to_string())?;
+                let mut client = NodeServiceClient::new(channel);
                 let resp = client
                     .dispatch_ability(req)
                     .await
@@ -127,17 +131,11 @@ impl CrossNodeDispatcher {
         resource_refund: Option<(String, f32)>,
     ) {
         let timeout = self.timeout;
+        let pool = self.pool.clone();
         tokio::spawn(async move {
-            let endpoint_str = if endpoint.starts_with("http") {
-                endpoint
-            } else {
-                format!("http://{}", endpoint)
-            };
-
             let res = tokio::time::timeout(timeout, async {
-                let mut client = NodeServiceClient::connect(endpoint_str)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let channel = pool.get_channel(&endpoint).map_err(|e| e.to_string())?;
+                let mut client = NodeServiceClient::new(channel);
                 let resp = client
                     .dispatch_batch_ability(req.clone())
                     .await

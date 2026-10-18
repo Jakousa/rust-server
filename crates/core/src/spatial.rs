@@ -287,67 +287,14 @@ pub fn ray_intersects_aabb(origin: Vec3, target: Vec3, aabb: &BoundingBox3D) -> 
         return false;
     }
 
-    let ray_dir = Vec3::new(
-        dir.x / target_dist,
-        dir.y / target_dist,
-        dir.z / target_dist,
-    );
-
-    let (mut t_min, mut t_max) = (0.0f32, target_dist);
-
-    // X slab
-    if ray_dir.x.abs() > 1e-6 {
-        let inv_d = 1.0 / ray_dir.x;
-        let mut t1 = (aabb.min.0 - origin.x) * inv_d;
-        let mut t2 = (aabb.max.0 - origin.x) * inv_d;
-        if t1 > t2 {
-            std::mem::swap(&mut t1, &mut t2);
-        }
-        t_min = t_min.max(t1);
-        t_max = t_max.min(t2);
-        if t_min > t_max {
-            return false;
-        }
-    } else if origin.x < aabb.min.0 || origin.x > aabb.max.0 {
-        return false;
+    match aabb.intersect_ray_with_normal(
+        (origin.x, origin.y, origin.z),
+        (dir.x, dir.y, dir.z),
+        target_dist,
+    ) {
+        Some((t, _normal)) => t < target_dist - 1e-4,
+        None => false,
     }
-
-    // Y slab
-    if ray_dir.y.abs() > 1e-6 {
-        let inv_d = 1.0 / ray_dir.y;
-        let mut t1 = (aabb.min.1 - origin.y) * inv_d;
-        let mut t2 = (aabb.max.1 - origin.y) * inv_d;
-        if t1 > t2 {
-            std::mem::swap(&mut t1, &mut t2);
-        }
-        t_min = t_min.max(t1);
-        t_max = t_max.min(t2);
-        if t_min > t_max {
-            return false;
-        }
-    } else if origin.y < aabb.min.1 || origin.y > aabb.max.1 {
-        return false;
-    }
-
-    // Z slab
-    if ray_dir.z.abs() > 1e-6 {
-        let inv_d = 1.0 / ray_dir.z;
-        let mut t1 = (aabb.min.2 - origin.z) * inv_d;
-        let mut t2 = (aabb.max.2 - origin.z) * inv_d;
-        if t1 > t2 {
-            std::mem::swap(&mut t1, &mut t2);
-        }
-        t_min = t_min.max(t1);
-        t_max = t_max.min(t2);
-        if t_min > t_max {
-            return false;
-        }
-    } else if origin.z < aabb.min.2 || origin.z > aabb.max.2 {
-        return false;
-    }
-
-    // Intersected strictly between origin and target
-    t_max > 1e-4 && t_min < target_dist - 1e-4
 }
 
 #[cfg(test)]

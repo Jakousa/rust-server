@@ -127,26 +127,50 @@ impl TrajectoryController {
         match self.profile {
             BehaviorProfile::HotspotClustering => {
                 let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                let r = rng.gen_range(0.0..self.hotspot_radius);
+                let max_r = self.hotspot_radius.max(0.01);
+                let r = rng.gen_range(0.0..max_r);
                 let target_x = self.hotspot_center.x + r * angle.cos();
                 let target_z = self.hotspot_center.z + r * angle.sin();
                 let target_y = self.hotspot_center.y;
                 self.target = self.bounds.clamp(Vec3::new(target_x, target_y, target_z));
             }
             BehaviorProfile::RandomWalk | BehaviorProfile::CombatInteraction => {
-                // Pick a coordinate across the origin or quadrant boundary
-                let target_x = if self.position.x > 0.0 {
-                    rng.gen_range(self.bounds.min.x..0.0)
+                let (min_x, max_x) = if self.bounds.min.x < self.bounds.max.x {
+                    (self.bounds.min.x, self.bounds.max.x)
                 } else {
-                    rng.gen_range(0.0..self.bounds.max.x)
+                    (self.bounds.min.x, self.bounds.min.x + 0.01)
+                };
+                let (min_y, max_y) = if self.bounds.min.y < self.bounds.max.y {
+                    (self.bounds.min.y, self.bounds.max.y)
+                } else {
+                    (self.bounds.min.y, self.bounds.min.y + 0.01)
+                };
+                let (min_z, max_z) = if self.bounds.min.z < self.bounds.max.z {
+                    (self.bounds.min.z, self.bounds.max.z)
+                } else {
+                    (self.bounds.min.z, self.bounds.min.z + 0.01)
                 };
 
-                let target_y = rng.gen_range(self.bounds.min.y..self.bounds.max.y);
-
-                let target_z = if self.position.z > 0.0 {
-                    rng.gen_range(self.bounds.min.z..0.0)
+                let target_x = if min_x < 0.0 && max_x > 0.0 {
+                    if self.position.x > 0.0 {
+                        rng.gen_range(min_x..0.0)
+                    } else {
+                        rng.gen_range(0.0..max_x)
+                    }
                 } else {
-                    rng.gen_range(0.0..self.bounds.max.z)
+                    rng.gen_range(min_x..max_x)
+                };
+
+                let target_y = rng.gen_range(min_y..max_y);
+
+                let target_z = if min_z < 0.0 && max_z > 0.0 {
+                    if self.position.z > 0.0 {
+                        rng.gen_range(min_z..0.0)
+                    } else {
+                        rng.gen_range(0.0..max_z)
+                    }
+                } else {
+                    rng.gen_range(min_z..max_z)
                 };
 
                 self.target = Vec3::new(target_x, target_y, target_z);
@@ -162,15 +186,23 @@ impl TrajectoryController {
             return (self.position, self.velocity);
         }
 
-        let dx = self.target.x - self.position.x;
-        let dy = self.target.y - self.position.y;
-        let dz = self.target.z - self.position.z;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let mut dx = self.target.x - self.position.x;
+        let mut dy = self.target.y - self.position.y;
+        let mut dz = self.target.z - self.position.z;
+        let mut dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-        // If target reached within waypoint arrival radius, choose a new target
+        // If target reached within waypoint arrival radius, choose a new target (single refresh, non-recursive)
         if dist < 2.0 {
             self.pick_new_target();
-            return self.step(dt_seconds);
+            dx = self.target.x - self.position.x;
+            dy = self.target.y - self.position.y;
+            dz = self.target.z - self.position.z;
+            dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        }
+
+        if dist < 1e-4 {
+            self.velocity = Vec3::ZERO;
+            return (self.position, self.velocity);
         }
 
         // Compute direction unit vector
@@ -276,5 +308,16 @@ mod tests {
             BehaviorProfile::CombatInteraction
         );
         assert!("invalid".parse::<BehaviorProfile>().is_err());
+    }
+
+    #[test]
+    fn test_trajectory_small_bound_step() {
+        let bounds = WorldBounds::new(Vec3::new(-0.5, -0.5, -0.5), Vec3::new(0.5, 0.5, 0.5));
+        let mut ctrl = TrajectoryController::new(Vec3::ZERO, 5.0, bounds);
+
+        for _ in 0..50 {
+            let (pos, _vel) = ctrl.step(0.05);
+            assert!(bounds.contains(pos));
+        }
     }
 }

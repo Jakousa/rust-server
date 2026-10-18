@@ -31,6 +31,7 @@ pub enum SessionError {
 pub struct BotSession {
     pub guid: Guid,
     pub session_id: u64,
+    pub sequence: u32,
     stream: Option<TcpStream>,
     read_buf: BytesMut,
     pub current_position: Vec3,
@@ -48,6 +49,7 @@ impl BotSession {
         Self {
             guid,
             session_id: 0,
+            sequence: 0,
             stream: None,
             read_buf: BytesMut::with_capacity(4096),
             current_position: initial_pos,
@@ -83,6 +85,7 @@ impl BotSession {
 
     /// Sends a movement packet with current position and velocity.
     pub async fn send_movement(&mut self, timestamp_ms: u64) -> Result<(), SessionError> {
+        self.sequence = self.sequence.wrapping_add(1);
         let packet = ClientPacket::Movement(MovementPacket {
             entity_id: self.guid.raw(),
             position: self.current_position,
@@ -90,7 +93,7 @@ impl BotSession {
             yaw: 0.0,
             pitch: 0.0,
             timestamp: timestamp_ms,
-            sequence: 1,
+            sequence: self.sequence,
         });
         self.send_packet(&packet).await
     }

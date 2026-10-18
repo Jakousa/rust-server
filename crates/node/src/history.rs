@@ -397,74 +397,7 @@ impl SpatialHistoryBuffer {
         let Some((f_a, f_b, alpha)) = self.find_bounding_frames(target_time) else {
             return Vec::new();
         };
-
-        if f_a.tick == f_b.tick || alpha <= 1e-6 {
-            return f_a.entities.clone();
-        }
-        if (alpha - 1.0).abs() <= 1e-6 {
-            return f_b.entities.clone();
-        }
-
-        use std::collections::HashMap;
-        let mut map_a: HashMap<Guid, &HistoricalEntityRecord> =
-            HashMap::with_capacity(f_a.entities.len());
-        for ent in &f_a.entities {
-            map_a.insert(ent.guid, ent);
-        }
-
-        let mut reconstructed = Vec::with_capacity(f_b.entities.len());
-        let inv_alpha = 1.0 - alpha;
-
-        for ent_b in &f_b.entities {
-            if let Some(ent_a) = map_a.remove(&ent_b.guid) {
-                // Entity exists in both frames: linearly interpolate
-                let pos = (
-                    ent_a.position.0 * inv_alpha + ent_b.position.0 * alpha,
-                    ent_a.position.1 * inv_alpha + ent_b.position.1 * alpha,
-                    ent_a.position.2 * inv_alpha + ent_b.position.2 * alpha,
-                );
-                let bounds = BoundingBox3D::new(
-                    (
-                        ent_a.bounds.min.0 * inv_alpha + ent_b.bounds.min.0 * alpha,
-                        ent_a.bounds.min.1 * inv_alpha + ent_b.bounds.min.1 * alpha,
-                        ent_a.bounds.min.2 * inv_alpha + ent_b.bounds.min.2 * alpha,
-                    ),
-                    (
-                        ent_a.bounds.max.0 * inv_alpha + ent_b.bounds.max.0 * alpha,
-                        ent_a.bounds.max.1 * inv_alpha + ent_b.bounds.max.1 * alpha,
-                        ent_a.bounds.max.2 * inv_alpha + ent_b.bounds.max.2 * alpha,
-                    ),
-                );
-                let vel = (
-                    ent_a.velocity.0 * inv_alpha + ent_b.velocity.0 * alpha,
-                    ent_a.velocity.1 * inv_alpha + ent_b.velocity.1 * alpha,
-                    ent_a.velocity.2 * inv_alpha + ent_b.velocity.2 * alpha,
-                );
-                let yaw = ent_a.yaw * inv_alpha + ent_b.yaw * alpha;
-                let pitch = ent_a.pitch * inv_alpha + ent_b.pitch * alpha;
-
-                reconstructed.push(HistoricalEntityRecord {
-                    guid: ent_b.guid,
-                    position: pos,
-                    bounds,
-                    velocity: vel,
-                    yaw,
-                    pitch,
-                });
-            } else if alpha >= 0.5 {
-                // Entity only spawned in frame B; include if past midpoint
-                reconstructed.push(ent_b.clone());
-            }
-        }
-
-        // Include entities that despawned in frame B if alpha < 0.5
-        if alpha < 0.5 {
-            for (_, ent_a) in map_a {
-                reconstructed.push(ent_a.clone());
-            }
-        }
-
-        reconstructed
+        interpolate_frames(f_a, f_b, alpha)
     }
 
     /// Reconstructs the historical spatial scene at `target_ms`.
@@ -472,71 +405,7 @@ impl SpatialHistoryBuffer {
         let Some((f_a, f_b, alpha)) = self.find_bounding_frames_ms(target_ms) else {
             return Vec::new();
         };
-
-        if f_a.tick == f_b.tick || alpha <= 1e-6 {
-            return f_a.entities.clone();
-        }
-        if (alpha - 1.0).abs() <= 1e-6 {
-            return f_b.entities.clone();
-        }
-
-        use std::collections::HashMap;
-        let mut map_a: HashMap<Guid, &HistoricalEntityRecord> =
-            HashMap::with_capacity(f_a.entities.len());
-        for ent in &f_a.entities {
-            map_a.insert(ent.guid, ent);
-        }
-
-        let mut reconstructed = Vec::with_capacity(f_b.entities.len());
-        let inv_alpha = 1.0 - alpha;
-
-        for ent_b in &f_b.entities {
-            if let Some(ent_a) = map_a.remove(&ent_b.guid) {
-                let pos = (
-                    ent_a.position.0 * inv_alpha + ent_b.position.0 * alpha,
-                    ent_a.position.1 * inv_alpha + ent_b.position.1 * alpha,
-                    ent_a.position.2 * inv_alpha + ent_b.position.2 * alpha,
-                );
-                let bounds = BoundingBox3D::new(
-                    (
-                        ent_a.bounds.min.0 * inv_alpha + ent_b.bounds.min.0 * alpha,
-                        ent_a.bounds.min.1 * inv_alpha + ent_b.bounds.min.1 * alpha,
-                        ent_a.bounds.min.2 * inv_alpha + ent_b.bounds.min.2 * alpha,
-                    ),
-                    (
-                        ent_a.bounds.max.0 * inv_alpha + ent_b.bounds.max.0 * alpha,
-                        ent_a.bounds.max.1 * inv_alpha + ent_b.bounds.max.1 * alpha,
-                        ent_a.bounds.max.2 * inv_alpha + ent_b.bounds.max.2 * alpha,
-                    ),
-                );
-                let vel = (
-                    ent_a.velocity.0 * inv_alpha + ent_b.velocity.0 * alpha,
-                    ent_a.velocity.1 * inv_alpha + ent_b.velocity.1 * alpha,
-                    ent_a.velocity.2 * inv_alpha + ent_b.velocity.2 * alpha,
-                );
-                let yaw = ent_a.yaw * inv_alpha + ent_b.yaw * alpha;
-                let pitch = ent_a.pitch * inv_alpha + ent_b.pitch * alpha;
-
-                reconstructed.push(HistoricalEntityRecord {
-                    guid: ent_b.guid,
-                    position: pos,
-                    bounds,
-                    velocity: vel,
-                    yaw,
-                    pitch,
-                });
-            } else if alpha >= 0.5 {
-                reconstructed.push(ent_b.clone());
-            }
-        }
-
-        if alpha < 0.5 {
-            for (_, ent_a) in map_a {
-                reconstructed.push(ent_a.clone());
-            }
-        }
-
-        reconstructed
+        interpolate_frames(f_a, f_b, alpha)
     }
 
     /// Performs an authoritative lag-compensated raycast against historical entity bounding boxes.
@@ -590,39 +459,16 @@ impl SpatialHistoryBuffer {
 
         let (f_a, f_b, _) = self.find_bounding_frames(clamped_target)?;
         let tick_bracket = (f_a.tick, f_b.tick);
-
         let entities = self.interpolate_scene(clamped_target);
-        let mut closest_hit: Option<HistoricalHitResult> = None;
-        let mut min_t = max_distance;
 
-        for ent in entities {
-            if Some(ent.guid) == exclude_guid {
-                continue;
-            }
-
-            if let Some(t) = ent.bounds.intersects_ray(origin, norm_dir, min_t) {
-                if t >= 0.0 && t <= min_t {
-                    min_t = t;
-                    let hit_point = (
-                        origin.0 + norm_dir.0 * t,
-                        origin.1 + norm_dir.1 * t,
-                        origin.2 + norm_dir.2 * t,
-                    );
-                    closest_hit = Some(HistoricalHitResult {
-                        target_guid: ent.guid,
-                        hit_point,
-                        distance: t,
-                        tick_bracket,
-                    });
-                }
-            }
-        }
-
-        if closest_hit.is_some() {
-            metrics::counter!("mmo_lag_compensation_hits_total").increment(1);
-        }
-
-        closest_hit
+        raycast_interpolated_scene(
+            origin,
+            norm_dir,
+            max_distance,
+            tick_bracket,
+            &entities,
+            exclude_guid,
+        )
     }
 
     /// Millisecond variant of authoritative lag-compensated raycast.
@@ -664,39 +510,16 @@ impl SpatialHistoryBuffer {
         let (clamped_ms, _) = self.clamp_rewind_ms(current_ms, target_ms);
         let (f_a, f_b, _) = self.find_bounding_frames_ms(clamped_ms)?;
         let tick_bracket = (f_a.tick, f_b.tick);
-
         let entities = self.interpolate_scene_ms(clamped_ms);
-        let mut closest_hit: Option<HistoricalHitResult> = None;
-        let mut min_t = max_distance;
 
-        for ent in entities {
-            if Some(ent.guid) == exclude_guid {
-                continue;
-            }
-
-            if let Some(t) = ent.bounds.intersects_ray(origin, norm_dir, min_t) {
-                if t >= 0.0 && t <= min_t {
-                    min_t = t;
-                    let hit_point = (
-                        origin.0 + norm_dir.0 * t,
-                        origin.1 + norm_dir.1 * t,
-                        origin.2 + norm_dir.2 * t,
-                    );
-                    closest_hit = Some(HistoricalHitResult {
-                        target_guid: ent.guid,
-                        hit_point,
-                        distance: t,
-                        tick_bracket,
-                    });
-                }
-            }
-        }
-
-        if closest_hit.is_some() {
-            metrics::counter!("mmo_lag_compensation_hits_total").increment(1);
-        }
-
-        closest_hit
+        raycast_interpolated_scene(
+            origin,
+            norm_dir,
+            max_distance,
+            tick_bracket,
+            &entities,
+            exclude_guid,
+        )
     }
 
     /// Authoritatively validates whether a target entity was within range at historical timestamp `target_time`.
@@ -740,6 +563,123 @@ impl Default for SpatialHistoryBuffer {
     fn default() -> Self {
         Self::new(Self::DEFAULT_CAPACITY, Self::DEFAULT_ENTITY_CAPACITY)
     }
+}
+
+/// Linearly interpolates entity positions, bounding boxes, velocities, and orientations between two bounding frames.
+fn interpolate_frames(
+    f_a: &HistoricalTickFrame,
+    f_b: &HistoricalTickFrame,
+    alpha: f32,
+) -> Vec<HistoricalEntityRecord> {
+    if f_a.tick == f_b.tick || alpha <= 1e-6 {
+        return f_a.entities.clone();
+    }
+    if (alpha - 1.0).abs() <= 1e-6 {
+        return f_b.entities.clone();
+    }
+
+    use std::collections::HashMap;
+    let mut map_a: HashMap<Guid, &HistoricalEntityRecord> =
+        HashMap::with_capacity(f_a.entities.len());
+    for ent in &f_a.entities {
+        map_a.insert(ent.guid, ent);
+    }
+
+    let mut reconstructed = Vec::with_capacity(f_b.entities.len());
+    let inv_alpha = 1.0 - alpha;
+
+    for ent_b in &f_b.entities {
+        if let Some(ent_a) = map_a.remove(&ent_b.guid) {
+            // Entity exists in both frames: linearly interpolate
+            let pos = (
+                ent_a.position.0 * inv_alpha + ent_b.position.0 * alpha,
+                ent_a.position.1 * inv_alpha + ent_b.position.1 * alpha,
+                ent_a.position.2 * inv_alpha + ent_b.position.2 * alpha,
+            );
+            let bounds = BoundingBox3D::new(
+                (
+                    ent_a.bounds.min.0 * inv_alpha + ent_b.bounds.min.0 * alpha,
+                    ent_a.bounds.min.1 * inv_alpha + ent_b.bounds.min.1 * alpha,
+                    ent_a.bounds.min.2 * inv_alpha + ent_b.bounds.min.2 * alpha,
+                ),
+                (
+                    ent_a.bounds.max.0 * inv_alpha + ent_b.bounds.max.0 * alpha,
+                    ent_a.bounds.max.1 * inv_alpha + ent_b.bounds.max.1 * alpha,
+                    ent_a.bounds.max.2 * inv_alpha + ent_b.bounds.max.2 * alpha,
+                ),
+            );
+            let vel = (
+                ent_a.velocity.0 * inv_alpha + ent_b.velocity.0 * alpha,
+                ent_a.velocity.1 * inv_alpha + ent_b.velocity.1 * alpha,
+                ent_a.velocity.2 * inv_alpha + ent_b.velocity.2 * alpha,
+            );
+            let yaw = ent_a.yaw * inv_alpha + ent_b.yaw * alpha;
+            let pitch = ent_a.pitch * inv_alpha + ent_b.pitch * alpha;
+
+            reconstructed.push(HistoricalEntityRecord {
+                guid: ent_b.guid,
+                position: pos,
+                bounds,
+                velocity: vel,
+                yaw,
+                pitch,
+            });
+        } else if alpha >= 0.5 {
+            // Entity only spawned in frame B; include if past midpoint
+            reconstructed.push(ent_b.clone());
+        }
+    }
+
+    // Include entities that despawned in frame B if alpha < 0.5
+    if alpha < 0.5 {
+        for (_, ent_a) in map_a {
+            reconstructed.push(ent_a.clone());
+        }
+    }
+
+    reconstructed
+}
+
+/// Helper performing closest raycast against historical entity bounding boxes.
+fn raycast_interpolated_scene(
+    origin: (f32, f32, f32),
+    norm_dir: (f32, f32, f32),
+    max_distance: f32,
+    tick_bracket: (u64, u64),
+    entities: &[HistoricalEntityRecord],
+    exclude_guid: Option<Guid>,
+) -> Option<HistoricalHitResult> {
+    let mut closest_hit: Option<HistoricalHitResult> = None;
+    let mut min_t = max_distance;
+
+    for ent in entities {
+        if Some(ent.guid) == exclude_guid {
+            continue;
+        }
+
+        if let Some(t) = ent.bounds.intersects_ray(origin, norm_dir, min_t) {
+            if t >= 0.0 && t <= min_t {
+                min_t = t;
+                let hit_point = (
+                    origin.0 + norm_dir.0 * t,
+                    origin.1 + norm_dir.1 * t,
+                    origin.2 + norm_dir.2 * t,
+                );
+                closest_hit = Some(HistoricalHitResult {
+                    target_guid: ent.guid,
+                    hit_point,
+                    distance: t,
+                    tick_bracket,
+                });
+            }
+        }
+    }
+
+    if closest_hit.is_some() {
+        metrics::counter!("mmo_lag_compensation_hits_total").increment(1);
+    }
+
+    closest_hit
 }
 
 #[cfg(test)]
