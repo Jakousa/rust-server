@@ -312,6 +312,7 @@ pub struct TickContext<'a> {
     pub events: &'a mut EventQueue,
     pub dt_sec: f32,
     pub tick: u64,
+    pub collision_world: Option<&'a dyn crate::collision::CollisionWorld>,
 }
 
 /// Batch system executed during the simulation tick over the entity store.

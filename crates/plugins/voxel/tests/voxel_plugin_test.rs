@@ -240,6 +240,7 @@ fn test_voxel_tick_system_persistence_events_and_pruning() {
             entities: &mut entities,
             events: &mut event_queue,
             octree: &mut octree,
+            collision_world: None,
         };
         tick_systems[0].update(&mut ctx);
     }
@@ -269,6 +270,7 @@ fn test_voxel_tick_system_persistence_events_and_pruning() {
             entities: &mut entities,
             events: &mut event_queue,
             octree: &mut octree,
+            collision_world: None,
         };
         tick_systems[0].update(&mut ctx);
     }

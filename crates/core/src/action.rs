@@ -437,6 +437,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.05,
                 tick: 1,
+                collision_world: None,
             };
             tick_system.update(&mut ctx);
         }
@@ -457,6 +458,7 @@ mod tests {
                 events: &mut events,
                 dt_sec: 0.05,
                 tick: 2,
+                collision_world: None,
             };
             tick_system.update(&mut ctx);
         }

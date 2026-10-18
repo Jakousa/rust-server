@@ -84,6 +84,7 @@ fn test_data_driven_content_pipeline_and_hot_reload() {
             events: &mut events,
             dt_sec: 0.1,
             tick: 1,
+            collision_world: None,
         };
         spawner_system.update(&mut ctx);
     }
@@ -194,6 +195,7 @@ fn test_data_driven_content_pipeline_and_hot_reload() {
             events: &mut events,
             dt_sec: 0.1,
             tick: 2,
+            collision_world: None,
         };
         spawner_system.update(&mut ctx);
     }

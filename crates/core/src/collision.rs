@@ -4,7 +4,7 @@
 //! raycasting hit structures, continuous collision detection (CCD) sweep tests,
 //! and reference spatial substrates.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::guid::Guid;
 use crate::octree::BoundingBox3D;
@@ -235,6 +235,43 @@ impl AabbCollisionWorld {
         )
         .map(|(dist, normal)| (dist, Vec3::new(normal.0, normal.1, normal.2)))
     }
+
+    /// Checks whether a linear segment between `from` and `to` is completely unobstructed,
+    /// testing both raycast line-of-sight and clearance bounding box sweep.
+    pub fn is_segment_clear(&self, from: Vec3, to: Vec3, clearance: f32) -> bool {
+        let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
+        let dist = diff.length();
+        if dist < 1e-4 {
+            return true;
+        }
+        let Some(norm_dir) = diff.normalized() else {
+            return true;
+        };
+
+        // 1. Line-of-sight raycast check
+        if self
+            .raycast(from, norm_dir, dist, SpatialQueryFilter::all())
+            .is_some()
+        {
+            return false;
+        }
+
+        // 2. Continuous collision sweep test with clearance volume
+        if clearance > 0.0 {
+            let clearance_box = BoundingBox3D::new(
+                (from.x - clearance, from.y - clearance, from.z - clearance),
+                (from.x + clearance, from.y + clearance, from.z + clearance),
+            );
+            if self
+                .sweep_test(&clearance_box, diff, SpatialQueryFilter::all())
+                .is_some()
+            {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 impl CollisionWorld for AabbCollisionWorld {
@@ -402,40 +439,202 @@ impl CollisionWorld for AabbCollisionWorld {
             return None;
         }
 
-        // 1. Direct path check
-        let dir = Vec3::new(end.x - start.x, end.y - start.y, end.z - start.z);
-        let dist = dir.length();
+        // Fast Path 1: Check start & end point traversability
+        if !self.is_point_traversable(start) || !self.is_point_traversable(end) {
+            return None;
+        }
+
+        // Fast Path 2: Negligible distance
+        let diff = Vec3::new(end.x - start.x, end.y - start.y, end.z - start.z);
+        let dist = diff.length();
         if dist < 1e-4 {
             return Some(vec![start, end]);
         }
 
-        let norm_dir = dir.normalized()?;
-        // Check if direct ray hits anything before end
-        let hit = self.raycast(start, norm_dir, dist, SpatialQueryFilter::all());
-        if hit.is_none() {
+        const STEP: f32 = 1.0;
+        const CLEARANCE: f32 = 0.4;
+        const MAX_EXPANDED_NODES: usize = 2048;
+
+        // Fast Path 3: Direct line-of-sight raycast & clearance sweep
+        if self.is_segment_clear(start, end, CLEARANCE) {
             return Some(vec![start, end]);
         }
 
-        // 2. Simple obstacle avoidance routing around the blocking obstacle
-        let hit_hit = hit.unwrap();
-        if let Some(obstacle_id) = hit_hit.entity_id {
-            if let Some(bounds) = self.get_obstacle(obstacle_id) {
-                // Route around the obstacle corners
-                let margin = 0.5f32;
-                // Corner 1: (min.x - margin, max.y, min.z - margin)
-                let wp1 = Vec3::new(bounds.min.0 - margin, start.y, bounds.min.2 - margin);
-                // Corner 2: (max.x + margin, max.y, min.z - margin)
-                let wp2 = Vec3::new(bounds.max.0 + margin, start.y, bounds.min.2 - margin);
+        // Discretized 3D/2.5D A* Lattice Search anchored at `start`
+        #[derive(Copy, Clone, PartialEq)]
+        struct AStarNode {
+            f_score: f32,
+            coord: (i32, i32, i32),
+        }
 
-                let d1 = start.distance(&wp1) + wp1.distance(&end);
-                let d2 = start.distance(&wp2) + wp2.distance(&end);
-                let chosen_wp = if d1 <= d2 { wp1 } else { wp2 };
+        impl Eq for AStarNode {}
 
-                return Some(vec![start, chosen_wp, end]);
+        impl PartialOrd for AStarNode {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
             }
         }
 
-        Some(vec![start, end])
+        impl Ord for AStarNode {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other
+                    .f_score
+                    .partial_cmp(&self.f_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let cell_pos = |c: (i32, i32, i32)| {
+            Vec3::new(
+                start.x + c.0 as f32 * STEP,
+                start.y + c.1 as f32 * STEP,
+                start.z + c.2 as f32 * STEP,
+            )
+        };
+
+        let goal_cell = (
+            ((end.x - start.x) / STEP).round() as i32,
+            ((end.y - start.y) / STEP).round() as i32,
+            ((end.z - start.z) / STEP).round() as i32,
+        );
+
+        let heuristic = |c: (i32, i32, i32)| {
+            let pos = cell_pos(c);
+            let dx = end.x - pos.x;
+            let dy = end.y - pos.y;
+            let dz = end.z - pos.z;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+
+        let mut open_set = BinaryHeap::new();
+        let mut g_score: HashMap<(i32, i32, i32), f32> = HashMap::new();
+        let mut came_from: HashMap<(i32, i32, i32), (i32, i32, i32)> = HashMap::new();
+
+        let start_coord = (0, 0, 0);
+        g_score.insert(start_coord, 0.0);
+        open_set.push(AStarNode {
+            f_score: heuristic(start_coord),
+            coord: start_coord,
+        });
+
+        let mut expanded_count = 0;
+        let mut reached_goal_coord: Option<(i32, i32, i32)> = None;
+        let check_vertical = (end.y - start.y).abs() > 0.5;
+
+        while let Some(current) = open_set.pop() {
+            let curr_coord = current.coord;
+            let curr_g = match g_score.get(&curr_coord) {
+                Some(&g) => g,
+                None => continue,
+            };
+            let curr_pos = cell_pos(curr_coord);
+
+            // Goal condition: within <= 1.5 * STEP of end (or goal cell reached) and clear line to end
+            let to_end = Vec3::new(end.x - curr_pos.x, end.y - curr_pos.y, end.z - curr_pos.z);
+            let dist_to_end = to_end.length();
+            if (dist_to_end <= 1.5 * STEP || curr_coord == goal_cell)
+                && self.is_segment_clear(curr_pos, end, CLEARANCE)
+            {
+                reached_goal_coord = Some(curr_coord);
+                break;
+            }
+
+            expanded_count += 1;
+            if expanded_count >= MAX_EXPANDED_NODES {
+                break;
+            }
+
+            let mut neighbors: Vec<((i32, i32, i32), f32)> = vec![
+                ((curr_coord.0 + 1, curr_coord.1, curr_coord.2), 1.0),
+                ((curr_coord.0 - 1, curr_coord.1, curr_coord.2), 1.0),
+                ((curr_coord.0, curr_coord.1, curr_coord.2 + 1), 1.0),
+                ((curr_coord.0, curr_coord.1, curr_coord.2 - 1), 1.0),
+                (
+                    (curr_coord.0 + 1, curr_coord.1, curr_coord.2 + 1),
+                    std::f32::consts::SQRT_2,
+                ),
+                (
+                    (curr_coord.0 - 1, curr_coord.1, curr_coord.2 + 1),
+                    std::f32::consts::SQRT_2,
+                ),
+                (
+                    (curr_coord.0 + 1, curr_coord.1, curr_coord.2 - 1),
+                    std::f32::consts::SQRT_2,
+                ),
+                (
+                    (curr_coord.0 - 1, curr_coord.1, curr_coord.2 - 1),
+                    std::f32::consts::SQRT_2,
+                ),
+            ];
+            if check_vertical {
+                neighbors.push(((curr_coord.0, curr_coord.1 + 1, curr_coord.2), 1.0));
+                neighbors.push(((curr_coord.0, curr_coord.1 - 1, curr_coord.2), 1.0));
+            }
+
+            for (next_coord, cost) in neighbors {
+                let next_pos = cell_pos(next_coord);
+                if !self.is_point_traversable(next_pos) {
+                    continue;
+                }
+                if !self.is_segment_clear(curr_pos, next_pos, CLEARANCE) {
+                    continue;
+                }
+
+                let tentative_g = curr_g + cost;
+                if tentative_g < *g_score.get(&next_coord).unwrap_or(&f32::INFINITY) {
+                    came_from.insert(next_coord, curr_coord);
+                    g_score.insert(next_coord, tentative_g);
+                    let f = tentative_g + heuristic(next_coord);
+                    open_set.push(AStarNode {
+                        f_score: f,
+                        coord: next_coord,
+                    });
+                }
+            }
+        }
+
+        let goal_coord = reached_goal_coord?;
+
+        // Reconstruct raw waypoint sequence from goal to start
+        let mut raw_coords = Vec::new();
+        let mut curr = goal_coord;
+        raw_coords.push(curr);
+        while let Some(&prev) = came_from.get(&curr) {
+            raw_coords.push(prev);
+            curr = prev;
+        }
+        raw_coords.reverse();
+
+        let mut raw: Vec<Vec3> = raw_coords.into_iter().map(cell_pos).collect();
+        if raw.is_empty() {
+            raw.push(start);
+        } else {
+            raw[0] = start;
+        }
+
+        let last_pos = *raw.last().unwrap();
+        let dist_last_to_end =
+            Vec3::new(end.x - last_pos.x, end.y - last_pos.y, end.z - last_pos.z).length();
+        if dist_last_to_end > 1e-4 {
+            raw.push(end);
+        }
+
+        // Line-of-sight string-pulling (greedy path smoothing)
+        let mut smoothed = vec![raw[0]];
+        let mut current_idx = 0;
+        while current_idx + 1 < raw.len() {
+            let mut furthest_idx = current_idx + 1;
+            for candidate_idx in ((current_idx + 2)..raw.len()).rev() {
+                if self.is_segment_clear(raw[current_idx], raw[candidate_idx], CLEARANCE) {
+                    furthest_idx = candidate_idx;
+                    break;
+                }
+            }
+            smoothed.push(raw[furthest_idx]);
+            current_idx = furthest_idx;
+        }
+
+        Some(smoothed)
     }
 }
 
@@ -647,5 +846,124 @@ mod tests {
         assert!(world
             .sweep_test(&small_box, Vec3::new(10.0, 0.0, 0.0), filter_match)
             .is_some());
+    }
+
+    #[test]
+    fn test_pathfinding_around_single_wall() {
+        let mut world = AabbCollisionWorld::new();
+        let obstacle_id = Guid(101);
+        let wall = create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 2.0, 3.0));
+        world.register_obstacle(obstacle_id, wall);
+
+        let start = Vec3::new(-5.0, 0.0, 0.0);
+        let end = Vec3::new(5.0, 0.0, 0.0);
+        let path = world
+            .find_path(start, end)
+            .expect("should find path around single wall");
+
+        assert!(path.len() >= 3);
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+
+        for i in 0..(path.len() - 1) {
+            let from = path[i];
+            let to = path[i + 1];
+            assert!(world.is_segment_clear(from, to, 0.4));
+        }
+    }
+
+    #[test]
+    fn test_pathfinding_around_l_shaped_barrier() {
+        let mut world = AabbCollisionWorld::new();
+        // Wall 1: from x = -2.0 to 2.0 at z = 0.0 (half_size = (2.0, 1.0, 0.5))
+        world.register_obstacle(
+            Guid(201),
+            create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 1.0, 0.5)),
+        );
+        // Wall 2: extending from x = 2.0 along +z to z = 4.0 (center = (2.0, 0.0, 2.0), half_size = (0.5, 1.0, 2.0))
+        world.register_obstacle(
+            Guid(202),
+            create_test_aabb(Vec3::new(2.0, 0.0, 2.0), Vec3::new(0.5, 1.0, 2.0)),
+        );
+
+        let start = Vec3::new(0.0, 0.0, 2.0);
+        let end = Vec3::new(4.0, 0.0, -2.0);
+
+        let path = world
+            .find_path(start, end)
+            .expect("should navigate around L-shaped barrier");
+        assert!(path.len() >= 3);
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+
+        for i in 0..(path.len() - 1) {
+            let from = path[i];
+            let to = path[i + 1];
+            assert!(world.is_segment_clear(from, to, 0.4));
+        }
+    }
+
+    #[test]
+    fn test_pathfinding_around_u_shaped_trap() {
+        let mut world = AabbCollisionWorld::new();
+        // Back wall of U: x in [-3.0, 3.0], z at 0.0
+        world.register_obstacle(
+            Guid(301),
+            create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(3.0, 1.0, 0.5)),
+        );
+        // Left arm of U: x at -3.0, z from 0.0 to 4.0
+        world.register_obstacle(
+            Guid(302),
+            create_test_aabb(Vec3::new(-3.0, 0.0, 2.0), Vec3::new(0.5, 1.0, 2.0)),
+        );
+        // Right arm of U: x at 3.0, z from 0.0 to 4.0
+        world.register_obstacle(
+            Guid(303),
+            create_test_aabb(Vec3::new(3.0, 0.0, 2.0), Vec3::new(0.5, 1.0, 2.0)),
+        );
+
+        let start = Vec3::new(0.0, 0.0, 1.0);
+        let end = Vec3::new(0.0, 0.0, -3.0);
+
+        let path = world
+            .find_path(start, end)
+            .expect("should escape U-trap and reach destination");
+        assert!(path.len() >= 4);
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+
+        for i in 0..(path.len() - 1) {
+            let from = path[i];
+            let to = path[i + 1];
+            assert!(world.is_segment_clear(from, to, 0.4));
+        }
+    }
+
+    #[test]
+    fn test_pathfinding_unreachable_enclosed_target() {
+        let mut world = AabbCollisionWorld::new();
+        // 4 solid enclosing walls around (0, 0, 0)
+        world.register_obstacle(
+            Guid(401),
+            create_test_aabb(Vec3::new(0.0, 0.0, 2.0), Vec3::new(2.5, 1.0, 0.5)),
+        );
+        world.register_obstacle(
+            Guid(402),
+            create_test_aabb(Vec3::new(0.0, 0.0, -2.0), Vec3::new(2.5, 1.0, 0.5)),
+        );
+        world.register_obstacle(
+            Guid(403),
+            create_test_aabb(Vec3::new(-2.0, 0.0, 0.0), Vec3::new(0.5, 1.0, 2.5)),
+        );
+        world.register_obstacle(
+            Guid(404),
+            create_test_aabb(Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.5, 1.0, 2.5)),
+        );
+
+        let start = Vec3::new(-10.0, 0.0, 0.0);
+        let end = Vec3::new(0.0, 0.0, 0.0);
+
+        let path = world.find_path(start, end);
+        assert!(path.is_none(), "fully enclosed target must be unreachable");
     }
 }

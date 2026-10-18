@@ -793,15 +793,20 @@ impl TickSimulation {
         }
 
         // 1. Run batch tick systems registered by plugins
-        let mut tick_ctx = TickContext {
-            entities: &mut self.entity_store,
-            octree: &mut self.octree,
-            events: &mut self.event_queue,
-            dt_sec,
-            tick: self.tick_counter,
-        };
-        for system in &mut self.tick_systems {
-            system.update(&mut tick_ctx);
+        {
+            let collision_guard = self.collision_world.read().ok();
+            let collision_ref = collision_guard.as_deref();
+            let mut tick_ctx = TickContext {
+                entities: &mut self.entity_store,
+                octree: &mut self.octree,
+                events: &mut self.event_queue,
+                dt_sec,
+                tick: self.tick_counter,
+                collision_world: collision_ref,
+            };
+            for system in &mut self.tick_systems {
+                system.update(&mut tick_ctx);
+            }
         }
 
         // 2. Snapshot entity GUIDs to avoid borrowing conflicts during hook dispatch
