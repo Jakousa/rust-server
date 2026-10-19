@@ -1,0 +1,36 @@
+# Declarative k3d cluster configuration for local MMO development and testing.
+# Can be booted directly via:
+#   k3d cluster create --config k8s/k3d.yaml
+# Or via:
+#   ./scripts/cluster.sh up
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: mmo-cluster
+servers: 1
+agents: 0
+ports:
+  - port: 8080:8080/udp
+    nodeFilters:
+      - loadbalancer
+  - port: 8080:8080/tcp
+    nodeFilters:
+      - loadbalancer
+  - port: 50051:50051
+    nodeFilters:
+      - loadbalancer
+  - port: 9090:9090
+    nodeFilters:
+      - loadbalancer
+  - port: 3000:3000
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:0
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

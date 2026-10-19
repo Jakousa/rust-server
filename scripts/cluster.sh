@@ -3,12 +3,15 @@ set -euo pipefail
 
 CLUSTER_NAME="mmo-cluster"
 IMAGE_TAG="mmo-server:local"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG_FILE="${REPO_ROOT}/k8s/k3d.yaml"
 
 usage() {
     echo "Usage: $0 {up|down|build|import|deploy|reload|all|status|logs <app>|loadtest|chaos}"
     echo ""
     echo "Commands:"
-    echo "  up       Create local k3d cluster with MMO port forwards"
+    echo "  up       Create local k3d cluster with MMO port forwards (using k8s/k3d.yaml)"
     echo "  down     Tear down local k3d cluster"
     echo "  build    Build local Docker image (${IMAGE_TAG})"
     echo "  import   Import local Docker image into k3d"
@@ -26,14 +29,8 @@ cmd_up() {
     if k3d cluster list | grep -q "^${CLUSTER_NAME}\b"; then
         echo "[k3d] Cluster '${CLUSTER_NAME}' already exists."
     else
-        echo "[k3d] Creating cluster '${CLUSTER_NAME}'..."
-        k3d cluster create "${CLUSTER_NAME}" \
-            --port "8080:8080/udp@loadbalancer" \
-            --port "8080:8080/tcp@loadbalancer" \
-            --port "50051:50051@loadbalancer" \
-            --port "9090:9090@loadbalancer" \
-            --port "3000:3000@loadbalancer" \
-            --k3s-arg "--disable=traefik@server:0"
+        echo "[k3d] Creating cluster '${CLUSTER_NAME}' using declarative config (${CONFIG_FILE})..."
+        k3d cluster create --config "${CONFIG_FILE}"
         echo "[k3d] Cluster created successfully."
     fi
 }
@@ -45,7 +42,7 @@ cmd_down() {
 
 cmd_build() {
     echo "[Docker] Building image '${IMAGE_TAG}'..."
-    docker build -t "${IMAGE_TAG}" .
+    docker build -t "${IMAGE_TAG}" "${REPO_ROOT}"
 }
 
 cmd_import() {
@@ -55,7 +52,7 @@ cmd_import() {
 
 cmd_deploy() {
     echo "[k8s] Applying manifests from k8s/overlays/local..."
-    kubectl apply -k k8s/overlays/local
+    kubectl apply -k "${REPO_ROOT}/k8s/overlays/local"
     echo "[k8s] Deployment applied. Pods will start momentarily."
 }
 

@@ -69,8 +69,9 @@ npm --prefix web run build
 To verify cluster-wide distributed behaviors:
 
 ```bash
-# Provision local Kubernetes cluster (k3d)
+# Provision local Kubernetes cluster (k3d) via declarative config (k8s/k3d.yaml)
 ./scripts/cluster.sh up
+# Or directly: k3d cluster create --config k8s/k3d.yaml
 
 # Build and deploy all cluster components
 ./scripts/cluster.sh all
