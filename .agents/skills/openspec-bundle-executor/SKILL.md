@@ -28,6 +28,7 @@ Every bundle in `openspec/changes/` has already been architected by a Principal 
    ```
 2. **Select the Target Bundle**:
    - Check [`openspec/ROADMAP.md`](../../../openspec/ROADMAP.md) and pick the next uncompleted bundle in dependency order (or the specific bundle requested by the user).
+   - *(Note: All 10 initial groundwork bundles in `openspec/ROADMAP.md` have been completed and archived. If `openspec/changes/` contains no active bundles, use `openspec-propose` or `openspec-pro-workflow` to propose and plan a new change first.)*
 3. **Read All 4 Bundle Artifacts Completely Before Writing Code**:
    - `openspec/changes/<bundle-name>/proposal.md`
    - `openspec/changes/<bundle-name>/specs/.../spec.md`
