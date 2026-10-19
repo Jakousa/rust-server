@@ -26,7 +26,7 @@ exclude_re = [
 
     # External-service-dependent mutants (Postgres and Redis are not hosted in headless CI unit tests):
     'replace > with .* in <impl SessionCacheBackend for RedisCache>::remove_session',
-    '<impl SocialBus for RedisSocialBus>::publish',
+    '<impl SocialBus for RedisSocialBus>::.*',
     'Database::is_postgres',
     'Database::pg_pool',
     'Database::ensure_entity_snapshots_blob_column',
