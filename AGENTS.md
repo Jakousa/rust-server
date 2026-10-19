@@ -48,9 +48,9 @@ Keep the primary orchestrator focused on system architecture, OpenSpec planning,
 ## 3. Engineering Workflows & Quality Gates
 
 1. **Master Roadmap & Pre-Architected OpenSpec Bundles (`openspec/ROADMAP.md`)**:
-   * The repository maintains an ordered Master Execution Roadmap in [`openspec/ROADMAP.md`](openspec/ROADMAP.md) backed by pre-architected, compiler-ready OpenSpec groundwork bundles under `openspec/changes/<bundle-name>/`.
-   * Before starting any implementation task, check [`openspec/ROADMAP.md`](openspec/ROADMAP.md) and read the [`openspec-bundle-executor`](.agents/skills/openspec-bundle-executor/SKILL.md) skill.
-   * **Do not stray from `design.md` and `tasks.md`**: Each bundle specifies exact file paths, line numbers, struct/trait definitions, concurrency invariants, and test scenarios so implementation agents can execute deterministically without architectural drift.
+   * The repository maintains an ordered Master Execution Roadmap in [`openspec/ROADMAP.md`](openspec/ROADMAP.md). All 10 initial groundwork bundles have been fully implemented, verified, and archived under `openspec/changes/archive/`.
+   * When groundwork bundles exist under `openspec/changes/<bundle-name>/`, implementation agents must consult [`openspec/ROADMAP.md`](openspec/ROADMAP.md) and execute them using the [`openspec-bundle-executor`](.agents/skills/openspec-bundle-executor/SKILL.md) skill without architectural drift.
+   * When `openspec/changes/` contains no active bundles, new changes must be proposed via the standard OpenSpec lifecycle (`openspec-propose` or `openspec-pro-workflow`).
 
 2. **OpenSpec Lifecycle**:
    * All non-trivial changes must be planned via OpenSpec (`openspec/changes/<change-name>/`).
