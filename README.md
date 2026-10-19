@@ -137,8 +137,9 @@ npm run build
 Cluster lifecycle and chaos testing are abstracted into single-step commands via [`scripts/cluster.sh`](scripts/cluster.sh):
 
 ```bash
-# 1. Provision local Kubernetes cluster (k3d) with port forwards
+# 1. Provision local Kubernetes cluster (k3d) via declarative config (k8s/k3d.yaml)
 ./scripts/cluster.sh up
+# Or directly: k3d cluster create --config k8s/k3d.yaml
 
 # 2. Build images and deploy cluster (Director, Gateway, Nodes, Postgres, Grafana)
 ./scripts/cluster.sh all
