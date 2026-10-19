@@ -744,5 +744,14 @@ mod tests {
             "SELECT * FROM items WHERE a = ? AND b = ?"
         );
         assert_eq!(db.for_update_suffix(), "");
+
+        let pg_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let pg_db = Database {
+            backend: DbBackend::Postgres(pg_pool),
+        };
+        assert!(pg_db.is_postgres());
+        assert_eq!(pg_db.for_update_suffix(), " FOR UPDATE");
     }
 }

@@ -426,39 +426,36 @@ impl TransactionCoordinator {
         );
 
         let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let affected = sqlx::query(&query_del_str)
-                    .bind(tx_id)
-                    .execute(pool)
-                    .await?
-                    .rows_affected();
-
-                if affected > 0 {
-                    let _ = sqlx::query(&query_ins)
-                        .bind(tx_id)
-                        .bind(now_ms)
-                        .execute(pool)
-                        .await;
-                }
-                affected
-            }
-            DbBackend::Postgres(pool) => {
-                let affected = sqlx::query(&query_del_str)
-                    .bind(tx_id)
-                    .execute(pool)
-                    .await?
-                    .rows_affected();
-
-                if affected > 0 {
-                    let _ = sqlx::query(&query_ins)
-                        .bind(tx_id)
-                        .bind(now_ms)
-                        .execute(pool)
-                        .await;
-                }
-                affected
-            }
+            DbBackend::Sqlite(pool) => sqlx::query(&query_del_str)
+                .bind(tx_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            DbBackend::Postgres(pool) => sqlx::query(&query_del_str)
+                .bind(tx_id)
+                .execute(pool)
+                .await?
+                .rows_affected(),
         };
+
+        if rows_affected > 0 {
+            match self.db.backend() {
+                DbBackend::Sqlite(pool) => {
+                    let _ = sqlx::query(&query_ins)
+                        .bind(tx_id)
+                        .bind(now_ms)
+                        .execute(pool)
+                        .await;
+                }
+                DbBackend::Postgres(pool) => {
+                    let _ = sqlx::query(&query_ins)
+                        .bind(tx_id)
+                        .bind(now_ms)
+                        .execute(pool)
+                        .await;
+                }
+            }
+        }
 
         Ok(rows_affected > 0)
     }
