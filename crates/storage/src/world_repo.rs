@@ -135,6 +135,8 @@ pub struct WorldObjectRepository {
     db: Database,
 }
 
+pub type WorldRepository = WorldObjectRepository;
+
 impl WorldObjectRepository {
     /// Constructs a new `WorldObjectRepository` wrapping the provided database handle.
     pub fn new(db: Database) -> Self {
@@ -197,6 +199,31 @@ impl WorldObjectRepository {
         }
 
         Ok(())
+    }
+
+    /// Alias for `upsert_world_object`.
+    pub async fn save_world_object(&self, record: &WorldObjectRecord) -> Result<(), StorageError> {
+        self.upsert_world_object(record).await
+    }
+
+    /// Alias for `upsert_world_objects_batch`.
+    pub async fn save_world_objects_batch(
+        &self,
+        records: &[WorldObjectRecord],
+    ) -> Result<(), StorageError> {
+        self.upsert_world_objects_batch(records).await
+    }
+
+    /// Alias for `get_objects_in_sector`.
+    pub async fn load_sector_objects(
+        &self,
+        world_id: u64,
+        sector_x: i32,
+        sector_y: i32,
+        sector_z: i32,
+    ) -> Result<Vec<WorldObjectRecord>, StorageError> {
+        self.get_objects_in_sector(world_id, sector_x, sector_y, sector_z)
+            .await
     }
 
     /// Fetches a world object by primary key `(world_id, object_id)`.

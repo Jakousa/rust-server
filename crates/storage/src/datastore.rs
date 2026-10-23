@@ -125,6 +125,8 @@ pub struct DataStore {
     write_lock: Arc<Mutex<()>>,
 }
 
+pub type DocumentStore = DataStore;
+
 impl Default for DataStore {
     fn default() -> Self {
         Self::new()

@@ -23,6 +23,7 @@ futures-util = "0.3.31"
 
 [dev-dependencies]
 tempfile = "3.14"
+mmo-storage = { path = ".", features = ["test-helpers"] }
 
 [lints]
 workspace = true

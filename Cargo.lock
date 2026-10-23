@@ -2099,6 +2099,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "mmo-core",
+ "mmo-storage",
  "redis",
  "rmp-serde",
  "serde",

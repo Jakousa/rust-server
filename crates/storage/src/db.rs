@@ -357,6 +357,24 @@ impl Database {
 
     /// Executes idempotent database migrations setting up core tables and indexes.
     pub async fn run_migrations(&self) -> Result<(), StorageError> {
+        let blob_type = if self.is_postgres() { "BYTEA" } else { "BLOB" };
+        let create_entity_snapshots = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS entity_snapshots (
+                guid BIGINT PRIMARY KEY,
+                pos_x REAL NOT NULL,
+                pos_y REAL NOT NULL,
+                pos_z REAL NOT NULL,
+                rotation REAL NOT NULL DEFAULT 0.0,
+                attributes_json TEXT NOT NULL DEFAULT '{{}}',
+                state_blob {},
+                version BIGINT NOT NULL DEFAULT 1,
+                timestamp BIGINT NOT NULL
+            );
+            "#,
+            blob_type
+        );
+
         let statements = [
             r#"
             CREATE TABLE IF NOT EXISTS accounts (
@@ -383,19 +401,7 @@ impl Database {
             r#"
             CREATE INDEX IF NOT EXISTS idx_characters_account ON characters(account_id);
             "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS entity_snapshots (
-                guid BIGINT PRIMARY KEY,
-                pos_x REAL NOT NULL,
-                pos_y REAL NOT NULL,
-                pos_z REAL NOT NULL,
-                rotation REAL NOT NULL DEFAULT 0.0,
-                attributes_json TEXT NOT NULL DEFAULT '{}',
-                state_blob BLOB,
-                version BIGINT NOT NULL DEFAULT 1,
-                timestamp BIGINT NOT NULL
-            );
-            "#,
+            create_entity_snapshots.as_str(),
             r#"
             CREATE TABLE IF NOT EXISTS inventories (
                 character_guid BIGINT PRIMARY KEY,
