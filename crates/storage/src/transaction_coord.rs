@@ -16,6 +16,28 @@ impl TransactionCoordinator {
         Self { db }
     }
 
+    /// Executes a complete two-phase transfer (prepare + commit) in sequence.
+    pub async fn execute_transfer(
+        &self,
+        tx_id: &str,
+        src_container_id: u64,
+        src_slot: u32,
+        dst_container_id: u64,
+        dst_slot: u32,
+        lease_duration_ms: u64,
+    ) -> Result<ContainerTransactionRecord, StorageError> {
+        self.prepare_transfer(
+            tx_id,
+            src_container_id,
+            src_slot,
+            dst_container_id,
+            dst_slot,
+            lease_duration_ms,
+        )
+        .await?;
+        self.commit_transfer(tx_id).await
+    }
+
     /// Phase 1: Prepares a transfer by reserving the source item and target slot under strict row locks.
     pub async fn prepare_transfer(
         &self,

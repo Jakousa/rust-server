@@ -2,12 +2,11 @@
 
 This document is the single source of truth for bringing the **Distributed Rust MMO Server Platform** to 100% production fruition across all MMO genres (Tab-Target RPGs, Voxel/Survival Sandboxes, Tactical/Shooter MMOs, and 6-DoF Space/Vehicular Simulations).
 
-> [!NOTE]
-> **Roadmap Status: 100% Complete & Archived (All 10 Bundles Delivered)**
-> All 10 foundational OpenSpec groundwork bundles have been successfully implemented, quality-gate verified (`cargo fmt`, `cargo clippy`, `cargo test`), merged into `main`, and archived under `openspec/changes/archive/` with their canonical specifications synced to `openspec/specs/`.
+> [!IMPORTANT]
+> **Active Roadmap Status: Phase 4 Queued (Bundles #11–#15 Pending Implementation)**
+> Phases 1–3 (Bundles #1–#10) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
 >
-> There are currently **no pending or active groundwork bundles** under `openspec/changes/`.
-> For new feature proposals or enhancements, follow the OpenSpec proposal lifecycle via the [`openspec-pro-workflow`](../.agents/skills/openspec-pro-workflow/SKILL.md) or [`openspec-propose`](../.agents/skills/openspec-propose/SKILL.md) skills.
+> **Phase 4 (Bundles #11–#15)** is now architected under `openspec/changes/` to close remaining production testing, fuzzing, mutation, and CI coverage gaps. Implementation agents should execute Bundles #11–#15 in order using the [`openspec-bundle-executor`](../.agents/skills/openspec-bundle-executor/SKILL.md) skill.
 
 ---
 
@@ -59,3 +58,17 @@ This document is the single source of truth for bringing the **Distributed Rust 
 | **8** | [`pluggable-kinematics-and-hierarchy`](changes/archive/2026-10-18-pluggable-kinematics-and-hierarchy/) | #111 | [#122](https://github.com/Jakousa/rust-server/pull/122) | Completed | `mmo-core`, `mmo-node` | Add pluggable `MotionIntegrator` (`DiscreteGround` and `Newtonian6DoF`), volumetric `CollisionWorld::sweep_test` during movement validation, server-authorized `ImpulseAllowance` for knockbacks/dashes, `parent_guid` relative transform hierarchies (`attach_child`, `propagate_hierarchy_transforms`) for moving vehicles/ships, and atomic parent-child group migration. |
 | **9** | [`spatial-navgrid-pathfinding`](changes/archive/2026-10-18-spatial-navgrid-pathfinding/) | #112 | [#123](https://github.com/Jakousa/rust-server/pull/123) | Completed | `mmo-core`, `mmo-node`, `mmo-gameplay` | Replace single-corner fallback in `AabbCollisionWorld::find_path` with bounded 3D/2.5D A* search and line-of-sight string-pulling; expose `collision_world` on `TickContext`; wire `FsmBrainSystem` to navigate NPCs around multi-wall obstacles. |
 | **10** | [`character-lifecycle-and-e2e-cluster-suite`](changes/archive/2026-10-18-character-lifecycle-and-e2e-cluster-suite/) | #81, #85 | [#124](https://github.com/Jakousa/rust-server/pull/124) | Completed | `mmo-node`, `mmo-gateway`, `mmo-loadtest`, `k8s/` | Implement `hydrate_player_session` (restoring saved position, rotation, and components on login) and `disconnect_player_session` (capturing final snapshot and despawning on logout); convert `k8s/base/postgres.yaml` to `StatefulSet` with PVC and harden PodSecurity + PDBs across `k8s/base/`; add declarative `ScenarioRunner` (`--scenario`) in `mmo-loadtest`. |
+
+---
+
+## Active Groundwork Bundles (Phase 4)
+
+### Phase 4: Production Verification, Fuzzing & CI Coverage Hardening (P1)
+
+| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| :---: | :--- | :---: | :---: | :---: | :--- | :--- |
+| **11** | [`postgres-ci-dual-dialect-verification`](changes/archive/2026-10-23-postgres-ci-dual-dialect-verification/) | [#128](https://github.com/Jakousa/rust-server/issues/128) | — | Completed | `mmo-storage`, `.github/workflows/` | Add `connect_test_databases()` dual-dialect test harness in `crates/storage/src/test_helpers.rs`; add `postgres_dialect_integration_test.rs` exercising all repositories, 2PC transfers, escrow, marketplace, world objects (`bind_upsert_postgres`), and document store; provision live `postgres:16-alpine` service container in `.github/workflows/rust.yml`. |
+| **12** | [`adversarial-wire-and-codec-fuzzing`](changes/adversarial-wire-and-codec-fuzzing/) | [#129](https://github.com/Jakousa/rust-server/issues/129) | — | Pending | `mmo-schema`, `mmo-plugin-voxel`, `mmo-client-wasm` | Add adversarial and mutated-frame `proptest` suites for `ClientPacket::decode`, `ClientPacket::decode_frame`, and `BitReader` in `mmo-schema`; add `PaletteChunk` RLE roundtrip and crafted `VXR1` header fuzz tests in `mmo-plugin-voxel`; add corrupted-stream recovery fuzz tests for `WasmClientWorld::process_packet` in `mmo-client-wasm`. |
+| **13** | [`expanded-mutation-testing-matrix`](changes/expanded-mutation-testing-matrix/) | [#130](https://github.com/Jakousa/rust-server/issues/130) | — | Pending | `mmo-core`, `mmo-node`, `mmo-gameplay`, `.github/workflows/` | Add boundary and mutation-killing unit tests for `crates/core/src/collision.rs`, `crates/node/src/kinematics.rs`, and `crates/gameplay/src/trade.rs`, and expand `.github/workflows/mutation-tests.yml` matrix to verify zero surviving mutants across all three modules alongside `mmo-schema` and `mmo-storage`. |
+| **14** | [`network-and-gateway-submodule-unit-coverage`](changes/network-and-gateway-submodule-unit-coverage/) | [#131](https://github.com/Jakousa/rust-server/issues/131) | — | Pending | `mmo-node`, `mmo-gateway`, `mmo-loadtest` | Add direct inline unit tests to `crates/node/src/network/{migration.rs, ghost.rs, client_pool.rs}`, `crates/gateway/src/server/intercept.rs`, and `crates/loadtest/src/scenario.rs` covering lease rollbacks, boundary ghost queries, sender anti-spoofing, marketplace error fallbacks, and scenario JSON serialization. |
+| **15** | [`wasm-and-web-frontend-ci-verification`](changes/wasm-and-web-frontend-ci-verification/) | [#132](https://github.com/Jakousa/rust-server/issues/132) | — | Pending | `mmo-client-wasm`, `web/`, `.github/workflows/` | Add `wasm32-unknown-unknown` target clippy check for `mmo-client-wasm` in `.github/workflows/rust.yml`; add Vitest unit test suite (`web/src/__tests__/inspector.test.js`) testing `PlayerControls` and `WorldObjectRenderer` 64-bit `BigInt` ID reconstruction; run `npm ci && npm test && npm run build` in CI. |

@@ -1,6 +1,70 @@
 //! Test helpers and fixture builders for storage entities.
 
+use crate::db::{Database, StorageError};
 pub use crate::models::{ContainerRecordBuilder, ItemRecordBuilder};
+
+/// Truncates all tables in PostgreSQL to ensure test isolation.
+pub async fn reset_postgres_tables(db: &Database) -> Result<(), StorageError> {
+    if let Some(pool) = db.pg_pool() {
+        sqlx::query(
+            r#"
+            TRUNCATE TABLE
+                market_listings,
+                trades,
+                container_transactions,
+                container_reservations,
+                escrows,
+                items,
+                inventories,
+                containers,
+                entity_snapshots,
+                characters,
+                accounts,
+                world_objects
+            CASCADE;
+            "#,
+        )
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Connects to an in-memory SQLite database and, if `TEST_POSTGRES_URL` is configured,
+/// connects to PostgreSQL, runs migrations, and truncates all tables for a clean test run.
+///
+/// If `REQUIRE_POSTGRES_TEST` is set to `"1"` or `"true"`, panics if `TEST_POSTGRES_URL` is missing.
+pub async fn connect_test_databases() -> Result<Vec<(&'static str, Database)>, StorageError> {
+    let require_pg = std::env::var("REQUIRE_POSTGRES_TEST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let pg_url = std::env::var("TEST_POSTGRES_URL").ok();
+    connect_test_databases_impl(pg_url, require_pg).await
+}
+
+/// Internal helper parameterized by configuration for hermetic unit testing.
+pub async fn connect_test_databases_impl(
+    pg_url: Option<String>,
+    require_pg: bool,
+) -> Result<Vec<(&'static str, Database)>, StorageError> {
+    let sqlite_db = Database::connect_memory().await?;
+    let mut dbs = vec![("sqlite", sqlite_db)];
+
+    match pg_url {
+        Some(url) if !url.trim().is_empty() => {
+            let pg_db = Database::connect(&url).await?;
+            pg_db.run_migrations().await?;
+            reset_postgres_tables(&pg_db).await?;
+            dbs.push(("postgres", pg_db));
+        }
+        _ if require_pg => {
+            panic!("REQUIRE_POSTGRES_TEST=1 is set, but TEST_POSTGRES_URL is missing or empty");
+        }
+        _ => {}
+    }
+
+    Ok(dbs)
+}
 
 #[cfg(test)]
 mod tests {
@@ -81,5 +145,29 @@ mod tests {
         assert_eq!(item.attributes, serde_json::json!({"power": 10}));
         assert_eq!(item.created_at, 1100);
         assert_eq!(item.updated_at, 1200);
+    }
+
+    #[tokio::test]
+    async fn test_connect_test_databases_fallback_sqlite() {
+        let dbs = connect_test_databases_impl(None, false).await.unwrap();
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0].0, "sqlite");
+        assert!(dbs[0].1.ping().await.is_ok());
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "REQUIRE_POSTGRES_TEST=1 is set, but TEST_POSTGRES_URL is missing or empty"
+    )]
+    async fn test_connect_test_databases_require_pg_missing_panics() {
+        let _ = connect_test_databases_impl(None, true).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "REQUIRE_POSTGRES_TEST=1 is set, but TEST_POSTGRES_URL is missing or empty"
+    )]
+    async fn test_connect_test_databases_require_pg_empty_url_panics() {
+        let _ = connect_test_databases_impl(Some("   ".to_string()), true).await;
     }
 }

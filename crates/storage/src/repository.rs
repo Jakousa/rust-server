@@ -76,6 +76,8 @@ pub struct CharacterRepository {
     db: Database,
 }
 
+pub type StorageRepository = CharacterRepository;
+
 impl CharacterRepository {
     pub fn new(db: Database) -> Self {
         Self { db }
@@ -406,6 +408,11 @@ impl CharacterRepository {
             version: version as u64,
             timestamp: timestamp as u64,
         }))
+    }
+
+    /// Alias for `get_snapshot`.
+    pub async fn load_snapshot(&self, guid: u64) -> Result<Option<EntitySnapshot>, StorageError> {
+        self.get_snapshot(guid).await
     }
 
     /// Retrieves character inventory metadata.
