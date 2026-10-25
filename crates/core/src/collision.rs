@@ -966,4 +966,223 @@ mod tests {
         let path = world.find_path(start, end);
         assert!(path.is_none(), "fully enclosed target must be unreachable");
     }
+
+    #[test]
+    fn test_mutation_killing_boundary_collision_coverage() {
+        // 1. SpatialQueryFilter defaults
+        let filter = SpatialQueryFilter::all();
+        assert_eq!(filter.ignore_id, None);
+        assert_eq!(filter.collision_layers, u32::MAX);
+
+        // 2. EmptyCollisionWorld filter method
+        let empty = EmptyCollisionWorld;
+        assert!(empty.is_point_traversable_with_filter(Vec3::new(1.0, 2.0, 3.0), filter));
+
+        // 3. AabbCollisionWorld len, is_empty, getters
+        let mut world = AabbCollisionWorld::new();
+        assert_eq!(world.len(), 0);
+        assert!(world.is_empty());
+        let id1 = Guid(11);
+        let id2 = Guid(12);
+        let box1 = create_test_aabb(Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let box2 = create_test_aabb(Vec3::new(5.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        world.register_obstacle(id1, box1);
+        assert_eq!(world.len(), 1);
+        assert!(!world.is_empty());
+        assert_eq!(world.get_obstacle(id1), Some(&box1));
+        assert_eq!(world.get_obstacle(id2), None);
+        assert_eq!(world.get_obstacle_record(id1).unwrap().bounds, box1);
+        assert_eq!(world.get_obstacle_record(id1).unwrap().layer_mask, u32::MAX);
+        assert_eq!(world.get_obstacle_record(id2), None);
+
+        // 4. Non-finite point traversability
+        assert!(!world.is_point_traversable_with_filter(Vec3::new(f32::NAN, 0.0, 0.0), filter));
+        assert!(!world.is_point_traversable_with_filter(Vec3::new(0.0, f32::INFINITY, 0.0), filter));
+        assert!(
+            !world.is_point_traversable_with_filter(Vec3::new(0.0, 0.0, f32::NEG_INFINITY), filter)
+        );
+
+        // 5. is_segment_clear zero distance & clearance sweep branch
+        assert!(world.is_segment_clear(
+            Vec3::new(10.0, 10.0, 10.0),
+            Vec3::new(10.0, 10.0, 10.0),
+            0.5
+        ));
+        // Ray from (0, 2, 0) to (10, 2, 0) misses obstacle at (2, 0, 0) [top is y=0.5]
+        // But clearance box with radius 1.8 reaches down to y = 0.2 <= 0.5, hitting the box
+        assert!(!world.is_segment_clear(Vec3::new(0.0, 2.0, 0.0), Vec3::new(10.0, 2.0, 0.0), 1.8));
+        assert!(world.is_segment_clear(Vec3::new(0.0, 2.0, 0.0), Vec3::new(10.0, 2.0, 0.0), 0.0));
+
+        // 6. Raycast non-finite & invalid distance handling
+        assert!(world
+            .raycast(
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, f32::INFINITY, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, f32::NEG_INFINITY),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, f32::INFINITY, 0.0),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, f32::NEG_INFINITY),
+                10.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                0.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                -5.0,
+                filter
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                f32::NAN,
+                filter
+            )
+            .is_none());
+
+        // 7. Raycast closest hit ordering
+        world.register_obstacle(id2, box2);
+        let hit = world
+            .raycast(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                20.0,
+                filter,
+            )
+            .unwrap();
+        assert_eq!(hit.entity_id, Some(id1));
+        assert!((hit.distance - 1.5).abs() < 1e-4);
+        assert!((hit.point.x - 1.5).abs() < 1e-4);
+        assert!((hit.point.y - 0.0).abs() < 1e-4);
+        assert!((hit.point.z - 0.0).abs() < 1e-4);
+
+        // 8. Sweep test non-finite & tiny translation
+        let moving = create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        assert!(world
+            .sweep_test(&moving, Vec3::new(f32::NAN, 0.0, 0.0), filter)
+            .is_none());
+        assert!(world
+            .sweep_test(&moving, Vec3::new(0.0, f32::INFINITY, 0.0), filter)
+            .is_none());
+        assert!(world
+            .sweep_test(&moving, Vec3::new(0.0, 0.0, f32::NEG_INFINITY), filter)
+            .is_none());
+        assert!(world
+            .sweep_test(&moving, Vec3::new(1e-5, 0.0, 0.0), filter)
+            .is_none());
+
+        // 9. Sweep test exact hit fraction, coordinates and earlier hit resolution
+        // Moving box center starts at (-2, 0, 0), half-extents (0.5, 0.5, 0.5)
+        // Sweeps along +X by 10.0 units. Obstacle 1 center (2, 0, 0) [bounds [1.5, 2.5]]
+        // Expanded box min_x = 1.5 - 0.5 = 1.0
+        // Contact distance = 1.0 - (-2.0) = 3.0
+        // Translation distance = 10.0 => fraction = 3.0 / 10.0 = 0.3
+        let sweep_hit = world
+            .sweep_test(
+                &create_test_aabb(Vec3::new(-2.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+                Vec3::new(10.0, 0.0, 0.0),
+                filter,
+            )
+            .unwrap();
+        assert_eq!(sweep_hit.entity_id, Some(id1));
+        assert!((sweep_hit.hit_fraction - 0.3).abs() < 1e-4);
+        assert!((sweep_hit.point.x - 1.0).abs() < 1e-4);
+        assert!((sweep_hit.point.y - 0.0).abs() < 1e-4);
+        assert!((sweep_hit.point.z - 0.0).abs() < 1e-4);
+        assert!((sweep_hit.normal.x - (-1.0)).abs() < 1e-4);
+
+        // 10. Find path invalid coordinates, inside obstacles, zero distance, vertical
+        assert!(world
+            .find_path(Vec3::new(f32::NAN, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0))
+            .is_none());
+        assert!(world
+            .find_path(
+                Vec3::new(0.0, f32::INFINITY, 0.0),
+                Vec3::new(10.0, 0.0, 0.0)
+            )
+            .is_none());
+        assert!(world
+            .find_path(
+                Vec3::new(0.0, 0.0, f32::NEG_INFINITY),
+                Vec3::new(10.0, 0.0, 0.0)
+            )
+            .is_none());
+        assert!(world
+            .find_path(Vec3::new(0.0, 0.0, 0.0), Vec3::new(f32::NAN, 0.0, 0.0))
+            .is_none());
+        assert!(world
+            .find_path(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, f32::INFINITY, 0.0))
+            .is_none());
+        assert!(world
+            .find_path(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, f32::NEG_INFINITY)
+            )
+            .is_none());
+        assert!(world
+            .find_path(Vec3::new(2.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0))
+            .is_none());
+        assert!(world
+            .find_path(Vec3::new(10.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0))
+            .is_none());
+        let same = world
+            .find_path(Vec3::new(10.0, 10.0, 10.0), Vec3::new(10.0, 10.0, 10.0))
+            .unwrap();
+        assert_eq!(same.len(), 2);
+        assert_eq!(same[0], Vec3::new(10.0, 10.0, 10.0));
+        assert_eq!(same[1], Vec3::new(10.0, 10.0, 10.0));
+
+        // Vertical pathfinding
+        let vert = world
+            .find_path(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 3.0, 0.0))
+            .unwrap();
+        assert_eq!(vert.len(), 2);
+    }
 }

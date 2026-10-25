@@ -1196,4 +1196,234 @@ mod tests {
             other => panic!("expected WallClipping, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_mutation_killing_boundary_kinematics_coverage() {
+        use mmo_core::collision::AabbCollisionWorld;
+        use mmo_core::octree::BoundingBox3D;
+
+        // 1. KinematicConfig and Default
+        let cfg = KinematicConfig::default();
+        assert_eq!(cfg.max_speed, 10.0);
+        assert_eq!(cfg.max_teleport_distance, None);
+        assert!((cfg.tolerance_multiplier - 1.1).abs() < 1e-4);
+
+        // 2. KinematicViolationReason Display formatters
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::SpeedCapExceeded {
+                speed: 12.0,
+                max_speed: 10.0
+            }
+        )
+        .contains("speed cap exceeded"));
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::TeleportDetected {
+                distance: 50.0,
+                max_distance: 20.0
+            }
+        )
+        .contains("teleport detected"));
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::InvalidDeltaTime { dt: -0.1 }
+        )
+        .contains("invalid delta time"));
+        assert!(
+            format!("{}", KinematicViolationReason::NonFiniteCoordinates)
+                .contains("non-finite coordinates")
+        );
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::NonMonotonicSequence {
+                seq: 1,
+                last_seq: 2
+            }
+        )
+        .contains("non-monotonic sequence"));
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::ObstacleCollision {
+                hit_point: (1.0, 2.0, 3.0),
+                entity_id: Some(Guid(5))
+            }
+        )
+        .contains("obstacle collision detected"));
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::WallClipping {
+                hit_point: (1.0, 2.0, 3.0),
+                entity_id: None
+            }
+        )
+        .contains("wall clipping detected"));
+        assert!(format!(
+            "{}",
+            KinematicViolationReason::AccelerationCapExceeded {
+                acceleration: 30.0,
+                max_acceleration: 20.0
+            }
+        )
+        .contains("acceleration cap exceeded"));
+
+        // 3. KinematicViolation constructors & Display
+        let v_clip =
+            KinematicViolation::wall_clipping((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), Some(Guid(7)));
+        assert_eq!(v_clip.snap_back(), (0.0, 0.0, 0.0));
+        assert!(matches!(
+            v_clip.reason(),
+            KinematicViolationReason::WallClipping { .. }
+        ));
+        assert!(format!("{v_clip}").contains("Kinematic violation"));
+
+        let v_accel = KinematicViolation::acceleration_cap_exceeded((1.0, 1.0, 1.0), 30.0, 20.0);
+        assert_eq!(v_accel.snap_back(), (1.0, 1.0, 1.0));
+        assert!(matches!(
+            v_accel.reason(),
+            KinematicViolationReason::AccelerationCapExceeded { .. }
+        ));
+
+        // 4. EntityKinematicState with_position & grant_impulse
+        let mut state =
+            EntityKinematicState::new(std::time::Instant::now()).with_position((5.0, 5.0, 5.0));
+        assert_eq!(state.last_position, (5.0, 5.0, 5.0));
+        state.grant_impulse(10.0, 5, 100);
+        assert_eq!(
+            state.impulse_allowance,
+            Some(ImpulseAllowance {
+                bonus_distance: 10.0,
+                expires_at_tick: 105
+            })
+        );
+
+        // 5. KinematicValidator with_teleport_distance, grant_impulse, and Default
+        let validator = KinematicValidator::default().with_teleport_distance(15.0);
+        assert_eq!(validator.max_speed, 10.0);
+        assert_eq!(validator.max_teleport_distance, Some(15.0));
+        validator.grant_impulse(&mut state, 20.0, 10, 200);
+        assert_eq!(
+            state.impulse_allowance,
+            Some(ImpulseAllowance {
+                bonus_distance: 20.0,
+                expires_at_tick: 210
+            })
+        );
+
+        // 6. Impulse allowance expiration boundary
+        let mut col = AabbCollisionWorld::new();
+        col.register_obstacle(
+            Guid(99),
+            BoundingBox3D::new((100.0, 100.0, 100.0), (101.0, 101.0, 101.0)),
+        );
+        // Tick 210: allowance still valid
+        let res_valid = validator.validate_move_with_collision(
+            (0.0, 0.0, 0.0),
+            (25.0, 0.0, 0.0),
+            1.0,
+            &col,
+            None,
+            Some(&mut state),
+            210,
+        );
+        assert!(res_valid.is_ok());
+        assert_eq!(state.impulse_allowance, None);
+
+        // Expired impulse (tick 211 > 210)
+        state.grant_impulse(20.0, 10, 200); // expires at 210
+        let res_expired = validator.validate_move_with_collision(
+            (0.0, 0.0, 0.0),
+            (25.0, 0.0, 0.0),
+            1.0,
+            &col,
+            None,
+            Some(&mut state),
+            211,
+        );
+        assert!(res_expired.is_err());
+
+        // 7. validate_move_with_collision_simple
+        assert!(validator
+            .validate_move_with_collision_simple((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), 1.0, &col, None)
+            .is_ok());
+        assert!(validator
+            .validate_move_with_collision_simple((0.0, 0.0, 0.0), (20.0, 0.0, 0.0), 1.0, &col, None)
+            .is_err());
+
+        // 8. DiscreteKinematicIntegrator step validation
+        let integrator = DiscreteKinematicIntegrator;
+        let mut disc_state = EntityKinematicState::new(std::time::Instant::now());
+        disc_state.last_position = (0.0, 0.0, 0.0);
+        disc_state.last_dt = 0.1;
+        let disc_cfg = KinematicConfig {
+            max_speed: 10.0,
+            max_teleport_distance: Some(15.0),
+            tolerance_multiplier: 1.1,
+        };
+        assert!(integrator
+            .validate_step(
+                &disc_cfg,
+                &mut disc_state,
+                (f32::NAN, 0.0, 0.0),
+                1,
+                None,
+                None
+            )
+            .is_err());
+        assert!(integrator
+            .validate_step(
+                &disc_cfg,
+                &mut disc_state,
+                (0.0, f32::INFINITY, 0.0),
+                1,
+                None,
+                None
+            )
+            .is_err());
+        assert!(integrator
+            .validate_step(
+                &disc_cfg,
+                &mut disc_state,
+                (0.0, 0.0, f32::NEG_INFINITY),
+                1,
+                None,
+                None
+            )
+            .is_err());
+        disc_state.last_dt = -1.0;
+        // Default dt applied when <= 0.0 in state
+        assert!(integrator
+            .validate_step(&disc_cfg, &mut disc_state, (0.1, 0.0, 0.0), 1, None, None)
+            .is_ok());
+        assert_eq!(disc_state.last_position, (0.1, 0.0, 0.0));
+
+        // 9. Newtonian6DoF linear damping check
+        let newton_integrator = Newtonian6DoFIntegrator;
+        let mut newton_state = EntityKinematicState::new(std::time::Instant::now());
+        newton_state.last_position = (0.0, 0.0, 0.0);
+        newton_state.velocity = (0.0, 0.0, 0.0);
+        newton_state.last_dt = 1.0;
+        newton_state.motion_mode = MotionMode::Newtonian6DoF {
+            max_acceleration: 20.0,
+            linear_damping: 0.5,
+        };
+        let newton_cfg = KinematicConfig {
+            max_speed: 100.0,
+            max_teleport_distance: None,
+            tolerance_multiplier: 1.1,
+        };
+        let pos = newton_integrator
+            .validate_step(
+                &newton_cfg,
+                &mut newton_state,
+                (10.0, 0.0, 0.0),
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(pos, (10.0, 0.0, 0.0));
+        // factor = 1.0 - 0.5 * 1.0 = 0.5 => velocity.0 = 10.0 * 0.5 = 5.0
+        assert!((newton_state.velocity.0 - 5.0).abs() < 1e-4);
+    }
 }

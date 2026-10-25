@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: 'Specific package to run mutation tests on (mmo-schema, mmo-storage, or all)'
+        description: 'Specific package/target to run mutation tests on (mmo-schema, mmo-storage, mmo-core-collision, mmo-node-kinematics, mmo-gameplay-trade, or all)'
         required: false
         default: 'all'
       additional_args:
@@ -70,7 +70,7 @@ jobs:
           echo "should_run=true" >> $GITHUB_OUTPUT
 
   mutation-tests:
-    name: Mutation Testing (${{ matrix.package }})
+    name: Mutation Testing (${{ matrix.name }})
     needs: [check-trigger]
     if: needs.check-trigger.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -78,7 +78,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [mmo-schema, mmo-storage]
+        include:
+          - name: mmo-schema
+            package: mmo-schema
+            file_arg: ""
+            test_filter: "-- --lib"
+          - name: mmo-storage
+            package: mmo-storage
+            file_arg: ""
+            test_filter: "-- --lib"
+          - name: mmo-core-collision
+            package: mmo-core
+            file_arg: "--file crates/core/src/collision.rs"
+            test_filter: "-- --lib collision"
+          - name: mmo-node-kinematics
+            package: mmo-node
+            file_arg: "--file crates/node/src/kinematics.rs"
+            test_filter: "-- --lib kinematics"
+          - name: mmo-gameplay-trade
+            package: mmo-gameplay
+            file_arg: "--file crates/gameplay/src/trade.rs"
+            test_filter: "-- --lib trade"
 
     steps:
       - name: Checkout repository
@@ -87,8 +107,8 @@ jobs:
       - name: Check Package Filter
         id: pkg_filter
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ inputs.package }}" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "${{ matrix.package }}" ]; then
-            echo "Package filter '${{ inputs.package }}' does not match matrix package '${{ matrix.package }}'. Skipping."
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ inputs.package }}" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "${{ matrix.name }}" ] && [ "${{ inputs.package }}" != "${{ matrix.package }}" ]; then
+            echo "Package filter '${{ inputs.package }}' does not match matrix '${{ matrix.name }}'. Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -122,20 +142,11 @@ jobs:
       - name: Run Mutation Testing
         if: steps.pkg_filter.outputs.skip != 'true'
         run: |
-          EXTRA_ARGS="${{ inputs.additional_args }}"
-          if [ -z "$EXTRA_ARGS" ]; then
-            EXTRA_ARGS="--jobs 2 -- --lib"
-          elif [[ "$EXTRA_ARGS" != *"--jobs"* ]] && [[ "$EXTRA_ARGS" != *"-j "* ]]; then
-            EXTRA_ARGS="$EXTRA_ARGS --jobs 2"
-          fi
-          if [[ "$EXTRA_ARGS" != *"--"* ]]; then
-            EXTRA_ARGS="$EXTRA_ARGS -- --lib"
-          fi
-          cargo mutants --package "${{ matrix.package }}" $EXTRA_ARGS
+          cargo mutants --package "${{ matrix.package }}" ${{ matrix.file_arg }} --jobs 2 ${{ matrix.test_filter }}
 
       - name: Upload Mutation Test Report
         uses: actions/upload-artifact@v4
         if: always() && steps.pkg_filter.outputs.skip != 'true'
         with:
-          name: mutation-report-${{ matrix.package }}
+          name: mutation-report-${{ matrix.name }}
           path: mutants.out/
