@@ -1,0 +1,26 @@
+name: Feature Request
+description: Propose an engine feature, plugin capability, or architectural enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for proposing an enhancement! Note that core crates must remain genre-agnostic.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: Is your feature request related to a specific limitation or use case?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution or Architectural Design
+      description: Describe your proposed design, affected crates, or plugin APIs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative designs or approaches considered?

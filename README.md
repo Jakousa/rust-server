@@ -1,5 +1,9 @@
 # Distributed Rust MMO Server Platform
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
+[![CI](https://github.com/Jakousa/rust-server/actions/workflows/rust.yml/badge.svg)](https://github.com/Jakousa/rust-server/actions/workflows/rust.yml)
+
 A high-performance, server-authoritative, spatially partitioned virtual world simulation engine and modular gameplay platform written in Rust.
 
 ---
@@ -156,3 +160,15 @@ Cluster lifecycle and chaos testing are abstracted into single-step commands via
 # 6. Fast iteration: rebuild code, re-import image, and rolling restart
 ./scripts/cluster.sh reload
 ```
+
+---
+
+## Contributing
+
+Contributions, feedback, and architectural discussions are welcome! Please check our [Contributing Guidelines](CONTRIBUTING.md) and [Architecture Guide](ARCHITECTURE.md) to get started.
+
+---
+
+## License
+
+This project is open source and available under the [MIT License](LICENSE) — free for anyone to use, extend, modify, and build upon.

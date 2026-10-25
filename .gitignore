@@ -1,9 +1,22 @@
 /target
 .vscode
+.idea/
 node_modules
 dist
 web/node_modules
 web/dist
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
 
 sbxenv.yaml
 mutants.out*/
