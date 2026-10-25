@@ -578,4 +578,114 @@ mod tests {
         assert_eq!(aborted, Some(session_id));
         assert!(trade_mgr.get_session_mut(session_id).is_none());
     }
+
+    #[test]
+    fn test_mutation_killing_boundary_trade_coverage() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 501);
+        let p2 = Guid::new(EntityType::Player, 1, 502);
+        let p3 = Guid::new(EntityType::Player, 1, 503);
+        let outsider = Guid::new(EntityType::Player, 1, 999);
+
+        // Spawn entities
+        let _k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (3.0, 4.0, 0.0)); // Exact distance = 5.0 (MAX_TRADE_DISTANCE)
+        let _k3 = store.spawn(p3, (0.0, 0.0, 5.01)); // Distance > 5.0
+
+        let mut trade_mgr = TradeManager::new();
+
+        // Self trade
+        assert_eq!(
+            trade_mgr.start_session(p1, p1, &store),
+            Err("Cannot trade with self")
+        );
+
+        // Out-of-range start
+        assert_eq!(
+            trade_mgr.start_session(p1, p3, &store),
+            Err("Players too far apart to initiate trade")
+        );
+
+        // Exact 5.0 distance start passes and allocates sequential IDs
+        let s1 = trade_mgr.start_session(p1, p2, &store).unwrap();
+        assert_eq!(s1, 1);
+
+        // Participant already in trade (p1 in trade, p3 not)
+        assert_eq!(
+            trade_mgr.start_session(p1, p3, &store),
+            Err("Player already in active trade session")
+        );
+        // Participant already in trade (p3 not in trade, p2 in trade)
+        assert_eq!(
+            trade_mgr.start_session(p3, p2, &store),
+            Err("Player already in active trade session")
+        );
+
+        // TradeSession method checks with outsider & lock states
+        let session = trade_mgr.get_session_mut(s1).unwrap();
+        assert_eq!(
+            session.set_offer(outsider, TradeOffer::default()),
+            Err("Player not a participant in trade")
+        );
+        assert_eq!(
+            session.lock(outsider),
+            Err("Player not a participant in trade")
+        );
+        assert_eq!(
+            session.accept(outsider),
+            Err("Both players must lock their offers before accepting")
+        );
+
+        // Only p1 locks -> accept must fail
+        session.lock(p1).unwrap();
+        assert_eq!(
+            session.accept(p1),
+            Err("Both players must lock their offers before accepting")
+        );
+
+        // Unlock p1 by setting offer, then only p2 locks -> accept must fail
+        session.set_offer(p1, TradeOffer::default()).unwrap();
+        session.lock(p2).unwrap();
+        assert_eq!(
+            session.accept(p2),
+            Err("Both players must lock their offers before accepting")
+        );
+
+        // Both lock -> accept succeeds
+        session.lock(p1).unwrap();
+        assert_eq!(
+            session.accept(outsider),
+            Err("Player not a participant in trade")
+        );
+        assert!(!session.accept(p1).unwrap());
+        assert!(session.accept(p2).unwrap());
+
+        // Once completed, set_offer fails
+        session.completed = true;
+        assert_eq!(
+            session.set_offer(p1, TradeOffer::default()),
+            Err("Trade session already finished")
+        );
+        session.completed = false;
+
+        // check_distance_and_abort boundary checks
+        // At exact distance 5.0 (3, 4, 0), abort should NOT trigger
+        assert_eq!(trade_mgr.check_distance_and_abort(p2, &store), None);
+        assert!(trade_mgr.get_session_mut(s1).is_some());
+
+        // Move p2 to (0, 0, 5.01) -> dist > 5.0 -> abort triggers
+        store.get_mut(k2).unwrap().position = (0.0, 0.0, 5.01);
+        assert_eq!(trade_mgr.check_distance_and_abort(p2, &store), Some(s1));
+        assert!(trade_mgr.get_session_mut(s1).is_none());
+        assert_eq!(trade_mgr.check_distance_and_abort(p2, &store), None);
+
+        // Cancel session non-existent
+        assert!(trade_mgr.cancel_session(999).is_none());
+
+        // Allocate second session to check increment
+        store.get_mut(k2).unwrap().position = (0.0, 0.0, 0.0);
+        let s2 = trade_mgr.start_session(p1, p2, &store).unwrap();
+        assert_eq!(s2, 2);
+        assert!(trade_mgr.cancel_session(s2).is_some());
+    }
 }
