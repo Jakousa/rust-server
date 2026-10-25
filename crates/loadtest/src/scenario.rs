@@ -385,3 +385,78 @@ impl ScenarioRunner {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scenario_manifest_json_roundtrip_all_step_variants() {
+        let manifest = ScenarioManifest {
+            name: "comprehensive_e2e".to_string(),
+            gateway_addr: "127.0.0.1:8080".to_string(),
+            max_p99_rtt_ms: Some(150.0),
+            steps: vec![
+                ScenarioStep::Connect { bot_id: 1 },
+                ScenarioStep::Authenticate {
+                    bot_id: 1,
+                    token: "valid_jwt_token".to_string(),
+                    expect_success: true,
+                },
+                ScenarioStep::Move {
+                    bot_id: 1,
+                    position: [10.0, 0.0, -5.5],
+                    velocity: [1.0, 0.0, 0.0],
+                    yaw: 1.57,
+                },
+                ScenarioStep::Ping { bot_id: 1 },
+                ScenarioStep::WaitMs { duration_ms: 100 },
+                ScenarioStep::AssertKnownEntity {
+                    bot_id: 1,
+                    target_guid: 42,
+                    max_distance: Some(30.0),
+                },
+                ScenarioStep::Chat {
+                    bot_id: 1,
+                    channel: "chat:global".to_string(),
+                    message: "Hello cluster".to_string(),
+                },
+                ScenarioStep::Disconnect { bot_id: 1 },
+            ],
+        };
+
+        let json_str = serde_json::to_string_pretty(&manifest).expect("serialization succeeds");
+        assert!(json_str.contains(r#""action": "connect""#));
+        assert!(json_str.contains(r#""action": "authenticate""#));
+        assert!(json_str.contains(r#""action": "move""#));
+        assert!(json_str.contains(r#""action": "ping""#));
+        assert!(json_str.contains(r#""action": "wait_ms""#));
+        assert!(json_str.contains(r#""action": "assert_known_entity""#));
+        assert!(json_str.contains(r#""action": "chat""#));
+        assert!(json_str.contains(r#""action": "disconnect""#));
+
+        let parsed: ScenarioManifest =
+            serde_json::from_str(&json_str).expect("deserialization succeeds");
+        assert_eq!(parsed.name, "comprehensive_e2e");
+        assert_eq!(parsed.gateway_addr, "127.0.0.1:8080");
+        assert_eq!(parsed.max_p99_rtt_ms, Some(150.0));
+        assert_eq!(parsed.steps.len(), 8);
+    }
+
+    #[test]
+    fn test_scenario_report_serialization() {
+        let report = ScenarioReport {
+            scenario_name: "bench_run".to_string(),
+            steps_executed: 10,
+            total_duration_ms: 500,
+            p50_rtt_ms: 12.5,
+            p99_rtt_ms: 35.0,
+            errors: vec!["minor glitch".to_string()],
+        };
+        let serialized = serde_json::to_string(&report).unwrap();
+        let deserialized: ScenarioReport = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.scenario_name, "bench_run");
+        assert_eq!(deserialized.steps_executed, 10);
+        assert_eq!(deserialized.errors.len(), 1);
+    }
+}

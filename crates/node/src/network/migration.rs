@@ -468,3 +468,190 @@ pub async fn execute_batch_entity_migration(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mmo_core::BoundingBox3D;
+
+    fn test_bounds() -> BoundingBox3D {
+        BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0))
+    }
+
+    #[test]
+    fn test_ingest_migrated_entity_missing_position_and_out_of_bounds() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+
+        // 1. Missing position coordinates -> Err((1, _))
+        let req_missing_pos = MigrateEntityRequest {
+            guid: 101,
+            source_node_id: 2,
+            target_node_id: 1,
+            position: None,
+            velocity: None,
+            yaw: 0.0,
+            pitch: 0.0,
+            last_sequence: 1,
+            session_id: 0,
+            components: vec![],
+            topology_epoch: 1,
+            last_migration_tick: 0,
+        };
+        let res1 = ingest_migrated_entity(&mut sim, &req_missing_pos);
+        assert!(res1.is_err());
+        let (code1, msg1) = res1.unwrap_err();
+        assert_eq!(code1, 1);
+        assert!(msg1.contains("Missing position"));
+
+        // 2. Out of bounds coordinates -> Err((2, _))
+        let req_out_of_bounds = MigrateEntityRequest {
+            guid: 101,
+            source_node_id: 2,
+            target_node_id: 1,
+            position: Some(Vector3 {
+                x: 500.0,
+                y: 500.0,
+                z: 500.0,
+            }),
+            velocity: None,
+            yaw: 0.0,
+            pitch: 0.0,
+            last_sequence: 1,
+            session_id: 0,
+            components: vec![],
+            topology_epoch: 1,
+            last_migration_tick: 0,
+        };
+        let res2 = ingest_migrated_entity(&mut sim, &req_out_of_bounds);
+        assert!(res2.is_err());
+        let (code2, msg2) = res2.unwrap_err();
+        assert_eq!(code2, 2);
+        assert!(msg2.contains("outside recipient node"));
+    }
+
+    #[test]
+    fn test_ingest_migrated_entity_removes_ghost_and_restores_state() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::from_raw(202);
+
+        // Pre-insert ghost record into ghost store
+        let ghost = crate::network::ghost::GhostRecord {
+            guid,
+            position: (50.0, 50.0, 50.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: vec![],
+            last_tick: 10,
+            source_node_id: 2,
+        };
+        sim.ghost_store.insert_or_update(ghost);
+        assert!(sim.ghost_store.contains(guid));
+
+        let req = MigrateEntityRequest {
+            guid: guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            position: Some(Vector3 {
+                x: 50.0,
+                y: 50.0,
+                z: 50.0,
+            }),
+            velocity: Some(Vector3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            yaw: 1.57,
+            pitch: 0.0,
+            last_sequence: 77,
+            session_id: 999,
+            components: vec![],
+            topology_epoch: 1,
+            last_migration_tick: 15,
+        };
+
+        assert!(ingest_migrated_entity(&mut sim, &req).is_ok());
+
+        // Ghost must be removed
+        assert!(!sim.ghost_store.contains(guid));
+
+        // Entity exists in entity store and octree
+        assert!(sim.entity_store.get_by_guid(guid).is_some());
+        assert!(sim
+            .octree
+            .query_radius((50.0, 50.0, 50.0), 1.0)
+            .contains(&guid));
+
+        // Kinematic tracking state restored
+        let kin = sim
+            .kinematic_states
+            .get(&guid)
+            .expect("kinematic state present");
+        assert_eq!(kin.last_sequence, 77);
+
+        // Cooldown tick preserved
+        assert_eq!(sim.get_last_migration_tick(guid), Some(15));
+
+        // AoI observer registered for session_id 999
+        assert!(sim.aoi.get_observer(999).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_batch_migration_all_or_nothing_lease_rollback() {
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            test_bounds(),
+        )));
+        let g1 = Guid::from_raw(301);
+        let g2 = Guid::from_raw(302);
+
+        {
+            let mut guard = sim.write().await;
+            guard.entity_store.spawn(g1, (10.0, 10.0, 10.0));
+            guard.entity_store.spawn(g2, (20.0, 20.0, 20.0));
+            // Pre-acquire lease on g2 to force conflict
+            assert!(guard.acquire_migration_lease(g2));
+        }
+
+        let pool = GrpcClientPool::new();
+        let res = execute_batch_entity_migration_pooled(
+            &pool,
+            sim.clone(),
+            &[g1, g2],
+            2,
+            "127.0.0.1:50052",
+            None,
+        )
+        .await;
+
+        assert_eq!(res, Err(MigrationError::LeaseConflict(g2)));
+
+        // Verify g1 lease was rolled back (not left acquired)
+        let mut guard = sim.write().await;
+        assert!(guard.acquire_migration_lease(g1));
+    }
+
+    #[tokio::test]
+    async fn test_batch_migration_empty_slice_short_circuits() {
+        let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            test_bounds(),
+        )));
+        let pool = GrpcClientPool::new();
+        let report =
+            execute_batch_entity_migration_pooled(&pool, sim, &[], 2, "127.0.0.1:50052", None)
+                .await
+                .expect("empty batch succeeds immediately");
+
+        assert_eq!(
+            report,
+            BatchMigrationReport {
+                success: true,
+                total_requested: 0,
+                migrated_count: 0,
+                error_message: String::new(),
+            }
+        );
+    }
+}

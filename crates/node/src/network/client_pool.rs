@@ -70,3 +70,42 @@ impl GrpcClientPool {
         self.channels.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_client_pool_caching_and_invalidation() {
+        let pool = GrpcClientPool::new();
+        let endpoint = "127.0.0.1:50051";
+
+        // First lazy retrieval inserts into cache
+        let ch1 = pool.get_channel(endpoint).expect("valid endpoint");
+        assert_eq!(pool.channels.len(), 1);
+
+        // Second retrieval returns cached channel
+        let ch2 = pool.get_channel(endpoint).expect("returns cached");
+        assert_eq!(pool.channels.len(), 1);
+        drop((ch1, ch2));
+
+        // Invalidation removes by normalized http:// URI
+        pool.invalidate(endpoint);
+        assert_eq!(pool.channels.len(), 0);
+
+        // Clearing all channels
+        let _ = pool.get_channel("http://127.0.0.1:50052");
+        let _ = pool.get_channel("http://127.0.0.1:50053");
+        assert_eq!(pool.channels.len(), 2);
+        pool.clear();
+        assert_eq!(pool.channels.len(), 0);
+    }
+
+    #[test]
+    fn test_client_pool_invalid_endpoint_error() {
+        let pool = GrpcClientPool::new();
+        // Completely invalid URI (control characters or invalid scheme syntax)
+        let res = pool.get_channel("http://[::1:::invalid");
+        assert!(res.is_err());
+    }
+}
