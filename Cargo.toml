@@ -17,6 +17,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["Jami Kousa <jami.kousa@gmail.com>"]
+repository = "https://github.com/Jakousa/rust-server"
 publish = false
 
 [workspace.lints.clippy]
