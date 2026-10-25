@@ -150,6 +150,25 @@ prop_compose! {
     }
 }
 
+fn arb_any_client_packet() -> impl Strategy<Value = ClientPacket> {
+    prop_oneof![
+        arb_movement_packet().prop_map(ClientPacket::Movement),
+        arb_interaction_packet().prop_map(ClientPacket::Interaction),
+        arb_auth_request_packet().prop_map(ClientPacket::AuthRequest),
+        arb_auth_response_packet().prop_map(ClientPacket::AuthResponse),
+        arb_social_message_packet().prop_map(ClientPacket::SocialMessage),
+        arb_market_buy_packet().prop_map(ClientPacket::MarketBuyRequest),
+        any::<u64>()
+            .prop_map(|ts| ClientPacket::Ping(mmo_schema::client::PingPacket { timestamp: ts })),
+        (any::<u64>(), any::<u64>()).prop_map(|(c, s)| ClientPacket::Pong(
+            mmo_schema::client::PongPacket {
+                client_timestamp: c,
+                server_timestamp: s,
+            }
+        )),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -364,6 +383,52 @@ proptest! {
         let norm = payload.normalized_direction().unwrap();
         let len = (norm.x * norm.x + norm.y * norm.y + norm.z * norm.z).sqrt();
         prop_assert!((len - 1.0).abs() < 1e-4, "Normalized length was {}", len);
+    }
+
+    #[test]
+    fn fuzz_arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let _ = ClientPacket::decode(&bytes);
+        let mut buf = BytesMut::from(&bytes[..]);
+        let _ = ClientPacket::decode_frame(&mut buf);
+    }
+
+    #[test]
+    fn fuzz_mutated_valid_packet_frames_never_panic(
+        packet in arb_any_client_packet(),
+        mutations in proptest::collection::vec((0usize..512, any::<u8>()), 1..16),
+        truncate_len in proptest::option::of(0usize..512),
+    ) {
+        let mut encoded = packet.encode();
+        for (pos, val) in mutations {
+            if !encoded.is_empty() {
+                let idx = pos % encoded.len();
+                encoded[idx] = val;
+            }
+        }
+        if let Some(trunc) = truncate_len {
+            if trunc < encoded.len() {
+                encoded.truncate(trunc);
+            }
+        }
+        let _ = ClientPacket::decode(&encoded);
+        let mut buf = BytesMut::from(&encoded[..]);
+        let _ = ClientPacket::decode_frame(&mut buf);
+    }
+
+    #[test]
+    fn fuzz_bitreader_arbitrary_bitstreams(
+        bytes in proptest::collection::vec(any::<u8>(), 0..256),
+        bit_widths in proptest::collection::vec(1usize..=64usize, 1..64),
+    ) {
+        let mut reader = mmo_schema::bitpack::BitReader::new(&bytes);
+        for width in bit_widths {
+            let _ = reader.read_bits(width);
+            let _ = reader.read_bool();
+            let _ = reader.get_varint_u32();
+            let _ = reader.get_varint_u64();
+            reader.align_byte();
+            let _ = reader.read_bytes(width.min(16));
+        }
     }
 }
 

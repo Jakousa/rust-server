@@ -239,6 +239,11 @@ impl PaletteChunk {
         self.revision
     }
 
+    /// Sets the revision number.
+    pub fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+
     /// Number of palette entries.
     pub fn palette_len(&self) -> usize {
         self.palette.len()
