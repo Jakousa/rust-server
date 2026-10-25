@@ -20,7 +20,9 @@ export class PlayerControls {
     this.sequence = 1;
     this.onCastCallback = null;
 
-    this.initListeners();
+    if (typeof window !== "undefined") {
+      this.initListeners();
+    }
   }
 
   initListeners() {

@@ -69,6 +69,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
@@ -83,6 +84,23 @@ jobs:
 
       - name: Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check WASM Target (mmo-client-wasm)
+        run: cargo clippy --package mmo-client-wasm --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Web Frontend Unit Tests & Build
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run build
 
       - name: Supply-Chain and License Audit (cargo-deny)
         run: cargo deny check
