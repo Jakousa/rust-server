@@ -306,3 +306,273 @@ impl GatewayInterceptHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mmo_core::guid::Guid;
+    use mmo_schema::client::{
+        market_error_codes, MarketBuyRequestPacket, MarketCancelRequestPacket,
+        MarketListRequestPacket, MarketQueryRequestPacket, MarketResponsePacket,
+        SocialMessagePacket, SocialSubscribePacket, SocialUnsubscribePacket,
+    };
+    use tokio::sync::mpsc;
+
+    #[allow(clippy::type_complexity)]
+    fn create_test_handler() -> (
+        GatewayInterceptHandler,
+        Arc<SessionRouter>,
+        Arc<GatewaySubscriptionManager>,
+        Arc<DashMap<u64, SessionSink>>,
+    ) {
+        let router = Arc::new(SessionRouter::new());
+        let subscription_manager = Arc::new(GatewaySubscriptionManager::new());
+        let session_sinks = Arc::new(DashMap::new());
+        let active_bus_subscriptions = Arc::new(DashMap::new());
+
+        let handler = GatewayInterceptHandler::new(
+            router.clone(),
+            subscription_manager.clone(),
+            None,
+            None,
+            session_sinks.clone(),
+            active_bus_subscriptions,
+        );
+
+        (handler, router, subscription_manager, session_sinks)
+    }
+
+    #[tokio::test]
+    async fn test_social_message_anti_spoofing_drops_mismatched_sender() {
+        let (handler, router, sub_mgr, sinks) = create_test_handler();
+        let s1 = 1u64;
+        let s2 = 2u64;
+        let bound_guid = Guid::from_raw(100);
+        router.register_session(s1, bound_guid, "127.0.0.1:50051".to_string());
+
+        // Subscribe session 2 to chat:global
+        sub_mgr.subscribe(s2, "chat:global".to_string());
+        let (stx2, mut srx2) = mpsc::channel(16);
+        let (dtx2, _drx2) = mpsc::channel(16);
+        sinks.insert(s2, SessionSink::new(dtx2, stx2));
+
+        // 1. Spoofed sender_guid = 200 (bound is 100) -> dropped
+        let spoofed_packet = ClientPacket::SocialMessage(SocialMessagePacket {
+            channel_type: 0,
+            target_id: 0,
+            sender_guid: 200,
+            sender_name: "Imposter".to_string(),
+            content: "Spoofed message".to_string(),
+            timestamp: 1000,
+        });
+        assert!(handler.handle_packet(s1, &spoofed_packet).await);
+        assert!(
+            srx2.try_recv().is_err(),
+            "spoofed packet must not be delivered"
+        );
+
+        // 2. Legitimate sender_guid = 100 -> delivered
+        let legit_packet = ClientPacket::SocialMessage(SocialMessagePacket {
+            channel_type: 0,
+            target_id: 0,
+            sender_guid: 100,
+            sender_name: "RealPlayer".to_string(),
+            content: "Hello friends".to_string(),
+            timestamp: 1001,
+        });
+        assert!(handler.handle_packet(s1, &legit_packet).await);
+        assert!(
+            srx2.try_recv().is_ok(),
+            "legit packet must be delivered to subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_social_subscribe_unsubscribe_and_remove_session() {
+        let (handler, _router, sub_mgr, _sinks) = create_test_handler();
+        let s1 = 10u64;
+
+        // Subscribe all standard channel types and custom name
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 0,
+                    channel_name: String::new(),
+                    target_id: 0,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("chat:global").contains(&s1));
+
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 1,
+                    channel_name: String::new(),
+                    target_id: 55,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("whisper:55").contains(&s1));
+
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 2,
+                    channel_name: String::new(),
+                    target_id: 77,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("chat:party:77").contains(&s1));
+
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 3,
+                    channel_name: String::new(),
+                    target_id: 88,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("chat:guild:88").contains(&s1));
+
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 4,
+                    channel_name: String::new(),
+                    target_id: 0,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("chat:area").contains(&s1));
+
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                    channel_type: 99,
+                    channel_name: "trade:lfg".to_string(),
+                    target_id: 0,
+                }),
+            )
+            .await;
+        assert!(sub_mgr.get_subscribers("trade:lfg").contains(&s1));
+
+        // Unsubscribe custom name
+        handler
+            .handle_packet(
+                s1,
+                &ClientPacket::SocialUnsubscribe(SocialUnsubscribePacket {
+                    channel_type: 0,
+                    channel_name: "trade:lfg".to_string(),
+                    target_id: 0,
+                }),
+            )
+            .await;
+        assert!(!sub_mgr.get_subscribers("trade:lfg").contains(&s1));
+
+        // remove_session cleans up remaining subscriptions
+        handler.remove_session(s1);
+        assert!(sub_mgr.get_subscribers("whisper:55").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_market_requests_unauthenticated_and_unavailable_errors() {
+        let (handler, _router, _sub_mgr, sinks) = create_test_handler();
+        let s1 = 42u64;
+        let (stx, mut srx) = mpsc::channel(16);
+        let (dtx, _drx) = mpsc::channel(16);
+        sinks.insert(s1, SessionSink::new(dtx, stx));
+
+        // 1. Unauthenticated MarketListRequest -> UNAUTHORIZED
+        let list_pkt = ClientPacket::MarketListRequest(MarketListRequestPacket {
+            item_instance_id: "inst_1".to_string(),
+            src_container_id: 10,
+            src_slot: 0,
+            price: 100,
+            duration_secs: 3600,
+        });
+        assert!(handler.handle_packet(s1, &list_pkt).await);
+        let bytes = srx.try_recv().expect("response sent");
+        let resp = ClientPacket::decode(&bytes).expect("decodable");
+        match resp {
+            ClientPacket::MarketResponse(m) => {
+                assert_eq!(m.request_type, 1);
+                assert!(!m.success);
+                assert_eq!(m.error_code, market_error_codes::UNAUTHORIZED);
+            }
+            other => panic!("expected MarketResponse, got {other:?}"),
+        }
+
+        // 2. Unauthenticated MarketBuyRequest -> UNAUTHORIZED
+        let buy_pkt = ClientPacket::MarketBuyRequest(MarketBuyRequestPacket {
+            listing_id: "list_1".to_string(),
+            buyer_container_id: 10,
+            payment_container_id: 11,
+            price: 100,
+        });
+        assert!(handler.handle_packet(s1, &buy_pkt).await);
+        let bytes = srx.try_recv().expect("response sent");
+        let resp = ClientPacket::decode(&bytes).expect("decodable");
+        match resp {
+            ClientPacket::MarketResponse(m) => {
+                assert_eq!(m.request_type, 2);
+                assert_eq!(m.error_code, market_error_codes::UNAUTHORIZED);
+            }
+            other => panic!("expected MarketResponse, got {other:?}"),
+        }
+
+        // 3. Unauthenticated MarketCancelRequest -> UNAUTHORIZED
+        let cancel_pkt = ClientPacket::MarketCancelRequest(MarketCancelRequestPacket {
+            listing_id: "list_1".to_string(),
+            dst_container_id: 10,
+        });
+        assert!(handler.handle_packet(s1, &cancel_pkt).await);
+        let bytes = srx.try_recv().expect("response sent");
+        let resp = ClientPacket::decode(&bytes).expect("decodable");
+        match resp {
+            ClientPacket::MarketResponse(m) => {
+                assert_eq!(m.request_type, 3);
+                assert_eq!(m.error_code, market_error_codes::UNAUTHORIZED);
+            }
+            other => panic!("expected MarketResponse, got {other:?}"),
+        }
+
+        // 4. MarketQueryRequest with service None -> INTERNAL_ERROR
+        let query_pkt = ClientPacket::MarketQueryRequest(MarketQueryRequestPacket {
+            item_def_id: 1,
+            min_price: 10,
+            max_price: 1000,
+            offset: 0,
+            limit: 10,
+        });
+        assert!(handler.handle_packet(s1, &query_pkt).await);
+        let bytes = srx.try_recv().expect("response sent");
+        let resp = ClientPacket::decode(&bytes).expect("decodable");
+        match resp {
+            ClientPacket::MarketResponse(m) => {
+                assert_eq!(m.request_type, 4);
+                assert_eq!(m.error_code, market_error_codes::INTERNAL_ERROR);
+            }
+            other => panic!("expected MarketResponse, got {other:?}"),
+        }
+
+        // 5. Unsolicited MarketResponse from client intercepted & dropped
+        let unsolicited = ClientPacket::MarketResponse(MarketResponsePacket {
+            request_type: 1,
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            listings: vec![],
+        });
+        assert!(handler.handle_packet(s1, &unsolicited).await);
+        assert!(srx.try_recv().is_err());
+    }
+}
