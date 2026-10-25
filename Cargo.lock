@@ -1947,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "mmo-schema",
+ "proptest",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -2074,6 +2075,7 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "mmo-core",
+ "proptest",
  "serde",
  "thiserror 2.0.20",
 ]

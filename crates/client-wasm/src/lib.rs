@@ -514,6 +514,7 @@ mod tests {
     use mmo_schema::client::{
         delta_flags, EntityDeltaBatchPacket, EntityDeltaState, EntityDespawnPacket,
     };
+    use proptest::prelude::*;
 
     #[test]
     fn test_wasm_client_world_lifecycle_and_render_buffer() {
@@ -1050,5 +1051,41 @@ mod tests {
         // Hard snap threshold exceeded -> hard snap reconciled
         assert_eq!(world.prediction_buffer.pending_input_count(), 0);
         assert_eq!(world.get_entity_position(local_id), Some((50.0, 0.0, 0.0)));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn fuzz_process_packet_arbitrary_bytes_and_recovery(
+            corrupted in proptest::collection::vec(any::<u8>(), 0..1024),
+            client_ts in any::<u64>(),
+            server_ts in any::<u64>(),
+        ) {
+            let mut world = WasmClientWorld::new();
+            let res = world.process_packet(&corrupted);
+
+            let valid_packet = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                client_timestamp: client_ts,
+                server_timestamp: server_ts,
+            });
+            let valid_frame = valid_packet.encode();
+
+            if res.is_err() {
+                let initial = world.received_packets;
+                prop_assert!(world.process_packet(&valid_frame).is_ok());
+                prop_assert_eq!(world.received_packets, initial + 1);
+            } else if world.incoming_buffer.is_empty() {
+                let initial = world.received_packets;
+                prop_assert!(world.process_packet(&valid_frame).is_ok());
+                prop_assert_eq!(world.received_packets, initial + 1);
+            } else {
+                if world.process_packet(&valid_frame).is_err() {
+                    let initial = world.received_packets;
+                    prop_assert!(world.process_packet(&valid_frame).is_ok());
+                    prop_assert_eq!(world.received_packets, initial + 1);
+                }
+            }
+        }
     }
 }
