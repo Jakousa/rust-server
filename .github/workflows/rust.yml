@@ -10,6 +10,10 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -150,7 +154,7 @@ jobs:
   mutants:
     name: Mutation Testing Gate
     needs: [filter]
-    if: needs.filter.outputs.code == 'true' && (github.event_name == 'push' || needs.filter.outputs.schema == 'true')
+    if: needs.filter.outputs.code == 'true' && needs.filter.outputs.schema == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -223,8 +227,8 @@ jobs:
             fi
           fi
 
-          # 4. If schema changed (or push to main with code), mutants job MUST have executed and succeeded
-          if [ "${{ needs.filter.outputs.code }}" == "true" ] && { [ "${{ github.event_name }}" == "push" ] || [ "${{ needs.filter.outputs.schema }}" == "true" ]; }; then
+          # 4. If schema changed, mutants job MUST have executed and succeeded
+          if [ "${{ needs.filter.outputs.code }}" == "true" ] && [ "${{ needs.filter.outputs.schema }}" == "true" ]; then
             if [ "${{ needs.mutants.result }}" != "success" ]; then
               echo "Schema modified, but Mutation testing job did not succeed (status: ${{ needs.mutants.result }})"
               exit 1

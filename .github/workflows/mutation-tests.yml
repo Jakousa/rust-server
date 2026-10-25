@@ -1,9 +1,9 @@
-name: Nightly Mutation Testing
+name: Mutation Testing Suite
 
 on:
   schedule:
-    # Run every night at 03:00 UTC
-    - cron: '0 3 * * *'
+    # Weekly on Sunday at 03:00 UTC (disabled nightly to conserve GitHub Actions Pro quota)
+    - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
       package:
@@ -14,14 +14,65 @@ on:
         description: 'Additional arguments to pass to cargo-mutants'
         required: false
         default: '--jobs 2 -- --lib'
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  check-trigger:
+    name: Check Trigger & Freshness
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Evaluate execution conditions
+        id: check
+        run: |
+          # 1. PR trigger: only execute if labeled with 'mutation-test'
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            if [ "${{ github.event.label.name }}" != "mutation-test" ]; then
+              echo "PR labeled with '${{ github.event.label.name }}', not 'mutation-test'. Skipping mutation testing."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "PR labeled with 'mutation-test'. Proceeding with mutation testing."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 2. Schedule trigger: only run if new commits exist in the past 7 days on the branch
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            COMMITS=$(git log --since="7 days ago" --oneline)
+            if [ -z "$COMMITS" ]; then
+              echo "No commits found on branch in the last 7 days. Skipping scheduled mutation testing to conserve CI quota."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Recent commits detected in the last 7 days. Proceeding with scheduled mutation testing."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 3. workflow_dispatch: always execute
+          echo "Manual workflow dispatch. Proceeding."
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
   mutation-tests:
     name: Mutation Testing (${{ matrix.package }})
+    needs: [check-trigger]
+    if: needs.check-trigger.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -33,33 +84,44 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check Package Filter
+        id: pkg_filter
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ inputs.package }}" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "${{ matrix.package }}" ]; then
+            echo "Package filter '${{ inputs.package }}' does not match matrix package '${{ matrix.package }}'. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Free runner disk space
+        if: steps.pkg_filter.outputs.skip != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
 
       - name: Install Protoc
+        if: steps.pkg_filter.outputs.skip != 'true'
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust toolchain
+        if: steps.pkg_filter.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Rust cache
+        if: steps.pkg_filter.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-mutants
+        if: steps.pkg_filter.outputs.skip != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
 
-      - name: Run Nightly Mutation Testing
+      - name: Run Mutation Testing
+        if: steps.pkg_filter.outputs.skip != 'true'
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ] && [ -n "${{ inputs.package }}" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "${{ matrix.package }}" ]; then
-            echo "Skipping ${{ matrix.package }} (package filter: ${{ inputs.package }})"
-            mkdir -p mutants.out
-            exit 0
-          fi
           EXTRA_ARGS="${{ inputs.additional_args }}"
           if [ -z "$EXTRA_ARGS" ]; then
             EXTRA_ARGS="--jobs 2 -- --lib"
@@ -73,7 +135,7 @@ jobs:
 
       - name: Upload Mutation Test Report
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.pkg_filter.outputs.skip != 'true'
         with:
-          name: nightly-mutation-report-${{ matrix.package }}
+          name: mutation-report-${{ matrix.package }}
           path: mutants.out/
