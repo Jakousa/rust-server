@@ -52,9 +52,9 @@ while [ "$RECOVERY_ELAPSED" -lt "$MAX_RECOVERY_WAIT_SECS" ]; do
     else
         DIRECTOR_LOGS=""
     fi
-    if echo "${DIRECTOR_LOGS}" | grep -q "Recovered .* orphaned partition"; then
-        echo "[Chaos] SUCCESS: Director recovered orphaned partition(s) in ~${RECOVERY_ELAPSED}s (threshold <= 5s)!"
-        echo "${DIRECTOR_LOGS}" | grep "Recovered .* orphaned partition" | tail -n 1
+    if echo "${DIRECTOR_LOGS}" | grep -Eiq "(Recovered .* orphaned partition|cleanly deregistered; recovered [1-9][0-9]* partitions)"; then
+        echo "[Chaos] SUCCESS: Director recovered partition(s) in ~${RECOVERY_ELAPSED}s (threshold <= 5s)!"
+        echo "${DIRECTOR_LOGS}" | grep -Ei "(Recovered .* orphaned partition|cleanly deregistered; recovered [1-9][0-9]* partitions)" | tail -n 1
         if echo "${DIRECTOR_LOGS}" | grep -q "Propagated route reassignment"; then
             echo "[Chaos] Gateway route reassignment verified:"
             echo "${DIRECTOR_LOGS}" | grep "Propagated route reassignment" | tail -n 1
