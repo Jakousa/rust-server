@@ -3,36 +3,36 @@
 This document is the single source of truth for bringing the **Distributed Rust MMO Server Platform** to 100% production fruition across all MMO genres (Tab-Target RPGs, Voxel/Survival Sandboxes, Tactical/Shooter MMOs, and 6-DoF Space/Vehicular Simulations).
 
 > [!IMPORTANT]
-> **Active Roadmap Status: Phase 5 Queued (Bundle #16 — Playable Village & Barter Vertical Slice PoC)**
-> Phases 1–4 (Bundles #1–#15) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
+> **Active Roadmap Status: Phase 5 Queued (Playable Village & Barter Vertical Slice PoC)**
+> Phases 1–4 (#1–#15) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
 >
-> **Phase 5 (Bundle #16)** is now architected under [`openspec/changes/village-barter-vertical-slice-poc/`](changes/village-barter-vertical-slice-poc/) to deliver the first end-to-end playable multiplayer game slice (Village NPCs, player starter inventories, NPC barter, player-to-player trade, WebTransport daemon & browser UI).
+> **Phase 5** is now architected under [`openspec/changes/village-barter-vertical-slice-poc/`](changes/village-barter-vertical-slice-poc/) to deliver the first end-to-end playable multiplayer game slice (Village NPCs, player starter inventories, NPC barter, player-to-player trade, WebTransport daemon & browser UI).
 
 ---
 
-## Execution Rules for Future Bundles & Changes
+## Execution Rules for Future Changes
 
-1. **Check for Active Bundles**:
-   - Check `openspec/changes/`. If new groundwork bundles have been proposed, execute them in dependency order following [`openspec-bundle-executor`](../.agents/skills/openspec-bundle-executor/SKILL.md).
+1. **Check for Active Changes**:
+   - Check `openspec/changes/`. If active changes exist, execute them following [`openspec-apply-change`](../.agents/skills/openspec-apply-change/SKILL.md).
    - If `openspec/changes/` contains only `archive/`, new work must first be proposed via `openspec-propose` or `openspec-pro-workflow`.
 2. **Never Skip or Stray from `design.md` and `tasks.md`**:
-   - Each OpenSpec bundle is architected against exact file paths and line numbers. Read `proposal.md`, `specs/`, `design.md`, and `tasks.md` in full before editing any code.
+   - Each OpenSpec change is architected against exact file paths and line numbers. Read `proposal.md`, `specs/`, `design.md`, and `tasks.md` in full before editing any code.
 3. **Dedicated Feature Branches**:
-   - Create a dedicated feature branch `feat/<bundle-name>` from latest `origin/main`. Never commit directly to `main`.
+   - Create a dedicated feature branch `feat/<change-name>` from latest `origin/main`. Never commit directly to `main`.
 4. **Strict Quality Gates Before Every PR**:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings allowed)
    - `cargo test --workspace`
 5. **Sync Specs & Archive on Completion**:
-   - Copy/merge `openspec/changes/<bundle-name>/specs/.../spec.md` into `openspec/specs/.../spec.md` and `git mv openspec/changes/<bundle-name> openspec/changes/archive/YYYY-MM-DD-<bundle-name>` (either in the implementation PR or immediately upon merge).
+   - Copy/merge `openspec/changes/<change-name>/specs/.../spec.md` into `openspec/specs/.../spec.md` and `git mv openspec/changes/<change-name> openspec/changes/archive/YYYY-MM-DD-<change-name>` (either in the implementation PR or immediately upon merge).
 
 ---
 
-## Delivered Groundwork Bundles
+## Delivered Milestones
 
 ### Phase 1: Core Runtime, Director/Gateway, Gameplay & Client-WASM Bug Fixes (P0)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
 | **1** | [`director-gateway-failover-and-routing-fixes`](changes/archive/2026-10-17-director-gateway-failover-and-routing-fixes/) | #102 | [#116](https://github.com/Jakousa/rust-server/pull/116) | Completed | `mmo-director`, `mmo-gateway` | Resolve dead/new node `listen_addr` from `NodeRegistry` on failover & deregistration; wire `reap_idle_instances` & `check_and_recover_stale_gateways` in `director/src/main.rs`; read `REALM_ID`/`FEDERATION_HMAC_SECRET` from env; 3-axis bidirectional Octree boundary smoothing with parent `Branch::bounds` union updates; QUIC datagram `Ping` + `intercept_handler` & safe `active_send_stream` handling. |
 | **2** | [`gameplay-trade-ability-and-wasm-fixes`](changes/archive/2026-10-17-gameplay-trade-ability-and-wasm-fixes/) | #103 | [#116](https://github.com/Jakousa/rust-server/pull/116) | Completed | `mmo-gameplay` | Fix `TradeManager::execute_atomic_swap` item ownership verification, giver item removal, weight checks, and currency settlement; pre-validate `ability.range` and `ActionQueue` busy state before deducting mana/cooldowns; enforce single-guild membership in `GuildManager`; sync `Octree`, `AttributeSet`, and `EntityDiedEvent` in WASM `host_api.rs`; wire `EncumbranceHookHandler` and `DamageProcessingSystem`. |
@@ -42,7 +42,7 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ### Phase 2: Storage & Core Modularity, Deduplication & High-Frequency Performance (P1)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
 | **4** | [`storage-dialect-deduplication`](changes/archive/2026-10-17-storage-dialect-deduplication/) | #98 | [#118](https://github.com/Jakousa/rust-server/pull/118) | Completed | `mmo-storage` | Consolidate ~1,500 lines of duplicated SQLite vs. PostgreSQL methods across `escrow_coord.rs`, `marketplace.rs`, `transaction_coord.rs`, and `repository.rs` using `with_dialect_tx!`, `Database::sql`, `compute_free_slots`, and shared time helpers; propagate snapshot errors; gate `test_helpers`. |
 | **5** | [`node-gateway-core-modularity-and-perf`](changes/archive/2026-10-18-node-gateway-core-modularity-and-perf/) | #100, #101, #105 | [#119](https://github.com/Jakousa/rust-server/pull/119) | Completed | `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-schema`, `mmo-loadtest` | Split `network.rs` and `server.rs` god modules; add `GrpcClientPool` (`DashMap`) and MPSC client input queue in `mmo-node`; unify TCP/QUIC/WebTransport auth handshake; unify single/batch migration; consolidate Ray-AABB slab math onto `BoundingBox3D` and enforce `collision_layers`; bucket `EventQueue` by `TypeId`; eliminate per-tick `Vec` allocations in `AttributeSet::tick` and `SpatialHistoryBuffer::push_frame`; wire `BotSession` sequencing/acks and non-recursive `TrajectoryController` in `mmo-loadtest`; harden `u16` string casts in `mmo-schema`. |
@@ -51,7 +51,7 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ### Phase 3: The "100% Genre-Agnostic MMO Substrate" Primitives (P1/P2)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
 | **6** | [`genre-agnostic-core-and-indexed-attributes`](changes/archive/2026-10-18-genre-agnostic-core-and-indexed-attributes/) | #96 | [#120](https://github.com/Jakousa/rust-server/pull/120) | Completed | `mmo-core`, `mmo-node`, `mmo-schema`, `mmo-gameplay` | Sever `mmo-gameplay` dependency from `mmo-node` `[dependencies]`; introduce `AttributeId(u8)` fast-indexed attributes, `Entity::state_flags`, `ScriptReloadable` trait, and generalized `CooldownTracker` / `ActionDefinition` in `mmo-core`; support extensible `InteractionType::Custom(u8)` in `mmo-schema`. |
 | **7** | [`bitwise-visibility-phasing-and-stealth`](changes/archive/2026-10-18-bitwise-visibility-phasing-and-stealth/) | #110 | [#121](https://github.com/Jakousa/rust-server/pull/121) | Completed | `mmo-core`, `mmo-node` | Add `phase_mask: u64`, `visibility_mask: u64`, `stealth_level: u8`, and `detection_level: u8` (`Entity::can_observe`) to `Entity` and `WorldObject`; filter AoI candidates prior to density throttling and emit immediate despawn packets when an entity enters stealth or shifts phase. |
@@ -61,11 +61,11 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ---
 
-## Active Groundwork Bundles (Phase 4)
+## Historical Phases (Phase 2)
 
 ### Phase 4: Production Verification, Fuzzing & CI Coverage Hardening (P1)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
 | **11** | [`postgres-ci-dual-dialect-verification`](changes/archive/2026-10-23-postgres-ci-dual-dialect-verification/) | [#128](https://github.com/Jakousa/rust-server/issues/128) | — | Completed | `mmo-storage`, `.github/workflows/` | Add `connect_test_databases()` dual-dialect test harness in `crates/storage/src/test_helpers.rs`; add `postgres_dialect_integration_test.rs` exercising all repositories, 2PC transfers, escrow, marketplace, world objects (`bind_upsert_postgres`), and document store; provision live `postgres:16-alpine` service container in `.github/workflows/rust.yml`. |
 | **12** | [`adversarial-wire-and-codec-fuzzing`](changes/archive/2026-10-25-adversarial-wire-and-codec-fuzzing/) | [#129](https://github.com/Jakousa/rust-server/issues/129) | — | Completed | `mmo-schema`, `mmo-plugin-voxel`, `mmo-client-wasm` | Add adversarial and mutated-frame `proptest` suites for `ClientPacket::decode`, `ClientPacket::decode_frame`, and `BitReader` in `mmo-schema`; add `PaletteChunk` RLE roundtrip and crafted `VXR1` header fuzz tests in `mmo-plugin-voxel`; add corrupted-stream recovery fuzz tests for `WasmClientWorld::process_packet` in `mmo-client-wasm`. |
@@ -75,10 +75,10 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ---
 
-## Active Groundwork Bundles (Phase 5)
+## Active Milestone (Phase 5)
 
 ### Phase 5: Playable Village & Barter Vertical Slice PoC (P0)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
-| **16** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | — | — | Planned | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | Implement `VillagePlugin` & `VillagerMerchantComponent` (3 NPC villagers, village `WorldObject` buildings, starter player inventories, and `module_id = 0x02` packet handler for NPC barter & 2-player atomic `TradeManager` swaps); extract reusable node daemon runner & `mmo-village-node` binary; auto-hydrate arriving player sessions on `mmo-node`; bind `WebTransportServer` (`:4433/udp`) + `/cert-hash` endpoint in `mmo-gateway`; wire Village Inventory & Trade UI in `web/`. |
+| **16** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | [#143](https://github.com/Jakousa/rust-server/issues/143), [#144](https://github.com/Jakousa/rust-server/issues/144) | [#142](https://github.com/Jakousa/rust-server/pull/142) | In Progress | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | Implement `VillagePlugin` & `VillagerMerchantComponent` (3 NPC villagers, village `WorldObject` buildings, starter player inventories, and `module_id = 0x02` packet handler for NPC barter & 2-player atomic `TradeManager` swaps); extract reusable node daemon runner & `mmo-village-node` binary; auto-hydrate arriving player sessions on `mmo-node`; bind `WebTransportServer` (`:4433/udp`) + `/cert-hash` endpoint in `mmo-gateway`; wire Village Inventory & Trade HUD in `web/`. |

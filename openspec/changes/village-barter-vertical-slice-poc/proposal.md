@@ -1,7 +1,7 @@
 # Playable Village & Barter Vertical Slice PoC Proposal
 
 ## Context & Problem Statement
-All 15 foundational engine, storage, networking, spatial, and verification bundles (`openspec/ROADMAP.md` Phases 1–4) are complete. However, the runnable daemon binaries (`mmo-gateway`, `mmo-node`) and the browser frontend (`web/`) are not yet wired into a cohesive, playable end-to-end game:
+All 15 foundational engine, storage, networking, spatial, and verification milestones (`openspec/ROADMAP.md` Phases 1–4) are complete. However, the runnable daemon binaries (`mmo-gateway`, `mmo-node`) and the browser frontend (`web/`) are not yet wired into a cohesive, playable end-to-end game:
 
 1. **Gateway WebTransport Daemon & Dev/PoC Handshake Gap**:
    - `crates/gateway/src/main.rs` only binds the TCP listener (`0.0.0.0:8080`) and does not start `WebTransportServer` (`0.0.0.0:4433`) or expose its self-signed ECDSA SHA-256 certificate digest (`cert_digest`) for browser clients.
