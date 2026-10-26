@@ -3,10 +3,10 @@
 This document is the single source of truth for bringing the **Distributed Rust MMO Server Platform** to 100% production fruition across all MMO genres (Tab-Target RPGs, Voxel/Survival Sandboxes, Tactical/Shooter MMOs, and 6-DoF Space/Vehicular Simulations).
 
 > [!IMPORTANT]
-> **Active Roadmap Status: Phase 5 Queued (Bundle #16 — Playable Village & Barter Vertical Slice PoC)**
-> Phases 1–4 (Bundles #1–#15) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
+> **Active Roadmap Status: Phase 5 Queued (Playable Village & Barter Vertical Slice PoC)**
+> Phases 1–4 (#1–#15) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
 >
-> **Phase 5 (Bundle #16)** is now architected under [`openspec/changes/village-barter-vertical-slice-poc/`](changes/village-barter-vertical-slice-poc/) to deliver the first end-to-end playable multiplayer game slice (Village NPCs, player starter inventories, NPC barter, player-to-player trade, WebTransport daemon & browser UI).
+> **Phase 5** is now architected under [`openspec/changes/village-barter-vertical-slice-poc/`](changes/village-barter-vertical-slice-poc/) to deliver the first end-to-end playable multiplayer game slice (Village NPCs, player starter inventories, NPC barter, player-to-player trade, WebTransport daemon & browser UI).
 
 ---
 
@@ -75,10 +75,10 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ---
 
-## Active Groundwork Bundles (Phase 5)
+## Active Milestone (Phase 5)
 
 ### Phase 5: Playable Village & Barter Vertical Slice PoC (P0)
 
-| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| Order | OpenSpec Change Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
 | :---: | :--- | :---: | :---: | :---: | :--- | :--- |
-| **16** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | — | — | Planned | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | Implement `VillagePlugin` & `VillagerMerchantComponent` (3 NPC villagers, village `WorldObject` buildings, starter player inventories, and `module_id = 0x02` packet handler for NPC barter & 2-player atomic `TradeManager` swaps); extract reusable node daemon runner & `mmo-village-node` binary; auto-hydrate arriving player sessions on `mmo-node`; bind `WebTransportServer` (`:4433/udp`) + `/cert-hash` endpoint in `mmo-gateway`; wire Village Inventory & Trade UI in `web/`. |
+| **16** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | [#143](https://github.com/Jakousa/rust-server/issues/143), [#144](https://github.com/Jakousa/rust-server/issues/144) | [#142](https://github.com/Jakousa/rust-server/pull/142) | In Progress | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | Implement `VillagePlugin` & `VillagerMerchantComponent` (3 NPC villagers, village `WorldObject` buildings, starter player inventories, and `module_id = 0x02` packet handler for NPC barter & 2-player atomic `TradeManager` swaps); extract reusable node daemon runner & `mmo-village-node` binary; auto-hydrate arriving player sessions on `mmo-node`; bind `WebTransportServer` (`:4433/udp`) + `/cert-hash` endpoint in `mmo-gateway`; wire Village Inventory & Trade HUD in `web/`. |
