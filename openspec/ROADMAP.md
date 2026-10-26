@@ -10,25 +10,25 @@ This document is the single source of truth for bringing the **Distributed Rust 
 
 ---
 
-## Execution Rules for Future Bundles & Changes
+## Execution Rules for Future Changes
 
-1. **Check for Active Bundles**:
-   - Check `openspec/changes/`. If new groundwork bundles have been proposed, execute them in dependency order following [`openspec-bundle-executor`](../.agents/skills/openspec-bundle-executor/SKILL.md).
+1. **Check for Active Changes**:
+   - Check `openspec/changes/`. If active changes exist, execute them following [`openspec-apply-change`](../.agents/skills/openspec-apply-change/SKILL.md).
    - If `openspec/changes/` contains only `archive/`, new work must first be proposed via `openspec-propose` or `openspec-pro-workflow`.
 2. **Never Skip or Stray from `design.md` and `tasks.md`**:
-   - Each OpenSpec bundle is architected against exact file paths and line numbers. Read `proposal.md`, `specs/`, `design.md`, and `tasks.md` in full before editing any code.
+   - Each OpenSpec change is architected against exact file paths and line numbers. Read `proposal.md`, `specs/`, `design.md`, and `tasks.md` in full before editing any code.
 3. **Dedicated Feature Branches**:
-   - Create a dedicated feature branch `feat/<bundle-name>` from latest `origin/main`. Never commit directly to `main`.
+   - Create a dedicated feature branch `feat/<change-name>` from latest `origin/main`. Never commit directly to `main`.
 4. **Strict Quality Gates Before Every PR**:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings allowed)
    - `cargo test --workspace`
 5. **Sync Specs & Archive on Completion**:
-   - Copy/merge `openspec/changes/<bundle-name>/specs/.../spec.md` into `openspec/specs/.../spec.md` and `git mv openspec/changes/<bundle-name> openspec/changes/archive/YYYY-MM-DD-<bundle-name>` (either in the implementation PR or immediately upon merge).
+   - Copy/merge `openspec/changes/<change-name>/specs/.../spec.md` into `openspec/specs/.../spec.md` and `git mv openspec/changes/<change-name> openspec/changes/archive/YYYY-MM-DD-<change-name>` (either in the implementation PR or immediately upon merge).
 
 ---
 
-## Delivered Groundwork Bundles
+## Delivered Milestones
 
 ### Phase 1: Core Runtime, Director/Gateway, Gameplay & Client-WASM Bug Fixes (P0)
 
