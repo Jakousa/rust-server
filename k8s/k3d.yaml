@@ -25,6 +25,11 @@ ports:
   - port: 3000:3000
     nodeFilters:
       - loadbalancer
+registries:
+  create:
+    name: mmo-registry
+    host: "0.0.0.0"
+    hostPort: "5000"
 options:
   k3s:
     extraArgs:
