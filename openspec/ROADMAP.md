@@ -3,10 +3,10 @@
 This document is the single source of truth for bringing the **Distributed Rust MMO Server Platform** to 100% production fruition across all MMO genres (Tab-Target RPGs, Voxel/Survival Sandboxes, Tactical/Shooter MMOs, and 6-DoF Space/Vehicular Simulations).
 
 > [!IMPORTANT]
-> **Active Roadmap Status: Phase 4 Queued (Bundles #11–#15 Pending Implementation)**
-> Phases 1–3 (Bundles #1–#10) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
+> **Active Roadmap Status: Phase 5 Queued (Bundle #16 — Playable Village & Barter Vertical Slice PoC)**
+> Phases 1–4 (Bundles #1–#15) have been delivered, verified, merged into `main`, and archived under `openspec/changes/archive/`.
 >
-> **Phase 4 (Bundles #11–#15)** is now architected under `openspec/changes/` to close remaining production testing, fuzzing, mutation, and CI coverage gaps. Implementation agents should execute Bundles #11–#15 in order using the [`openspec-bundle-executor`](../.agents/skills/openspec-bundle-executor/SKILL.md) skill.
+> **Phase 5 (Bundle #16)** is now architected under [`openspec/changes/village-barter-vertical-slice-poc/`](changes/village-barter-vertical-slice-poc/) to deliver the first end-to-end playable multiplayer game slice (Village NPCs, player starter inventories, NPC barter, player-to-player trade, WebTransport daemon & browser UI).
 
 ---
 
@@ -71,4 +71,14 @@ This document is the single source of truth for bringing the **Distributed Rust 
 | **12** | [`adversarial-wire-and-codec-fuzzing`](changes/archive/2026-10-25-adversarial-wire-and-codec-fuzzing/) | [#129](https://github.com/Jakousa/rust-server/issues/129) | — | Completed | `mmo-schema`, `mmo-plugin-voxel`, `mmo-client-wasm` | Add adversarial and mutated-frame `proptest` suites for `ClientPacket::decode`, `ClientPacket::decode_frame`, and `BitReader` in `mmo-schema`; add `PaletteChunk` RLE roundtrip and crafted `VXR1` header fuzz tests in `mmo-plugin-voxel`; add corrupted-stream recovery fuzz tests for `WasmClientWorld::process_packet` in `mmo-client-wasm`. |
 | **13** | [`expanded-mutation-testing-matrix`](changes/archive/2026-10-25-expanded-mutation-testing-matrix/) | [#130](https://github.com/Jakousa/rust-server/issues/130) | — | Completed | `mmo-core`, `mmo-node`, `mmo-gameplay`, `.github/workflows/` | Add boundary and mutation-killing unit tests for `crates/core/src/collision.rs`, `crates/node/src/kinematics.rs`, and `crates/gameplay/src/trade.rs`, and expand `.github/workflows/mutation-tests.yml` matrix to verify zero surviving mutants across all three modules alongside `mmo-schema` and `mmo-storage`. |
 | **14** | [`network-and-gateway-submodule-unit-coverage`](changes/archive/2026-10-25-network-and-gateway-submodule-unit-coverage/) | [#131](https://github.com/Jakousa/rust-server/issues/131) | — | Completed | `mmo-node`, `mmo-gateway`, `mmo-loadtest` | Add direct inline unit tests to `crates/node/src/network/{migration.rs, ghost.rs, client_pool.rs}`, `crates/gateway/src/server/intercept.rs`, and `crates/loadtest/src/scenario.rs` covering lease rollbacks, boundary ghost queries, sender anti-spoofing, marketplace error fallbacks, and scenario JSON serialization. |
-| **15** | [`wasm-and-web-frontend-ci-verification`](changes/archive/2026-10-25-wasm-and-web-frontend-ci-verification/) | [#132](https://github.com/Jakousa/rust-server/issues/132) | — | Completed | `mmo-client-wasm`, `web/`, `.github/workflows/` | Add `wasm32-unknown-unknown` target clippy check for `mmo-client-wasm` in `.github/workflows/rust.yml`; add Vitest unit test suite (`web/src/__tests__/inspector.test.js`) testing `PlayerControls` and `WorldObjectRenderer` 64-bit `BigInt` ID reconstruction; run `npm ci && npm test && npm run build` in CI. |
+| **15** | [`wasm-and-web-frontend-ci-verification`](changes/archive/2026-10-25-wasm-and-web-frontend-ci-verification/) | [#132](https://github.com/Jakousa/rust-server/issues/132) | [#140](https://github.com/Jakousa/rust-server/pull/140) | Completed | `mmo-client-wasm`, `web/`, `.github/workflows/` | Add `wasm32-unknown-unknown` target clippy check for `mmo-client-wasm` in `.github/workflows/rust.yml`; add Vitest unit test suite (`web/src/__tests__/inspector.test.js`) testing `PlayerControls` and `WorldObjectRenderer` 64-bit `BigInt` ID reconstruction; run `npm ci && npm test && npm run build` in CI. |
+
+---
+
+## Active Groundwork Bundles (Phase 5)
+
+### Phase 5: Playable Village & Barter Vertical Slice PoC (P0)
+
+| Order | OpenSpec Bundle Directory | GitHub Issue(s) | PR | Status | Target Crates | Summary of Scope |
+| :---: | :--- | :---: | :---: | :---: | :--- | :--- |
+| **16** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | — | — | Planned | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | Implement `VillagePlugin` & `VillagerMerchantComponent` (3 NPC villagers, village `WorldObject` buildings, starter player inventories, and `module_id = 0x02` packet handler for NPC barter & 2-player atomic `TradeManager` swaps); extract reusable node daemon runner & `mmo-village-node` binary; auto-hydrate arriving player sessions on `mmo-node`; bind `WebTransportServer` (`:4433/udp`) + `/cert-hash` endpoint in `mmo-gateway`; wire Village Inventory & Trade UI in `web/`. |
