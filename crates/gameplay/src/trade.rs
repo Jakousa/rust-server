@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use mmo_core::{DomainEvent, EntityStore, GameplayPlugin, Guid, PluginContext};
 
 use crate::inventory::{InventoryComponent, ItemStack};
 
 /// Offer submitted by a player in a trade session.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TradeOffer {
     pub items: Vec<ItemStack>,
     pub currency: u64,
@@ -166,8 +168,21 @@ impl TradeManager {
         Ok(session_id)
     }
 
+    pub fn get_session(&self, session_id: u64) -> Option<&TradeSession> {
+        self.sessions.get(&session_id)
+    }
+
     pub fn get_session_mut(&mut self, session_id: u64) -> Option<&mut TradeSession> {
         self.sessions.get_mut(&session_id)
+    }
+
+    pub fn get_session_by_player(&self, player: Guid) -> Option<&TradeSession> {
+        let session_id = self.player_to_session.get(&player)?;
+        self.sessions.get(session_id)
+    }
+
+    pub fn is_player_trading(&self, player: Guid) -> bool {
+        self.player_to_session.contains_key(&player)
     }
 
     pub fn cancel_session(&mut self, session_id: u64) -> Option<TradeSession> {

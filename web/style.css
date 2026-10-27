@@ -226,3 +226,318 @@ button:disabled {
   font-size: 12px;
   color: #cbd5e1;
 }
+
+/* Village HUD & Inventory Container */
+.village-hud-container {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 15;
+  pointer-events: none;
+}
+
+.village-hud-container .hud-panel {
+  pointer-events: auto;
+  width: 320px;
+  margin-bottom: 0;
+}
+
+.coin-purse {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fbbf24;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.coin-icon {
+  font-size: 14px;
+}
+
+.gold-amount {
+  color: #fde047;
+  font-family: monospace;
+}
+
+.inventory-weight-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-bottom: 8px;
+  color: #94a3b8;
+}
+
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.inventory-slot {
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  height: 64px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  position: relative;
+  transition: all 0.15s ease;
+}
+
+.inventory-slot.occupied {
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(30, 58, 138, 0.25);
+}
+
+.inventory-slot.occupied:hover {
+  border-color: #38bdf8;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
+}
+
+.slot-item-name {
+  font-size: 10px;
+  font-weight: 600;
+  color: #e2e8f0;
+  line-height: 1.1;
+  word-break: break-word;
+}
+
+.slot-item-qty {
+  font-size: 10px;
+  font-weight: 700;
+  color: #38bdf8;
+  align-self: flex-end;
+  font-family: monospace;
+}
+
+.slot-item-weight {
+  font-size: 8px;
+  color: #64748b;
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+}
+
+/* Modals */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-window {
+  background: #0f172a;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
+  padding: 20px;
+  color: #f8fafc;
+  max-width: 540px;
+  width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding-bottom: 10px;
+}
+
+.modal-header h2 {
+  font-size: 18px;
+  font-weight: 700;
+  color: #f1f5f9;
+}
+
+.npc-role-tag {
+  font-size: 11px;
+  color: #38bdf8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.close-btn {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.close-btn:hover {
+  color: #f8fafc;
+}
+
+.npc-dialog-box {
+  background: rgba(30, 41, 59, 0.6);
+  border-left: 3px solid #f59e0b;
+  padding: 10px 14px;
+  border-radius: 0 6px 6px 0;
+  font-style: italic;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+
+.barter-recipes-header {
+  font-size: 12px;
+  text-transform: uppercase;
+  color: #94a3b8;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.barter-recipes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.barter-recipe-card {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.barter-recipe-card:hover {
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+.recipe-exchange {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  flex: 1;
+}
+
+.recipe-reqs {
+  color: #f87171;
+}
+
+.recipe-rewards {
+  color: #4ade80;
+}
+
+.barter-arrow {
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.barter-action-btn {
+  background: #2563eb;
+  color: white;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.barter-action-btn:hover {
+  background: #1d4ed8;
+}
+
+/* Trade Modal */
+.trade-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.trade-col {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trade-col h3 {
+  font-size: 13px;
+  font-weight: 700;
+  color: #93c5fd;
+  text-transform: uppercase;
+}
+
+.trade-gold-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.trade-gold-input-row input {
+  width: 70px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(15, 23, 42, 0.8);
+  color: #fde047;
+  font-family: monospace;
+}
+
+.partner-gold-display {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.trade-item-list {
+  min-height: 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.trade-status-msg {
+  text-align: center;
+  font-size: 12px;
+  color: #94a3b8;
+  font-style: italic;
+  padding: 4px 0;
+}
+
+.accept-btn {
+  background: #16a34a;
+  color: white;
+}
+
+.accept-btn:hover:not(:disabled) {
+  background: #15803d;
+}
+
+.modal-footer {
+  display: flex;
+  gap: 8px;
+}

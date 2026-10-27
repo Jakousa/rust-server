@@ -203,8 +203,31 @@ export class WorldRenderer {
       });
       bodyMesh = new THREE.Mesh(geo, mat);
       bodyMesh.position.y = 1.3;
+    } else if (entityType === 2) {
+      // Villager NPC: purple/indigo robe capsule with golden merchant marker diamond
+      const geo = new THREE.CapsuleGeometry(0.8, 1.8, 8, 16);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x8b5cf6, // Purple villager attire
+        roughness: 0.5,
+      });
+      bodyMesh = new THREE.Mesh(geo, mat);
+      bodyMesh.position.y = 1.3;
+
+      // Floating golden merchant diamond marker
+      const markerGeo = new THREE.OctahedronGeometry(0.35);
+      const markerMat = new THREE.MeshStandardMaterial({
+        color: 0xf59e0b,
+        metalness: 0.8,
+        roughness: 0.2,
+        emissive: 0xd97706,
+        emissiveIntensity: 0.5,
+      });
+      const marker = new THREE.Mesh(markerGeo, markerMat);
+      marker.position.y = 3.3;
+      group.add(marker);
+      group.userData.marker = marker;
     } else {
-      // Hostile Mob / NPC: red cube
+      // Hostile Mob / Other: red cube
       const geo = new THREE.BoxGeometry(1.6, 1.6, 1.6);
       const mat = new THREE.MeshStandardMaterial({
         color: 0xef4444,
@@ -265,6 +288,13 @@ export class WorldRenderer {
   }
 
   render() {
+    // Animate rotating golden merchant markers
+    const angle = performance.now() * 0.002;
+    for (const group of this.entities.values()) {
+      if (group.userData.marker) {
+        group.userData.marker.rotation.y = angle;
+      }
+    }
     this.renderer.render(this.scene, this.camera);
   }
 

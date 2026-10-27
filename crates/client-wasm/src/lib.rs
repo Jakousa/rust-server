@@ -51,6 +51,7 @@ pub struct WasmClientWorld {
     client_time: f64,
     incoming_buffer: BytesMut,
     pending_acks: VecDeque<u64>,
+    last_interaction_result: Option<String>,
 }
 
 impl Default for WasmClientWorld {
@@ -77,6 +78,7 @@ impl WasmClientWorld {
             client_time: 0.0,
             incoming_buffer: BytesMut::with_capacity(16384),
             pending_acks: VecDeque::new(),
+            last_interaction_result: None,
         }
     }
 
@@ -240,8 +242,27 @@ impl WasmClientWorld {
             ClientPacket::Pong(_pong) => {
                 // Heartbeat reply acknowledged
             }
-            ClientPacket::InteractionResult(_res) => {
-                // Action result acknowledged
+            ClientPacket::AuthResponse(resp) => {
+                if resp.success {
+                    self.session_id = resp.session_id;
+                    self.local_player_id = Some(resp.player_guid);
+                }
+            }
+            ClientPacket::InteractionResult(res) => {
+                let payload_str = if res.payload.is_empty() {
+                    serde_json::to_string(&serde_json::json!({
+                        "action_id": res.action_id,
+                        "success": res.success,
+                        "error_code": res.error_code,
+                    }))
+                    .unwrap_or_default()
+                } else {
+                    match String::from_utf8(res.payload) {
+                        Ok(s) => s,
+                        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+                    }
+                };
+                self.last_interaction_result = Some(payload_str);
             }
             ClientPacket::WorldObjectSpawn(spawn) => {
                 self.world_objects.insert_or_update(&spawn);
@@ -372,6 +393,31 @@ impl WasmClientWorld {
         });
 
         pkt.encode()
+    }
+
+    /// Encodes a custom interaction with arbitrary payload bytes (e.g. Village NPC barter or player trade).
+    pub fn encode_custom_interaction(
+        &self,
+        target_guid: u64,
+        action_id: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let source_guid = self.local_player_id.unwrap_or(0);
+
+        let pkt = ClientPacket::Interaction(InteractionPacket {
+            source_guid,
+            target_guid,
+            interaction_type: InteractionType::Custom(0),
+            action_id,
+            payload: Bytes::copy_from_slice(payload),
+        });
+
+        pkt.encode()
+    }
+
+    /// Returns and clears the latest InteractionResult payload (JSON string), if available.
+    pub fn take_last_interaction_result(&mut self) -> Option<String> {
+        self.last_interaction_result.take()
     }
 
     /// Returns a flat `Float32Array` render buffer for high-performance WebGL rendering.
@@ -613,6 +659,63 @@ mod tests {
             .process_packet(&despawn.encode())
             .expect("should process despawn");
         assert_eq!(world.get_render_buffer().len(), 0);
+    }
+
+    #[test]
+    fn test_wasm_client_world_auth_response_and_interaction_result() {
+        use mmo_schema::client::{AuthResponsePacket, InteractionResultPacket};
+
+        let mut world = WasmClientWorld::new();
+        assert_eq!(world.session_id(), 0);
+        assert_eq!(world.local_player_id(), None);
+        assert_eq!(world.take_last_interaction_result(), None);
+
+        // 1. Process AuthResponse
+        let auth_resp = ClientPacket::AuthResponse(AuthResponsePacket {
+            success: true,
+            error_code: 0,
+            session_id: 1234,
+            player_guid: 987654321,
+            assigned_node: "127.0.0.1:50052".to_string(),
+            error_message: String::new(),
+        });
+        world.process_packet(&auth_resp.encode()).unwrap();
+
+        assert_eq!(world.session_id(), 1234);
+        assert_eq!(world.local_player_id(), Some(987654321));
+
+        // 2. Encode custom interaction
+        let custom_payload = b"{\"recipe_id\":2}";
+        let action_id = (0x0002 << 16) | 2;
+        let encoded = world.encode_custom_interaction(555, action_id, custom_payload);
+        assert!(!encoded.is_empty());
+
+        let mut decode_buf = bytes::BytesMut::from(&encoded[..]);
+        if let Ok(Some(ClientPacket::Interaction(pkt))) =
+            ClientPacket::decode_frame(&mut decode_buf)
+        {
+            assert_eq!(pkt.source_guid, 987654321);
+            assert_eq!(pkt.target_guid, 555);
+            assert_eq!(pkt.action_id, action_id);
+            assert_eq!(&pkt.payload[..], custom_payload);
+        } else {
+            panic!("Expected decoded Interaction packet");
+        }
+
+        // 3. Process InteractionResult
+        let json_result = "{\"status\":\"success\",\"gold\":65}";
+        let interact_res = ClientPacket::InteractionResult(InteractionResultPacket {
+            action_id,
+            success: true,
+            error_code: 0,
+            payload: json_result.as_bytes().to_vec(),
+        });
+        world.process_packet(&interact_res.encode()).unwrap();
+
+        let taken = world.take_last_interaction_result();
+        assert_eq!(taken, Some(json_result.to_string()));
+        // Subsequent take returns None (drained)
+        assert_eq!(world.take_last_interaction_result(), None);
     }
 
     #[test]

@@ -1550,4 +1550,85 @@ mod tests {
             panic!("Expected InteractionResultPacket");
         }
     }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_auto_hydration_for_new_player() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let new_player = Guid::new(EntityType::Player, 1, 888);
+        let non_player = Guid::new(EntityType::Npc, 1, 999);
+
+        let spawn_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = Arc::clone(&spawn_counter);
+
+        {
+            let mut s = sim.write().await;
+            s.hooks.register_fn(move |event, _ctx| {
+                if let mmo_core::Event::OnSpawn { entity, .. } = event {
+                    if *entity == new_player {
+                        counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        // 1. Unknown non-player entity is rejected
+        let move_pkt =
+            mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
+                entity_id: non_player.raw(),
+                position: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                sequence: 1,
+                timestamp: 100,
+            });
+        let resp_non_player = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 2,
+                guid: non_player.raw(),
+                packet_data: move_pkt.encode(),
+                session_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_non_player.success);
+        assert!(resp_non_player.error_message.contains("not found on node"));
+
+        // 2. Newly arriving Player entity is auto-hydrated
+        let player_move_pkt =
+            mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
+                entity_id: new_player.raw(),
+                position: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                sequence: 1,
+                timestamp: 100,
+            });
+        let resp_player = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 3,
+                guid: new_player.raw(),
+                packet_data: player_move_pkt.encode(),
+                session_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            resp_player.success,
+            "resp_player failed: {}",
+            resp_player.error_message
+        );
+
+        // Verify entity is now stored, AoI observer is registered, and spawn hook was triggered
+        let s = sim.read().await;
+        assert!(s.entity_store.contains_guid(new_player));
+        assert!(s.aoi.get_observer(3).is_some());
+        assert_eq!(spawn_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }

@@ -284,6 +284,18 @@ impl WebTransportServer {
         let is_authenticated =
             Arc::new(std::sync::atomic::AtomicBool::new(authenticator.is_none()));
 
+        // Auto-register default player route in PoC / unauthenticated mode
+        if authenticator.is_none() {
+            if let Some(ref target_node) = default_node_address {
+                let default_guid = mmo_core::Guid::new(
+                    mmo_core::EntityType::Player,
+                    1,
+                    (session_id & 0xFFFF_FFFF) as u32,
+                );
+                router.register_session(session_id, default_guid, target_node.clone());
+            }
+        }
+
         // Task 3: Datagram Ingress (unreliable client movement / ACKs)
         let conn_datagram_in = connection.clone();
         let disp_datagram = dispatcher.clone();
@@ -396,6 +408,40 @@ impl WebTransportServer {
                             {
                                 metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
                                     .increment(1);
+
+                                // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid
+                                if let mmo_schema::client::ClientPacket::AuthRequest(_auth_req) =
+                                    &pkt
+                                {
+                                    if auth_opt.is_none() {
+                                        let default_guid = mmo_core::Guid::new(
+                                            mmo_core::EntityType::Player,
+                                            1,
+                                            (session_id & 0xFFFF_FFFF) as u32,
+                                        );
+                                        let assigned_node = default_node_opt
+                                            .clone()
+                                            .unwrap_or_else(|| "127.0.0.1:50052".to_string());
+                                        router_stream.register_session(
+                                            session_id,
+                                            default_guid,
+                                            assigned_node.clone(),
+                                        );
+                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
+                                            mmo_schema::client::AuthResponsePacket {
+                                                success: true,
+                                                error_code: 0,
+                                                session_id,
+                                                player_guid: default_guid.raw(),
+                                                assigned_node,
+                                                error_message: String::new(),
+                                            },
+                                        );
+                                        let _ = send_stream.write_all(&resp.encode()).await;
+                                        continue;
+                                    }
+                                }
+
                                 if let Some(ref handler) = intercept_stream {
                                     if handler.handle_packet(session_id, &pkt).await {
                                         continue;

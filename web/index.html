@@ -62,7 +62,95 @@
 
     <div class="hud-panel controls-hint">
       <div class="hint-title">Controls</div>
-      <div class="hint-text">WASD: Move | Q/E: Rotate Yaw | Space: Cast Ability | Mouse: Pan View</div>
+      <div class="hint-text">WASD: Move | Q/E: Rotate Yaw | Space: Cast Ability | E: Interact/Barter | Mouse: Pan View</div>
+    </div>
+  </div>
+
+  <!-- Village Inventory & Coin Purse Panel -->
+  <div id="village-hud" class="village-hud-container">
+    <div class="hud-panel inventory-panel">
+      <div class="panel-header">
+        <span class="panel-title">Village Inventory</span>
+        <span class="coin-purse"><span class="coin-icon">🪙</span> <span id="val-gold" class="gold-amount">0</span> Gold</span>
+      </div>
+      <div class="inventory-weight-row">
+        <span class="stat-label">Weight:</span>
+        <span id="val-weight" class="stat-val font-mono">0.0 / 100.0 kg</span>
+      </div>
+      <div id="inventory-grid" class="inventory-grid">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <!-- Target Interaction / Proximity Panel -->
+    <div id="target-panel" class="hud-panel target-panel" style="display: none;">
+      <div class="panel-header">
+        <span id="target-name" class="panel-title">Target</span>
+        <span id="target-type" class="metric-highlight">Villager</span>
+      </div>
+      <div class="hud-row">
+        <span class="stat-label">Distance:</span>
+        <span id="target-distance" class="stat-val">-- m</span>
+      </div>
+      <div class="hud-buttons">
+        <button id="btn-interact" class="primary-btn">Interact [E]</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- NPC Barter Modal -->
+  <div id="npc-barter-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-window barter-window">
+      <div class="modal-header">
+        <div>
+          <h2 id="npc-name">Blacksmith Ilmari</h2>
+          <span id="npc-role" class="npc-role-tag">Village Artisan</span>
+        </div>
+        <button id="btn-close-barter" class="close-btn">&times;</button>
+      </div>
+      <div class="npc-dialog-box">
+        <p id="npc-greeting">"Fine steel and sturdy tools for the village."</p>
+      </div>
+      <div class="barter-recipes-header">Available Trades</div>
+      <div id="barter-recipes-list" class="barter-recipes-list">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Player-to-Player Trade Modal -->
+  <div id="player-trade-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-window trade-window">
+      <div class="modal-header">
+        <div>
+          <h2>Direct Player Trade</h2>
+          <span class="trade-session-label">Session #<span id="trade-session-id">--</span></span>
+        </div>
+        <button id="btn-close-trade" class="close-btn">&times;</button>
+      </div>
+      <div class="trade-grid">
+        <div class="trade-col">
+          <h3>My Offer</h3>
+          <div class="trade-gold-input-row">
+            <label for="trade-offer-gold">Offer Gold:</label>
+            <input type="number" id="trade-offer-gold" min="0" value="0" />
+          </div>
+          <div id="trade-my-items" class="trade-item-list"></div>
+        </div>
+        <div class="trade-col">
+          <h3>Partner Offer</h3>
+          <div class="partner-gold-display">
+            <span>Gold:</span> <span id="trade-partner-gold" class="gold-amount">0</span> 🪙
+          </div>
+          <div id="trade-partner-items" class="trade-item-list"></div>
+        </div>
+      </div>
+      <div id="trade-status-msg" class="trade-status-msg">Waiting for trade offer...</div>
+      <div class="modal-footer">
+        <button id="btn-trade-offer" class="primary-btn">Submit Offer</button>
+        <button id="btn-trade-accept" class="accept-btn">Lock & Accept</button>
+        <button id="btn-trade-cancel" class="danger-btn">Cancel Trade</button>
+      </div>
     </div>
   </div>
 

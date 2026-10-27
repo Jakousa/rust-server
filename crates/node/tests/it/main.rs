@@ -14,3 +14,4 @@ mod npc_ai;
 mod persistence;
 mod plugin_gameplay;
 mod social_bus;
+mod village_barter_integration;

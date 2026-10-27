@@ -10,6 +10,7 @@ pub mod history;
 pub mod instance;
 pub mod kinematics;
 pub mod network;
+pub mod runner;
 pub mod sector;
 pub mod sim;
 pub mod snapshotter;
@@ -38,6 +39,7 @@ pub use network::{
     GhostBroadcaster, GhostRecord, GhostStore, MigrationError, NetworkError, NodeServiceImpl,
     RemoteCommandErrorCode,
 };
+pub use runner::run_node_daemon_with_sim;
 pub use sector::{PlacementError, SectorManager, MAX_INTERACTION_DISTANCE};
 pub use sim::{AbilityCompensation, ContainerTransferNotification, TickSimulation};
 pub use snapshotter::{drain_and_shutdown_node, SnapshotPayload, WriteBehindSnapshotter};

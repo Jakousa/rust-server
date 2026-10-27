@@ -9,9 +9,16 @@ publish.workspace = true
 
 [dependencies]
 mmo-core = { path = "../core" }
+mmo-node = { path = "../node" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.42", features = ["full"] }
 tracing = "0.1"
 wasmtime = { version = "49.0", default-features = false, features = ["runtime", "cranelift", "wat", "std"] }
+
+[[bin]]
+name = "mmo-village-node"
+path = "src/bin/mmo_village_node.rs"
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }

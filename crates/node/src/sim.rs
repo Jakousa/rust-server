@@ -526,10 +526,13 @@ impl TickSimulation {
 
         self.entity_store.spawn(guid, position);
         self.octree.insert(guid, position);
-        self.hooks.dispatch(&Event::OnSpawn {
-            entity: guid,
-            position,
-        });
+        self.hooks.dispatch_with_entities(
+            &Event::OnSpawn {
+                entity: guid,
+                position,
+            },
+            &mut self.entity_store,
+        );
         true
     }
 

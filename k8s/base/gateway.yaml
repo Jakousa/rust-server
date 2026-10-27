@@ -48,6 +48,9 @@ spec:
             - name: DEFAULT_NODE_ADDR
               value: "mmo-node-0.mmo-node:50052"
           ports:
+            - name: webtransport
+              containerPort: 4433
+              protocol: UDP
             - name: quic-udp
               containerPort: 8080
               protocol: UDP
@@ -98,6 +101,10 @@ spec:
   selector:
     app: mmo-gateway
   ports:
+    - name: webtransport
+      port: 4433
+      targetPort: 4433
+      protocol: UDP
     - name: quic-udp
       port: 8080
       targetPort: 8080

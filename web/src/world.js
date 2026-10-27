@@ -33,6 +33,27 @@ export class WorldObjectRenderer {
         roughness: 0.7,
         metalness: 0.1,
       }),
+      // Village PoC Structures (Prefabs 10..=13)
+      well: new THREE.MeshStandardMaterial({
+        color: 0x0284c7, // Deep Water Cyan / Stone
+        roughness: 0.4,
+        metalness: 0.2,
+      }),
+      forge: new THREE.MeshStandardMaterial({
+        color: 0xea580c, // Hearth Flame Orange / Iron
+        roughness: 0.6,
+        metalness: 0.5,
+      }),
+      stall: new THREE.MeshStandardMaterial({
+        color: 0x16a34a, // Herbal Green / Timber
+        roughness: 0.5,
+        metalness: 0.1,
+      }),
+      house: new THREE.MeshStandardMaterial({
+        color: 0x78350f, // Warm Timber / Thatch
+        roughness: 0.7,
+        metalness: 0.1,
+      }),
     };
   }
 
@@ -89,7 +110,7 @@ export class WorldObjectRenderer {
       if (group.userData.mesh) {
         group.userData.mesh.material = isDamaged
           ? this.materials.damaged
-          : this.materials.defaultStructure;
+          : this.getMaterialForPrefab(prefabId);
       }
 
       // Update health bar if present
@@ -112,12 +133,35 @@ export class WorldObjectRenderer {
     }
   }
 
+  getMaterialForPrefab(prefabId) {
+    switch (prefabId) {
+      case 10:
+        return this.materials.well;
+      case 11:
+        return this.materials.forge;
+      case 12:
+        return this.materials.stall;
+      case 13:
+        return this.materials.house;
+      default:
+        return this.materials.defaultStructure;
+    }
+  }
+
   createObjectMesh(prefabId, sx, sy, sz) {
     const group = new THREE.Group();
 
-    // Base geometry: Unit cube scaled by transform
-    const geo = new THREE.BoxGeometry(1.0, 1.0, 1.0);
-    const mesh = new THREE.Mesh(geo, this.materials.defaultStructure);
+    // Base geometry: Unit cube scaled by transform (or cylinder for well)
+    const mat = this.getMaterialForPrefab(prefabId);
+    let geo;
+    if (prefabId === 10) {
+      // Well: cylinder
+      geo = new THREE.CylinderGeometry(0.5, 0.5, 1.0, 16);
+    } else {
+      geo = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+    }
+
+    const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     group.add(mesh);

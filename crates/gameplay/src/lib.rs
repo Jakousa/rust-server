@@ -20,6 +20,7 @@ pub mod scripting;
 pub mod spawner;
 pub mod threat;
 pub mod trade;
+pub mod village;
 
 pub use ability::{
     execute_or_start_ability, execute_or_start_ability_with_collision,
@@ -59,3 +60,9 @@ pub use spawner::{
 };
 pub use threat::{ThreatEntry, ThreatPlugin, ThreatSystem, ThreatTableComponent};
 pub use trade::{TradeCompletedEvent, TradeManager, TradeOffer, TradePlugin, TradeSession};
+pub use village::{
+    bootstrap_village_world, build_state_response, build_trade_session_view, BarterRecipe,
+    InspectRequest, NpcBarterRequest, PlayerStarterKitHook, PlayerTradeOfferRequest,
+    PlayerTradeSessionRequest, PlayerTradeStartRequest, TradeSessionView, VillagePlugin,
+    VillageTradePacketHandler, VillageTradeStateResponse, VillagerMerchantComponent,
+};
