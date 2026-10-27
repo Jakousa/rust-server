@@ -8,6 +8,8 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let wt_bind_addr =
+        std::env::var("WEBTRANSPORT_ADDR").unwrap_or_else(|_| "0.0.0.0:4433".to_string());
 
     let admin_addr: std::net::SocketAddr = std::env::var("ADMIN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
@@ -38,7 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("Gateway ID          : {gateway_id}");
     println!("Region              : {region}");
-    println!("Listen Address      : {listen_addr}");
+    println!("Listen Address      : {listen_addr} (TCP)");
+    println!("WebTransport Address: {wt_bind_addr} (UDP)");
     println!("Probe Address       : {probe_addr}");
     println!("Capacity            : {capacity}");
     println!("Admin Address       : {admin_addr}");
@@ -74,7 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
-    let server = Arc::new(GatewayServer::with_packet_channel(router, packet_tx).with_cache(cache));
+    let server = Arc::new(
+        GatewayServer::with_packet_channel(router, packet_tx)
+            .with_cache(cache)
+            .with_default_node_address(default_node_addr.clone()),
+    );
 
     // Background worker to consume routed client packets and forward to node cluster via BackhaulPool
     let backhaul_pool = Arc::clone(server.backhaul_pool());
@@ -196,6 +203,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server.session_sinks(),
     );
 
+    // Bind and launch WebTransport HTTP/3 listener (with self-signed cert discovery)
+    let mut wt_shutdown_tx = None;
+    if let Ok(wt_addr) = wt_bind_addr.parse::<std::net::SocketAddr>() {
+        match server.bind_webtransport(wt_addr).await {
+            Ok(wt_server) => {
+                let digest = wt_server.cert_digest().to_string();
+                println!("[Gateway] WebTransport HTTP/3 listener bound on UDP {wt_addr}");
+                println!("[Gateway] WebTransport SHA-256 Certificate Fingerprint: {digest}");
+                telemetry.set_cert_hash(&digest);
+
+                let (_wt_handle, tx) = wt_server.run_background();
+                wt_shutdown_tx = Some(tx);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[Gateway] Failed to bind WebTransport HTTP/3 listener on {wt_addr}: {e}"
+                );
+            }
+        }
+    } else {
+        eprintln!("[Gateway] Invalid WEBTRANSPORT_ADDR: {wt_bind_addr}");
+    }
+
     let listener = server.bind(&listen_addr).await?;
     telemetry.mark_ready();
     println!("Edge Gateway actively listening for client connections on {listen_addr}");
@@ -257,6 +287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::time::Duration::from_secs(3),
         )
         .await;
+    if let Some(tx) = wt_shutdown_tx {
+        let _ = tx.send(());
+    }
     let _ = grpc_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), grpc_handle).await;
     println!("[Gateway] Clean shutdown complete (closed {drained} active session(s)).");

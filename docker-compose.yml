@@ -59,6 +59,8 @@ services:
       - mmo-net
     ports:
       - "8080:8080"
+      - "4433:4433/udp"
+      - "9091:9091"
     depends_on:
       - node-1
       - node-2

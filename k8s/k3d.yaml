@@ -10,6 +10,12 @@ metadata:
 servers: 1
 agents: 0
 ports:
+  - port: 4433:4433/udp
+    nodeFilters:
+      - loadbalancer
+  - port: 9091:9091
+    nodeFilters:
+      - loadbalancer
   - port: 8080:8080/udp
     nodeFilters:
       - loadbalancer

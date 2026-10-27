@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -28,13 +28,15 @@ pub enum TelemetryError {
 struct AppState {
     handle: PrometheusHandle,
     ready: Arc<AtomicBool>,
+    cert_hash: Arc<RwLock<Option<String>>>,
 }
 
-/// Unified administrative HTTP server hosting `/metrics`, `/healthz`, and `/ready`.
+/// Unified administrative HTTP server hosting `/metrics`, `/healthz`, `/ready`, and `/cert-hash`.
 #[derive(Clone)]
 pub struct TelemetryServer {
     handle: PrometheusHandle,
     ready: Arc<AtomicBool>,
+    cert_hash: Arc<RwLock<Option<String>>>,
 }
 
 impl TelemetryServer {
@@ -57,7 +59,20 @@ impl TelemetryServer {
         Ok(Self {
             handle,
             ready: Arc::new(AtomicBool::new(false)),
+            cert_hash: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Sets the active SHA-256 certificate fingerprint exposed via `GET /cert-hash`.
+    pub fn set_cert_hash(&self, hash: impl Into<String>) {
+        if let Ok(mut lock) = self.cert_hash.write() {
+            *lock = Some(hash.into());
+        }
+    }
+
+    /// Returns the currently configured certificate hash, if set.
+    pub fn cert_hash(&self) -> Option<String> {
+        self.cert_hash.read().ok().and_then(|lock| lock.clone())
     }
 
     /// Marks the service as ready to serve traffic (`/ready` returns 200).
@@ -80,17 +95,19 @@ impl TelemetryServer {
         self.handle.render()
     }
 
-    /// Builds the `axum::Router` hosting `/metrics`, `/healthz`, and `/ready`.
+    /// Builds the `axum::Router` hosting `/metrics`, `/healthz`, `/ready`, and `/cert-hash`.
     pub fn router(&self) -> Router {
         let state = AppState {
             handle: self.handle.clone(),
             ready: Arc::clone(&self.ready),
+            cert_hash: Arc::clone(&self.cert_hash),
         };
 
         Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/healthz", get(healthz_handler))
             .route("/ready", get(ready_handler))
+            .route("/cert-hash", get(cert_hash_handler))
             .with_state(state)
     }
 
@@ -137,12 +154,83 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn cert_hash_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let hash_opt = state.cert_hash.read().ok().and_then(|lock| lock.clone());
+    match hash_opt {
+        Some(hash) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
+            serde_json::to_string(&serde_json::json!({ "cert_hash": hash })).unwrap_or_default(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
+            serde_json::to_string(
+                &serde_json::json!({ "error": "Certificate hash not configured" }),
+            )
+            .unwrap_or_default(),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_telemetry_cert_hash_endpoint() {
+        let server = TelemetryServer::init().unwrap();
+        let router = server.router();
+
+        // 1. Initial GET /cert-hash without set_cert_hash should return 404 NOT_FOUND
+        let req = Request::builder()
+            .uri("/cert-hash")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+
+        // 2. Set certificate hash and verify 200 OK + JSON body + CORS
+        let expected_hash = "12:34:56:78:90:ab:cd:ef";
+        server.set_cert_hash(expected_hash);
+        assert_eq!(server.cert_hash(), Some(expected_hash.to_string()));
+
+        let req = Request::builder()
+            .uri("/cert-hash")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["cert_hash"], expected_hash);
+    }
 
     #[tokio::test]
     async fn test_telemetry_healthz_and_ready_transitions() {

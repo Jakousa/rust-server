@@ -610,10 +610,48 @@ impl NodeService for NodeServiceImpl {
                     }
 
                     if !sim.entity_store.contains_guid(guid) {
-                        return Ok(tonic::Response::new(ForwardClientPacketResponse {
-                            success: false,
-                            error_message: format!("Entity {} not found on node", guid),
-                        }));
+                        if guid.entity_type() == mmo_core::EntityType::Player {
+                            let initial_snapshot = match &packet {
+                                mmo_schema::client::ClientPacket::Movement(m)
+                                    if sim.octree.bounds.contains((
+                                        m.position.x,
+                                        m.position.y,
+                                        m.position.z,
+                                    )) =>
+                                {
+                                    Some(mmo_storage::EntitySnapshot {
+                                        guid: guid.raw(),
+                                        position: (m.position.x, m.position.y, m.position.z),
+                                        rotation: m.yaw,
+                                        attributes: serde_json::Value::Null,
+                                        state_blob: None,
+                                        version: 1,
+                                        timestamp: 0,
+                                    })
+                                }
+                                _ => None,
+                            };
+                            let pos = sim.hydrate_player_session(
+                                guid,
+                                req.session_id,
+                                req.session_epoch,
+                                initial_snapshot.as_ref(),
+                                80.0,
+                            );
+                            let sim_ref = &mut *sim;
+                            sim_ref.hooks.dispatch_with_entities(
+                                &mmo_core::Event::OnSpawn {
+                                    entity: guid,
+                                    position: pos,
+                                },
+                                &mut sim_ref.entity_store,
+                            );
+                        } else {
+                            return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                success: false,
+                                error_message: format!("Entity {} not found on node", guid),
+                            }));
+                        }
                     }
 
                     if sim.is_migrating(guid) {

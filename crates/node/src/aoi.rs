@@ -447,6 +447,11 @@ impl AoiManager {
         self.observers.get(&session_id)
     }
 
+    /// Returns true if an observer session is actively registered.
+    pub fn is_observer_registered(&self, session_id: u64) -> bool {
+        self.observers.contains_key(&session_id)
+    }
+
     /// Retrieves a mutable reference to an observer by session ID.
     pub fn get_observer_mut(&mut self, session_id: u64) -> Option<&mut ObserverState> {
         self.observers.get_mut(&session_id)

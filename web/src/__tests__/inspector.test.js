@@ -1,7 +1,17 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import * as THREE from "three";
 import { PlayerControls } from "../controls.js";
 import { WorldObjectRenderer } from "../world.js";
+import { WorldRenderer } from "../renderer.js";
+import { ClientWorldBridge } from "../main.js";
+import { UIController } from "../ui.js";
+import {
+  OPCODES,
+  INTERACTION_TYPES,
+  encodeAuthRequest,
+  encodeInteraction,
+  encodeMovement,
+} from "../protocol.js";
 
 describe("PlayerControls", () => {
   it("normalizes diagonal movement vector on w + d input", () => {
@@ -53,22 +63,22 @@ describe("WorldObjectRenderer", () => {
 
     const buf = new Float32Array(16);
     const lo = 3735928559; // 0xDEADBEEF
-    const hi = 305419896;  // 0x12345678
+    const hi = 305419896; // 0x12345678
     buf[0] = lo;
     buf[1] = 42; // prefabId
     buf[2] = 10.0; // x
-    buf[3] = 0.0;  // y
+    buf[3] = 0.0; // y
     buf[4] = 20.0; // z
-    buf[5] = 0.0;  // qx
-    buf[6] = 0.0;  // qy
-    buf[7] = 0.0;  // qz
-    buf[8] = 1.0;  // qw
-    buf[9] = 1.0;  // sx
+    buf[5] = 0.0; // qx
+    buf[6] = 0.0; // qy
+    buf[7] = 0.0; // qz
+    buf[8] = 1.0; // qw
+    buf[9] = 1.0; // sx
     buf[10] = 1.0; // sy
     buf[11] = 1.0; // sz
-    buf[12] = 16;  // stateFlags (DAMAGED)
+    buf[12] = 16; // stateFlags (DAMAGED)
     buf[13] = 0.5; // hpPct
-    buf[14] = 1;   // revision
+    buf[14] = 1; // revision
     buf[15] = hi;
 
     renderer.updateFromBuffer(buf);
@@ -83,5 +93,277 @@ describe("WorldObjectRenderer", () => {
     // Empty buffer clears / despawns all objects
     renderer.updateFromBuffer(new Float32Array(0));
     expect(renderer.objects.size).toBe(0);
+  });
+
+  it("assigns distinct materials for Village prefabs: 10 (well), 11 (forge), 12 (stall), 13 (house)", () => {
+    const scene = new THREE.Scene();
+    const renderer = new WorldObjectRenderer(scene);
+
+    const prefabs = [10, 11, 12, 13];
+    const expectedMaterials = [
+      renderer.materials.well,
+      renderer.materials.forge,
+      renderer.materials.stall,
+      renderer.materials.house,
+    ];
+
+    prefabs.forEach((pid, idx) => {
+      const buf = new Float32Array(16);
+      buf[0] = idx + 1; // id lo
+      buf[1] = pid; // prefabId
+      buf[8] = 1.0; // qw
+      buf[9] = 1.0; // sx
+      buf[10] = 1.0; // sy
+      buf[11] = 1.0; // sz
+      buf[15] = 0; // id hi
+
+      renderer.updateFromBuffer(buf);
+      const obj = renderer.objects.get(BigInt(idx + 1));
+      expect(obj).toBeDefined();
+      expect(obj.userData.mesh.material).toBe(expectedMaterials[idx]);
+    });
+  });
+});
+
+describe("WorldRenderer Entities", () => {
+  it("renders villager NPC (entityType === 2) with purple attire and floating golden merchant marker", () => {
+    // Pure Three.js mesh factory testing (node-compatible, without WebGLRenderer requirement)
+    const npcGroup = WorldRenderer.prototype.createEntityMesh(2, false);
+    expect(npcGroup).toBeDefined();
+    expect(npcGroup.userData.marker).toBeDefined();
+    expect(npcGroup.userData.marker.material.color.getHex()).toBe(0xf59e0b);
+
+    // Remote player (entityType === 1)
+    const playerGroup = WorldRenderer.prototype.createEntityMesh(1, false);
+    expect(playerGroup.userData.marker).toBeUndefined();
+
+    // Local player
+    const localGroup = WorldRenderer.prototype.createEntityMesh(1, true);
+    expect(localGroup.userData.marker).toBeUndefined();
+  });
+});
+
+describe("Protocol Encoders", () => {
+  it("encodes ClientPacket::AuthRequest with 0x4D4D magic and 0x0011 opcode", () => {
+    const frame = encodeAuthRequest("guest-user-123", 1);
+    expect(frame[0]).toBe(0x4d);
+    expect(frame[1]).toBe(0x4d);
+
+    const view = new DataView(frame.buffer);
+    const opcode = view.getUint16(2, true);
+    expect(opcode).toBe(OPCODES.AUTH_REQUEST);
+
+    const tokenLen = view.getUint16(8, true);
+    expect(tokenLen).toBe("guest-user-123".length);
+  });
+
+  it("encodes ClientPacket::Interaction with target, action_id, and payload", () => {
+    const payload = new TextEncoder().encode(JSON.stringify({ recipe_id: 1 }));
+    const actionId = (0x0002 << 16) | 2; // Sub-opcode 2: NpcBarter
+    const frame = encodeInteraction(1001, 2002, actionId, payload, INTERACTION_TYPES.TRADE);
+
+    const view = new DataView(frame.buffer);
+    expect(view.getUint16(2, true)).toBe(OPCODES.INTERACTION);
+    expect(Number(view.getBigUint64(8, true))).toBe(1001);
+    expect(Number(view.getBigUint64(16, true))).toBe(2002);
+    expect(frame[24]).toBe(INTERACTION_TYPES.TRADE);
+    expect(view.getUint32(25, true)).toBe(actionId);
+    expect(view.getUint32(29, true)).toBe(payload.length);
+  });
+
+  it("encodes ClientPacket::Movement with entity ID and position coordinates", () => {
+    const sample = { x: 12.5, y: 1.0, z: -8.2, yaw: 3.14 };
+    const frame = encodeMovement(42, sample);
+
+    const view = new DataView(frame.buffer);
+    expect(view.getUint16(2, true)).toBe(OPCODES.MOVEMENT);
+    expect(Number(view.getBigUint64(8, true))).toBe(42);
+    expect(view.getFloat32(16, true)).toBeCloseTo(12.5, 5);
+    expect(view.getFloat32(20, true)).toBeCloseTo(1.0, 5);
+    expect(view.getFloat32(24, true)).toBeCloseTo(-8.2, 5);
+    expect(view.getFloat32(40, true)).toBeCloseTo(3.14, 5);
+  });
+});
+
+describe("ClientWorldBridge", () => {
+  it("ingests AuthResponse packet and sets local session and player guid", () => {
+    const bridge = new ClientWorldBridge();
+
+    // Encode mock AuthResponse frame (opcode 0x0012)
+    const frame = new Uint8Array(8 + 25);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.AUTH_RESPONSE, true);
+    view.setUint32(4, 25, true);
+
+    frame[8] = 1; // success: true
+    view.setUint32(9, 0, true); // error_code
+    view.setBigUint64(13, 777n, true); // session_id
+    view.setBigUint64(21, 55555n, true); // player_guid
+
+    let callbackTriggered = false;
+    bridge.onAuthResponse((res) => {
+      callbackTriggered = true;
+      expect(res.sessionId).toBe(777);
+      expect(res.playerGuid).toBe(55555);
+    });
+
+    bridge.processPacket(frame);
+    expect(callbackTriggered).toBe(true);
+    expect(bridge.sessionId).toBe(777);
+    expect(bridge.localPlayerGuid).toBe(55555);
+  });
+
+  it("ingests InteractionResult packet and extracts JSON payload", () => {
+    const bridge = new ClientWorldBridge();
+    const payloadObj = {
+      player_inventory: { currency: 65, current_weight: 12.0, max_weight: 100.0, slots: [] },
+    };
+    const jsonStr = JSON.stringify(payloadObj);
+    const jsonBytes = new TextEncoder().encode(jsonStr);
+
+    const frame = new Uint8Array(8 + 13 + jsonBytes.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.INTERACTION_RESULT, true);
+    view.setUint32(4, 13 + jsonBytes.length, true);
+
+    view.setUint32(8, (0x0002 << 16) | 1, true); // action_id
+    frame[12] = 1; // success
+    view.setUint32(13, 0, true); // error_code
+    view.setUint32(17, jsonBytes.length, true); // payload_len
+    frame.set(jsonBytes, 21);
+
+    let receivedData = null;
+    bridge.onInteractionResult((res) => {
+      receivedData = res.data;
+    });
+
+    bridge.processPacket(frame);
+    expect(receivedData).toEqual(payloadObj);
+  });
+});
+
+describe("UIController Village HUD", () => {
+  let elements;
+
+  function createMockElement(id = "", className = "") {
+    return {
+      id,
+      className,
+      style: {},
+      children: [],
+      textContent: "",
+      value: "",
+      disabled: false,
+      _innerHTML: "",
+      get innerHTML() {
+        return this._innerHTML;
+      },
+      set innerHTML(val) {
+        this._innerHTML = val;
+        if (typeof val === "string" && val.includes("<button")) {
+          const btn = createMockElement("", "barter-action-btn");
+          this.children = [btn];
+        }
+      },
+      appendChild(child) {
+        this.children.push(child);
+      },
+      addEventListener(evt, fn) {
+        this._listeners = this._listeners || {};
+        this._listeners[evt] = fn;
+      },
+      click() {
+        if (this._listeners && this._listeners["click"]) {
+          this._listeners["click"]({ target: this });
+        }
+      },
+      querySelector(sel) {
+        return this.children[0] || createMockElement();
+      },
+    };
+  }
+
+  beforeEach(() => {
+    elements = new Map();
+    globalThis.document = {
+      getElementById(id) {
+        if (!elements.has(id)) {
+          elements.set(id, createMockElement(id));
+        }
+        return elements.get(id);
+      },
+      createElement(tag) {
+        return createMockElement("", "");
+      },
+    };
+  });
+
+  it("updates gold, weight, and inventory slots", () => {
+    const ui = new UIController();
+    const inv = {
+      currency: 85,
+      current_weight: 15.5,
+      max_weight: 100.0,
+      slots: [
+        { item_id: 1001, name: "Iron Ore", quantity: 3, unit_weight: 2.0 },
+        null,
+      ],
+    };
+
+    ui.updateInventory(inv);
+
+    expect(document.getElementById("val-gold").textContent).toBe(85);
+    expect(document.getElementById("val-weight").textContent).toBe("15.5 / 100.0 kg");
+    const grid = document.getElementById("inventory-grid");
+    expect(grid.children.length).toBe(2);
+    expect(grid.children[0].className).toContain("occupied");
+    expect(grid.children[0].innerHTML).toContain("Iron Ore");
+    expect(grid.children[1].className).toContain("empty");
+  });
+
+  it("shows and populates NPC barter modal with recipe barter action callbacks", () => {
+    const ui = new UIController();
+    let barterRecipeId = null;
+
+    const merchant = {
+      name: "Blacksmith Ilmari",
+      role: "Blacksmith",
+      greeting: "Fine iron tools.",
+      recipes: [
+        {
+          recipe_id: 1,
+          required_items: [{ name: "Iron Ore", quantity: 2 }],
+          required_currency: 0,
+          reward_items: [{ name: "Iron Pickaxe", quantity: 1 }],
+          reward_currency: 0,
+        },
+      ],
+    };
+
+    ui.showNpcBarter(merchant, (recipeId) => {
+      barterRecipeId = recipeId;
+    });
+
+    const modal = document.getElementById("npc-barter-modal");
+    expect(modal.style.display).toBe("flex");
+    expect(document.getElementById("npc-name").textContent).toBe("Blacksmith Ilmari");
+    expect(document.getElementById("npc-greeting").textContent).toBe("Fine iron tools.");
+
+    const recipesList = document.getElementById("barter-recipes-list");
+    expect(recipesList.children.length).toBe(1);
+    const card = recipesList.children[0];
+    expect(card.innerHTML).toContain("2x Iron Ore");
+    expect(card.innerHTML).toContain("1x Iron Pickaxe");
+
+    const barterBtn = card.querySelector(".barter-action-btn");
+    barterBtn.click();
+    expect(barterRecipeId).toBe(1);
+
+    ui.hideNpcBarter();
+    expect(modal.style.display).toBe("none");
   });
 });

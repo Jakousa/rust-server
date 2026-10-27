@@ -1989,8 +1989,10 @@ name = "mmo-gameplay"
 version = "0.1.0"
 dependencies = [
  "mmo-core",
+ "mmo-node",
  "mmo-storage",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
