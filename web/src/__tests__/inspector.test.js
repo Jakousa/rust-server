@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as THREE from "three";
 import { PlayerControls } from "../controls.js";
 import { WorldObjectRenderer } from "../world.js";
@@ -14,6 +14,108 @@ import {
 } from "../protocol.js";
 
 describe("PlayerControls", () => {
+
+  it("initializes window event listeners and handles keydown/keyup events", () => {
+    const addEventListenerMock = vi.fn();
+    vi.stubGlobal('window', { addEventListener: addEventListenerMock });
+
+    const controls = new PlayerControls();
+
+    expect(addEventListenerMock).toHaveBeenCalledTimes(2);
+    expect(addEventListenerMock).toHaveBeenCalledWith("keydown", expect.any(Function));
+    expect(addEventListenerMock).toHaveBeenCalledWith("keyup", expect.any(Function));
+
+    const keydownHandler = addEventListenerMock.mock.calls.find(call => call[0] === "keydown")[1];
+    const keyupHandler = addEventListenerMock.mock.calls.find(call => call[0] === "keyup")[1];
+
+    // Test keydown
+    keydownHandler({ key: "w" });
+    expect(controls.keys.w).toBe(true);
+    keydownHandler({ key: "A" }); // test lowercase conversion
+    expect(controls.keys.a).toBe(true);
+    keydownHandler({ key: "s" });
+    expect(controls.keys.s).toBe(true);
+    keydownHandler({ key: "d" });
+    expect(controls.keys.d).toBe(true);
+    keydownHandler({ key: "q" });
+    expect(controls.keys.q).toBe(true);
+    keydownHandler({ key: "e" });
+    expect(controls.keys.e).toBe(true);
+    keydownHandler({ key: " ", code: "Space" });
+    expect(controls.keys.space).toBe(true);
+
+    // Test keyup
+    keyupHandler({ key: "w" });
+    expect(controls.keys.w).toBe(false);
+    keyupHandler({ key: "A" });
+    expect(controls.keys.a).toBe(false);
+    keyupHandler({ key: "s" });
+    expect(controls.keys.s).toBe(false);
+    keyupHandler({ key: "d" });
+    expect(controls.keys.d).toBe(false);
+    keyupHandler({ key: "q" });
+    expect(controls.keys.q).toBe(false);
+    keyupHandler({ key: "e" });
+    expect(controls.keys.e).toBe(false);
+    keyupHandler({ key: " ", code: "Space" });
+    expect(controls.keys.space).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("triggers onCastCallback when Space is pressed", () => {
+    const addEventListenerMock = vi.fn();
+    vi.stubGlobal('window', { addEventListener: addEventListenerMock });
+
+    const controls = new PlayerControls();
+    const castMock = vi.fn();
+    controls.onCast(castMock);
+
+    const keydownHandler = addEventListenerMock.mock.calls.find(call => call[0] === "keydown")[1];
+
+    // Press Space
+    keydownHandler({ key: " ", code: "Space" });
+
+    expect(castMock).toHaveBeenCalledTimes(1);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("updates position correctly using setPosition", () => {
+    const controls = new PlayerControls();
+    controls.setPosition(10.5, 2.0, -5.5);
+
+    expect(controls.position.x).toBe(10.5);
+    expect(controls.position.y).toBe(2.0);
+    expect(controls.position.z).toBe(-5.5);
+  });
+
+  it("cancels movement when opposite keys are pressed (w+s, a+d)", () => {
+    const controls = new PlayerControls();
+
+    const startX = controls.position.x;
+    const startZ = controls.position.z;
+    const dt = 0.5;
+
+    // w + s
+    controls.keys.w = true;
+    controls.keys.s = true;
+    controls.update(dt);
+
+    expect(controls.position.x).toBeCloseTo(startX, 5);
+    expect(controls.position.z).toBeCloseTo(startZ, 5);
+
+    // a + d
+    controls.keys.w = false;
+    controls.keys.s = false;
+    controls.keys.a = true;
+    controls.keys.d = true;
+    controls.update(dt);
+
+    expect(controls.position.x).toBeCloseTo(startX, 5);
+    expect(controls.position.z).toBeCloseTo(startZ, 5);
+  });
+
   it("normalizes diagonal movement vector on w + d input", () => {
     const controls = new PlayerControls();
     controls.keys.w = true;
