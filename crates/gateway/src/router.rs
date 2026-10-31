@@ -21,6 +21,8 @@ pub struct SessionRouter {
     guid_to_node: DashMap<Guid, String>,
     /// Maps client session ID directly to authoritative simulation node address.
     session_to_node: DashMap<u64, String>,
+    /// Maps client session ID to authoritative session epoch.
+    session_to_epoch: DashMap<u64, u64>,
 }
 
 impl Clone for SessionRouter {
@@ -41,6 +43,9 @@ impl Clone for SessionRouter {
             router
                 .session_to_node
                 .insert(*item.key(), item.value().clone());
+        }
+        for item in self.session_to_epoch.iter() {
+            router.session_to_epoch.insert(*item.key(), *item.value());
         }
         router
     }
@@ -180,13 +185,24 @@ impl SessionRouter {
         None
     }
 
-    /// Removes a client session and its associated player GUID and route mappings.
+    /// Resolves the authoritative session epoch for a given client session ID.
+    pub fn get_epoch_by_session(&self, session_id: u64) -> Option<u64> {
+        self.session_to_epoch.get(&session_id).map(|r| *r.value())
+    }
+
+    /// Sets or updates the authoritative session epoch for a given client session ID.
+    pub fn set_session_epoch(&self, session_id: u64, epoch: u64) {
+        self.session_to_epoch.insert(session_id, epoch);
+    }
+
+    /// Removes a client session and its associated player GUID, epoch, and route mappings.
     ///
     /// Removes routing destinations first to ensure no stale forwarding occurs.
     /// Returns the player `Guid` associated with the removed session, if found.
     pub fn remove_session(&self, session_id: u64) -> Option<Guid> {
-        // 1. Remove destination route first
+        // 1. Remove destination route and epoch first
         self.session_to_node.remove(&session_id);
+        self.session_to_epoch.remove(&session_id);
 
         // 2. Remove identity maps last
         if let Some((_, guid)) = self.session_to_guid.remove(&session_id) {

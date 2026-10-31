@@ -68,7 +68,8 @@ impl EscrowCoordinator {
     ) -> Result<EscrowRecord, StorageError> {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
-        let expires_at_ms = now_ms + (ttl_seconds as i64 * 1000);
+        let ttl_seconds = ttl_seconds.min(30 * 86400);
+        let expires_at_ms = now_ms.saturating_add((ttl_seconds as i64).saturating_mul(1000));
         let secret_hash = hash_secret(secret);
 
         if item_instance_ids.is_empty() {
@@ -77,24 +78,45 @@ impl EscrowCoordinator {
             ));
         }
 
+        if depositor_container_id == escrow_container_id {
+            return Err(StorageError::InvalidParameter(
+                "Depositor and escrow containers must be distinct".to_string(),
+            ));
+        }
+
+        let mut unique_items = std::collections::HashSet::with_capacity(item_instance_ids.len());
+        for id in item_instance_ids {
+            if !unique_items.insert(id) {
+                return Err(StorageError::DuplicateItem(id.clone()));
+            }
+        }
+
+        let (first_cid, second_cid) = if depositor_container_id < escrow_container_id {
+            (depositor_container_id, escrow_container_id)
+        } else {
+            (escrow_container_id, depositor_container_id)
+        };
+
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
-            // 1. Verify depositor and escrow containers exist
-            let c_dep_sql = format!(
-                "SELECT container_id FROM containers WHERE container_id = ?{}",
-                lock_suffix!()
-            );
-            let c_dep = sqlx::query(&q!(&c_dep_sql))
-                .bind(depositor_container_id as i64)
-                .fetch_optional(&mut *conn)
-                .await?;
-            let c_esc_sql = format!(
+            // 1. Verify depositor and escrow containers exist, locking in ascending ID order to prevent deadlocks
+            let c_lock_sql = format!(
                 "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
             );
-            let c_esc = sqlx::query(&q!(&c_esc_sql))
-                .bind(escrow_container_id as i64)
+            let row_first = sqlx::query(&q!(&c_lock_sql))
+                .bind(first_cid as i64)
                 .fetch_optional(&mut *conn)
                 .await?;
+            let row_second = sqlx::query(&q!(&c_lock_sql))
+                .bind(second_cid as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+            let (c_dep, c_esc) = if depositor_container_id < escrow_container_id {
+                (row_first, row_second)
+            } else {
+                (row_second, row_first)
+            };
 
             if c_dep.is_none() {
                 return Err(StorageError::ContainerNotFound(depositor_container_id));

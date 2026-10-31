@@ -64,7 +64,10 @@ impl MemoryCache {
 #[async_trait]
 impl SessionCacheBackend for MemoryCache {
     async fn set_session(&self, data: &SessionData, ttl_secs: u64) -> Result<(), StorageError> {
-        let expire = Instant::now() + Duration::from_secs(ttl_secs);
+        let safe_ttl = ttl_secs.min(30 * 86400);
+        let expire = Instant::now()
+            .checked_add(Duration::from_secs(safe_ttl))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30 * 86400));
         let mut map = self.sessions.write().await;
         map.insert(data.session_id, (data.clone(), expire));
         Ok(())
@@ -87,7 +90,10 @@ impl SessionCacheBackend for MemoryCache {
     }
 
     async fn stage_handover(&self, data: &HandoverData, ttl_secs: u64) -> Result<(), StorageError> {
-        let expire = Instant::now() + Duration::from_secs(ttl_secs);
+        let safe_ttl = ttl_secs.min(30 * 86400);
+        let expire = Instant::now()
+            .checked_add(Duration::from_secs(safe_ttl))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30 * 86400));
         let mut map = self.handovers.write().await;
         map.insert(data.guid, (data.clone(), expire));
         Ok(())
@@ -349,5 +355,42 @@ mod tests {
         };
         assert!(cache.stage_handover(&handover, 30).await.is_err());
         assert!(cache.claim_handover(999).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_cache_extreme_ttl_does_not_overflow() {
+        let cache = MemoryCache::new();
+
+        let session = SessionData {
+            session_id: 111,
+            guid: 222,
+            node_address: "127.0.0.1:50051".to_string(),
+            expires_at: 1000,
+        };
+
+        // Extreme TTL u64::MAX must not panic on Instant overflow
+        assert!(cache.set_session(&session, u64::MAX).await.is_ok());
+        let fetched = cache.get_session(111).await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().guid, 222);
+
+        let handover = HandoverData {
+            guid: 333,
+            source_node: 1,
+            target_node: 2,
+            snapshot: EntitySnapshot {
+                guid: 333,
+                position: (0.0, 0.0, 0.0),
+                rotation: 0.0,
+                attributes: serde_json::json!({}),
+                state_blob: None,
+                version: 1,
+                timestamp: 1000,
+            },
+            staged_at: 1000,
+        };
+        assert!(cache.stage_handover(&handover, u64::MAX).await.is_ok());
+        let claimed = cache.claim_handover(333).await.unwrap();
+        assert!(claimed.is_some());
     }
 }

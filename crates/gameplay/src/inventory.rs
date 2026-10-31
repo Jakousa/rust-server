@@ -213,7 +213,13 @@ impl ModularPacketHandler for InventoryPacketHandler {
                     1 => EquipSlot::Chest,
                     2 => EquipSlot::MainHand,
                     3 => EquipSlot::OffHand,
-                    _ => EquipSlot::Boots,
+                    4 => EquipSlot::Boots,
+                    other => {
+                        return Err(PacketHandlerError::MalformedPayload {
+                            module_id: 0x01,
+                            message: format!("Invalid equipment slot index {}", other),
+                        });
+                    }
                 };
 
                 let inv = entity
@@ -235,9 +241,13 @@ impl ModularPacketHandler for InventoryPacketHandler {
 
                 let old_item = equip.equip(equip_slot, item);
                 if let Some(old) = old_item {
-                    // Put previous equipped item back into inventory if possible
+                    // Put previous equipped item directly back into the vacated inventory slot
                     if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
-                        let _ = inv.add_item(old);
+                        if inv_slot < inv.slots.len() && inv.slots[inv_slot].is_none() {
+                            inv.slots[inv_slot] = Some(old);
+                        } else {
+                            let _ = inv.add_item(old);
+                        }
                     }
                 }
 
@@ -451,7 +461,7 @@ mod tests {
         let eq = entity.get_component::<EquipmentComponent>().unwrap();
         assert_eq!(eq.get_equipped(&EquipSlot::Head).unwrap().item_id, 51);
         let inv = entity.get_component::<InventoryComponent>().unwrap();
-        assert_eq!(inv.slots[0].as_ref().unwrap().item_id, 50);
+        assert_eq!(inv.slots[1].as_ref().unwrap().item_id, 50);
 
         // 8. Equip into Chest (1), MainHand (2), OffHand (3), Boots (4)
         for (sub_slot, equip_slot) in [
@@ -471,6 +481,18 @@ mod tests {
             let eq = entity.get_component::<EquipmentComponent>().unwrap();
             assert!(eq.get_equipped(&equip_slot).is_some());
         }
+
+        // 9. Invalid slot index (> 4) returns MalformedPayload
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+        let idx = inv_mut
+            .add_item(ItemStack::new(999, "Invalid", 1, 1.0))
+            .unwrap();
+        let err = handler.handle(guid, 1, &[idx as u8, 5], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
     }
 
     #[test]

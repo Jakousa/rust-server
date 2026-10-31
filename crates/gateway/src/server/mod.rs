@@ -88,6 +88,8 @@ pub struct RoutedPacket {
     pub guid: Option<Guid>,
     /// Destination authoritative simulation node network address (e.g. "127.0.0.1:50051").
     pub node_address: String,
+    /// Authoritative gateway session epoch.
+    pub session_epoch: u64,
     /// The decoded client packet.
     pub packet: ClientPacket,
 }
@@ -744,6 +746,7 @@ impl GatewayServer {
             cache: self.cache.clone(),
             subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(writer_handle),
+            intercept_handler: Some(Arc::new(intercept_handler.clone())),
         };
 
         let mut buf = BytesMut::with_capacity(8192);
@@ -768,6 +771,14 @@ impl GatewayServer {
                             std::io::ErrorKind::UnexpectedEof,
                             "Client disconnected before authentication",
                         )));
+                    }
+                    if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                        return Err(GatewayError::Codec(
+                            mmo_schema::client::ClientCodecError::PacketTooLarge {
+                                size: buf.len(),
+                                max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
+                            },
+                        ));
                     }
                     metrics::counter!("mmo_gateway_bytes_received_total")
                         .increment(bytes_read as u64);
@@ -1007,6 +1018,7 @@ impl GatewayServer {
             cache: self.cache.clone(),
             subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(downstream_handle),
+            intercept_handler: Some(Arc::new(intercept_handler.clone())),
         };
 
         loop {
@@ -1089,13 +1101,36 @@ impl GatewayServer {
                                         let timeout = auth.auth_timeout();
                                         let auth_fut = async {
                                             loop {
-                                                if let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
-                                                    return Ok::<ClientPacket, GatewayError>(pkt);
+                                                match ClientPacket::decode_frame(&mut buf) {
+                                                    Ok(Some(pkt)) => {
+                                                        return Ok::<ClientPacket, GatewayError>(pkt);
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(e) => {
+                                                        metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "malformed_frame").increment(1);
+                                                        return Err(GatewayError::Codec(e));
+                                                    }
+                                                }
+                                                if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                                    return Err(GatewayError::Codec(
+                                                        mmo_schema::client::ClientCodecError::PacketTooLarge {
+                                                            size: buf.len(),
+                                                            max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
+                                                        },
+                                                    ));
                                                 }
                                                 match recv.read(&mut chunk).await {
                                                     Ok(Some(n)) if n > 0 => {
                                                         metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
                                                         buf.extend_from_slice(&chunk[..n]);
+                                                        if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                                            return Err(GatewayError::Codec(
+                                                                mmo_schema::client::ClientCodecError::PacketTooLarge {
+                                                                    size: buf.len(),
+                                                                    max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
+                                                                },
+                                                            ));
+                                                        }
                                                     }
                                                     _ => return Err(GatewayError::Io(std::io::Error::new(
                                                         std::io::ErrorKind::UnexpectedEof,

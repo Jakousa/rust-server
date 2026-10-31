@@ -55,6 +55,18 @@ impl GhostStore {
             .map(|v| (v.x, v.y, v.z))
             .unwrap_or((0.0, 0.0, 0.0));
 
+        if !pos.0.is_finite()
+            || !pos.1.is_finite()
+            || !pos.2.is_finite()
+            || !vel.0.is_finite()
+            || !vel.1.is_finite()
+            || !vel.2.is_finite()
+            || !proto.yaw.is_finite()
+            || !proto.pitch.is_finite()
+        {
+            return false;
+        }
+
         let record = GhostRecord {
             guid: Guid::from_raw(proto.guid),
             position: pos,
@@ -436,6 +448,53 @@ mod tests {
         assert_eq!(store.len(), 1);
         store.clear();
         assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_ghost_store_upsert_rejects_non_finite_floats() {
+        let mut store = GhostStore::new();
+
+        // 1. Ghost with NaN in position
+        let proto_nan_pos = GhostEntity {
+            guid: 501,
+            position: Some(Vector3 {
+                x: f32::NAN,
+                y: 1.0,
+                z: 2.0,
+            }),
+            velocity: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: vec![],
+            last_tick: 10,
+        };
+        assert!(!store.upsert_from_proto(1, &proto_nan_pos));
+        assert!(store.is_empty());
+
+        // 2. Ghost with Infinity in yaw
+        let proto_inf_yaw = GhostEntity {
+            guid: 502,
+            position: Some(Vector3 {
+                x: 0.0,
+                y: 1.0,
+                z: 2.0,
+            }),
+            velocity: Some(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            yaw: f32::INFINITY,
+            pitch: 0.0,
+            component_data: vec![],
+            last_tick: 10,
+        };
+        assert!(!store.upsert_from_proto(1, &proto_inf_yaw));
         assert!(store.is_empty());
     }
 

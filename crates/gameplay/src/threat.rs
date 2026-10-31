@@ -43,7 +43,7 @@ impl ThreatTableComponent {
 
     /// Adds or updates threat for a given target. Updates `current_target` if thresholds are exceeded.
     pub fn add_threat(&mut self, target: Guid, amount: f32) {
-        if amount <= 0.0 {
+        if !amount.is_finite() || amount <= 0.0 {
             return;
         }
 
@@ -60,7 +60,7 @@ impl ThreatTableComponent {
                 .entries
                 .iter()
                 .enumerate()
-                .min_by(|a, b| a.1.threat.partial_cmp(&b.1.threat).unwrap())
+                .min_by(|a, b| a.1.threat.total_cmp(&b.1.threat))
             {
                 if amount > lowest.threat {
                     self.entries[idx] = ThreatEntry {
@@ -110,7 +110,7 @@ impl ThreatTableComponent {
         let highest_entry = self
             .entries
             .iter()
-            .max_by(|a, b| a.threat.partial_cmp(&b.threat).unwrap())
+            .max_by(|a, b| a.threat.total_cmp(&b.threat))
             .unwrap();
 
         match self.current_target {
@@ -346,5 +346,30 @@ mod tests {
         let table = monster_ent.get_component::<ThreatTableComponent>().unwrap();
         assert_eq!(table.current_target, None);
         assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn test_nan_and_negative_threat_safety() {
+        let mut table = ThreatTableComponent::new(2, 1.1);
+        let g1 = Guid::new(mmo_core::EntityType::Player, 1, 100);
+        let g2 = Guid::new(mmo_core::EntityType::Player, 1, 101);
+        let g3 = Guid::new(mmo_core::EntityType::Player, 1, 102);
+
+        // NaN and negative/zero should be ignored and never panic
+        table.add_threat(g1, f32::NAN);
+        table.add_threat(g1, -5.0);
+        table.add_threat(g1, 0.0);
+        assert_eq!(table.get_threat(g1), 0.0);
+        assert_eq!(table.current_target, None);
+
+        // Valid threat works and total_cmp prevents panics
+        table.add_threat(g1, 10.0);
+        table.add_threat(g2, 20.0);
+        assert_eq!(table.current_target, Some(g2));
+
+        // Adding threat when table is full uses total_cmp without panicking
+        table.add_threat(g3, 25.0);
+        assert_eq!(table.current_target, Some(g3));
+        table.add_threat(g1, f32::NAN);
     }
 }

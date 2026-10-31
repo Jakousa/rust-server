@@ -55,6 +55,10 @@ impl GatewayInterceptHandler {
                 return;
             }
             if let Ok(mut rx) = bus.subscribe(topic).await {
+                // If active subscribers for the topic already dropped to 0 while awaiting subscription, don't spawn
+                if self.subscription_manager.get_subscribers(topic).is_empty() {
+                    return;
+                }
                 let topic_name = topic.to_string();
                 let sub_mgr = self.subscription_manager.clone();
                 let sinks = self.session_sinks.clone();
@@ -92,21 +96,32 @@ impl GatewayInterceptHandler {
                         }
                     }
                 });
-                self.active_bus_subscriptions
-                    .insert(topic.to_string(), handle);
+                if let Some(old_handle) = self
+                    .active_bus_subscriptions
+                    .insert(topic.to_string(), handle)
+                {
+                    old_handle.abort();
+                }
             }
         }
     }
 
-    /// Cleanly deregisters all subscriptions for `session_id`, terminating idle whisper listeners.
+    /// Cleanly deregisters all subscriptions for `session_id`, terminating idle topic listeners.
     pub fn remove_session(&self, session_id: u64) {
         let removed = self.subscription_manager.remove_session(session_id);
         for topic in removed {
-            if topic.starts_with("whisper:")
-                && self.subscription_manager.get_subscribers(&topic).is_empty()
-            {
+            if self.subscription_manager.get_subscribers(&topic).is_empty() {
                 if let Some((_, handle)) = self.active_bus_subscriptions.remove(&topic) {
                     handle.abort();
+                }
+                if let Some(ref bus) = self.social_bus {
+                    let bus = bus.clone();
+                    let topic_clone = topic.clone();
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move {
+                            let _ = bus.unsubscribe(&topic_clone).await;
+                        });
+                    }
                 }
             }
         }
@@ -128,13 +143,19 @@ impl GatewayInterceptHandler {
     pub async fn handle_packet(&self, session_id: u64, packet: &ClientPacket) -> bool {
         match packet {
             ClientPacket::SocialMessage(msg) => {
-                // Anti-Spoofing: If the session has an authenticated player GUID, sender_guid must match.
-                if let Some(bound_guid) = self.router.get_guid_by_session(session_id) {
-                    if msg.sender_guid != bound_guid.raw() {
+                // Anti-Spoofing: Must be an authenticated session and sender_guid must match bound_guid.
+                let bound_guid = match self.router.get_guid_by_session(session_id) {
+                    Some(guid) => guid,
+                    None => {
                         metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
                             .increment(1);
                         return true;
                     }
+                };
+                if msg.sender_guid != bound_guid.raw() {
+                    metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                        .increment(1);
+                    return true;
                 }
 
                 let topic = match msg.channel_type {
@@ -187,12 +208,41 @@ impl GatewayInterceptHandler {
                 true
             }
             ClientPacket::SocialSubscribe(sub) => {
+                // Authorization: Must be an authenticated session to subscribe to social topics.
+                let bound_guid = match self.router.get_guid_by_session(session_id) {
+                    Some(guid) => guid,
+                    None => {
+                        metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                            .increment(1);
+                        return true;
+                    }
+                };
+
                 let topic = if !sub.channel_name.is_empty() {
+                    // Prevent whisper impersonation or eavesdropping via custom channel names
+                    if sub.channel_name.starts_with("whisper:") {
+                        let expected = format!("whisper:{}", bound_guid.raw());
+                        if sub.channel_name != expected {
+                            metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                                .increment(1);
+                            return true;
+                        }
+                    }
                     sub.channel_name.clone()
                 } else {
                     match sub.channel_type {
                         0 => "chat:global".to_string(),
-                        1 => format!("whisper:{}", sub.target_id),
+                        1 => {
+                            // Whisper subscription is strictly restricted to the session's own GUID
+                            if sub.target_id != bound_guid.raw() {
+                                metrics::counter!(
+                                    "mmo_gateway_spoofed_social_packets_dropped_total"
+                                )
+                                .increment(1);
+                                return true;
+                            }
+                            format!("whisper:{}", bound_guid.raw())
+                        }
                         2 => format!("chat:party:{}", sub.target_id),
                         3 => format!("chat:guild:{}", sub.target_id),
                         4 => "chat:area".to_string(),
@@ -388,9 +438,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_social_message_unbound_session_dropped() {
+        let (handler, _router, sub_mgr, sinks) = create_test_handler();
+        let unauthenticated_session = 999u64;
+        let s2 = 2u64;
+
+        sub_mgr.subscribe(s2, "chat:global".to_string());
+        let (stx2, mut srx2) = mpsc::channel(16);
+        let (dtx2, _drx2) = mpsc::channel(16);
+        sinks.insert(s2, SessionSink::new(dtx2, stx2));
+
+        // Unbound session sends message claiming sender_guid = 100
+        let msg_pkt = ClientPacket::SocialMessage(SocialMessagePacket {
+            channel_type: 0,
+            target_id: 0,
+            sender_guid: 100,
+            sender_name: "Anonymous".to_string(),
+            content: "Spoofed global message".to_string(),
+            timestamp: 1000,
+        });
+        assert!(
+            handler
+                .handle_packet(unauthenticated_session, &msg_pkt)
+                .await
+        );
+        assert!(
+            srx2.try_recv().is_err(),
+            "unbound session message must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_social_subscribe_unauthorized_whisper_dropped() {
+        let (handler, router, sub_mgr, _sinks) = create_test_handler();
+        let s1 = 101u64;
+        let my_guid = Guid::from_raw(500);
+        let victim_guid = 600u64;
+        router.register_session(s1, my_guid, "127.0.0.1:50051".to_string());
+
+        // 1. Attempt to eavesdrop via channel_type = 1 and victim's target_id
+        let eavesdrop_type1 = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+            channel_type: 1,
+            channel_name: String::new(),
+            target_id: victim_guid,
+        });
+        handler.handle_packet(s1, &eavesdrop_type1).await;
+        assert!(
+            !sub_mgr.get_subscribers("whisper:600").contains(&s1),
+            "cannot subscribe to victim's whisper channel via channel_type=1"
+        );
+
+        // 2. Attempt to eavesdrop via channel_name = "whisper:600"
+        let eavesdrop_named = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+            channel_type: 0,
+            channel_name: "whisper:600".to_string(),
+            target_id: 0,
+        });
+        handler.handle_packet(s1, &eavesdrop_named).await;
+        assert!(
+            !sub_mgr.get_subscribers("whisper:600").contains(&s1),
+            "cannot subscribe to victim's whisper channel via channel_name"
+        );
+
+        // 3. Subscribing to own whisper succeeds
+        let own_whisper = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+            channel_type: 1,
+            channel_name: String::new(),
+            target_id: 500,
+        });
+        handler.handle_packet(s1, &own_whisper).await;
+        assert!(
+            sub_mgr.get_subscribers("whisper:500").contains(&s1),
+            "subscribing to own whisper channel must succeed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_social_subscribe_unsubscribe_and_remove_session() {
-        let (handler, _router, sub_mgr, _sinks) = create_test_handler();
+        let (handler, router, sub_mgr, _sinks) = create_test_handler();
         let s1 = 10u64;
+        router.register_session(s1, Guid::from_raw(55), "127.0.0.1:50051".to_string());
 
         // Subscribe all standard channel types and custom name
         handler

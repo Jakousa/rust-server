@@ -440,46 +440,63 @@ impl TransactionCoordinator {
     /// Aborts an active transfer reservation and cleans up locks.
     pub async fn abort_transfer(&self, tx_id: &str) -> Result<bool, StorageError> {
         let now_ms = current_time_ms();
-        let query_del_str = self
-            .db
-            .sql("DELETE FROM container_reservations WHERE tx_id = ?");
-        let query_ins = self.db.sql(
-            "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, 0, 0, '', 'aborted', ?)",
-        );
 
-        let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query(&query_del_str)
-                .bind(tx_id)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-            DbBackend::Postgres(pool) => sqlx::query(&query_del_str)
-                .bind(tx_id)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
+        with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // 1. Fetch reservation details if present
+            let rows = sqlx::query(&q!(
+                "SELECT container_id, item_instance_id, reservation_type FROM container_reservations WHERE tx_id = ?"
+            ))
+            .bind(tx_id)
+            .fetch_all(&mut *conn)
+            .await?;
 
-        if rows_affected > 0 {
-            match self.db.backend() {
-                DbBackend::Sqlite(pool) => {
-                    let _ = sqlx::query(&query_ins)
-                        .bind(tx_id)
-                        .bind(now_ms)
-                        .execute(pool)
-                        .await;
-                }
-                DbBackend::Postgres(pool) => {
-                    let _ = sqlx::query(&query_ins)
-                        .bind(tx_id)
-                        .bind(now_ms)
-                        .execute(pool)
-                        .await;
+            if rows.is_empty() {
+                return Ok(false);
+            }
+
+            let mut src_cid: u64 = 0;
+            let mut dst_cid: u64 = 0;
+            let mut item_id = String::new();
+
+            for r in rows {
+                let res_type: String = r.try_get("reservation_type")?;
+                let cid: i64 = r.try_get("container_id")?;
+                let item_opt: Option<String> = r.try_get("item_instance_id")?;
+
+                if res_type == "transfer_out" {
+                    src_cid = cid as u64;
+                    if let Some(id) = item_opt {
+                        item_id = id;
+                    }
+                } else if res_type == "transfer_in" {
+                    dst_cid = cid as u64;
                 }
             }
-        }
 
-        Ok(rows_affected > 0)
+            // 2. Delete the active reservation rows
+            let rows_affected =
+                sqlx::query(&q!("DELETE FROM container_reservations WHERE tx_id = ?"))
+                    .bind(tx_id)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+
+            if rows_affected > 0 {
+                // 3. Insert transaction audit log atomically, propagating errors
+                sqlx::query(&q!(
+                    "INSERT INTO container_transactions (tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms) VALUES (?, ?, ?, ?, 'aborted', ?)"
+                ))
+                .bind(tx_id)
+                .bind(src_cid as i64)
+                .bind(dst_cid as i64)
+                .bind(&item_id)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            Ok(rows_affected > 0)
+        })
     }
 
     /// Background lease reaper: aborts all expired reservations.

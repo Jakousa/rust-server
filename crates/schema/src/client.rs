@@ -210,11 +210,15 @@ impl Vec3 {
                 got: src.remaining(),
             });
         }
-        Ok(Self {
-            x: src.get_f32_le(),
-            y: src.get_f32_le(),
-            z: src.get_f32_le(),
-        })
+        let x = src.get_f32_le();
+        let y = src.get_f32_le();
+        let z = src.get_f32_le();
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return Err(ClientCodecError::InvalidData(
+                "Non-finite float in Vec3".to_string(),
+            ));
+        }
+        Ok(Self { x, y, z })
     }
 }
 
@@ -295,6 +299,12 @@ impl MovementPacket {
         let pitch = src.get_f32_le();
         let timestamp = src.get_u64_le();
         let sequence = src.get_u32_le();
+
+        if !yaw.is_finite() || !pitch.is_finite() {
+            return Err(ClientCodecError::InvalidData(
+                "Non-finite rotation float in MovementPacket".to_string(),
+            ));
+        }
 
         Ok(Self {
             entity_id,
@@ -1419,6 +1429,22 @@ impl PlaceObjectPacket {
             z: src.get_f32_le(),
         };
         let properties = get_property_map(src)?;
+
+        if !pos.x.is_finite()
+            || !pos.y.is_finite()
+            || !pos.z.is_finite()
+            || !rot.0.is_finite()
+            || !rot.1.is_finite()
+            || !rot.2.is_finite()
+            || !rot.3.is_finite()
+            || !scale.x.is_finite()
+            || !scale.y.is_finite()
+            || !scale.z.is_finite()
+        {
+            return Err(ClientCodecError::InvalidData(
+                "Non-finite float in PlaceObjectPacket".to_string(),
+            ));
+        }
 
         Ok(Self {
             prefab_id,
@@ -5104,5 +5130,46 @@ mod tests {
         let mut reader = buf.freeze();
         let written_len = reader.get_u16_le();
         assert_eq!(written_len, u16::MAX);
+    }
+
+    #[test]
+    fn test_vec3_and_movement_non_finite_rejection() {
+        // 1. Vec3 with NaN x
+        let mut buf_nan = BytesMut::new();
+        buf_nan.put_f32_le(f32::NAN);
+        buf_nan.put_f32_le(0.0);
+        buf_nan.put_f32_le(0.0);
+        assert!(matches!(
+            Vec3::decode(&mut buf_nan.freeze()),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // 2. Vec3 with Infinity y
+        let mut buf_inf = BytesMut::new();
+        buf_inf.put_f32_le(0.0);
+        buf_inf.put_f32_le(f32::INFINITY);
+        buf_inf.put_f32_le(0.0);
+        assert!(matches!(
+            Vec3::decode(&mut buf_inf.freeze()),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // 3. MovementPacket with NaN yaw
+        let mut move_buf = BytesMut::new();
+        move_buf.put_u64_le(1); // entity_id
+        move_buf.put_f32_le(0.0); // pos.x
+        move_buf.put_f32_le(0.0); // pos.y
+        move_buf.put_f32_le(0.0); // pos.z
+        move_buf.put_f32_le(0.0); // vel.x
+        move_buf.put_f32_le(0.0); // vel.y
+        move_buf.put_f32_le(0.0); // vel.z
+        move_buf.put_f32_le(f32::NAN); // yaw
+        move_buf.put_f32_le(0.0); // pitch
+        move_buf.put_u64_le(100); // timestamp
+        move_buf.put_u32_le(1); // sequence
+        assert!(matches!(
+            MovementPacket::decode(&mut move_buf.freeze()),
+            Err(ClientCodecError::InvalidData(_))
+        ));
     }
 }

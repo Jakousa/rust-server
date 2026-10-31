@@ -624,19 +624,22 @@ impl GlobalOctreeCoordinator {
             }
         }
 
-        // 3. Update NodeRegistry assigned bounds
-        registry.remove_assigned_bounds(reporting_node_id, &original_bounds);
-        for (&child, &assigned_id) in sub_bounds.iter().zip(assigned_node_ids.iter()) {
-            registry.add_assigned_bounds(assigned_id, child);
-        }
-
-        // 4. Update coordinator topology tree
+        // 3. Update coordinator topology tree first. If split fails (octant not found),
+        // abort without corrupting registry or topology epoch.
         let mut assignments_arr: [(BoundingBox3D, u32); 8] =
             [(original_bounds, reporting_node_id); 8];
         for i in 0..8 {
             assignments_arr[i] = (sub_bounds[i], assigned_node_ids[i]);
         }
-        self.root.split_at(&original_bounds, &assignments_arr);
+        if !self.root.split_at(&original_bounds, &assignments_arr) {
+            return Vec::new();
+        }
+
+        // 4. Update NodeRegistry assigned bounds on successful split
+        registry.remove_assigned_bounds(reporting_node_id, &original_bounds);
+        for (&child, &assigned_id) in sub_bounds.iter().zip(assigned_node_ids.iter()) {
+            registry.add_assigned_bounds(assigned_id, child);
+        }
 
         self.last_split_times
             .insert(reporting_node_id, std::time::Instant::now());

@@ -677,6 +677,13 @@ impl CharacterRepository {
             ));
         }
 
+        let mut unique_items = std::collections::HashSet::with_capacity(item_instance_ids.len());
+        for id in item_instance_ids {
+            if !unique_items.insert(id) {
+                return Err(StorageError::DuplicateItem(id.clone()));
+            }
+        }
+
         let (first_guid, second_guid) = (
             sender_guid.min(recipient_guid),
             sender_guid.max(recipient_guid),

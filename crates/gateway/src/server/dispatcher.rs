@@ -119,11 +119,14 @@ impl PacketDispatcher {
             .and_then(|g| router.get_route_by_guid(g))
             .or_else(|| router.get_route_by_session(session_id));
 
+        let session_epoch = router.get_epoch_by_session(session_id).unwrap_or(0);
+
         match node_address {
             Some(addr) => Ok(RoutedPacket {
                 session_id,
                 guid,
                 node_address: addr,
+                session_epoch,
                 packet,
             }),
             None => Err(GatewayError::NoRouteFound { session_id, guid }),

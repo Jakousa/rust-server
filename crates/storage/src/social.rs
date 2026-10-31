@@ -118,6 +118,11 @@ pub trait SocialBus: Send + Sync {
         &self,
         channel: &str,
     ) -> Result<broadcast::Receiver<SocialEnvelope>, SocialBusError>;
+
+    /// Unsubscribes from a named topic channel, freeing resources if no active receivers remain.
+    async fn unsubscribe(&self, _channel: &str) -> Result<(), SocialBusError> {
+        Ok(())
+    }
 }
 
 /// In-memory broadcast social bus ideal for standalone testing or single-process topologies.
@@ -164,6 +169,16 @@ impl SocialBus for MemorySocialBus {
         let sender = self.get_or_create_sender(channel);
         Ok(sender.subscribe())
     }
+
+    async fn unsubscribe(&self, channel: &str) -> Result<(), SocialBusError> {
+        let mut channels = self.channels.lock().unwrap();
+        if let Some(sender) = channels.get(channel) {
+            if sender.receiver_count() == 0 {
+                channels.remove(channel);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Wire payload envelope exchanged over Redis PubSub to identify message origin.
@@ -179,6 +194,7 @@ pub struct RedisSocialBus {
     node_id: String,
     memory_fallback: MemorySocialBus,
     subscribed_channels: Arc<Mutex<std::collections::HashSet<String>>>,
+    active_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 impl RedisSocialBus {
@@ -195,6 +211,7 @@ impl RedisSocialBus {
             node_id,
             memory_fallback: MemorySocialBus::new(),
             subscribed_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            active_tasks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -210,6 +227,7 @@ impl RedisSocialBus {
             node_id: node_id.into(),
             memory_fallback: MemorySocialBus::new(),
             subscribed_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            active_tasks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -256,8 +274,10 @@ impl SocialBus for RedisSocialBus {
             let memory_fallback = self.memory_fallback.clone();
             let my_node_id = self.node_id.clone();
             let channels_set = self.subscribed_channels.clone();
+            let active_tasks_ref = self.active_tasks.clone();
+            let channel_key = channel_name.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 use futures_util::StreamExt;
                 let mut retry_delay_ms = 100u64;
                 loop {
@@ -303,10 +323,26 @@ impl SocialBus for RedisSocialBus {
                         break;
                     }
                 }
+                active_tasks_ref.lock().unwrap().remove(&channel_name);
             });
+            self.active_tasks
+                .lock()
+                .unwrap()
+                .insert(channel_key, handle.abort_handle());
         }
 
         self.memory_fallback.subscribe(channel).await
+    }
+
+    async fn unsubscribe(&self, channel: &str) -> Result<(), SocialBusError> {
+        {
+            let mut set = self.subscribed_channels.lock().unwrap();
+            set.remove(channel);
+        }
+        if let Some(abort_handle) = self.active_tasks.lock().unwrap().remove(channel) {
+            abort_handle.abort();
+        }
+        self.memory_fallback.unsubscribe(channel).await
     }
 }
 
@@ -365,6 +401,16 @@ mod tests {
             .expect("timed out waiting for message")
             .unwrap();
         assert_eq!(received, SocialEnvelope::Chat(whisper));
+    }
+
+    #[tokio::test]
+    async fn test_memory_social_bus_unsubscribe() {
+        let bus = MemorySocialBus::new();
+        let rx = bus.subscribe("chat:temp").await.unwrap();
+        assert_eq!(bus.channels.lock().unwrap().len(), 1);
+        drop(rx);
+        bus.unsubscribe("chat:temp").await.unwrap();
+        assert_eq!(bus.channels.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
