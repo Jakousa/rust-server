@@ -1015,3 +1015,112 @@ pub fn execute_remote_ability(
         cast_id,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mmo_core::guid::EntityType;
+    use mmo_schema::cluster::RemoteCommandRequest;
+
+    #[test]
+    fn test_extract_initiator_happy_path_exact_size() {
+        let guid = Guid::new(EntityType::Player, 1, 12345);
+        let payload = guid.raw().to_le_bytes().to_vec();
+
+        let req = RemoteCommandRequest {
+            guid: 0,
+            action_id: 0,
+            payload,
+            source_node_id: 0,
+            target_node_id: 0,
+        };
+
+        let result = extract_initiator(&req);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), guid);
+    }
+
+    #[test]
+    fn test_extract_initiator_happy_path_extra_data() {
+        let guid = Guid::new(EntityType::Npc, 2, 9876);
+        let mut payload = guid.raw().to_le_bytes().to_vec();
+        payload.extend_from_slice(&[1, 2, 3, 4, 5]); // extra data
+
+        let req = RemoteCommandRequest {
+            guid: 0,
+            action_id: 0,
+            payload,
+            source_node_id: 0,
+            target_node_id: 0,
+        };
+
+        let result = extract_initiator(&req);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), guid);
+    }
+
+    #[test]
+    fn test_extract_initiator_error_too_small() {
+        let payload = vec![1, 2, 3, 4, 5, 6, 7]; // 7 bytes
+
+        let req = RemoteCommandRequest {
+            guid: 0,
+            action_id: 0,
+            payload,
+            source_node_id: 0,
+            target_node_id: 0,
+        };
+
+        let result = extract_initiator(&req);
+        assert!(result.is_err());
+        if let Err(NetworkError::MalformedPayload(msg)) = result {
+            assert!(msg.contains("minimum 8 bytes required"));
+        } else {
+            panic!("Expected MalformedPayload error");
+        }
+    }
+
+    #[test]
+    fn test_extract_initiator_error_zero_guid() {
+        let payload = vec![0, 0, 0, 0, 0, 0, 0, 0]; // 8 bytes of zeros
+
+        let req = RemoteCommandRequest {
+            guid: 0,
+            action_id: 0,
+            payload,
+            source_node_id: 0,
+            target_node_id: 0,
+        };
+
+        let result = extract_initiator(&req);
+        assert!(result.is_err());
+        if let Err(NetworkError::MalformedPayload(msg)) = result {
+            assert!(msg.contains("cannot be zero"));
+        } else {
+            panic!("Expected MalformedPayload error");
+        }
+    }
+
+    #[test]
+    fn test_extract_initiator_roundtrip() {
+        let initiator = Guid::new(EntityType::Player, 1, 42);
+        let target = Guid::new(EntityType::Npc, 1, 100);
+        let action_id = 99;
+        let extra_payload = vec![10, 20, 30];
+        let source_node_id = 1;
+        let target_node_id = 2;
+
+        let req = make_remote_command(
+            initiator,
+            target,
+            action_id,
+            &extra_payload,
+            source_node_id,
+            target_node_id,
+        );
+
+        let result = extract_initiator(&req);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), initiator);
+    }
+}
