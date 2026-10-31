@@ -8,6 +8,10 @@ import {
   encodeAuthRequest,
   encodeInteraction,
   encodeMovement,
+  readVarintU64,
+  readVarintU32,
+  readVarintString,
+  skipPropertyMap,
 } from "./protocol.js";
 
 /**
@@ -130,37 +134,91 @@ export class ClientWorldBridge {
       // Entity deltas are applied to replicas
     }
 
-    // Opcode 0x000B: WorldObjectSpawn
-    if (opcode === OPCODES.WORLD_OBJECT_SPAWN && view.byteLength >= 48) {
-      // Simplified parsing for world object mock adapter
-      const objId = Number(view.getBigUint64(8, true));
-      const prefabId = view.getUint32(16, true);
-      const x = view.getFloat32(20, true);
-      const y = view.getFloat32(24, true);
-      const z = view.getFloat32(28, true);
-      this.worldObjects.set(objId, {
-        id: objId,
+    // Opcode 0x000B: WorldObjectSpawn (LEB128 varints for object_id, prefab_id)
+    if (opcode === OPCODES.WORLD_OBJECT_SPAWN && view.byteLength >= 10) {
+      let offset = 8;
+      const { value: objIdBig, bytesRead: b1 } = readVarintU64(view, offset);
+      offset += b1;
+      const { value: prefabId, bytesRead: b2 } = readVarintU32(view, offset);
+      offset += b2;
+
+      let x = 0, y = 0, z = 0;
+      let qx = 0, qy = 0, qz = 0, qw = 1;
+      let sx = 1, sy = 1, sz = 1;
+      let stateFlags = 0;
+      let hpPct = 1.0;
+      let revision = 1;
+
+      if (view.byteLength >= offset + 16 * 4) {
+        x = view.getFloat32(offset, true);
+        y = view.getFloat32(offset + 4, true);
+        z = view.getFloat32(offset + 8, true);
+        qx = view.getFloat32(offset + 12, true);
+        qy = view.getFloat32(offset + 16, true);
+        qz = view.getFloat32(offset + 20, true);
+        qw = view.getFloat32(offset + 24, true);
+        sx = view.getFloat32(offset + 28, true);
+        sy = view.getFloat32(offset + 32, true);
+        sz = view.getFloat32(offset + 36, true);
+        // bounds_min (12 bytes) + bounds_max (12 bytes)
+        offset += 16 * 4;
+
+        if (offset < view.byteLength) {
+          const sfRes = readVarintU32(view, offset);
+          stateFlags = sfRes.value;
+          offset += sfRes.bytesRead;
+          if (offset < view.byteLength) {
+            // owner_type
+            offset += 1;
+            const sRes = readVarintString(view, offset);
+            offset += sRes.bytesRead;
+            if (offset < view.byteLength) {
+              const hasHealth = view.getUint8(offset);
+              offset += 1;
+              if (hasHealth !== 0 && offset < view.byteLength) {
+                const curHp = readVarintU32(view, offset);
+                offset += curHp.bytesRead;
+                const maxHp = readVarintU32(view, offset);
+                offset += maxHp.bytesRead;
+                hpPct = maxHp.value > 0 ? curHp.value / maxHp.value : 1.0;
+              }
+              const propBytes = skipPropertyMap(view, offset);
+              offset += propBytes;
+              if (offset < view.byteLength) {
+                const revRes = readVarintU64(view, offset);
+                revision = Number(revRes.value);
+              }
+            }
+          }
+        }
+      }
+
+      this.worldObjects.set(objIdBig, {
+        id: objIdBig,
         prefabId,
         x,
         y,
         z,
-        qx: 0,
-        qy: 0,
-        qz: 0,
-        qw: 1,
-        sx: 1,
-        sy: 1,
-        sz: 1,
-        stateFlags: 0,
-        hpPct: 1.0,
-        revision: 1,
+        qx,
+        qy,
+        qz,
+        qw,
+        sx,
+        sy,
+        sz,
+        stateFlags,
+        hpPct,
+        revision,
       });
+      return;
     }
 
-    // Opcode 0x000D: WorldObjectDespawn
-    if (opcode === OPCODES.WORLD_OBJECT_DESPAWN && view.byteLength >= 16) {
-      const objId = Number(view.getBigUint64(8, true));
-      this.worldObjects.delete(objId);
+    // Opcode 0x000D: WorldObjectDespawn (LEB128 varint for object_id)
+    if (opcode === OPCODES.WORLD_OBJECT_DESPAWN && view.byteLength >= 9) {
+      const { value: objIdBig } = readVarintU64(view, 8);
+      this.worldObjects.delete(objIdBig);
+      this.worldObjects.delete(Number(objIdBig));
+      return;
     }
   }
 
@@ -170,73 +228,74 @@ export class ClientWorldBridge {
 
   getRenderBuffer(localPlayerPos, localPlayerYaw) {
     // Layout: [guid_lo, guid_hi, x, y, z, yaw, hp_pct, cast_pct, entity_type] * N
-    const buffer = [];
+    // GUID lo and hi halves are packed losslessly via Uint32Array bit-reinterpretation
+    const entityStride = 9;
+    const remoteCount = Array.from(this.entities.values()).filter(
+      (e) => BigInt(e.id) !== BigInt(this.localPlayerGuid)
+    ).length;
+    const totalCount = 1 + remoteCount;
+    const floatBuffer = new Float32Array(totalCount * entityStride);
+    const uintBuffer = new Uint32Array(floatBuffer.buffer);
 
+    let offset = 0;
     const localGuidBigInt = BigInt(this.localPlayerGuid);
-    const localLo = Number(localGuidBigInt & 0xffffffffn);
-    const localHi = Number((localGuidBigInt >> 32n) & 0xffffffffn);
+    uintBuffer[offset] = Number(localGuidBigInt & 0xffffffffn) >>> 0;
+    uintBuffer[offset + 1] = Number((localGuidBigInt >> 32n) & 0xffffffffn) >>> 0;
+    floatBuffer[offset + 2] = localPlayerPos.x;
+    floatBuffer[offset + 3] = localPlayerPos.y;
+    floatBuffer[offset + 4] = localPlayerPos.z;
+    floatBuffer[offset + 5] = localPlayerYaw;
+    floatBuffer[offset + 6] = 1.0;
+    floatBuffer[offset + 7] = 0.0;
+    floatBuffer[offset + 8] = 1.0;
+    offset += entityStride;
 
-    // Local player entry
-    buffer.push(
-      localLo,
-      localHi,
-      localPlayerPos.x,
-      localPlayerPos.y,
-      localPlayerPos.z,
-      localPlayerYaw,
-      1.0,
-      0.0,
-      1.0
-    );
-
-    // Remote entity entries
     for (const ent of this.entities.values()) {
-      if (ent.id === this.localPlayerGuid) continue;
+      if (BigInt(ent.id) === BigInt(this.localPlayerGuid)) continue;
       const entGuidBigInt = BigInt(ent.id);
-      const entLo = Number(entGuidBigInt & 0xffffffffn);
-      const entHi = Number((entGuidBigInt >> 32n) & 0xffffffffn);
-      buffer.push(
-        entLo,
-        entHi,
-        ent.x,
-        ent.y,
-        ent.z,
-        ent.yaw,
-        ent.hpPct,
-        ent.castPct,
-        ent.type
-      );
+      uintBuffer[offset] = Number(entGuidBigInt & 0xffffffffn) >>> 0;
+      uintBuffer[offset + 1] = Number((entGuidBigInt >> 32n) & 0xffffffffn) >>> 0;
+      floatBuffer[offset + 2] = ent.x;
+      floatBuffer[offset + 3] = ent.y;
+      floatBuffer[offset + 4] = ent.z;
+      floatBuffer[offset + 5] = ent.yaw;
+      floatBuffer[offset + 6] = ent.hpPct;
+      floatBuffer[offset + 7] = ent.castPct;
+      floatBuffer[offset + 8] = ent.type;
+      offset += entityStride;
     }
 
-    return new Float32Array(buffer);
+    return floatBuffer;
   }
 
   getWorldObjectsRenderBuffer() {
-    const buffer = [];
+    // Layout: 16 floats per object. GUID lo (offset 0) and hi (offset 15) packed losslessly
+    const STRIDE = 16;
+    const floatBuffer = new Float32Array(this.worldObjects.size * STRIDE);
+    const uintBuffer = new Uint32Array(floatBuffer.buffer);
+
+    let offset = 0;
     for (const obj of this.worldObjects.values()) {
       const objIdBigInt = BigInt(obj.id);
-      const objLo = Number(objIdBigInt & 0xffffffffn);
-      const objHi = Number((objIdBigInt >> 32n) & 0xffffffffn);
-      buffer.push(
-        objLo,
-        obj.prefabId,
-        obj.x,
-        obj.y,
-        obj.z,
-        obj.qx,
-        obj.qy,
-        obj.qz,
-        obj.qw,
-        obj.sx,
-        obj.sy,
-        obj.sz,
-        obj.stateFlags,
-        obj.hpPct,
-        obj.revision,
-        objHi
-      );
+      uintBuffer[offset] = Number(objIdBigInt & 0xffffffffn) >>> 0;
+      floatBuffer[offset + 1] = obj.prefabId;
+      floatBuffer[offset + 2] = obj.x;
+      floatBuffer[offset + 3] = obj.y;
+      floatBuffer[offset + 4] = obj.z;
+      floatBuffer[offset + 5] = obj.qx;
+      floatBuffer[offset + 6] = obj.qy;
+      floatBuffer[offset + 7] = obj.qz;
+      floatBuffer[offset + 8] = obj.qw;
+      floatBuffer[offset + 9] = obj.sx;
+      floatBuffer[offset + 10] = obj.sy;
+      floatBuffer[offset + 11] = obj.sz;
+      floatBuffer[offset + 12] = obj.stateFlags;
+      floatBuffer[offset + 13] = obj.hpPct;
+      floatBuffer[offset + 14] = obj.revision;
+      uintBuffer[offset + 15] = Number((objIdBigInt >> 32n) & 0xffffffffn) >>> 0;
+      offset += STRIDE;
     }
-    return new Float32Array(buffer);
+    return floatBuffer;
   }
 
   getTelemetryJson() {
@@ -292,19 +351,23 @@ if (typeof window !== "undefined") {
   }
 
   let nearestTarget = null;
+  let activeTradeSessionId = 0;
 
   // Interaction response listener for Village HUD updates
   world.onInteractionResult((res) => {
     if (!res.data) return;
 
-    // 1. Update player inventory if included
-    if (res.data.player_inventory) {
-      ui.updateInventory(res.data.player_inventory);
+    // 1. Update player inventory if included (authoritative VillageTradeStateResponse.inventory)
+    const inv = res.data.inventory || res.data.player_inventory;
+    const currentWeight = res.data.current_weight ?? inv?.current_weight;
+    if (inv) {
+      ui.updateInventory(inv, currentWeight);
     }
 
-    // 2. Open NPC Barter modal if merchant data present
-    if (res.data.npc_merchant && nearestTarget) {
-      ui.showNpcBarter(res.data.npc_merchant, (recipeId) => {
+    // 2. Open NPC Barter modal if merchant data present (authoritative target_merchant)
+    const merchant = res.data.target_merchant || res.data.npc_merchant;
+    if (merchant && nearestTarget) {
+      ui.showNpcBarter(merchant, (recipeId) => {
         // Send Sub-opcode 2: NpcBarter
         const actionId = (0x0002 << 16) | 2;
         const payload = new TextEncoder().encode(
@@ -321,9 +384,16 @@ if (typeof window !== "undefined") {
       });
     }
 
-    // 3. Open Player Trade modal if active trade session present
-    if (res.data.trade_session) {
-      ui.showPlayerTrade(res.data.trade_session);
+    // 3. Open Player Trade modal if active trade session present (authoritative active_trade)
+    const tradeSession = res.data.active_trade || res.data.trade_session;
+    if (tradeSession) {
+      activeTradeSessionId = tradeSession.session_id || activeTradeSessionId;
+      ui.showPlayerTrade(tradeSession);
+    }
+
+    // 4. Close trade modal if trade completed
+    if (res.data.trade_completed || (tradeSession && tradeSession.completed)) {
+      ui.hidePlayerTrade();
     }
   });
 
@@ -386,7 +456,7 @@ if (typeof window !== "undefined") {
       if (!transport.connected) return;
       const actionId = (0x0002 << 16) | 4; // Sub-opcode 4: Offer
       const payload = new TextEncoder().encode(
-        JSON.stringify({ session_id: 1, currency: gold, items })
+        JSON.stringify({ session_id: activeTradeSessionId, currency: gold, items })
       );
       const pkt = encodeInteraction(
         world.localPlayerGuid,
@@ -400,7 +470,9 @@ if (typeof window !== "undefined") {
     onTradeAccept: () => {
       if (!transport.connected) return;
       const actionId = (0x0002 << 16) | 5; // Sub-opcode 5: Accept
-      const payload = new TextEncoder().encode(JSON.stringify({ session_id: 1 }));
+      const payload = new TextEncoder().encode(
+        JSON.stringify({ session_id: activeTradeSessionId })
+      );
       const pkt = encodeInteraction(
         world.localPlayerGuid,
         nearestTarget ? nearestTarget.id : 0,
@@ -413,7 +485,9 @@ if (typeof window !== "undefined") {
     onTradeCancel: () => {
       if (!transport.connected) return;
       const actionId = (0x0002 << 16) | 6; // Sub-opcode 6: Cancel
-      const payload = new TextEncoder().encode(JSON.stringify({ session_id: 1 }));
+      const payload = new TextEncoder().encode(
+        JSON.stringify({ session_id: activeTradeSessionId })
+      );
       const pkt = encodeInteraction(
         world.localPlayerGuid,
         nearestTarget ? nearestTarget.id : 0,

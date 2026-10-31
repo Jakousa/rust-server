@@ -117,13 +117,14 @@ export class UIController {
     });
   }
 
-  updateInventory(inv) {
+  updateInventory(inv, currentWeight = null) {
     if (!inv) return;
     if (this.valGold && inv.currency !== undefined) {
       this.valGold.textContent = inv.currency;
     }
     if (this.valWeight) {
-      const cur = (inv.current_weight || 0).toFixed(1);
+      const curVal = currentWeight != null ? currentWeight : (inv.current_weight || 0);
+      const cur = Number(curVal).toFixed(1);
       const max = (inv.max_weight || 100.0).toFixed(1);
       this.valWeight.textContent = `${cur} / ${max} kg`;
     }
@@ -220,10 +221,25 @@ export class UIController {
       this.tradeSessionId.textContent = tradeSession.session_id || "Active";
     }
     if (this.tradePartnerGold) {
-      this.tradePartnerGold.textContent = tradeSession.partner_currency || 0;
+      const partnerGold = tradeSession.their_offer?.currency ?? tradeSession.partner_currency ?? 0;
+      this.tradePartnerGold.textContent = partnerGold;
     }
     if (this.tradeStatusMsg) {
-      this.tradeStatusMsg.textContent = tradeSession.status || "Trade active";
+      let status = tradeSession.status;
+      if (!status) {
+        if (tradeSession.completed) {
+          status = "Trade completed";
+        } else if (tradeSession.my_accepted && tradeSession.their_accepted) {
+          status = "Both accepted";
+        } else if (tradeSession.my_locked && tradeSession.their_locked) {
+          status = "Both locked";
+        } else if (tradeSession.their_locked) {
+          status = "Partner locked";
+        } else {
+          status = "Trade active";
+        }
+      }
+      this.tradeStatusMsg.textContent = status;
     }
     this.playerTradeModal.style.display = "flex";
   }

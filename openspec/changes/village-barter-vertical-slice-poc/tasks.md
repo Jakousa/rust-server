@@ -22,3 +22,12 @@
   - [x] 5.1 Run `cargo fmt --all -- --check`
   - [x] 5.2 Run `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy --package mmo-client-wasm --target wasm32-unknown-unknown -- -D warnings`
   - [x] 5.3 Run `cargo test --workspace` and `cd web && npm test && npm run build`
+
+- [x] 6. Wire Protocol, JSON Schema & 64-Bit GUID Lossless Fidelity Fixes (#153)
+  - [x] 6.1 Fix `encodeMovement` in `web/src/protocol.js` to 60-byte payload with timestamp and sequence matching `MovementPacket::decode`.
+  - [x] 6.2 Fix `startPingLoop` in `web/src/transport.js` to use `OPCODES.PING` (0x0007), handle `OPCODES.PONG` (0x0008) in `transport.js`, and support ping/pong in `crates/gateway/src/webtransport.rs`.
+  - [x] 6.3 Update `web/src/main.js` and `web/src/ui.js` to match `VillageTradeStateResponse` JSON contract (`inventory`, `current_weight`, `target_merchant`, `active_trade`) and dynamically track `activeTradeSessionId`.
+  - [x] 6.4 Implement LEB128 varint reading in `web/src/protocol.js` and update `ClientWorldBridge` in `web/src/main.js` for `WorldObjectSpawn` and `WorldObjectDespawn`.
+  - [x] 6.5 Fix 64-bit GUID float truncation by using `f32::from_bits` / `f32::to_bits` in `crates/client-wasm` and `Uint32Array` over `Float32Array.buffer` in `web/src/main.js`, `web/src/renderer.js`, and `web/src/world.js`.
+  - [x] 6.6 Attach disconnect handler to `this.transport.closed` in `web/src/transport.js`.
+  - [x] 6.7 Update and add unit tests in `crates/client-wasm` and `web/src/__tests__/inspector.test.js` to verify all fixes and run quality gates.

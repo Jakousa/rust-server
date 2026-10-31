@@ -12,7 +12,7 @@ The current focus is connecting the foundational engine crates into the first en
 
 | Focus Area | OpenSpec Change | GitHub Issue(s) | Status | Target Crates | Summary |
 | :--- | :--- | :---: | :---: | :--- | :--- |
-| **Playable Vertical Slice** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | [#143](https://github.com/Jakousa/rust-server/issues/143), [#144](https://github.com/Jakousa/rust-server/issues/144) | In Progress | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | First end-to-end playable slice: 3 NPC villagers (Blacksmith Ilmari, Herbalist Aino, Elder Väinö), village structures, starter inventories, atomic NPC barter & player-to-player trade, WebTransport listener with auto cert-hash discovery, and browser Village HUD. |
+| **Playable Vertical Slice** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | [#143](https://github.com/Jakousa/rust-server/issues/143), [#144](https://github.com/Jakousa/rust-server/issues/144), [#153](https://github.com/Jakousa/rust-server/issues/153) | In Progress | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | First end-to-end playable slice: 3 NPC villagers (Blacksmith Ilmari, Herbalist Aino, Elder Väinö), village structures, starter inventories, atomic NPC barter & player-to-player trade, WebTransport listener with auto cert-hash discovery, and browser Village HUD. |
 
 ---
 
