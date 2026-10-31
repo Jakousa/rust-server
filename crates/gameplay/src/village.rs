@@ -270,6 +270,52 @@ pub fn build_state_response(
     }
 }
 
+/// Hook handler that aborts active trade sessions if participants move too far apart or despawn.
+pub struct TradeDistanceHook {
+    pub trade_manager: Arc<std::sync::Mutex<TradeManager>>,
+}
+
+impl HookHandler for TradeDistanceHook {
+    fn handle(&self, _event: &Event, _ctx: &mut EventContext) {}
+
+    fn handle_with_entities(
+        &self,
+        event: &Event,
+        _ctx: &mut EventContext,
+        entities: &mut EntityStore,
+    ) {
+        let mut trade_mgr = self.trade_manager.lock().unwrap();
+        match event {
+            Event::BeforeMove { entity, to, .. } => {
+                if let Some(session) = trade_mgr.get_session_by_player(*entity) {
+                    let partner_guid = if session.player_a == *entity {
+                        session.player_b
+                    } else {
+                        session.player_a
+                    };
+                    if let Some(partner) = entities.get_by_guid(partner_guid) {
+                        let dx = to.0 - partner.position.0;
+                        let dy = to.1 - partner.position.1;
+                        let dz = to.2 - partner.position.2;
+                        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                        if dist > TradeManager::MAX_TRADE_DISTANCE {
+                            let session_id = session.session_id;
+                            trade_mgr.cancel_session(session_id);
+                        }
+                    }
+                }
+            }
+            Event::OnDespawn { entity } => {
+                if let Some(session) = trade_mgr.get_session_by_player(*entity) {
+                    let session_id = session.session_id;
+                    trade_mgr.cancel_session(session_id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Modular packet handler for `module_id = 0x02`.
 pub struct VillageTradePacketHandler {
     pub trade_manager: Arc<std::sync::Mutex<TradeManager>>,
@@ -397,7 +443,15 @@ impl ModularPacketHandler for VillageTradePacketHandler {
 
                 // Atomic inventory mutation with full rollback guarantee
                 let rollback = inv.clone();
-                inv.currency -= recipe.required_currency;
+                inv.currency = match inv.currency.checked_sub(recipe.required_currency) {
+                    Some(c) => c,
+                    None => {
+                        *inv = rollback;
+                        return Err(PacketHandlerError::Custom(
+                            "Insufficient currency".to_string(),
+                        ));
+                    }
+                };
                 for item in &recipe.required_items {
                     if !inv.remove_item_stack(item) {
                         *inv = rollback;
@@ -407,7 +461,13 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                     }
                 }
 
-                inv.currency += recipe.reward_currency;
+                inv.currency = match inv.currency.checked_add(recipe.reward_currency) {
+                    Some(c) => c,
+                    None => {
+                        *inv = rollback;
+                        return Err(PacketHandlerError::Custom("Currency overflow".to_string()));
+                    }
+                };
                 for item in &recipe.reward_items {
                     if let Err(e) = inv.add_item(item.clone()) {
                         *inv = rollback;
@@ -476,6 +536,71 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                         }
                     })?;
 
+                let caller = entities
+                    .get_by_guid(entity_guid)
+                    .ok_or(PacketHandlerError::EntityNotFound(entity_guid))?;
+                let caller_inv = caller
+                    .get_component::<InventoryComponent>()
+                    .ok_or_else(|| {
+                        PacketHandlerError::Custom(
+                            "Caller entity has no InventoryComponent".to_string(),
+                        )
+                    })?;
+
+                if req.currency > caller_inv.currency {
+                    return Err(PacketHandlerError::Custom(format!(
+                        "Insufficient currency for trade offer (offered {}, current {})",
+                        req.currency, caller_inv.currency
+                    )));
+                }
+
+                // Validate items and resolve canonical metadata strictly from authoritative slots
+                let mut canonical_items = Vec::with_capacity(req.items.len());
+                let mut test_inv = caller_inv.clone();
+
+                for item in req.items {
+                    if item.quantity == 0 {
+                        return Err(PacketHandlerError::Custom(
+                            "Offered item quantity must be greater than zero".to_string(),
+                        ));
+                    }
+                    if !item.unit_weight.is_finite() || item.unit_weight < 0.0 {
+                        return Err(PacketHandlerError::Custom(
+                            "Invalid item unit weight in trade offer".to_string(),
+                        ));
+                    }
+
+                    // Look up authoritative item definition in caller's inventory
+                    let canonical_slot = caller_inv
+                        .slots
+                        .iter()
+                        .flatten()
+                        .find(|s| s.item_id == item.item_id)
+                        .ok_or_else(|| {
+                            PacketHandlerError::Custom(format!(
+                                "Offered item {} not found in inventory",
+                                item.item_id
+                            ))
+                        })?;
+
+                    let canonical_stack = ItemStack::new(
+                        item.item_id,
+                        &canonical_slot.name,
+                        item.quantity,
+                        canonical_slot.unit_weight,
+                    );
+
+                    // Multi-stack test deduction prevents over-offering duplicate item IDs
+                    if !test_inv.remove_item_stack(&canonical_stack) {
+                        return Err(PacketHandlerError::Custom(format!(
+                            "Insufficient inventory quantity for item: {}",
+                            canonical_stack.name
+                        )));
+                    }
+
+                    canonical_items.push(canonical_stack);
+                }
+
                 let session = trade_mgr.get_session_mut(req.session_id).ok_or_else(|| {
                     PacketHandlerError::Custom(format!(
                         "Active trade session {} not found",
@@ -483,8 +608,14 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                     ))
                 })?;
 
+                if session.player_a != entity_guid && session.player_b != entity_guid {
+                    return Err(PacketHandlerError::Custom(
+                        "Caller is not a participant in this trade session".to_string(),
+                    ));
+                }
+
                 let offer = TradeOffer {
-                    items: req.items,
+                    items: canonical_items,
                     currency: req.currency,
                 };
 
@@ -517,16 +648,27 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                         ))
                     })?;
 
-                    session
-                        .lock(entity_guid)
-                        .map_err(|e| PacketHandlerError::Custom(e.to_string()))?;
+                    if session.player_a != entity_guid && session.player_b != entity_guid {
+                        return Err(PacketHandlerError::Custom(
+                            "Caller is not a participant in this trade session".to_string(),
+                        ));
+                    }
 
-                    if session.locked_a && session.locked_b {
+                    let is_caller_locked = if entity_guid == session.player_a {
+                        session.locked_a
+                    } else {
+                        session.locked_b
+                    };
+
+                    if !is_caller_locked {
+                        session
+                            .lock(entity_guid)
+                            .map_err(|e| PacketHandlerError::Custom(e.to_string()))?;
+                        false
+                    } else {
                         session
                             .accept(entity_guid)
                             .map_err(|e| PacketHandlerError::Custom(e.to_string()))?
-                    } else {
-                        false
                     }
                 };
 
@@ -560,6 +702,19 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                             message: e.to_string(),
                         }
                     })?;
+
+                let session = trade_mgr.get_session(req.session_id).ok_or_else(|| {
+                    PacketHandlerError::Custom(format!(
+                        "Active trade session {} not found",
+                        req.session_id
+                    ))
+                })?;
+
+                if session.player_a != entity_guid && session.player_b != entity_guid {
+                    return Err(PacketHandlerError::Custom(
+                        "Caller is not a participant in this trade session".to_string(),
+                    ));
+                }
 
                 trade_mgr.cancel_session(req.session_id);
                 let resp =
@@ -611,6 +766,9 @@ impl GameplayPlugin for VillagePlugin {
         ctx.codecs
             .register::<VillagerMerchantComponent>("villager_merchant");
         ctx.hooks.register_handler(Box::new(PlayerStarterKitHook));
+        ctx.hooks.register_handler(Box::new(TradeDistanceHook {
+            trade_manager: self.trade_manager.clone(),
+        }));
         ctx.packets.register(
             Self::MODULE_ID,
             Box::new(VillageTradePacketHandler::new(self.trade_manager.clone())),
@@ -1127,25 +1285,39 @@ mod tests {
             .unwrap();
         let state_p1: VillageTradeStateResponse = serde_json::from_slice(&res_p1).unwrap();
         assert!(!state_p1.trade_completed);
+        assert!(state_p1.active_trade.as_ref().unwrap().my_locked);
+        assert!(!state_p1.active_trade.as_ref().unwrap().their_locked);
 
-        // 5. P2 locks and accepts (sub-opcode 5)
+        // 5. P2 locks offer (sub-opcode 5)
         let res_p2 = handler
             .handle(p2, 5, &accept_req, &mut sim.entity_store)
-            .expect("P2 accept succeeds")
+            .expect("P2 lock succeeds")
             .unwrap();
         let state_p2: VillageTradeStateResponse = serde_json::from_slice(&res_p2).unwrap();
         assert!(!state_p2.trade_completed);
+        assert!(state_p2.active_trade.as_ref().unwrap().my_locked);
+        assert!(state_p2.active_trade.as_ref().unwrap().their_locked);
 
-        // 6. P1 accepts now that both are locked (sub-opcode 5) -> atomic swap executes!
-        let res_p1_final = handler
+        // 6. P1 accepts now that both are locked (sub-opcode 5)
+        let res_p1_accept = handler
             .handle(p1, 5, &accept_req, &mut sim.entity_store)
-            .expect("P1 final accept succeeds")
+            .expect("P1 accept succeeds")
             .unwrap();
-        let state_p1_final: VillageTradeStateResponse =
-            serde_json::from_slice(&res_p1_final).unwrap();
-        assert!(state_p1_final.trade_completed);
+        let state_p1_accept: VillageTradeStateResponse =
+            serde_json::from_slice(&res_p1_accept).unwrap();
+        assert!(!state_p1_accept.trade_completed);
+        assert!(state_p1_accept.active_trade.as_ref().unwrap().my_accepted);
 
-        // 6. Verify inventory states after swap
+        // 7. P2 accepts -> atomic swap executes!
+        let res_p2_final = handler
+            .handle(p2, 5, &accept_req, &mut sim.entity_store)
+            .expect("P2 final accept succeeds")
+            .unwrap();
+        let state_p2_final: VillageTradeStateResponse =
+            serde_json::from_slice(&res_p2_final).unwrap();
+        assert!(state_p2_final.trade_completed);
+
+        // 8. Verify inventory states after swap
         let p1_inv = sim
             .entity_store
             .get_by_guid(p1)
@@ -1199,5 +1371,248 @@ mod tests {
             .unwrap();
         let state_cancel: VillageTradeStateResponse = serde_json::from_slice(&res_cancel).unwrap();
         assert!(state_cancel.active_trade.is_none());
+    }
+
+    #[test]
+    fn test_trade_zero_quantity_weight_spoofing_and_multi_stack_guards() {
+        let mut sim = setup_village_sim();
+        let p1 = Guid::new(EntityType::Player, sim.node_id, 401);
+        let p2 = Guid::new(EntityType::Player, sim.node_id, 402);
+
+        sim.spawn_entity(p1, (0.0, 0.0, 0.0));
+        sim.spawn_entity(p2, (1.0, 0.0, 0.0));
+
+        let trade_mgr = Arc::new(std::sync::Mutex::new(TradeManager::new()));
+        let handler = VillageTradePacketHandler::new(trade_mgr.clone());
+
+        // Start session
+        let start_req = serde_json::to_vec(&PlayerTradeStartRequest {
+            target_guid: p2.raw(),
+        })
+        .unwrap();
+        let res = handler
+            .handle(p1, 3, &start_req, &mut sim.entity_store)
+            .unwrap()
+            .unwrap();
+        let state: VillageTradeStateResponse = serde_json::from_slice(&res).unwrap();
+        let session_id = state.active_trade.unwrap().session_id;
+
+        // 1. Zero quantity item offer rejected
+        let zero_offer = serde_json::to_vec(&PlayerTradeOfferRequest {
+            session_id,
+            items: vec![ItemStack::new(1001, "Iron Ore", 0, 2.0)],
+            currency: 0,
+        })
+        .unwrap();
+        let err = handler
+            .handle(p1, 4, &zero_offer, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err, PacketHandlerError::Custom(msg) if msg.contains("greater than zero"))
+        );
+
+        // 2. Negative and NaN unit weights rejected
+        let neg_weight = serde_json::to_vec(&PlayerTradeOfferRequest {
+            session_id,
+            items: vec![ItemStack::new(1001, "Iron Ore", 1, -10.0)],
+            currency: 0,
+        })
+        .unwrap();
+        let err = handler
+            .handle(p1, 4, &neg_weight, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err, PacketHandlerError::Custom(msg) if msg.contains("Invalid item unit weight"))
+        );
+
+        let nan_weight = serde_json::to_vec(&PlayerTradeOfferRequest {
+            session_id,
+            items: vec![ItemStack::new(1001, "Iron Ore", 1, f32::NAN)],
+            currency: 0,
+        })
+        .unwrap_or_else(|_| br#"{"session_id":1,"items":[{"item_id":1001,"name":"Iron Ore","quantity":1,"unit_weight":"NaN"}],"currency":0}"#.to_vec());
+        let err = handler
+            .handle(p1, 4, &nan_weight, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err, PacketHandlerError::Custom(ref msg) if msg.contains("Invalid item unit weight"))
+                || matches!(err, PacketHandlerError::MalformedPayload { .. })
+        );
+
+        // 3. Multi-stack over-offering: P1 only owns 3 Iron Ore (starter kit). Offering two stacks of 2 (total 4) fails.
+        let over_offer = serde_json::to_vec(&PlayerTradeOfferRequest {
+            session_id,
+            items: vec![
+                ItemStack::new(1001, "Iron Ore", 2, 2.0),
+                ItemStack::new(1001, "Iron Ore", 2, 2.0),
+            ],
+            currency: 0,
+        })
+        .unwrap();
+        let err = handler
+            .handle(p1, 4, &over_offer, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err, PacketHandlerError::Custom(msg) if msg.contains("Insufficient inventory quantity"))
+        );
+
+        // 4. Client submits spoofed name & unit_weight: server resolves canonical metadata
+        let spoofed_offer = serde_json::to_vec(&PlayerTradeOfferRequest {
+            session_id,
+            items: vec![ItemStack::new(1001, "Hacked Gold Diamond", 1, 0.0)],
+            currency: 5,
+        })
+        .unwrap();
+        let res = handler
+            .handle(p1, 4, &spoofed_offer, &mut sim.entity_store)
+            .expect("canonical resolution succeeds")
+            .unwrap();
+        let state: VillageTradeStateResponse = serde_json::from_slice(&res).unwrap();
+        let active = state.active_trade.unwrap();
+        assert_eq!(active.my_offer.items.len(), 1);
+        // Canonical name & weight should match starter kit (Iron Ore, 2.0)
+        assert_eq!(active.my_offer.items[0].name, "Iron Ore");
+        assert_eq!(active.my_offer.items[0].unit_weight, 2.0);
+    }
+
+    #[test]
+    fn test_trade_third_party_idor_protection() {
+        let mut sim = setup_village_sim();
+        let p1 = Guid::new(EntityType::Player, sim.node_id, 501);
+        let p2 = Guid::new(EntityType::Player, sim.node_id, 502);
+        let p3_attacker = Guid::new(EntityType::Player, sim.node_id, 503);
+
+        sim.spawn_entity(p1, (0.0, 0.0, 0.0));
+        sim.spawn_entity(p2, (1.0, 0.0, 0.0));
+        sim.spawn_entity(p3_attacker, (2.0, 0.0, 0.0));
+
+        let trade_mgr = Arc::new(std::sync::Mutex::new(TradeManager::new()));
+        let handler = VillageTradePacketHandler::new(trade_mgr.clone());
+
+        // Start session between P1 and P2
+        let start_req = serde_json::to_vec(&PlayerTradeStartRequest {
+            target_guid: p2.raw(),
+        })
+        .unwrap();
+        let res = handler
+            .handle(p1, 3, &start_req, &mut sim.entity_store)
+            .unwrap()
+            .unwrap();
+        let state: VillageTradeStateResponse = serde_json::from_slice(&res).unwrap();
+        let session_id = state.active_trade.unwrap().session_id;
+
+        // Attacker P3 tries to cancel session
+        let cancel_req = serde_json::to_vec(&PlayerTradeSessionRequest { session_id }).unwrap();
+        let err_cancel = handler
+            .handle(p3_attacker, 6, &cancel_req, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err_cancel, PacketHandlerError::Custom(msg) if msg.contains("not a participant"))
+        );
+
+        // Attacker P3 tries to accept session
+        let accept_req = serde_json::to_vec(&PlayerTradeSessionRequest { session_id }).unwrap();
+        let err_accept = handler
+            .handle(p3_attacker, 5, &accept_req, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err_accept, PacketHandlerError::Custom(msg) if msg.contains("not a participant"))
+        );
+
+        // Session should remain active
+        assert!(trade_mgr.lock().unwrap().get_session(session_id).is_some());
+    }
+
+    #[test]
+    fn test_trade_distance_hook_predictive_move_and_despawn() {
+        let mut sim = setup_village_sim();
+        let p1 = Guid::new(EntityType::Player, sim.node_id, 601);
+        let p2 = Guid::new(EntityType::Player, sim.node_id, 602);
+
+        sim.spawn_entity(p1, (0.0, 0.0, 0.0));
+        sim.spawn_entity(p2, (2.0, 0.0, 0.0));
+
+        let trade_mgr = Arc::new(std::sync::Mutex::new(TradeManager::new()));
+        let hook = TradeDistanceHook {
+            trade_manager: trade_mgr.clone(),
+        };
+
+        // Start session
+        let s_id = trade_mgr
+            .lock()
+            .unwrap()
+            .start_session(p1, p2, &sim.entity_store)
+            .unwrap();
+
+        // 1. Move within 5m: BeforeMove to (3.0, 0.0, 0.0) -> distance to p2(2.0, 0, 0) is 1m (< 5m)
+        let ev_safe = Event::BeforeMove {
+            entity: p1,
+            from: (0.0, 0.0, 0.0),
+            to: (3.0, 0.0, 0.0),
+        };
+        let mut ctx = EventContext::new();
+        hook.handle_with_entities(&ev_safe, &mut ctx, &mut sim.entity_store);
+        assert!(trade_mgr.lock().unwrap().get_session(s_id).is_some());
+
+        // 2. Move out of range (> 5m): BeforeMove to (10.0, 0.0, 0.0) -> distance to p2 is 8m (> 5m)
+        let ev_breach = Event::BeforeMove {
+            entity: p1,
+            from: (0.0, 0.0, 0.0),
+            to: (10.0, 0.0, 0.0),
+        };
+        hook.handle_with_entities(&ev_breach, &mut ctx, &mut sim.entity_store);
+        assert!(trade_mgr.lock().unwrap().get_session(s_id).is_none());
+
+        // 3. Despawn cleans up session
+        let s_id2 = trade_mgr
+            .lock()
+            .unwrap()
+            .start_session(p1, p2, &sim.entity_store)
+            .unwrap();
+        let ev_despawn = Event::OnDespawn { entity: p1 };
+        hook.handle_with_entities(&ev_despawn, &mut ctx, &mut sim.entity_store);
+        assert!(trade_mgr.lock().unwrap().get_session(s_id2).is_none());
+        assert!(!trade_mgr.lock().unwrap().is_player_trading(p2));
+    }
+
+    #[test]
+    fn test_npc_barter_currency_overflow_rollback() {
+        let mut sim = setup_village_sim();
+        let p1 = Guid::new(EntityType::Player, sim.node_id, 701);
+        let ilmari_guid = Guid::new(EntityType::Npc, sim.node_id, 1);
+
+        sim.spawn_entity(p1, (-9.0, 0.0, -5.0));
+        let trade_mgr = Arc::new(std::sync::Mutex::new(TradeManager::new()));
+        let handler = VillageTradePacketHandler::new(trade_mgr);
+
+        // Maximize player currency to test overflow on sell recipe 2 (rewards 15 gold)
+        if let Some(player) = sim.entity_store.get_mut_by_guid(p1) {
+            let inv = player.get_component_mut::<InventoryComponent>().unwrap();
+            inv.currency = u64::MAX - 5; // adding 15 would overflow u64
+        }
+
+        let barter_req_sell = serde_json::to_vec(&NpcBarterRequest {
+            target_guid: ilmari_guid.raw(),
+            recipe_id: 2,
+        })
+        .unwrap();
+
+        let err = handler
+            .handle(p1, 2, &barter_req_sell, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(
+            matches!(err, PacketHandlerError::Custom(msg) if msg.contains("Currency overflow"))
+        );
+
+        // Verify currency and inventory rolled back
+        let inv = sim
+            .entity_store
+            .get_by_guid(p1)
+            .unwrap()
+            .get_component::<InventoryComponent>()
+            .unwrap();
+        assert_eq!(inv.currency, u64::MAX - 5);
+        // Did not consume Iron Ore
+        assert!(inv.has_item_stack(&ItemStack::new(1001, "Iron Ore", 3, 2.0)));
     }
 }
