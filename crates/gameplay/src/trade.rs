@@ -123,6 +123,14 @@ pub struct TradeManager {
     next_session_id: u64,
 }
 
+#[inline]
+pub(crate) fn distance_3d(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> f32 {
+    let dx = p1.0 - p2.0;
+    let dy = p1.1 - p2.1;
+    let dz = p1.2 - p2.2;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 impl TradeManager {
     pub const MAX_TRADE_DISTANCE: f32 = 5.0;
 
@@ -151,10 +159,7 @@ impl TradeManager {
         let e1 = entities.get_by_guid(p1).ok_or("Player 1 not found")?;
         let e2 = entities.get_by_guid(p2).ok_or("Player 2 not found")?;
 
-        let dx = e1.position.0 - e2.position.0;
-        let dy = e1.position.1 - e2.position.1;
-        let dz = e1.position.2 - e2.position.2;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let dist = distance_3d(e1.position, e2.position);
 
         if dist > Self::MAX_TRADE_DISTANCE {
             return Err("Players too far apart to initiate trade");
@@ -210,10 +215,7 @@ impl TradeManager {
         let e1 = entities.get_by_guid(session.player_a)?;
         let e2 = entities.get_by_guid(session.player_b)?;
 
-        let dx = e1.position.0 - e2.position.0;
-        let dy = e1.position.1 - e2.position.1;
-        let dz = e1.position.2 - e2.position.2;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let dist = distance_3d(e1.position, e2.position);
 
         if dist > Self::MAX_TRADE_DISTANCE {
             self.cancel_session(session_id);
@@ -247,10 +249,7 @@ impl TradeManager {
             .ok_or("Entities could not be disjointly borrowed")?;
 
         // Re-verify distance at commit time
-        let dx = e1.position.0 - e2.position.0;
-        let dy = e1.position.1 - e2.position.1;
-        let dz = e1.position.2 - e2.position.2;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let dist = distance_3d(e1.position, e2.position);
         if dist > Self::MAX_TRADE_DISTANCE {
             self.cancel_session(session_id);
             return Err("Players moved too far apart to complete trade");
@@ -762,5 +761,118 @@ mod tests {
         assert_eq!(res, Err("Players moved too far apart to complete trade"));
         // Session should be canceled
         assert!(trade_mgr.get_session(session_id).is_none());
+    }
+
+    #[test]
+    fn test_distance_3d_exhaustive_components() {
+        // dx = 12 - 10 = 2, dy = 23 - 20 = 3, dz = 36 - 30 = 6
+        // sqrt(4 + 9 + 36) = sqrt(49) = 7.0
+        let p1 = (10.0, 20.0, 30.0);
+        let p2 = (12.0, 23.0, 36.0);
+        let d = distance_3d(p1, p2);
+        assert!((d - 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_trade_manager_is_player_trading_and_plugin_id() {
+        assert_eq!(TradePlugin.id(), "trade");
+
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 301);
+        let p2 = Guid::new(EntityType::Player, 1, 302);
+        store.spawn(p1, (0.0, 0.0, 0.0));
+        store.spawn(p2, (1.0, 0.0, 0.0));
+
+        let mut trade_mgr = TradeManager::new();
+        assert!(!trade_mgr.is_player_trading(p1));
+        assert!(!trade_mgr.is_player_trading(p2));
+
+        let sid = trade_mgr.start_session(p1, p2, &store).unwrap();
+        assert!(trade_mgr.is_player_trading(p1));
+        assert!(trade_mgr.is_player_trading(p2));
+
+        trade_mgr.cancel_session(sid);
+        assert!(!trade_mgr.is_player_trading(p1));
+        assert!(!trade_mgr.is_player_trading(p2));
+    }
+
+    #[test]
+    fn test_execute_atomic_swap_weight_limit_boundaries() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 401);
+        let p2 = Guid::new(EntityType::Player, 1, 402);
+
+        let k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (1.0, 0.0, 0.0));
+
+        // Player 1 has max_weight = 10.0, current_weight = 5.0
+        // Player 2 has max_weight = 10.0, current_weight = 2.0
+        let inv1 = InventoryComponent::new(4, 10.0);
+        let inv2 = InventoryComponent::new(4, 10.0);
+        store.get_mut(k1).unwrap().add_component(inv1);
+        store.get_mut(k2).unwrap().add_component(inv2);
+
+        // Player 2 offers item with weight exactly 5.0 -> Player 1 weight becomes 5.0 + 5.0 = 10.0 == max_weight
+        let mut trade_mgr = TradeManager::new();
+        let sid = trade_mgr.start_session(p1, p2, &store).unwrap();
+
+        let item_heavy = ItemStack::new(1, "Heavy Rock", 1, 5.0);
+        store
+            .get_mut(k2)
+            .unwrap()
+            .get_component_mut::<InventoryComponent>()
+            .unwrap()
+            .add_item(item_heavy.clone())
+            .unwrap();
+
+        let session = trade_mgr.get_session_mut(sid).unwrap();
+        session
+            .set_offer(
+                p2,
+                TradeOffer {
+                    items: vec![item_heavy.clone()],
+                    currency: 0,
+                },
+            )
+            .unwrap();
+        session.lock(p1).unwrap();
+        session.lock(p2).unwrap();
+        session.accept(p1).unwrap();
+        session.accept(p2).unwrap();
+
+        // Exact boundary (5.0 + 5.0 <= 10.0) MUST succeed
+        assert!(trade_mgr.execute_atomic_swap(sid, &mut store).is_ok());
+
+        // Now test exceeding weight: Player 1 has 5.0 weight. Offer 5.1 weight -> 10.1 > 10.0
+        let sid2 = trade_mgr.start_session(p1, p2, &store).unwrap();
+        let item_overweight = ItemStack::new(2, "Overweight Stone", 1, 5.1);
+        store
+            .get_mut(k2)
+            .unwrap()
+            .get_component_mut::<InventoryComponent>()
+            .unwrap()
+            .add_item(item_overweight.clone())
+            .unwrap();
+
+        let session2 = trade_mgr.get_session_mut(sid2).unwrap();
+        session2
+            .set_offer(
+                p2,
+                TradeOffer {
+                    items: vec![item_overweight],
+                    currency: 0,
+                },
+            )
+            .unwrap();
+        session2.lock(p1).unwrap();
+        session2.lock(p2).unwrap();
+        session2.accept(p1).unwrap();
+        session2.accept(p2).unwrap();
+
+        // Overweight must fail
+        assert_eq!(
+            trade_mgr.execute_atomic_swap(sid2, &mut store),
+            Err("Player A would exceed max weight")
+        );
     }
 }

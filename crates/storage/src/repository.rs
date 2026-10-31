@@ -1304,4 +1304,22 @@ mod tests {
             Err(StorageError::InventoryFull(8001, 1))
         ));
     }
+
+    #[tokio::test]
+    async fn test_load_snapshot_alias() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+        let snapshot = EntitySnapshot {
+            guid: 9999,
+            position: (1.0, 2.0, 3.0),
+            rotation: 0.0,
+            attributes: serde_json::json!({}),
+            state_blob: None,
+            version: 1,
+            timestamp: 100,
+        };
+        repo.save_snapshot(&snapshot).await.unwrap();
+        let loaded = repo.load_snapshot(9999).await.unwrap();
+        assert_eq!(loaded, Some(snapshot));
+    }
 }

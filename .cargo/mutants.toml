@@ -17,6 +17,14 @@ exclude_re = [
     # assigns 64 when `num_bits == 64`, which is a no-op across all usize inputs.
     'replace > with >= in BitWriter::write_bits',
 
+    # Equivalent mutants: distinct container IDs already enforced (`a == b` rejected earlier in the function),
+    # so `a < b` and `a <= b` evaluate to identical booleans.
+    'replace < with <= in EscrowCoordinator::create_escrow',
+    'replace < with <= in MarketplaceRepository::create_listing',
+
+    # Equivalent mutant: `Self::default()` is bitwise and semantically identical to `Default::default()`.
+    'replace SpatialQueryFilter::all -> Self with Default::default\(\)',
+
     # Infinite loop mutants (loops where the counter is never decremented or condition is a tautology for usize):
     'replace >= with < in put_varint_u64',
     'replace >= with < in put_varint_u32',
@@ -34,6 +42,8 @@ exclude_re = [
     'Database::ping',
     'replace \|\| with && in Database::connect',
     '.*_postgres\b',
+    'reset_postgres_tables',
+    'connect_test_databases.*',
 ]
 
 # Respect .gitignore when copying workspace to scratch directories

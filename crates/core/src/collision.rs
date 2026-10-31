@@ -1185,4 +1185,169 @@ mod tests {
             .unwrap();
         assert_eq!(vert.len(), 2);
     }
+
+    #[test]
+    fn test_exhaustive_boundary_and_non_zero_collision_coverage() {
+        let mut world = AabbCollisionWorld::new();
+        let box1 = BoundingBox3D::new((14.0, 19.0, 29.0), (16.0, 21.0, 31.0));
+        let id1 = Guid(101);
+        world.register_obstacle(id1, box1);
+
+        // 1. is_point_traversable_with_filter
+        assert!(!world.is_point_traversable_with_filter(
+            Vec3::new(15.0, 20.0, 30.0),
+            SpatialQueryFilter::all()
+        ));
+        assert!(world.is_point_traversable_with_filter(
+            Vec3::new(10.0, 20.0, 30.0),
+            SpatialQueryFilter::all()
+        ));
+
+        // 2. is_segment_clear with non-zero 3D coordinates
+        let p_start = Vec3::new(10.0, 20.0, 30.0);
+        let p_diag = Vec3::new(12.0, 23.0, 36.0);
+        assert!(world.is_segment_clear(p_start, p_diag, 0.5));
+        assert!(world.is_segment_clear(p_start, p_start, 0.5)); // dist < 1e-4
+
+        // Segment through obstacle must fail
+        let p_through = Vec3::new(20.0, 20.0, 30.0);
+        assert!(!world.is_segment_clear(p_start, p_through, 0.0));
+
+        // Segment with clearance clipping box1
+        let p_grazing_start = Vec3::new(10.0, 21.5, 30.0);
+        let p_grazing_end = Vec3::new(20.0, 21.5, 30.0);
+        assert!(world.is_segment_clear(p_grazing_start, p_grazing_end, 0.0)); // ray passes at Y=21.5 > 21.0
+        assert!(!world.is_segment_clear(p_grazing_start, p_grazing_end, 0.8)); // clearance 0.8 reaches down to 20.7 <= 21.0
+
+        // 3. Raycast with non-zero coordinates and verify exact hit point coordinates
+        let ray_hit = world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, 0.0, 0.0),
+                20.0,
+                SpatialQueryFilter::all(),
+            )
+            .expect("raycast should hit obstacle");
+        assert_eq!(ray_hit.entity_id, Some(id1));
+        assert!((ray_hit.distance - 4.0).abs() < 1e-4);
+        assert!((ray_hit.point.x - 14.0).abs() < 1e-4);
+        assert!((ray_hit.point.y - 20.0).abs() < 1e-4);
+        assert!((ray_hit.point.z - 30.0).abs() < 1e-4);
+
+        // Raycast non-finite & non-positive boundaries
+        assert!(world
+            .raycast(
+                Vec3::new(f32::NAN, 20.0, 30.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(10.0, f32::NAN, 30.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                Vec3::new(10.0, 20.0, f32::NAN),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, f32::NAN, 0.0),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, 0.0, f32::NAN),
+                10.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, 0.0, 0.0),
+                f32::NAN,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, 0.0, 0.0),
+                0.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .raycast(
+                p_start,
+                Vec3::new(1.0, 0.0, 0.0),
+                -1.0,
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+
+        // 4. Sweep test non-finite & zero boundaries
+        let small_box = BoundingBox3D::new((9.0, 19.0, 29.0), (10.0, 20.0, 30.0));
+        assert!(world
+            .sweep_test(
+                &small_box,
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .sweep_test(
+                &small_box,
+                Vec3::new(0.0, f32::NAN, 0.0),
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .sweep_test(
+                &small_box,
+                Vec3::new(0.0, 0.0, f32::NAN),
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+        assert!(world
+            .sweep_test(
+                &small_box,
+                Vec3::new(0.0, 0.0, 0.0),
+                SpatialQueryFilter::all()
+            )
+            .is_none());
+
+        // 5. find_path around obstacle at non-zero coordinates
+        let path = world
+            .find_path(p_start, p_through)
+            .expect("path around box should be found");
+        assert!(path.len() >= 2);
+        assert_eq!(path[0], p_start);
+        assert_eq!(*path.last().unwrap(), p_through);
+        for i in 0..path.len() - 1 {
+            assert!(world.is_segment_clear(path[i], path[i + 1], 0.2));
+        }
+    }
 }

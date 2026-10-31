@@ -56,6 +56,8 @@ pub struct MarketplaceRepository {
     db: Database,
 }
 
+const MAX_LISTING_DURATION_SECS: u64 = 30 * 86400;
+
 impl MarketplaceRepository {
     pub fn new(db: Database) -> Self {
         Self { db }
@@ -79,7 +81,7 @@ impl MarketplaceRepository {
     ) -> Result<MarketListingRecord, StorageError> {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
-        let duration_secs = duration_secs.min(30 * 86400);
+        let duration_secs = duration_secs.min(MAX_LISTING_DURATION_SECS);
         let expires_at_epoch_ms =
             now_ms.saturating_add((duration_secs as i64).saturating_mul(1000));
         let listing_id = format!("list-{}-{}-{}", seller_guid, src_slot, now_ms);
