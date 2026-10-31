@@ -5,12 +5,15 @@ import { WorldObjectRenderer } from "../world.js";
 import { WorldRenderer } from "../renderer.js";
 import { ClientWorldBridge } from "../main.js";
 import { UIController } from "../ui.js";
+import { WebTransportClient } from "../transport.js";
 import {
   OPCODES,
   INTERACTION_TYPES,
   encodeAuthRequest,
   encodeInteraction,
   encodeMovement,
+  readVarintU64,
+  readVarintU32,
 } from "../protocol.js";
 
 describe("PlayerControls", () => {
@@ -164,9 +167,10 @@ describe("WorldObjectRenderer", () => {
     const renderer = new WorldObjectRenderer(scene);
 
     const buf = new Float32Array(16);
-    const lo = 3735928559; // 0xDEADBEEF
-    const hi = 305419896; // 0x12345678
-    buf[0] = lo;
+    const u32 = new Uint32Array(buf.buffer);
+    const lo = 3735928559; // 0xDEADBEEF (> 2^24)
+    const hi = 305419896; // 0x12345678 (> 2^24)
+    u32[0] = lo;
     buf[1] = 42; // prefabId
     buf[2] = 10.0; // x
     buf[3] = 0.0; // y
@@ -181,11 +185,11 @@ describe("WorldObjectRenderer", () => {
     buf[12] = 16; // stateFlags (DAMAGED)
     buf[13] = 0.5; // hpPct
     buf[14] = 1; // revision
-    buf[15] = hi;
+    u32[15] = hi;
 
     renderer.updateFromBuffer(buf);
 
-    const expectedId = (BigInt(Math.round(buf[15])) << 32n) | BigInt(Math.round(buf[0]));
+    const expectedId = (BigInt(hi) << 32n) | BigInt(lo);
     expect(renderer.objects.has(expectedId)).toBe(true);
 
     const group = renderer.objects.get(expectedId);
@@ -211,13 +215,14 @@ describe("WorldObjectRenderer", () => {
 
     prefabs.forEach((pid, idx) => {
       const buf = new Float32Array(16);
-      buf[0] = idx + 1; // id lo
+      const u32 = new Uint32Array(buf.buffer);
+      u32[0] = idx + 1; // id lo
       buf[1] = pid; // prefabId
       buf[8] = 1.0; // qw
       buf[9] = 1.0; // sx
       buf[10] = 1.0; // sy
       buf[11] = 1.0; // sz
-      buf[15] = 0; // id hi
+      u32[15] = 0; // id hi
 
       renderer.updateFromBuffer(buf);
       const obj = renderer.objects.get(BigInt(idx + 1));
@@ -273,17 +278,36 @@ describe("Protocol Encoders", () => {
     expect(view.getUint32(29, true)).toBe(payload.length);
   });
 
-  it("encodes ClientPacket::Movement with entity ID and position coordinates", () => {
-    const sample = { x: 12.5, y: 1.0, z: -8.2, yaw: 3.14 };
-    const frame = encodeMovement(42, sample);
+  it("encodes ClientPacket::Movement with entity ID, 52-byte payload (60 bytes total), timestamp and sequence", () => {
+    const sample = {
+      x: 12.5,
+      y: 1.0,
+      z: -8.2,
+      vx: 1.5,
+      vy: 0.0,
+      vz: -0.5,
+      yaw: 3.14,
+      pitch: 0.5,
+      timestamp: 1698765432000,
+      sequence: 42,
+    };
+    const frame = encodeMovement(10001, sample);
 
+    expect(frame.length).toBe(60);
     const view = new DataView(frame.buffer);
     expect(view.getUint16(2, true)).toBe(OPCODES.MOVEMENT);
-    expect(Number(view.getBigUint64(8, true))).toBe(42);
+    expect(view.getUint32(4, true)).toBe(52); // Payload length 52
+    expect(Number(view.getBigUint64(8, true))).toBe(10001);
     expect(view.getFloat32(16, true)).toBeCloseTo(12.5, 5);
     expect(view.getFloat32(20, true)).toBeCloseTo(1.0, 5);
     expect(view.getFloat32(24, true)).toBeCloseTo(-8.2, 5);
+    expect(view.getFloat32(28, true)).toBeCloseTo(1.5, 5);
+    expect(view.getFloat32(32, true)).toBeCloseTo(0.0, 5);
+    expect(view.getFloat32(36, true)).toBeCloseTo(-0.5, 5);
     expect(view.getFloat32(40, true)).toBeCloseTo(3.14, 5);
+    expect(view.getFloat32(44, true)).toBeCloseTo(0.5, 5);
+    expect(Number(view.getBigUint64(48, true))).toBe(1698765432000);
+    expect(view.getUint32(56, true)).toBe(42);
   });
 });
 
@@ -346,6 +370,283 @@ describe("ClientWorldBridge", () => {
     bridge.processPacket(frame);
     expect(receivedData).toEqual(payloadObj);
   });
+
+  it("ingests authoritative VillageTradeStateResponse payload with inventory, current_weight, active_trade, and target_merchant", () => {
+    const bridge = new ClientWorldBridge();
+    const tradeState = {
+      player_guid: 12345,
+      inventory: { currency: 150, max_weight: 100.0, slots: [] },
+      current_weight: 22.5,
+      is_encumbered: false,
+      active_trade: {
+        session_id: 88,
+        player_a: 12345,
+        player_b: 67890,
+        my_offer: { currency: 10, items: [] },
+        their_offer: { currency: 50, items: [] },
+        my_locked: true,
+        their_locked: false,
+        my_accepted: false,
+        their_accepted: false,
+        completed: false,
+      },
+      target_merchant: {
+        name: "Elder Väinö",
+        role: "Elder",
+        greeting: "Welcome traveler.",
+        recipes: [],
+      },
+      trade_completed: false,
+    };
+    const jsonStr = JSON.stringify(tradeState);
+    const jsonBytes = new TextEncoder().encode(jsonStr);
+
+    const frame = new Uint8Array(8 + 13 + jsonBytes.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.INTERACTION_RESULT, true);
+    view.setUint32(4, 13 + jsonBytes.length, true);
+
+    view.setUint32(8, (0x0002 << 16) | 1, true); // action_id
+    frame[12] = 1; // success
+    view.setUint32(13, 0, true); // error_code
+    view.setUint32(17, jsonBytes.length, true); // payload_len
+    frame.set(jsonBytes, 21);
+
+    let receivedData = null;
+    bridge.onInteractionResult((res) => {
+      receivedData = res.data;
+    });
+
+    bridge.processPacket(frame);
+    expect(receivedData).toEqual(tradeState);
+    expect(receivedData.active_trade.session_id).toBe(88);
+    expect(receivedData.active_trade.their_offer.currency).toBe(50);
+    expect(receivedData.current_weight).toBe(22.5);
+  });
+
+  it("decodes WorldObjectSpawn and WorldObjectDespawn with LEB128 varints", () => {
+    const bridge = new ClientWorldBridge();
+
+    function writeVarint(val) {
+      let v = BigInt(val);
+      const bytes = [];
+      while (v >= 0x80n) {
+        bytes.push(Number((v & 0x7fn) | 0x80n));
+        v >>= 7n;
+      }
+      bytes.push(Number(v & 0x7fn));
+      return bytes;
+    }
+
+    const objId = 3000000000n;
+    const objIdBytes = writeVarint(objId);
+    const prefabBytes = writeVarint(12);
+    const floatBytes = new Uint8Array(64);
+    const fView = new DataView(floatBytes.buffer);
+    fView.setFloat32(0, 15.0, true); // x
+    fView.setFloat32(4, 2.0, true); // y
+    fView.setFloat32(8, -30.0, true); // z
+    fView.setFloat32(24, 1.0, true); // qw
+    fView.setFloat32(28, 1.0, true); // sx
+    fView.setFloat32(32, 1.0, true); // sy
+    fView.setFloat32(36, 1.0, true); // sz
+
+    const payload = [
+      ...objIdBytes,
+      ...prefabBytes,
+      ...Array.from(floatBytes),
+      0x00, // state_flags: 0
+      0x00, // owner_type: 0
+      0x00, // owner_id: ""
+      0x00, // has_health: 0
+      0x00, // properties count: 0
+      0x01, // revision: 1
+    ];
+
+    const frame = new Uint8Array(8 + payload.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.WORLD_OBJECT_SPAWN, true);
+    view.setUint32(4, payload.length, true);
+    frame.set(payload, 8);
+
+    bridge.processPacket(frame);
+    expect(bridge.worldObjects.has(objId)).toBe(true);
+    const obj = bridge.worldObjects.get(objId);
+    expect(obj.prefabId).toBe(12);
+    expect(obj.x).toBeCloseTo(15.0, 5);
+    expect(obj.y).toBeCloseTo(2.0, 5);
+    expect(obj.z).toBeCloseTo(-30.0, 5);
+
+    // Now test WorldObjectDespawn with varint object_id
+    const despawnPayload = [...objIdBytes];
+    const despawnFrame = new Uint8Array(8 + despawnPayload.length);
+    const dView = new DataView(despawnFrame.buffer);
+    despawnFrame[0] = 0x4d;
+    despawnFrame[1] = 0x4d;
+    dView.setUint16(2, OPCODES.WORLD_OBJECT_DESPAWN, true);
+    dView.setUint32(4, despawnPayload.length, true);
+    despawnFrame.set(despawnPayload, 8);
+
+    bridge.processPacket(despawnFrame);
+    expect(bridge.worldObjects.has(objId)).toBe(false);
+  });
+
+  it("preserves 64-bit GUIDs (> 2^24) losslessly through getRenderBuffer and getWorldObjectsRenderBuffer", () => {
+    const bridge = new ClientWorldBridge();
+    const entityGuid = (0xdead_beefn << 32n) | 0xcafe_baben; // Both halves > 2^24
+    const localPlayerGuid = (0x1234_5678n << 32n) | 0x8765_4321n;
+    bridge.localPlayerGuid = localPlayerGuid;
+
+    // Add remote entity
+    bridge.entities.set(entityGuid, {
+      id: entityGuid,
+      x: 10.0,
+      y: 1.0,
+      z: 20.0,
+      yaw: 0.0,
+      hpPct: 0.9,
+      castPct: 0.0,
+      type: 2,
+    });
+
+    const entityRenderBuf = bridge.getRenderBuffer({ x: 0, y: 0, z: 0 }, 0);
+    const u32Entity = new Uint32Array(entityRenderBuf.buffer);
+
+    // Entity 0 is local player
+    const recLocalLo = BigInt(u32Entity[0]);
+    const recLocalHi = BigInt(u32Entity[1]);
+    expect((recLocalHi << 32n) | recLocalLo).toBe(localPlayerGuid);
+
+    // Entity 1 is remote entity
+    const recRemoteLo = BigInt(u32Entity[9]);
+    const recRemoteHi = BigInt(u32Entity[10]);
+    expect((recRemoteHi << 32n) | recRemoteLo).toBe(entityGuid);
+
+    // Verify WorldRenderer.syncEntities decodes exact 64-bit GUID without truncation
+    const scene = new THREE.Scene();
+    const worldRenderer = new WorldRenderer(null, scene);
+    worldRenderer.syncEntities(entityRenderBuf, localPlayerGuid);
+    expect(worldRenderer.entities.has(entityGuid)).toBe(true);
+    expect(worldRenderer.entities.has(localPlayerGuid)).toBe(true);
+
+    // Test WorldObjects render buffer fidelity
+    const objectGuid = (0xcafe_d00dn << 32n) | 0xbeef_baben;
+    bridge.worldObjects.set(objectGuid, {
+      id: objectGuid,
+      prefabId: 11,
+      x: 5.0,
+      y: 0.0,
+      z: -10.0,
+      qx: 0,
+      qy: 0,
+      qz: 0,
+      qw: 1,
+      sx: 1,
+      sy: 1,
+      sz: 1,
+      stateFlags: 0,
+      hpPct: 1.0,
+      revision: 1,
+    });
+
+    const objRenderBuf = bridge.getWorldObjectsRenderBuffer();
+    const objRenderer = new WorldObjectRenderer(scene);
+    objRenderer.updateFromBuffer(objRenderBuf);
+    expect(objRenderer.objects.has(objectGuid)).toBe(true);
+  });
+});
+
+describe("WebTransportClient", () => {
+  it("startPingLoop transmits OPCODES.PING (0x0007) and receives OPCODES.PONG (0x0008) to update pingMs", () => {
+    vi.useFakeTimers();
+    const client = new WebTransportClient();
+    client.connected = true;
+
+    let sentData = null;
+    client.datagramWriter = {
+      write: vi.fn().mockImplementation((data) => {
+        sentData = data;
+        return Promise.resolve();
+      }),
+    };
+
+    client.startPingLoop();
+    vi.advanceTimersByTime(2100);
+
+    expect(client.datagramWriter.write).toHaveBeenCalled();
+    expect(sentData).not.toBeNull();
+    expect(sentData[0]).toBe(0x4d);
+    expect(sentData[1]).toBe(0x4d);
+    const view = new DataView(sentData.buffer);
+    expect(view.getUint16(2, true)).toBe(OPCODES.PING); // 0x0007
+    expect(view.getUint32(4, true)).toBe(8); // Payload len 8
+
+    // Test receiving OPCODES.PONG (0x0008)
+    const pongBuf = new Uint8Array(24);
+    pongBuf[0] = 0x4d;
+    pongBuf[1] = 0x4d;
+    const pView = new DataView(pongBuf.buffer);
+    pView.setUint16(2, OPCODES.PONG, true);
+    pView.setUint32(4, 16, true);
+    const pingSentTs = client.lastPingSentTime;
+    pView.setBigUint64(8, BigInt(Math.floor(pingSentTs)), true);
+    pView.setBigUint64(16, BigInt(Date.now()), true);
+
+    client.handleIncomingPacket(pongBuf);
+    expect(client.pingMs).toBeGreaterThanOrEqual(0);
+
+    client.disconnect();
+    expect(client.connected).toBe(false);
+    expect(client.pingInterval).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("observes transport.closed and marks client disconnected and notifies status", async () => {
+    const client = new WebTransportClient();
+    let statusNotified = null;
+    client.onStatus((s) => {
+      statusNotified = s;
+    });
+
+    let resolveClosed;
+    const closedPromise = new Promise((resolve) => {
+      resolveClosed = resolve;
+    });
+
+    // Mock WebTransport instance
+    const mockTransport = {
+      ready: Promise.resolve(),
+      closed: closedPromise,
+      datagrams: {
+        writable: { getWriter: () => ({ write: vi.fn(), close: vi.fn() }) },
+        readable: { getReader: () => ({ read: () => new Promise(() => {}), releaseLock: vi.fn() }) },
+      },
+      incomingBidirectionalStreams: {
+        getReader: () => ({ read: () => new Promise(() => {}), releaseLock: vi.fn() }),
+      },
+    };
+
+    vi.stubGlobal("WebTransport", vi.fn().mockImplementation(() => mockTransport));
+
+    await client.connect("https://127.0.0.1:4433");
+    expect(client.connected).toBe(true);
+
+    // Trigger server-side closed
+    resolveClosed();
+    await closedPromise;
+    // Allow microtasks to complete
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(client.connected).toBe(false);
+    expect(client.pingInterval).toBeNull();
+    expect(statusNotified.status).toBe("disconnected");
+
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("UIController Village HUD", () => {
@@ -360,16 +661,31 @@ describe("UIController Village HUD", () => {
       textContent: "",
       value: "",
       disabled: false,
+      attributes: {},
+      setAttribute(name, val) {
+        this.attributes[name] = String(val);
+      },
+      getAttribute(name) {
+        return this.attributes[name] || null;
+      },
+      replaceChildren(...newChildren) {
+        this.children = [...newChildren];
+      },
       _innerHTML: "",
       get innerHTML() {
-        return this._innerHTML;
+        if (this._innerHTML) return this._innerHTML;
+        return this.children
+          .map((c) => {
+            if (c.className) {
+              return `<span class="${c.className}">${c.textContent || c.innerHTML}</span>`;
+            }
+            return c.textContent || c.innerHTML;
+          })
+          .join("");
       },
       set innerHTML(val) {
         this._innerHTML = val;
-        if (typeof val === "string" && val.includes("<button")) {
-          const btn = createMockElement("", "barter-action-btn");
-          this.children = [btn];
-        }
+        this.children = [];
       },
       appendChild(child) {
         this.children.push(child);
@@ -384,7 +700,19 @@ describe("UIController Village HUD", () => {
         }
       },
       querySelector(sel) {
-        return this.children[0] || createMockElement();
+        if (!sel) return null;
+        const targetClass = sel.startsWith(".") ? sel.slice(1) : sel;
+        const findRecursive = (node) => {
+          if (node.className && node.className.split(" ").includes(targetClass)) {
+            return node;
+          }
+          for (const child of node.children) {
+            const found = findRecursive(child);
+            if (found) return found;
+          }
+          return null;
+        };
+        return findRecursive(this) || createMockElement();
       },
     };
   }
@@ -404,14 +732,16 @@ describe("UIController Village HUD", () => {
     };
   });
 
-  it("updates gold, weight, and inventory slots", () => {
+  it("updates gold, weight, and inventory slots safely without innerHTML XSS", () => {
     const ui = new UIController();
+    const xssPayload = "<script>alert('pwn')</script><img src=x onerror=alert(1)>";
     const inv = {
       currency: 85,
       current_weight: 15.5,
       max_weight: 100.0,
       slots: [
         { item_id: 1001, name: "Iron Ore", quantity: 3, unit_weight: 2.0 },
+        { item_id: 9999, name: xssPayload, quantity: 1, unit_weight: 0.5 },
         null,
       ],
     };
@@ -421,13 +751,30 @@ describe("UIController Village HUD", () => {
     expect(document.getElementById("val-gold").textContent).toBe(85);
     expect(document.getElementById("val-weight").textContent).toBe("15.5 / 100.0 kg");
     const grid = document.getElementById("inventory-grid");
-    expect(grid.children.length).toBe(2);
+    expect(grid.children.length).toBe(3);
     expect(grid.children[0].className).toContain("occupied");
-    expect(grid.children[0].innerHTML).toContain("Iron Ore");
-    expect(grid.children[1].className).toContain("empty");
+    
+    // Normal slot DOM nodes
+    const slot1 = grid.children[0];
+    expect(slot1.children.length).toBe(3);
+    expect(slot1.children[0].className).toBe("slot-item-name");
+    expect(slot1.children[0].textContent).toBe("Iron Ore");
+    expect(slot1.children[1].className).toBe("slot-item-qty");
+    expect(slot1.children[1].textContent).toBe("x3");
+    expect(slot1.children[2].className).toBe("slot-item-weight");
+    expect(slot1.children[2].textContent).toBe("6.0kg");
+
+    // XSS slot must use textContent and NOT raw innerHTML
+    const slotXss = grid.children[1];
+    expect(slotXss.children[0].className).toBe("slot-item-name");
+    expect(slotXss.children[0].textContent).toBe(xssPayload);
+    // Verified slot element did not set innerHTML directly
+    expect(slotXss._innerHTML).toBe("");
+
+    expect(grid.children[2].className).toContain("empty");
   });
 
-  it("shows and populates NPC barter modal with recipe barter action callbacks", () => {
+  it("shows and populates NPC barter modal safely with recipe barter action callbacks", () => {
     const ui = new UIController();
     let barterRecipeId = null;
 
@@ -438,7 +785,7 @@ describe("UIController Village HUD", () => {
       recipes: [
         {
           recipe_id: 1,
-          required_items: [{ name: "Iron Ore", quantity: 2 }],
+          required_items: [{ name: "<img src=x onerror=alert(1)>", quantity: 2 }],
           required_currency: 0,
           reward_items: [{ name: "Iron Pickaxe", quantity: 1 }],
           reward_currency: 0,
@@ -458,14 +805,57 @@ describe("UIController Village HUD", () => {
     const recipesList = document.getElementById("barter-recipes-list");
     expect(recipesList.children.length).toBe(1);
     const card = recipesList.children[0];
-    expect(card.innerHTML).toContain("2x Iron Ore");
-    expect(card.innerHTML).toContain("1x Iron Pickaxe");
+    
+    // Safe textContent check for recipe exchange with XSS payload
+    const reqsSpan = card.querySelector(".recipe-reqs");
+    expect(reqsSpan.textContent).toContain("2x <img src=x onerror=alert(1)>");
+    // Card was built programmatically via createElement, not innerHTML
+    expect(card._innerHTML).toBe("");
 
     const barterBtn = card.querySelector(".barter-action-btn");
+    expect(barterBtn.getAttribute("data-recipe-id")).toBe("1");
     barterBtn.click();
     expect(barterRecipeId).toBe(1);
 
     ui.hideNpcBarter();
+    expect(modal.style.display).toBe("none");
+  });
+
+  it("updates inventory weight using authoritative top-level current_weight from VillageTradeStateResponse", () => {
+    const ui = new UIController();
+    const inv = {
+      currency: 120,
+      max_weight: 150.0,
+      slots: [],
+    };
+    ui.updateInventory(inv, 45.2);
+
+    expect(document.getElementById("val-gold").textContent).toBe(120);
+    expect(document.getElementById("val-weight").textContent).toBe("45.2 / 150.0 kg");
+  });
+
+  it("shows player trade modal with partner currency from their_offer.currency", () => {
+    const ui = new UIController();
+    const tradeSession = {
+      session_id: 105,
+      my_offer: { currency: 25, items: [] },
+      their_offer: { currency: 90, items: [] },
+      my_locked: true,
+      their_locked: true,
+      my_accepted: false,
+      their_accepted: false,
+      completed: false,
+    };
+
+    ui.showPlayerTrade(tradeSession);
+
+    const modal = document.getElementById("player-trade-modal");
+    expect(modal.style.display).toBe("flex");
+    expect(document.getElementById("trade-session-id").textContent).toBe(105);
+    expect(document.getElementById("trade-partner-gold").textContent).toBe(90);
+    expect(document.getElementById("trade-status-msg").textContent).toBe("Both locked");
+
+    ui.hidePlayerTrade();
     expect(modal.style.display).toBe("none");
   });
 });

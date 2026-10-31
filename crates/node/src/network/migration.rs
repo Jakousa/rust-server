@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use mmo_core::Guid;
 use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
@@ -185,14 +186,24 @@ pub async fn execute_entity_migration_pooled(
 
     let mut client = NodeServiceClient::new(channel);
 
-    let resp = match client.migrate_entity(req).await {
-        Ok(r) => r.into_inner(),
-        Err(e) => {
+    let resp = match tokio::time::timeout(Duration::from_secs(5), client.migrate_entity(req)).await
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
             pool.invalidate(target_node_addr);
             let mut sim_guard = sim.write().await;
             sim_guard.release_migration_lease(guid);
             metrics::counter!("mmo_migration_rollbacks_total").increment(1);
             return Err(MigrationError::RpcFailed(e.to_string()));
+        }
+        Err(_) => {
+            pool.invalidate(target_node_addr);
+            let mut sim_guard = sim.write().await;
+            sim_guard.release_migration_lease(guid);
+            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
+            return Err(MigrationError::RpcFailed(
+                "Migration RPC timed out".to_string(),
+            ));
         }
     };
 
@@ -376,9 +387,14 @@ pub async fn execute_batch_entity_migration_pooled(
 
     let mut client = NodeServiceClient::new(channel);
 
-    let resp = match client.migrate_batch_entities(batch_req).await {
-        Ok(r) => r.into_inner(),
-        Err(e) => {
+    let resp = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.migrate_batch_entities(batch_req),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
             pool.invalidate(target_node_addr);
             let mut sim_guard = sim.write().await;
             for &g in guids {
@@ -386,6 +402,17 @@ pub async fn execute_batch_entity_migration_pooled(
             }
             metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
             return Err(MigrationError::RpcFailed(e.to_string()));
+        }
+        Err(_) => {
+            pool.invalidate(target_node_addr);
+            let mut sim_guard = sim.write().await;
+            for &g in guids {
+                sim_guard.release_migration_lease(g);
+            }
+            metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
+            return Err(MigrationError::RpcFailed(
+                "Migration RPC timed out".to_string(),
+            ));
         }
     };
 

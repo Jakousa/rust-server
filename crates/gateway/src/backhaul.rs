@@ -183,7 +183,7 @@ mod tests {
             session_id: 1,
             guid: Some(Guid::new(mmo_core::guid::EntityType::Player, 1, 1)),
             node_address: node_address.to_string(),
-            session_epoch: 0,
+            session_epoch: 1,
             packet: ClientPacket::Movement(MovementPacket {
                 entity_id: 1,
                 sequence: 1,

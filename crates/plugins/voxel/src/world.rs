@@ -98,6 +98,11 @@ impl VoxelWorld {
         self.chunks.len()
     }
 
+    /// Marks a chunk as dirty so it will be processed in the next flush cycle.
+    pub fn mark_chunk_dirty(&self, coord: VoxelChunkCoord) {
+        self.dirty_chunks.insert(coord);
+    }
+
     /// Returns `true` if the chunk is currently loaded.
     pub fn is_chunk_loaded(&self, coord: VoxelChunkCoord) -> bool {
         self.chunks.contains_key(&coord)

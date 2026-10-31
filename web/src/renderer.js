@@ -7,11 +7,15 @@ import { WorldObjectRenderer } from "./world.js";
 export class WorldRenderer {
   constructor(containerElement) {
     this.container = containerElement;
-
-    // Scene setup
+    this.entities = new Map();
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0b0f19);
     this.scene.fog = new THREE.FogExp2(0x0b0f19, 0.005);
+    this.worldObjects = new WorldObjectRenderer(this.scene);
+
+    if (typeof window === "undefined" || !containerElement) {
+      return;
+    }
 
     // Camera
     this.camera = new THREE.PerspectiveCamera(
@@ -29,12 +33,6 @@ export class WorldRenderer {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.container.appendChild(this.renderer.domElement);
-
-    // Entities Map: guid -> THREE.Group
-    this.entities = new Map();
-
-    // World Object Renderer
-    this.worldObjects = new WorldObjectRenderer(this.scene);
 
     // Lighting
     this.initLighting();
@@ -116,15 +114,21 @@ export class WorldRenderer {
    * [guid_lo, guid_hi, x, y, z, yaw, hp_pct, cast_pct, entity_type]
    */
   syncEntities(renderBuffer, localPlayerGuid = null) {
+    if (!renderBuffer || renderBuffer.length === 0) return;
     const activeGuids = new Set();
     const entityStride = 9;
     const count = Math.floor(renderBuffer.length / entityStride);
     const localBigInt = localPlayerGuid !== null ? BigInt(localPlayerGuid) : null;
+    const uint32View = new Uint32Array(
+      renderBuffer.buffer,
+      renderBuffer.byteOffset,
+      renderBuffer.length
+    );
 
     for (let i = 0; i < count; i++) {
       const offset = i * entityStride;
-      const guidLo = BigInt(Math.round(renderBuffer[offset]));
-      const guidHi = BigInt(Math.round(renderBuffer[offset + 1]));
+      const guidLo = BigInt(uint32View[offset]);
+      const guidHi = BigInt(uint32View[offset + 1]);
       const guid = (guidHi << 32n) | guidLo;
       const x = renderBuffer[offset + 2];
       const y = renderBuffer[offset + 3];

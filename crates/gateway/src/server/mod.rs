@@ -746,6 +746,7 @@ impl GatewayServer {
             cache: self.cache.clone(),
             subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(writer_handle),
+            intercept_handler: Some(Arc::new(intercept_handler.clone())),
         };
 
         let mut buf = BytesMut::with_capacity(8192);
@@ -1017,6 +1018,7 @@ impl GatewayServer {
             cache: self.cache.clone(),
             subscription_manager: Some(self.subscription_manager.clone()),
             writer_handle: Some(downstream_handle),
+            intercept_handler: Some(Arc::new(intercept_handler.clone())),
         };
 
         loop {

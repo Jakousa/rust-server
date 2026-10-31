@@ -117,27 +117,42 @@ export class UIController {
     });
   }
 
-  updateInventory(inv) {
+  updateInventory(inv, currentWeight = null) {
     if (!inv) return;
     if (this.valGold && inv.currency !== undefined) {
       this.valGold.textContent = inv.currency;
     }
     if (this.valWeight) {
-      const cur = (inv.current_weight || 0).toFixed(1);
+      const curVal = currentWeight != null ? currentWeight : (inv.current_weight || 0);
+      const cur = Number(curVal).toFixed(1);
       const max = (inv.max_weight || 100.0).toFixed(1);
       this.valWeight.textContent = `${cur} / ${max} kg`;
     }
     if (this.inventoryGrid && Array.isArray(inv.slots)) {
-      this.inventoryGrid.innerHTML = "";
+      if (typeof this.inventoryGrid.replaceChildren === "function") {
+        this.inventoryGrid.replaceChildren();
+      } else {
+        this.inventoryGrid.innerHTML = "";
+      }
       inv.slots.forEach((slot, idx) => {
         const slotEl = document.createElement("div");
         slotEl.className = `inventory-slot ${slot ? "occupied" : "empty"}`;
         if (slot) {
-          slotEl.innerHTML = `
-            <span class="slot-item-name">${slot.name || "Item #" + slot.item_id}</span>
-            <span class="slot-item-qty">x${slot.quantity || 1}</span>
-            <span class="slot-item-weight">${((slot.unit_weight || 0) * (slot.quantity || 1)).toFixed(1)}kg</span>
-          `;
+          const nameSpan = document.createElement("span");
+          nameSpan.className = "slot-item-name";
+          nameSpan.textContent = slot.name || "Item #" + slot.item_id;
+
+          const qtySpan = document.createElement("span");
+          qtySpan.className = "slot-item-qty";
+          qtySpan.textContent = `x${slot.quantity || 1}`;
+
+          const weightSpan = document.createElement("span");
+          weightSpan.className = "slot-item-weight";
+          weightSpan.textContent = `${((slot.unit_weight || 0) * (slot.quantity || 1)).toFixed(1)}kg`;
+
+          slotEl.appendChild(nameSpan);
+          slotEl.appendChild(qtySpan);
+          slotEl.appendChild(weightSpan);
         }
         this.inventoryGrid.appendChild(slotEl);
       });
@@ -165,7 +180,11 @@ export class UIController {
     if (this.npcGreeting) this.npcGreeting.textContent = merchant.greeting || "Greetings traveler.";
 
     if (this.barterRecipesList) {
-      this.barterRecipesList.innerHTML = "";
+      if (typeof this.barterRecipesList.replaceChildren === "function") {
+        this.barterRecipesList.replaceChildren();
+      } else {
+        this.barterRecipesList.innerHTML = "";
+      }
       const recipes = merchant.recipes || [];
       recipes.forEach((r) => {
         const card = document.createElement("div");
@@ -187,19 +206,36 @@ export class UIController {
           rewards.push(`${r.reward_currency} Gold`);
         }
 
-        card.innerHTML = `
-          <div class="recipe-exchange">
-            <span class="recipe-reqs">${reqs.join(" + ") || "Free"}</span>
-            <span class="barter-arrow">&rarr;</span>
-            <span class="recipe-rewards">${rewards.join(" + ")}</span>
-          </div>
-          <button class="barter-action-btn" data-recipe-id="${r.recipe_id}">Barter</button>
-        `;
+        const exchangeDiv = document.createElement("div");
+        exchangeDiv.className = "recipe-exchange";
 
-        const btn = card.querySelector(".barter-action-btn");
+        const reqsSpan = document.createElement("span");
+        reqsSpan.className = "recipe-reqs";
+        reqsSpan.textContent = reqs.join(" + ") || "Free";
+
+        const arrowSpan = document.createElement("span");
+        arrowSpan.className = "barter-arrow";
+        arrowSpan.textContent = "\u2192";
+
+        const rewardsSpan = document.createElement("span");
+        rewardsSpan.className = "recipe-rewards";
+        rewardsSpan.textContent = rewards.join(" + ");
+
+        exchangeDiv.appendChild(reqsSpan);
+        exchangeDiv.appendChild(arrowSpan);
+        exchangeDiv.appendChild(rewardsSpan);
+
+        const btn = document.createElement("button");
+        btn.className = "barter-action-btn";
+        btn.setAttribute("data-recipe-id", String(r.recipe_id));
+        btn.textContent = "Barter";
+
         btn.addEventListener("click", () => {
           if (onBarterClick) onBarterClick(r.recipe_id);
         });
+
+        card.appendChild(exchangeDiv);
+        card.appendChild(btn);
 
         this.barterRecipesList.appendChild(card);
       });
@@ -220,10 +256,25 @@ export class UIController {
       this.tradeSessionId.textContent = tradeSession.session_id || "Active";
     }
     if (this.tradePartnerGold) {
-      this.tradePartnerGold.textContent = tradeSession.partner_currency || 0;
+      const partnerGold = tradeSession.their_offer?.currency ?? tradeSession.partner_currency ?? 0;
+      this.tradePartnerGold.textContent = partnerGold;
     }
     if (this.tradeStatusMsg) {
-      this.tradeStatusMsg.textContent = tradeSession.status || "Trade active";
+      let status = tradeSession.status;
+      if (!status) {
+        if (tradeSession.completed) {
+          status = "Trade completed";
+        } else if (tradeSession.my_accepted && tradeSession.their_accepted) {
+          status = "Both accepted";
+        } else if (tradeSession.my_locked && tradeSession.their_locked) {
+          status = "Both locked";
+        } else if (tradeSession.their_locked) {
+          status = "Partner locked";
+        } else {
+          status = "Trade active";
+        }
+      }
+      this.tradeStatusMsg.textContent = status;
     }
     this.playerTradeModal.style.display = "flex";
   }

@@ -114,6 +114,15 @@ impl GatewayInterceptHandler {
                 if let Some((_, handle)) = self.active_bus_subscriptions.remove(&topic) {
                     handle.abort();
                 }
+                if let Some(ref bus) = self.social_bus {
+                    let bus = bus.clone();
+                    let topic_clone = topic.clone();
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move {
+                            let _ = bus.unsubscribe(&topic_clone).await;
+                        });
+                    }
+                }
             }
         }
     }

@@ -80,6 +80,12 @@ pub enum StorageError {
 
     #[error("Unauthorized marketplace action on listing {0}")]
     UnauthorizedMarketAction(String),
+
+    #[error("Duplicate item in transaction: {0}")]
+    DuplicateItem(String),
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 /// Database backend variant.

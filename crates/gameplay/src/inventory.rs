@@ -71,18 +71,21 @@ impl InventoryComponent {
     }
 
     pub fn has_item_stack(&self, item: &ItemStack) -> bool {
-        let total: u32 = self
+        if item.quantity == 0 {
+            return false;
+        }
+        let total: u64 = self
             .slots
             .iter()
             .flatten()
             .filter(|s| s.item_id == item.item_id && s.name == item.name)
-            .map(|s| s.quantity)
+            .map(|s| s.quantity as u64)
             .sum();
-        total >= item.quantity
+        total >= item.quantity as u64
     }
 
     pub fn remove_item_stack(&mut self, item: &ItemStack) -> bool {
-        if !self.has_item_stack(item) {
+        if item.quantity == 0 || !self.has_item_stack(item) {
             return false;
         }
 
@@ -107,6 +110,9 @@ impl InventoryComponent {
     }
 
     pub fn add_item(&mut self, item: ItemStack) -> Result<usize, &'static str> {
+        if item.quantity == 0 {
+            return Err("Item quantity must be greater than zero");
+        }
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(item);
@@ -213,7 +219,13 @@ impl ModularPacketHandler for InventoryPacketHandler {
                     1 => EquipSlot::Chest,
                     2 => EquipSlot::MainHand,
                     3 => EquipSlot::OffHand,
-                    _ => EquipSlot::Boots,
+                    4 => EquipSlot::Boots,
+                    other => {
+                        return Err(PacketHandlerError::MalformedPayload {
+                            module_id: 0x01,
+                            message: format!("Invalid equipment slot index {}", other),
+                        });
+                    }
                 };
 
                 let inv = entity
@@ -235,9 +247,13 @@ impl ModularPacketHandler for InventoryPacketHandler {
 
                 let old_item = equip.equip(equip_slot, item);
                 if let Some(old) = old_item {
-                    // Put previous equipped item back into inventory if possible
+                    // Put previous equipped item directly back into the vacated inventory slot
                     if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
-                        let _ = inv.add_item(old);
+                        if inv_slot < inv.slots.len() && inv.slots[inv_slot].is_none() {
+                            inv.slots[inv_slot] = Some(old);
+                        } else {
+                            let _ = inv.add_item(old);
+                        }
                     }
                 }
 
@@ -451,7 +467,7 @@ mod tests {
         let eq = entity.get_component::<EquipmentComponent>().unwrap();
         assert_eq!(eq.get_equipped(&EquipSlot::Head).unwrap().item_id, 51);
         let inv = entity.get_component::<InventoryComponent>().unwrap();
-        assert_eq!(inv.slots[0].as_ref().unwrap().item_id, 50);
+        assert_eq!(inv.slots[1].as_ref().unwrap().item_id, 50);
 
         // 8. Equip into Chest (1), MainHand (2), OffHand (3), Boots (4)
         for (sub_slot, equip_slot) in [
@@ -471,6 +487,18 @@ mod tests {
             let eq = entity.get_component::<EquipmentComponent>().unwrap();
             assert!(eq.get_equipped(&equip_slot).is_some());
         }
+
+        // 9. Invalid slot index (> 4) returns MalformedPayload
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+        let idx = inv_mut
+            .add_item(ItemStack::new(999, "Invalid", 1, 1.0))
+            .unwrap();
+        let err = handler.handle(guid, 1, &[idx as u8, 5], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
     }
 
     #[test]
@@ -498,5 +526,40 @@ mod tests {
         handler.handle_with_entities(&ev, &mut ctx, &mut store);
         assert!(ctx.is_canceled());
         assert_eq!(ctx.cancel_reason(), Some("encumbered"));
+    }
+
+    #[test]
+    fn test_zero_quantity_and_multi_stack_overflow_guards() {
+        let mut inv = InventoryComponent::new(4, 100.0);
+
+        // 1. Cannot add item with quantity == 0
+        let zero_item = ItemStack::new(100, "Ghost", 0, 1.0);
+        assert_eq!(
+            inv.add_item(zero_item.clone()),
+            Err("Item quantity must be greater than zero")
+        );
+
+        // 2. has_item_stack returns false for quantity == 0 even if item is not present
+        assert!(!inv.has_item_stack(&zero_item));
+
+        // Add 2 stacks of 2,000,000,000 quantity
+        let big_stack_1 = ItemStack::new(101, "Gold Bars", 2_000_000_000, 0.001);
+        let big_stack_2 = ItemStack::new(101, "Gold Bars", 2_000_000_000, 0.001);
+        inv.add_item(big_stack_1).unwrap();
+        inv.add_item(big_stack_2).unwrap();
+
+        // 3. has_item_stack returns false for quantity == 0 even if item IS present
+        let zero_gold = ItemStack::new(101, "Gold Bars", 0, 0.001);
+        assert!(!inv.has_item_stack(&zero_gold));
+        assert!(!inv.remove_item_stack(&zero_gold));
+
+        // 4. Multi-stack sum exceeds u32::MAX (4,000,000,000 > 3,000,000,000)
+        let query = ItemStack::new(101, "Gold Bars", 3_000_000_000, 0.001);
+        assert!(inv.has_item_stack(&query));
+
+        // 5. Remove spanning across stacks
+        assert!(inv.remove_item_stack(&query));
+        assert_eq!(inv.slots[0], None);
+        assert_eq!(inv.slots[1].as_ref().unwrap().quantity, 1_000_000_000);
     }
 }

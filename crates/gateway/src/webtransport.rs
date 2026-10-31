@@ -311,10 +311,28 @@ impl WebTransportServer {
                 }
 
                 let mut buf = BytesMut::from(&datagram[..]);
-                if let Ok(routed) = disp_datagram.process_frames(session_id, &mut buf) {
-                    if let Some(ref tx) = ptx_datagram {
-                        for pkt in routed {
-                            let _ = tx.send(pkt).await;
+                while let Ok(Some(pkt)) = mmo_schema::client::ClientPacket::decode_frame(&mut buf) {
+                    metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                        .increment(1);
+
+                    if let mmo_schema::client::ClientPacket::Ping(ref ping) = pkt {
+                        let pong = mmo_schema::client::ClientPacket::Pong(
+                            mmo_schema::client::PongPacket {
+                                client_timestamp: ping.timestamp,
+                                server_timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis()
+                                    as u64,
+                            },
+                        );
+                        let _ = conn_datagram_in.send_datagram(pong.encode());
+                        continue;
+                    }
+
+                    if let Ok(routed) = disp_datagram.dispatch_packet(session_id, pkt) {
+                        if let Some(ref tx) = ptx_datagram {
+                            let _ = tx.send(routed).await;
                         }
                     }
                 }
@@ -448,6 +466,21 @@ impl WebTransportServer {
                                         let _ = send_stream.write_all(&resp.encode()).await;
                                         continue;
                                     }
+                                }
+
+                                if let mmo_schema::client::ClientPacket::Ping(ref ping) = pkt {
+                                    let pong = mmo_schema::client::ClientPacket::Pong(
+                                        mmo_schema::client::PongPacket {
+                                            client_timestamp: ping.timestamp,
+                                            server_timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis()
+                                                as u64,
+                                        },
+                                    );
+                                    let _ = send_stream.write_all(&pong.encode()).await;
+                                    continue;
                                 }
 
                                 if let Some(ref handler) = intercept_stream {

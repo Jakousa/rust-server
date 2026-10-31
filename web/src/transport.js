@@ -1,3 +1,5 @@
+import { OPCODES } from "./protocol.js";
+
 /**
  * WebTransport Network Client.
  *
@@ -76,6 +78,29 @@ export class WebTransportClient {
       this.datagramWriter = this.transport.datagrams.writable.getWriter();
       this.notifyStatus("connected");
 
+      // Handle server-side disconnect or unexpected transport termination
+      this.transport.closed
+        .then(() => {
+          if (this.connected) {
+            this.connected = false;
+            if (this.pingInterval) {
+              clearInterval(this.pingInterval);
+              this.pingInterval = null;
+            }
+            this.notifyStatus("disconnected");
+          }
+        })
+        .catch((err) => {
+          if (this.connected) {
+            this.connected = false;
+            if (this.pingInterval) {
+              clearInterval(this.pingInterval);
+              this.pingInterval = null;
+            }
+            this.notifyStatus("disconnected", err?.message || String(err));
+          }
+        });
+
       // Start reader loops
       this.readDatagrams();
       this.readIncomingStreams();
@@ -85,6 +110,27 @@ export class WebTransportClient {
       this.connected = false;
       this.notifyStatus("disconnected", err.message);
       throw err;
+    }
+  }
+
+  /**
+   * Internal processor for incoming binary frames, computing ping RTT on PONG frames.
+   */
+  handleIncomingPacket(value) {
+    if (value && value.byteLength >= 8) {
+      const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+      if (view.getUint8(0) === 0x4d && view.getUint8(1) === 0x4d) {
+        const opcode = view.getUint16(2, true);
+        if (opcode === OPCODES.PONG && value.byteLength >= 24) {
+          const clientTimestamp = Number(view.getBigUint64(8, true));
+          const now = performance.now();
+          this.pingMs = Math.max(0, now - clientTimestamp);
+          return;
+        }
+      }
+    }
+    if (this.onPacketCallback) {
+      this.onPacketCallback(value);
     }
   }
 
@@ -99,9 +145,7 @@ export class WebTransportClient {
         if (done) break;
         if (value) {
           this.trackIngress(value.byteLength);
-          if (this.onPacketCallback) {
-            this.onPacketCallback(value);
-          }
+          this.handleIncomingPacket(value);
         }
       }
     } catch (err) {
@@ -146,9 +190,7 @@ export class WebTransportClient {
         if (done) break;
         if (value) {
           this.trackIngress(value.byteLength);
-          if (this.onPacketCallback) {
-            this.onPacketCallback(value);
-          }
+          this.handleIncomingPacket(value);
         }
       }
     } catch (err) {
@@ -195,17 +237,13 @@ export class WebTransportClient {
     this.pingInterval = setInterval(() => {
       if (!this.connected) return;
       this.lastPingSentTime = performance.now();
-      // Client packet ping: Magic [0x4D, 0x4D], Opcode 0x0006, Payload timestamp (8 bytes)
+      // Client packet ping: Magic [0x4D, 0x4D], Opcode 0x0007 (OPCODES.PING), Payload timestamp (8 bytes)
       const pingBuf = new Uint8Array(16);
-      pingBuf[0] = 0x4D;
-      pingBuf[1] = 0x4D;
-      pingBuf[2] = 0x06; // Opcode Ping
-      pingBuf[3] = 0x00;
-      pingBuf[4] = 0x08; // Length 8
-      pingBuf[5] = 0x00;
-      pingBuf[6] = 0x00;
-      pingBuf[7] = 0x00;
+      pingBuf[0] = 0x4d;
+      pingBuf[1] = 0x4d;
       const view = new DataView(pingBuf.buffer);
+      view.setUint16(2, OPCODES.PING, true);
+      view.setUint32(4, 8, true); // Payload len 8
       view.setBigUint64(8, BigInt(Math.floor(this.lastPingSentTime)), true);
       this.sendDatagram(pingBuf);
     }, 2000);
@@ -236,6 +274,7 @@ export class WebTransportClient {
     this.connected = false;
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
+      this.pingInterval = null;
     }
     if (this.datagramWriter) {
       try {

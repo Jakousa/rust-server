@@ -84,16 +84,38 @@ impl MarketplaceRepository {
             now_ms.saturating_add((duration_secs as i64).saturating_mul(1000));
         let listing_id = format!("list-{}-{}-{}", seller_guid, src_slot, now_ms);
 
+        if src_container_id == escrow_container_id {
+            return Err(StorageError::InvalidParameter(
+                "Source and escrow containers must be distinct".to_string(),
+            ));
+        }
+
+        let (first_cid, second_cid) = if src_container_id < escrow_container_id {
+            (src_container_id, escrow_container_id)
+        } else {
+            (escrow_container_id, src_container_id)
+        };
+
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
-            // 1. Verify seller ownership of source container
-            let c_src_sql = format!(
-                "SELECT container_id, owner_id FROM containers WHERE container_id = ?{}",
+            // 1. Verify seller ownership of source container and lock containers in ascending order
+            let c_lock_sql = format!(
+                "SELECT container_id, owner_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
             );
-            let c_src = sqlx::query(&q!(&c_src_sql))
-                .bind(src_container_id as i64)
+            let row_first = sqlx::query(&q!(&c_lock_sql))
+                .bind(first_cid as i64)
                 .fetch_optional(&mut *conn)
                 .await?;
+            let row_second = sqlx::query(&q!(&c_lock_sql))
+                .bind(second_cid as i64)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+            let (c_src, c_esc) = if src_container_id < escrow_container_id {
+                (row_first, row_second)
+            } else {
+                (row_second, row_first)
+            };
 
             let c_src_row = c_src.ok_or(StorageError::ContainerNotFound(src_container_id))?;
             let owner_id: String = c_src_row.try_get("owner_id")?;
@@ -102,15 +124,6 @@ impl MarketplaceRepository {
             }
 
             // 2. Verify escrow container exists and find free slot
-            let c_esc_sql = format!(
-                "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
-                lock_suffix!()
-            );
-            let c_esc = sqlx::query(&q!(&c_esc_sql))
-                .bind(escrow_container_id as i64)
-                .fetch_optional(&mut *conn)
-                .await?;
-
             let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
             let esc_cap: i32 = esc_row.try_get("capacity")?;
 

@@ -91,6 +91,8 @@ pub struct ContainerTransferNotification {
     pub error_message: Option<String>,
 }
 
+impl mmo_core::DomainEvent for ContainerTransferNotification {}
+
 impl TickSimulation {
     /// Simulation tick rate: 20 Hz (20 ticks per second).
     pub const TICK_RATE_HZ: u32 = 20;
@@ -906,8 +908,15 @@ impl TickSimulation {
             }
         }
 
-        // 0.2 Drain pending container transfer notifications
-        while let Ok(_notif) = self.container_transfer_receiver.try_recv() {}
+        // 0.2 Drain pending container transfer notifications and forward to event queue
+        while let Ok(notif) = self.container_transfer_receiver.try_recv() {
+            self.event_queue.push(notif);
+        }
+
+        // 0.25 Sweep expired migrating leases older than 5 seconds
+        let now = self.current_time;
+        self.migrating_leases
+            .retain(|_guid, start| now.saturating_duration_since(*start) <= Duration::from_secs(5));
 
         // 0.3 Reap idle instance domains and evict remaining non-player entities
         let reaped_instances = self.instances.reap_idle_instances();
@@ -2646,5 +2655,41 @@ mod tests {
             sim.disconnect_player_session(player_guid, 1).is_none(),
             "stale session epoch disconnect must be rejected"
         );
+    }
+
+    #[test]
+    fn test_container_transfer_notification_forwarding_and_lease_sweeping() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        // Queue container transfer notification
+        let notif = ContainerTransferNotification {
+            tx_id: "tx-test-123".to_string(),
+            src_container_id: 10,
+            dst_container_id: 20,
+            item_instance_id: "item-456".to_string(),
+            success: true,
+            error_message: None,
+        };
+        sim.queue_container_transfer(notif.clone());
+
+        // Insert an expired lease (>5s old) and a recent lease (<5s old)
+        let expired_guid = Guid::new(EntityType::Player, 1, 901);
+        let active_guid = Guid::new(EntityType::Player, 1, 902);
+        sim.migrating_leases
+            .insert(expired_guid, Instant::now() - Duration::from_secs(10));
+        sim.migrating_leases.insert(active_guid, Instant::now());
+
+        // Step simulation
+        sim.step(0.05);
+
+        // Verify container transfer notification was forwarded to event queue
+        let drained = sim.event_queue.drain::<ContainerTransferNotification>();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], notif);
+
+        // Verify expired lease was swept, while active lease remains
+        assert!(!sim.is_migrating(expired_guid));
+        assert!(sim.is_migrating(active_guid));
     }
 }

@@ -148,7 +148,7 @@ impl WorldObjectStore {
     pub fn get_render_buffer(&self) -> Vec<f32> {
         let mut buffer = Vec::with_capacity(self.objects.len() * 16);
         for obj in self.objects.values() {
-            buffer.push((obj.object_id & 0xFFFF_FFFF) as f32);
+            buffer.push(f32::from_bits((obj.object_id & 0xFFFF_FFFF) as u32));
             buffer.push(obj.prefab_id as f32);
             buffer.push(obj.position.0);
             buffer.push(obj.position.1);
@@ -163,7 +163,7 @@ impl WorldObjectStore {
             buffer.push(obj.state_flags as f32);
             buffer.push(obj.hp_percent());
             buffer.push(obj.revision as f32);
-            buffer.push((obj.object_id >> 32) as f32);
+            buffer.push(f32::from_bits((obj.object_id >> 32) as u32));
         }
         buffer
     }
@@ -236,13 +236,13 @@ mod tests {
         // Render buffer
         let buf = store.get_render_buffer();
         assert_eq!(buf.len(), 16);
-        assert_eq!(buf[0], 1001.0);
+        assert_eq!(buf[0].to_bits(), 1001);
         assert_eq!(buf[1], 42.0);
         assert_eq!(buf[2], 10.0);
         assert_eq!(buf[12], 5.0);
         assert_eq!(buf[13], 0.5);
         assert_eq!(buf[14], 2.0);
-        assert_eq!(buf[15], 0.0);
+        assert_eq!(buf[15].to_bits(), 0);
 
         // Despawn
         let despawn = WorldObjectDespawnPacket { object_id: 1001 };
@@ -254,8 +254,9 @@ mod tests {
     #[test]
     fn test_64bit_object_id_fidelity_in_render_buffer() {
         let mut store = WorldObjectStore::new();
-        let id_a = (1u64 << 48) | (1u64 << 32) | 1u64;
-        let id_b = (1u64 << 48) | (1u64 << 32) | 2u64;
+        // Values exceeding 2^24 (16,777,216) in both lower and upper 32-bit halves
+        let id_a = (0xDEAD_BEEFu64 << 32) | 0xCAFE_BABEu64;
+        let id_b = (0x1234_5678u64 << 32) | 0x8765_4321u64;
 
         store.insert_or_update(&sample_spawn(id_a, 1));
         store.insert_or_update(&sample_spawn(id_b, 1));
@@ -263,12 +264,14 @@ mod tests {
         let buf = store.get_render_buffer();
         assert_eq!(buf.len(), 32);
 
-        let reconstructed_0 = ((buf[15] as u64) << 32) | (buf[0] as u64);
-        let reconstructed_1 = ((buf[31] as u64) << 32) | (buf[16] as u64);
+        let reconstructed_0 = ((buf[15].to_bits() as u64) << 32) | (buf[0].to_bits() as u64);
+        let reconstructed_1 = ((buf[31].to_bits() as u64) << 32) | (buf[16].to_bits() as u64);
 
         let mut ids = vec![reconstructed_0, reconstructed_1];
         ids.sort_unstable();
-        assert_eq!(ids, vec![id_a, id_b]);
-        assert_ne!(buf[0], buf[16]);
+        let mut expected = vec![id_a, id_b];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert_ne!(buf[0].to_bits(), buf[16].to_bits());
     }
 }

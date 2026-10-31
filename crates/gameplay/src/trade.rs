@@ -56,23 +56,23 @@ impl TradeSession {
         }
         if player == self.player_a {
             self.offer_a = offer;
-            self.locked_a = false;
-            self.accepted_a = false;
-            self.accepted_b = false;
-            Ok(())
         } else if player == self.player_b {
             self.offer_b = offer;
-            self.locked_b = false;
-            self.accepted_a = false;
-            self.accepted_b = false;
-            Ok(())
         } else {
-            Err("Player not a participant in trade")
+            return Err("Player not a participant in trade");
         }
+        self.locked_a = false;
+        self.locked_b = false;
+        self.accepted_a = false;
+        self.accepted_b = false;
+        Ok(())
     }
 
     /// Locks in the offer. Both players must lock before accepting.
     pub fn lock(&mut self, player: Guid) -> Result<(), &'static str> {
+        if self.completed {
+            return Err("Trade session already finished");
+        }
         if player == self.player_a {
             self.locked_a = true;
             Ok(())
@@ -86,6 +86,9 @@ impl TradeSession {
 
     /// Marks acceptance. Only valid once both participants have locked their offers.
     pub fn accept(&mut self, player: Guid) -> Result<bool, &'static str> {
+        if self.completed {
+            return Err("Trade session already finished");
+        }
         if !self.locked_a || !self.locked_b {
             return Err("Both players must lock their offers before accepting");
         }
@@ -226,22 +229,37 @@ impl TradeManager {
         session_id: u64,
         entities: &mut EntityStore,
     ) -> Result<TradeCompletedEvent, &'static str> {
-        let session = self
-            .sessions
-            .get_mut(&session_id)
-            .ok_or("Trade session not found")?;
+        let (p1, p2) = {
+            let session = self
+                .sessions
+                .get(&session_id)
+                .ok_or("Trade session not found")?;
 
-        if !session.accepted_a || !session.accepted_b {
-            return Err("Trade not accepted by both participants");
-        }
-
-        let p1 = session.player_a;
-        let p2 = session.player_b;
+            if !session.accepted_a || !session.accepted_b {
+                return Err("Trade not accepted by both participants");
+            }
+            (session.player_a, session.player_b)
+        };
 
         // Disjoint mutable borrow of both player entities simultaneously
         let (e1, e2) = entities
             .get_two_mut(p1, p2)
             .ok_or("Entities could not be disjointly borrowed")?;
+
+        // Re-verify distance at commit time
+        let dx = e1.position.0 - e2.position.0;
+        let dy = e1.position.1 - e2.position.1;
+        let dz = e1.position.2 - e2.position.2;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist > Self::MAX_TRADE_DISTANCE {
+            self.cancel_session(session_id);
+            return Err("Players moved too far apart to complete trade");
+        }
+
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or("Trade session not found")?;
 
         let inv1 = e1
             .get_component_mut::<InventoryComponent>()
@@ -675,13 +693,23 @@ mod tests {
         assert!(!session.accept(p1).unwrap());
         assert!(session.accept(p2).unwrap());
 
-        // Once completed, set_offer fails
+        // Once completed, set_offer, lock, and accept fail
         session.completed = true;
         assert_eq!(
             session.set_offer(p1, TradeOffer::default()),
             Err("Trade session already finished")
         );
+        assert_eq!(session.lock(p1), Err("Trade session already finished"));
+        assert_eq!(session.accept(p1), Err("Trade session already finished"));
         session.completed = false;
+
+        // Verify bilateral lock reset on set_offer
+        session.lock(p1).unwrap();
+        session.lock(p2).unwrap();
+        assert!(session.locked_a && session.locked_b);
+        session.set_offer(p1, TradeOffer::default()).unwrap();
+        assert!(!session.locked_a);
+        assert!(!session.locked_b);
 
         // check_distance_and_abort boundary checks
         // At exact distance 5.0 (3, 4, 0), abort should NOT trigger
@@ -702,5 +730,37 @@ mod tests {
         let s2 = trade_mgr.start_session(p1, p2, &store).unwrap();
         assert_eq!(s2, 2);
         assert!(trade_mgr.cancel_session(s2).is_some());
+    }
+
+    #[test]
+    fn test_execute_atomic_swap_distance_reverification_aborts() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 101);
+        let p2 = Guid::new(EntityType::Player, 1, 102);
+
+        let k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (2.0, 0.0, 0.0)); // initially within 5m
+
+        let inv1 = InventoryComponent::new(4, 100.0).with_currency(50);
+        let inv2 = InventoryComponent::new(4, 100.0).with_currency(50);
+        store.get_mut(k1).unwrap().add_component(inv1);
+        store.get_mut(k2).unwrap().add_component(inv2);
+
+        let mut trade_mgr = TradeManager::new();
+        let session_id = trade_mgr.start_session(p1, p2, &store).unwrap();
+
+        let session = trade_mgr.get_session_mut(session_id).unwrap();
+        session.lock(p1).unwrap();
+        session.lock(p2).unwrap();
+        session.accept(p1).unwrap();
+        session.accept(p2).unwrap();
+
+        // Player 2 walks away to 10.0m before swap executes
+        store.get_mut(k2).unwrap().position = (10.0, 0.0, 0.0);
+
+        let res = trade_mgr.execute_atomic_swap(session_id, &mut store);
+        assert_eq!(res, Err("Players moved too far apart to complete trade"));
+        // Session should be canceled
+        assert!(trade_mgr.get_session(session_id).is_none());
     }
 }
