@@ -5172,4 +5172,194 @@ mod tests {
             Err(ClientCodecError::InvalidData(_))
         ));
     }
+
+    #[test]
+    fn test_vec3_is_finite_exhaustive() {
+        assert!(!Vec3 {
+            x: f32::NAN,
+            y: 1.0,
+            z: 1.0
+        }
+        .is_finite());
+        assert!(!Vec3 {
+            x: 1.0,
+            y: f32::NAN,
+            z: 1.0
+        }
+        .is_finite());
+        assert!(!Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: f32::NAN
+        }
+        .is_finite());
+        assert!(!Vec3 {
+            x: f32::INFINITY,
+            y: 1.0,
+            z: 1.0
+        }
+        .is_finite());
+        assert!(!Vec3 {
+            x: 1.0,
+            y: f32::INFINITY,
+            z: 1.0
+        }
+        .is_finite());
+        assert!(!Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: f32::INFINITY
+        }
+        .is_finite());
+        assert!(Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0
+        }
+        .is_finite());
+    }
+
+    #[test]
+    fn test_lag_compensation_payload_origin_direction_finite() {
+        let valid_origin = Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let nan_origin = Vec3 {
+            x: f32::NAN,
+            y: 0.0,
+            z: 0.0,
+        };
+        let valid_dir = Vec3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let nan_dir = Vec3 {
+            x: 1.0,
+            y: f32::NAN,
+            z: 0.0,
+        };
+
+        // 1. Origin non-finite, direction finite
+        let mut buf1 = BytesMut::new();
+        buf1.put_u64_le(100);
+        nan_origin.encode(&mut buf1);
+        valid_dir.encode(&mut buf1);
+        buf1.put_f32_le(50.0);
+        buf1.put_u32_le(1);
+        assert!(matches!(
+            LagCompensationPayload::decode(&mut buf1.freeze()),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+
+        // 2. Origin finite, direction non-finite
+        let mut buf2 = BytesMut::new();
+        buf2.put_u64_le(100);
+        valid_origin.encode(&mut buf2);
+        nan_dir.encode(&mut buf2);
+        buf2.put_f32_le(50.0);
+        buf2.put_u32_le(1);
+        assert!(matches!(
+            LagCompensationPayload::decode(&mut buf2.freeze()),
+            Err(ClientCodecError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn test_entity_delta_batch_boundary_and_exact_buffer() {
+        // 1. Valid empty batch with 0 remaining bytes at end
+        let mut buf_empty = BytesMut::new();
+        put_varint_u64(&mut buf_empty, 10); // server_tick
+        put_varint_u64(&mut buf_empty, 5); // baseline_tick
+        put_varint_u32(&mut buf_empty, 0); // despawn_len = 0
+        put_varint_u32(&mut buf_empty, 0); // delta_len = 0
+        let decoded = EntityDeltaBatchPacket::decode(&mut buf_empty.freeze())
+            .expect("empty batch with 0 deltas and 0 remaining bytes must decode successfully");
+        assert_eq!(decoded.despawns.len(), 0);
+        assert_eq!(decoded.deltas.len(), 0);
+
+        // 2. Exactly matching despawn buffer (despawn_len = 2, 2 bytes remaining)
+        // Despawns succeed, then fails reading delta_len varint (expected 1, got 0)
+        let mut buf_despawn = BytesMut::new();
+        put_varint_u64(&mut buf_despawn, 10);
+        put_varint_u64(&mut buf_despawn, 5);
+        put_varint_u32(&mut buf_despawn, 2);
+        buf_despawn.put_u8(1);
+        buf_despawn.put_u8(2);
+        let err = EntityDeltaBatchPacket::decode(&mut buf_despawn.freeze())
+            .expect_err("should exhaust buffer when attempting to read delta_len");
+        match err {
+            ClientCodecError::BufferTooShort { expected, got } => {
+                assert_eq!(expected, 1);
+                assert_eq!(got, 0);
+            }
+            other => panic!("expected BufferTooShort on delta_len, got {other:?}"),
+        }
+
+        // 3. delta_len = 2, 5 remaining bytes (needs 2 * 3 = 6 bytes)
+        let mut buf_deltas = BytesMut::new();
+        put_varint_u64(&mut buf_deltas, 10);
+        put_varint_u64(&mut buf_deltas, 5);
+        put_varint_u32(&mut buf_deltas, 0);
+        put_varint_u32(&mut buf_deltas, 2);
+        buf_deltas.put_slice(&[0u8; 5]);
+        let err = EntityDeltaBatchPacket::decode(&mut buf_deltas.freeze())
+            .expect_err("should reject delta_len requiring more bytes than remaining");
+        match err {
+            ClientCodecError::BufferTooShort { expected, got } => {
+                assert_eq!(expected, 6);
+                assert_eq!(got, 5);
+            }
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_put_u16_str_multibyte_boundary_truncation() {
+        let prefix = "a".repeat(u16::MAX as usize - 1);
+        let s = format!("{}🦀", prefix);
+        let mut buf = BytesMut::new();
+        put_u16_str(&mut buf, &s);
+        let len = buf.get_u16_le() as usize;
+        assert_eq!(len, u16::MAX as usize - 1);
+        let body = std::str::from_utf8(&buf).expect("truncated string must be valid UTF-8");
+        assert_eq!(body, prefix);
+    }
+
+    #[test]
+    fn test_get_property_map_count_buffer_bounds() {
+        let mut buf = BytesMut::new();
+        put_varint_u32(&mut buf, 5); // count = 5 -> requires at least 10 bytes (5 * 2)
+        buf.put_slice(&[0u8; 8]); // only 8 bytes provided
+        let err = get_property_map(&mut buf.freeze())
+            .expect_err("should reject property map with count > remaining / 2");
+        match err {
+            ClientCodecError::BufferTooShort { expected, got } => {
+                assert_eq!(expected, 10);
+                assert_eq!(got, 8);
+            }
+            other => panic!("expected BufferTooShort(10, 8), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_place_object_packet_non_finite_fields() {
+        for field_idx in 0..10 {
+            let mut floats = [1.0f32; 10];
+            floats[field_idx] = f32::NAN;
+
+            let mut buf = BytesMut::new();
+            put_varint_u32(&mut buf, 42); // prefab_id
+            for f in floats {
+                buf.put_f32_le(f);
+            }
+            put_varint_u32(&mut buf, 0); // 0 properties
+
+            let err = PlaceObjectPacket::decode(&mut buf.freeze())
+                .expect_err(&format!("field {field_idx} as NaN must be rejected"));
+            assert!(matches!(err, ClientCodecError::InvalidData(_)));
+        }
+    }
 }

@@ -679,4 +679,16 @@ mod tests {
         let deleted_again = repo.delete_world_object(1, 102).await.unwrap();
         assert!(!deleted_again);
     }
+
+    #[tokio::test]
+    async fn test_world_repo_aliases() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = WorldObjectRepository::new(db);
+        let obj1 = sample_record(501, 0, 0, 0, 1);
+        let obj2 = sample_record(502, 0, 0, 0, 1);
+        repo.save_world_object(&obj1).await.unwrap();
+        repo.save_world_objects_batch(&[obj2]).await.unwrap();
+        let objs = repo.load_sector_objects(1, 0, 0, 0).await.unwrap();
+        assert_eq!(objs.len(), 2);
+    }
 }

@@ -61,13 +61,13 @@ impl MemoryCache {
     }
 }
 
+const MAX_TTL_SECS: u64 = 30 * 86400;
+
 #[async_trait]
 impl SessionCacheBackend for MemoryCache {
     async fn set_session(&self, data: &SessionData, ttl_secs: u64) -> Result<(), StorageError> {
-        let safe_ttl = ttl_secs.min(30 * 86400);
-        let expire = Instant::now()
-            .checked_add(Duration::from_secs(safe_ttl))
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30 * 86400));
+        let safe_ttl = ttl_secs.min(MAX_TTL_SECS);
+        let expire = Instant::now() + Duration::from_secs(safe_ttl);
         let mut map = self.sessions.write().await;
         map.insert(data.session_id, (data.clone(), expire));
         Ok(())
@@ -105,10 +105,8 @@ impl SessionCacheBackend for MemoryCache {
     }
 
     async fn stage_handover(&self, data: &HandoverData, ttl_secs: u64) -> Result<(), StorageError> {
-        let safe_ttl = ttl_secs.min(30 * 86400);
-        let expire = Instant::now()
-            .checked_add(Duration::from_secs(safe_ttl))
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30 * 86400));
+        let safe_ttl = ttl_secs.min(MAX_TTL_SECS);
+        let expire = Instant::now() + Duration::from_secs(safe_ttl);
         let mut map = self.handovers.write().await;
         map.insert(data.guid, (data.clone(), expire));
         Ok(())
