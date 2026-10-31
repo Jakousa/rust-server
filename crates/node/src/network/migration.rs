@@ -71,8 +71,9 @@ pub fn ingest_migrated_entity(
 
     let guid = Guid::from_raw(req.guid);
 
-    // 1. Remove from ghost store if previously mirrored as a ghost
+    // 1. Remove from ghost store and clear any local migration tombstone
     sim.ghost_store.remove(guid);
+    sim.tombstoned_entities.remove(&guid);
 
     // 2. Insert entity into EntityStore and Octree
     sim.entity_store.spawn(guid, target_pos);
@@ -222,7 +223,7 @@ pub async fn execute_entity_migration_pooled(
         sim_guard.release_migration_lease(guid);
         sim_guard.kinematic_states.remove(&guid);
         sim_guard.last_migration_ticks.remove(&guid);
-        sim_guard.session_epochs.remove(&guid);
+        sim_guard.tombstoned_entities.insert(guid);
         sim_guard.aoi.unregister_by_guid(guid);
         sim_guard.sectors.clear_rate_limit(guid);
         sim_guard.instances.remove_entity(guid);

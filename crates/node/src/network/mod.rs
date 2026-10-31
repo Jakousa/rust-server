@@ -1009,6 +1009,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_remote_ability_nan_position_rejected() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let sim = TickSimulation::new(1, bounds).into_shared();
+        let target_guid = Guid::new(EntityType::Player, 1, 103);
+        let caster_guid = Guid::new(EntityType::Player, 2, 204);
+
+        {
+            let mut s = sim.write().await;
+            s.spawn_entity(target_guid, (10.0, 0.0, 0.0));
+            let ent = s.entity_store.get_mut_by_guid(target_guid).unwrap();
+            let mut attrs = mmo_core::AttributeSet::new();
+            attrs.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+            ent.add_component(attrs);
+        }
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let req = RemoteAbilityRequest {
+            ability_id: 1,
+            caster_guid: caster_guid.raw(),
+            target_guid: target_guid.raw(),
+            source_node_id: 2,
+            target_node_id: 1,
+            caster_position: Some(Vector3 {
+                x: f32::NAN,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max_range: 30.0,
+            damage: 30,
+            healing: 0,
+            resource_cost: 10,
+            cast_id: 3,
+        };
+
+        let resp = service
+            .dispatch_ability(tonic::Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.success);
+        assert_eq!(
+            resp.error_code,
+            RemoteAbilityErrorCode::RemoteAbilityOutOfRange as i32
+        );
+        assert!(resp.error_message.contains("finite"));
+    }
+
+    #[tokio::test]
     async fn test_execute_remote_ability_target_dead_and_migrating() {
         let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
         let sim = TickSimulation::new(1, bounds).into_shared();
@@ -1630,5 +1678,74 @@ mod tests {
         assert!(s.entity_store.contains_guid(new_player));
         assert!(s.aoi.get_observer(3).is_some());
         assert_eq!(spawn_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_forward_client_packet_tombstone_prevents_duplicate_rehydration() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
+        let player = Guid::new(EntityType::Player, 1, 777);
+
+        let service = NodeServiceImpl::new(Arc::clone(&sim));
+
+        // 1. Initial hydration succeeds
+        let move_pkt =
+            mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
+                entity_id: player.raw(),
+                position: mmo_schema::client::Vec3::new(10.0, 0.0, 10.0),
+                velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                sequence: 1,
+                timestamp: 100,
+            });
+        let resp = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 10,
+                guid: player.raw(),
+                packet_data: move_pkt.encode(),
+                session_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+
+        // 2. Entity migrates / despawns cleanly from this node
+        {
+            let mut s = sim.write().await;
+            assert!(s.despawn_entity(player));
+            assert!(s.tombstoned_entities.contains(&player));
+            assert!(!s.entity_store.contains_guid(player));
+        }
+
+        // 3. Late in-flight movement packet arrives from the old session
+        let late_move_pkt =
+            mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
+                entity_id: player.raw(),
+                position: mmo_schema::client::Vec3::new(10.5, 0.0, 10.0),
+                velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                sequence: 2,
+                timestamp: 105,
+            });
+        let late_resp = service
+            .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+                session_id: 10,
+                guid: player.raw(),
+                packet_data: late_move_pkt.encode(),
+                session_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Late packet must be rejected and must NOT resurrect duplicate entity
+        assert!(!late_resp.success);
+        assert!(late_resp.error_message.contains("migrated or despawned"));
+
+        let s = sim.read().await;
+        assert!(!s.entity_store.contains_guid(player));
     }
 }

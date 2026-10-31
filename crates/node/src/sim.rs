@@ -43,6 +43,7 @@ pub struct TickSimulation {
     pub migrating_leases: HashMap<Guid, Instant>,
     pub last_migration_ticks: HashMap<Guid, u64>,
     pub session_epochs: HashMap<Guid, u64>,
+    pub tombstoned_entities: std::collections::HashSet<Guid>,
     pub current_time: Instant,
     pub last_tick_duration: Duration,
     pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
@@ -152,6 +153,7 @@ impl TickSimulation {
             migrating_leases: HashMap::new(),
             last_migration_ticks: HashMap::new(),
             session_epochs: HashMap::new(),
+            tombstoned_entities: std::collections::HashSet::new(),
             current_time: Instant::now(),
             last_tick_duration: Duration::from_millis(0),
             ack_sender,
@@ -683,6 +685,7 @@ impl TickSimulation {
         self.migrating_leases.remove(&guid);
         self.last_migration_ticks.remove(&guid);
         self.session_epochs.remove(&guid);
+        self.tombstoned_entities.insert(guid);
         self.aoi.unregister_by_guid(guid);
         self.sectors.clear_rate_limit(guid);
         self.instances.remove_entity(guid);
@@ -725,6 +728,7 @@ impl TickSimulation {
         saved_snapshot: Option<&mmo_storage::EntitySnapshot>,
         aoi_radius: f32,
     ) -> (f32, f32, f32) {
+        self.tombstoned_entities.remove(&guid);
         if !self.update_session_epoch(guid, session_epoch) {
             return self
                 .entity_store
@@ -1231,22 +1235,15 @@ impl TickSimulation {
         if !state.initialized {
             state.initialized = true;
             state.last_move_time = now;
+            state.time_credit = 0.2;
             return Self::TICK_DT_SEC;
         }
 
         let elapsed = now.duration_since(state.last_move_time).as_secs_f32();
         state.last_move_time = now;
+        state.time_credit = (state.time_credit + elapsed).min(0.2);
 
-        if elapsed > 1.0 {
-            // Idle gap clamping: prevent banking idle time
-            Self::TICK_DT_SEC
-        } else if elapsed < Self::TICK_DT_SEC {
-            // Jitter tolerance: packets arriving compressed by network buffer flushes
-            // floor to nominal tick duration per sequence increment, capped at 0.2s
-            (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2)
-        } else {
-            elapsed
-        }
+        (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2)
     }
 
     /// Validates and processes a client-reported movement packet with sequence monotonicity checking.
@@ -1273,17 +1270,13 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
-        // 2. Monotonic sequence check (if sequence is specified and entity was already initialized)
-        let seq_delta = if sequence > 0 {
-            if let Some(state) = self.kinematic_states.get(&guid) {
-                if state.initialized && sequence <= state.last_sequence {
+        // 2. Monotonic sequence check (all packets subject to monotonicity if entity was initialized)
+        let seq_delta = if let Some(state) = self.kinematic_states.get(&guid) {
+            if state.initialized {
+                if sequence <= state.last_sequence {
                     return Err(current_pos);
                 }
-                if state.initialized && state.last_sequence > 0 {
-                    sequence - state.last_sequence
-                } else {
-                    1
-                }
+                sequence - state.last_sequence
             } else {
                 1
             }
@@ -1291,8 +1284,31 @@ impl TickSimulation {
             1
         };
 
-        // 3. Compute server-authoritative delta time with sequence jitter tolerance
-        let dt_sec = self.compute_server_dt_with_seq(guid, seq_delta);
+        // 3. Compute server-authoritative delta time and verify replenishing time credit
+        let now = self.current_time;
+        let dt_nominal = (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2);
+        {
+            let state = self
+                .kinematic_states
+                .entry(guid)
+                .or_insert_with(|| EntityKinematicState::new(now));
+
+            if !state.initialized {
+                state.initialized = true;
+                state.last_move_time = now;
+                state.time_credit = 0.2;
+            } else {
+                let elapsed = now.duration_since(state.last_move_time).as_secs_f32();
+                state.last_move_time = now;
+                state.time_credit = (state.time_credit + elapsed).min(0.2);
+            }
+
+            if state.time_credit < dt_nominal {
+                // Rate limit packet bursts exceeding accumulated time credit without draining credit
+                return Err(current_pos);
+            }
+        }
+        let dt_sec = dt_nominal;
 
         // 4. Kinematic & Collision validation (speed caps, teleport threshold, NaN/Inf, dt bounds, obstacle collision)
         let kin_state = self.kinematic_states.get_mut(&guid);
@@ -1371,11 +1387,10 @@ impl TickSimulation {
         }
         self.octree.insert(guid, new_pos);
 
-        // 9. Update kinematic sequence
+        // 9. Update kinematic sequence and deduct consumed time credit
         if let Some(state) = self.kinematic_states.get_mut(&guid) {
-            if sequence > 0 {
-                state.last_sequence = sequence;
-            }
+            state.last_sequence = sequence;
+            state.time_credit = (state.time_credit - dt_nominal).max(0.0);
         }
 
         // 9.5. Update parent-child hierarchy
@@ -1432,7 +1447,12 @@ impl TickSimulation {
         new_pos: (f32, f32, f32),
         _client_dt_sec: f32,
     ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
-        self.process_client_move_with_seq(guid, new_pos, 0)
+        let next_seq = self
+            .kinematic_states
+            .get(&guid)
+            .map(|s| s.last_sequence.saturating_add(1))
+            .unwrap_or(1);
+        self.process_client_move_with_seq(guid, new_pos, next_seq)
     }
 
     /// Explicit deterministic move validation bypassing server monotonic clocks.
@@ -1865,7 +1885,7 @@ mod tests {
         // Out-of-order sequence = 0 (or smaller than 1) should be rejected
         assert_eq!(
             sim.process_client_move_with_seq(guid, replay_pos, 0),
-            Ok(replay_pos)
+            Err(pos1)
         );
 
         // Advance 50ms and send monotonic sequence = 2
@@ -1977,6 +1997,51 @@ mod tests {
         sim.advance_time(std::time::Duration::from_millis(1));
         let res2 = sim.process_client_move_with_seq(guid, (51.0, 50.0, 0.0), 2);
         assert_eq!(res2, Ok((51.0, 50.0, 0.0)));
+    }
+
+    #[test]
+    fn test_process_client_move_high_frequency_burst_rate_limiting() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let guid = Guid::new(EntityType::Player, 1, 994);
+        assert!(sim.spawn_entity(guid, (10.0, 10.0, 0.0)));
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        let mut current_x = 10.0;
+
+        // Client attempts 100 packets spaced 2ms apart (200ms total elapsed real time)
+        // Each packet attempts to advance by 0.5 units (at 10 m/s nominal speed)
+        for seq in 1..=100 {
+            sim.advance_time(std::time::Duration::from_millis(2));
+            let target_x = current_x + 0.5;
+            match sim.process_client_move_with_seq(guid, (target_x, 10.0, 0.0), seq) {
+                Ok(pos) => {
+                    accepted += 1;
+                    current_x = pos.0;
+                }
+                Err(_) => {
+                    rejected += 1;
+                }
+            }
+        }
+
+        // Over 200ms, with 0.2s initial burst credit + 0.2s elapsed = 0.4s total budget,
+        // at 0.05s per nominal step, at most 8 steps (4.0 units) can succeed.
+        assert!(
+            accepted <= 8,
+            "Expected <= 8 accepted packets, got {accepted}"
+        );
+        assert!(
+            rejected >= 92,
+            "Expected >= 92 rejected packets, got {rejected}"
+        );
+        let final_pos = sim.entity_store.get_by_guid(guid).unwrap().position;
+        assert!(
+            final_pos.0 <= 14.5,
+            "Final position x={:.2} exceeded bounded movement distance (14.5)",
+            final_pos.0
+        );
     }
 
     #[test]

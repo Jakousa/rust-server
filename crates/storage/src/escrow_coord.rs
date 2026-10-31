@@ -68,7 +68,8 @@ impl EscrowCoordinator {
     ) -> Result<EscrowRecord, StorageError> {
         let now_ms = current_time_ms();
         let now_secs = current_time_secs();
-        let expires_at_ms = now_ms + (ttl_seconds as i64 * 1000);
+        let ttl_seconds = ttl_seconds.min(30 * 86400);
+        let expires_at_ms = now_ms.saturating_add((ttl_seconds as i64).saturating_mul(1000));
         let secret_hash = hash_secret(secret);
 
         if item_instance_ids.is_empty() {

@@ -341,14 +341,22 @@ impl WebTransportServer {
                         let timeout = auth.auth_timeout();
                         let auth_fut = async {
                             loop {
-                                if let Ok(Some(pkt)) =
-                                    mmo_schema::client::ClientPacket::decode_frame(&mut buf)
-                                {
-                                    return Ok::<mmo_schema::client::ClientPacket, ()>(pkt);
+                                match mmo_schema::client::ClientPacket::decode_frame(&mut buf) {
+                                    Ok(Some(pkt)) => {
+                                        return Ok::<mmo_schema::client::ClientPacket, ()>(pkt);
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => return Err(()),
+                                }
+                                if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                    return Err(());
                                 }
                                 match recv_stream.read(&mut temp).await {
                                     Ok(Some(n)) if n > 0 => {
                                         buf.extend_from_slice(&temp[..n]);
+                                        if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                            return Err(());
+                                        }
                                     }
                                     _ => return Err(()),
                                 }

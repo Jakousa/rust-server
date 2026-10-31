@@ -610,6 +610,17 @@ impl NodeService for NodeServiceImpl {
                     }
 
                     if !sim.entity_store.contains_guid(guid) {
+                        if sim.tombstoned_entities.contains(&guid) {
+                            metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+                            return Ok(tonic::Response::new(ForwardClientPacketResponse {
+                                success: false,
+                                error_message: format!(
+                                    "Entity {} has migrated or despawned",
+                                    guid
+                                ),
+                            }));
+                        }
+
                         if guid.entity_type() == mmo_core::EntityType::Player {
                             let initial_snapshot = match &packet {
                                 mmo_schema::client::ClientPacket::Movement(m)
@@ -964,6 +975,16 @@ pub fn execute_remote_ability(
 
     // 3. Authoritative Range Re-Validation (Anti-Cheat / Anti-Stale Ghost)
     if let Some(pos) = caster_position {
+        if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
+            return RemoteAbilityResponse {
+                success: false,
+                error_code: RemoteAbilityErrorCode::RemoteAbilityOutOfRange as i32,
+                error_message: "Caster position coordinates must be finite".to_string(),
+                target_guid: target_guid.raw(),
+                current_health: 0,
+                cast_id,
+            };
+        }
         let caster_pos = mmo_core::Vec3::new(pos.x, pos.y, pos.z);
         let target_pos =
             mmo_core::Vec3::new(entity.position.0, entity.position.1, entity.position.2);
