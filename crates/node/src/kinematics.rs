@@ -155,6 +155,7 @@ pub struct EntityKinematicState {
     pub motion_mode: MotionMode,
     pub impulse_allowance: Option<ImpulseAllowance>,
     pub last_dt: f32,
+    pub time_credit: f32,
 }
 
 impl EntityKinematicState {
@@ -170,6 +171,7 @@ impl EntityKinematicState {
             motion_mode: MotionMode::DiscreteGround,
             impulse_allowance: None,
             last_dt: 0.05,
+            time_credit: 0.2,
         }
     }
 
