@@ -85,29 +85,121 @@ export function encodeInteraction(
 }
 
 /**
+ * Decodes an unsigned LEB128 64-bit integer from a DataView at given byte offset.
+ */
+export function readVarintU64(view, offset) {
+  let result = 0n;
+  let shift = 0n;
+  let bytesRead = 0;
+  while (offset + bytesRead < view.byteLength) {
+    const byte = view.getUint8(offset + bytesRead);
+    bytesRead++;
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      break;
+    }
+    shift += 7n;
+    if (shift >= 64n) break;
+  }
+  return { value: result, bytesRead };
+}
+
+/**
+ * Decodes an unsigned LEB128 32-bit integer from a DataView at given byte offset.
+ */
+export function readVarintU32(view, offset) {
+  let result = 0;
+  let shift = 0;
+  let bytesRead = 0;
+  while (offset + bytesRead < view.byteLength) {
+    const byte = view.getUint8(offset + bytesRead);
+    bytesRead++;
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      break;
+    }
+    shift += 7;
+    if (shift >= 35) break;
+  }
+  return { value: result >>> 0, bytesRead };
+}
+
+/**
+ * Reads a length-prefixed UTF-8 string from a DataView at given byte offset.
+ */
+export function readVarintString(view, offset) {
+  const { value: len, bytesRead: lenBytes } = readVarintU32(view, offset);
+  const start = offset + lenBytes;
+  if (start + len > view.byteLength) {
+    return { value: "", bytesRead: lenBytes };
+  }
+  const bytes = new Uint8Array(view.buffer, view.byteOffset + start, len);
+  const value = new TextDecoder().decode(bytes);
+  return { value, bytesRead: lenBytes + len };
+}
+
+/**
+ * Skips a serialized PropertyMap in a DataView at given byte offset.
+ */
+export function skipPropertyMap(view, offset) {
+  let curOffset = offset;
+  if (curOffset >= view.byteLength) return 0;
+  const { value: count, bytesRead } = readVarintU32(view, curOffset);
+  curOffset += bytesRead;
+  for (let i = 0; i < count; i++) {
+    if (curOffset >= view.byteLength) break;
+    const keyRes = readVarintString(view, curOffset);
+    curOffset += keyRes.bytesRead;
+    if (curOffset >= view.byteLength) break;
+    const tag = view.getUint8(curOffset);
+    curOffset += 1;
+    if (tag === 0) {
+      // Null
+    } else if (tag === 1) {
+      // Bool
+      curOffset += 1;
+    } else if (tag === 2) {
+      // Int
+      const v = readVarintU64(view, curOffset);
+      curOffset += v.bytesRead;
+    } else if (tag === 3) {
+      // Float
+      curOffset += 8;
+    } else if (tag === 4 || tag === 5) {
+      // String or Bytes
+      const s = readVarintString(view, curOffset);
+      curOffset += s.bytesRead;
+    }
+  }
+  return curOffset - offset;
+}
+
+/**
  * Encodes ClientPacket::Movement (Opcode 0x0001).
+ * Payload size: 52 bytes (60 bytes frame total) matching MovementPacket::decode.
  */
 export function encodeMovement(entityId, sample) {
-  const moveBuf = new Uint8Array(48);
+  const payloadLen = 52;
+  const moveBuf = new Uint8Array(8 + payloadLen);
   moveBuf[0] = 0x4d;
   moveBuf[1] = 0x4d;
-  moveBuf[2] = 0x01;
-  moveBuf[3] = 0x00;
-  moveBuf[4] = 0x28; // Payload len 40
-  moveBuf[5] = 0x00;
-  moveBuf[6] = 0x00;
-  moveBuf[7] = 0x00;
-
   const view = new DataView(moveBuf.buffer);
+  view.setUint16(2, OPCODES.MOVEMENT, true);
+  view.setUint32(4, payloadLen, true);
+
   view.setBigUint64(8, BigInt(entityId), true);
-  view.setFloat32(16, sample.x, true);
-  view.setFloat32(20, sample.y, true);
-  view.setFloat32(24, sample.z, true);
-  view.setFloat32(28, 0.0, true);
-  view.setFloat32(32, 0.0, true);
-  view.setFloat32(36, 0.0, true);
-  view.setFloat32(40, sample.yaw, true);
-  view.setFloat32(44, 0.0, true);
+  view.setFloat32(16, sample.x ?? 0.0, true);
+  view.setFloat32(20, sample.y ?? 0.0, true);
+  view.setFloat32(24, sample.z ?? 0.0, true);
+  view.setFloat32(28, sample.vx ?? 0.0, true);
+  view.setFloat32(32, sample.vy ?? 0.0, true);
+  view.setFloat32(36, sample.vz ?? 0.0, true);
+  view.setFloat32(40, sample.yaw ?? 0.0, true);
+  view.setFloat32(44, sample.pitch ?? 0.0, true);
+  const timestamp = sample.timestamp != null ? BigInt(sample.timestamp) : BigInt(Date.now());
+  view.setBigUint64(48, timestamp, true);
+  const sequence = (sample.sequence ?? 0) >>> 0;
+  view.setUint32(56, sequence, true);
 
   return moveBuf;
 }

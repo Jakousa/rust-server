@@ -71,11 +71,12 @@ export class WorldObjectRenderer {
     const STRIDE = 16;
     const count = Math.floor(buffer.length / STRIDE);
     const activeIds = new Set();
+    const uint32View = new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.length);
 
     for (let i = 0; i < count; i++) {
       const offset = i * STRIDE;
-      const lo = BigInt(Math.round(buffer[offset]));
-      const hi = BigInt(Math.round(buffer[offset + 15]));
+      const lo = BigInt(uint32View[offset]);
+      const hi = BigInt(uint32View[offset + 15]);
       const objectId = (hi << 32n) | lo;
       const prefabId = Number(buffer[offset + 1]);
       const x = buffer[offset + 2];

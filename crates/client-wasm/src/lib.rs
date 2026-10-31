@@ -428,8 +428,8 @@ impl WasmClientWorld {
         let mut buffer = Vec::with_capacity(self.entities.len() * 9);
 
         for replica in self.entities.values() {
-            buffer.push((replica.entity_id & 0xFFFF_FFFF) as f32);
-            buffer.push((replica.entity_id >> 32) as f32);
+            buffer.push(f32::from_bits((replica.entity_id & 0xFFFF_FFFF) as u32));
+            buffer.push(f32::from_bits((replica.entity_id >> 32) as u32));
             buffer.push(replica.position.0);
             buffer.push(replica.position.1);
             buffer.push(replica.position.2);
@@ -630,8 +630,8 @@ mod tests {
         // Check render buffer layout
         let render_buf = world.get_render_buffer();
         assert_eq!(render_buf.len(), 9);
-        assert_eq!(render_buf[0], (mob_guid & 0xFFFF_FFFF) as f32);
-        assert_eq!(render_buf[1], (mob_guid >> 32) as f32);
+        assert_eq!(render_buf[0].to_bits(), (mob_guid & 0xFFFF_FFFF) as u32);
+        assert_eq!(render_buf[1].to_bits(), (mob_guid >> 32) as u32);
         assert_eq!(render_buf[6], 0.75); // 75 / 100 HP
 
         // Check movement encoding
@@ -751,7 +751,7 @@ mod tests {
 
         let buf = world.get_world_objects_render_buffer();
         assert_eq!(buf.len(), 16);
-        assert_eq!(buf[0], 5001.0);
+        assert_eq!(buf[0].to_bits(), 5001);
         assert_eq!(buf[1], 10.0);
         assert_eq!(buf[2], 25.0);
         assert_eq!(buf[13], 1.0); // 100 / 100 HP
@@ -1000,8 +1000,9 @@ mod tests {
     #[test]
     fn test_64bit_guid_fidelity_in_render_buffer() {
         let mut world = WasmClientWorld::new();
-        let guid_1 = (1u64 << 48) | (1u64 << 32) | 1u64;
-        let guid_2 = (1u64 << 48) | (1u64 << 32) | 2u64;
+        // Values exceeding 2^24 (16,777,216) in both lower and upper 32-bit halves
+        let guid_1 = (0xDEAD_BEEFu64 << 32) | 0xCAFE_BABEu64;
+        let guid_2 = (0x1234_5678u64 << 32) | 0x8765_4321u64;
 
         let state_1 = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
             entity_id: guid_1,
@@ -1037,9 +1038,9 @@ mod tests {
         assert!(guids.contains(&guid_1));
         assert!(guids.contains(&guid_2));
 
-        // Reconstruct both 64-bit GUIDs from render buffer
-        let rec_0 = ((buf[1] as u64) << 32) | (buf[0] as u64);
-        let rec_1 = ((buf[10] as u64) << 32) | (buf[9] as u64);
+        // Reconstruct both 64-bit GUIDs from render buffer via bit-reinterpretation
+        let rec_0 = ((buf[1].to_bits() as u64) << 32) | (buf[0].to_bits() as u64);
+        let rec_1 = ((buf[10].to_bits() as u64) << 32) | (buf[9].to_bits() as u64);
 
         let mut rec_ids = vec![rec_0, rec_1];
         rec_ids.sort_unstable();
@@ -1047,8 +1048,8 @@ mod tests {
         expected_ids.sort_unstable();
         assert_eq!(rec_ids, expected_ids);
 
-        // Lower halves in index 0 and 9 MUST NOT be equal (counter 1 vs 2)
-        assert_ne!(buf[0], buf[9]);
+        // Lower halves in index 0 and 9 MUST NOT be equal
+        assert_ne!(buf[0].to_bits(), buf[9].to_bits());
     }
 
     #[test]
