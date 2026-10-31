@@ -221,11 +221,13 @@ pub fn cast_cross_partition_ability(
         }
 
         // Apply effect directly to local target
+        let resolver = sim.combat_resolver.clone();
         let target_ent = sim
             .entity_store
             .get_mut_by_guid(target_guid)
             .ok_or("Target not found")?;
-        crate::combat_pipeline::apply_combat_effect(
+        crate::combat_pipeline::apply_combat_effect_with_resolver(
+            resolver.as_ref(),
             target_ent,
             target_guid,
             Some(caster_guid),
@@ -425,9 +427,11 @@ pub fn cast_boundary_sphere_aoe(
 
     // 4. Commit local hits immediately
     let mut local_hit_count = 0;
+    let resolver = sim.combat_resolver.clone();
     for local_cand in &targeting.local_targets {
         if let Some(target_ent) = sim.entity_store.get_mut_by_guid(local_cand.guid) {
-            if crate::combat_pipeline::apply_combat_effect(
+            if crate::combat_pipeline::apply_combat_effect_with_resolver(
+                resolver.as_ref(),
                 target_ent,
                 local_cand.guid,
                 Some(caster_guid),

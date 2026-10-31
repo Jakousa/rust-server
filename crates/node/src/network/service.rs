@@ -722,7 +722,8 @@ pub fn execute_remote_ability(
     }
 
     // 4. Alive check & Apply effects via unified combat pipeline
-    let outcome = match crate::combat_pipeline::apply_combat_effect(
+    let outcome = match crate::combat_pipeline::apply_combat_effect_with_resolver(
+        sim.combat_resolver.as_ref(),
         entity,
         target_guid,
         Some(caster_guid),

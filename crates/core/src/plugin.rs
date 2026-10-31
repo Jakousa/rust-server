@@ -379,6 +379,7 @@ pub struct PluginContext<'a> {
     pub event_queue: &'a mut EventQueue,
     pub packets: &'a mut ModularPacketRouter,
     pub tick_systems: &'a mut Vec<Box<dyn TickSystem>>,
+    pub combat_resolver: &'a mut Option<Arc<dyn crate::combat::CombatResolver>>,
 }
 
 /// Trait defining a standalone, decoupled gameplay plugin.
@@ -414,6 +415,7 @@ impl PluginManager {
         event_queue: &mut EventQueue,
         packets: &mut ModularPacketRouter,
         tick_systems: &mut Vec<Box<dyn TickSystem>>,
+        combat_resolver: &mut Option<Arc<dyn crate::combat::CombatResolver>>,
     ) {
         let mut ctx = PluginContext {
             hooks,
@@ -421,6 +423,7 @@ impl PluginManager {
             event_queue,
             packets,
             tick_systems,
+            combat_resolver,
         };
 
         for plugin in &self.plugins {
@@ -551,6 +554,7 @@ mod tests {
         let mut event_queue = EventQueue::new();
         let mut packets = ModularPacketRouter::new();
         let mut tick_systems = Vec::new();
+        let mut combat_resolver = None;
 
         manager.build_all(
             &mut hooks,
@@ -558,6 +562,7 @@ mod tests {
             &mut event_queue,
             &mut packets,
             &mut tick_systems,
+            &mut combat_resolver,
         );
 
         let mut store = ComponentStore::new();

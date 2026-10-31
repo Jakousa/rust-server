@@ -37,6 +37,7 @@ use mmo_storage::cache::{SessionCacheBackend, SessionData};
 use mmo_storage::db::StorageError;
 
 use crate::backhaul::BackhaulPool;
+use crate::interceptor::EdgePacketInterceptor;
 use crate::marketplace::GatewayMarketplaceService;
 use crate::quic::{create_quic_server, generate_self_signed_cert, QuicTransportError};
 use crate::router::SessionRouter;
@@ -118,6 +119,7 @@ pub struct GatewayServer {
     authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
     default_node_address: Option<String>,
     subscription_manager: Arc<GatewaySubscriptionManager>,
+    interceptors: Vec<Arc<dyn EdgePacketInterceptor>>,
     marketplace_service: Option<Arc<GatewayMarketplaceService>>,
     active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     handshake_timeout: Option<Duration>,
@@ -140,6 +142,7 @@ impl GatewayServer {
             authenticator: None,
             default_node_address: None,
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
+            interceptors: Vec::new(),
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
@@ -165,6 +168,7 @@ impl GatewayServer {
             authenticator: None,
             default_node_address: None,
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
+            interceptors: Vec::new(),
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
@@ -281,7 +285,14 @@ impl GatewayServer {
 
     /// Configures an asynchronous marketplace service operating at the edge gateway.
     pub fn with_marketplace(mut self, marketplace_service: Arc<GatewayMarketplaceService>) -> Self {
+        self.interceptors.push(marketplace_service.clone());
         self.marketplace_service = Some(marketplace_service);
+        self
+    }
+
+    /// Registers a generic edge packet interceptor consulted before packets are routed to nodes.
+    pub fn with_interceptor(mut self, interceptor: Arc<dyn EdgePacketInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
         self
     }
 
@@ -300,7 +311,7 @@ impl GatewayServer {
         GatewayInterceptHandler {
             router: self.router.clone(),
             subscription_manager: self.subscription_manager.clone(),
-            marketplace_service: self.marketplace_service.clone(),
+            interceptors: self.interceptors.clone(),
             social_bus: self.social_bus.clone(),
             session_sinks: self.session_sinks.clone(),
             active_bus_subscriptions: self.active_bus_subscriptions.clone(),

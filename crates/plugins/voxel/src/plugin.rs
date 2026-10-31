@@ -256,6 +256,7 @@ mod tests {
         let mut event_queue = EventQueue::new();
         let mut packets = ModularPacketRouter::new();
         let mut tick_systems = Vec::new();
+        let mut combat_resolver = None;
 
         manager.build_all(
             &mut hooks,
@@ -263,6 +264,7 @@ mod tests {
             &mut event_queue,
             &mut packets,
             &mut tick_systems,
+            &mut combat_resolver,
         );
 
         assert!(packets.has_module(VOXEL_MODULE_ID));

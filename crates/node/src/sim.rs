@@ -58,6 +58,7 @@ pub struct TickSimulation {
     pub snapshot_interval_ticks: u64,
     pub history: crate::history::SpatialHistoryBuffer,
     pub script_reloader: Option<Arc<dyn mmo_core::script::ScriptReloadable>>,
+    pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
 }
 
 /// Ingress packet queued from a gateway client session, drained at tick boundaries.
@@ -188,6 +189,7 @@ impl TickSimulation {
             snapshot_interval_ticks: 20,
             history: crate::history::SpatialHistoryBuffer::default(),
             script_reloader: None,
+            combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
         }
     }
 
@@ -961,13 +963,28 @@ impl TickSimulation {
 
     /// Initializes and builds all registered plugins.
     pub fn init_plugins(&mut self) {
+        let mut combat_resolver_opt = None;
         self.plugin_manager.build_all(
             &mut self.hooks,
             &mut self.codecs,
             &mut self.event_queue,
             &mut self.packets,
             &mut self.tick_systems,
+            &mut combat_resolver_opt,
         );
+        if let Some(resolver) = combat_resolver_opt {
+            self.combat_resolver = resolver;
+        }
+    }
+
+    /// Sets the combat resolver for this simulation node.
+    pub fn set_combat_resolver(&mut self, resolver: Arc<dyn mmo_core::combat::CombatResolver>) {
+        self.combat_resolver = resolver;
+    }
+
+    /// Returns a reference to the active combat resolver.
+    pub fn combat_resolver(&self) -> &Arc<dyn mmo_core::combat::CombatResolver> {
+        &self.combat_resolver
     }
 
     /// Attaches a script hot-reloader coordinator to this simulation node.

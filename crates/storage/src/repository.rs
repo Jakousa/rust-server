@@ -305,7 +305,6 @@ impl CharacterRepository {
                     timestamp = excluded.timestamp
                 WHERE excluded.version >= entity_snapshots.version
                 "#);
-
             for chunk in snapshots.chunks(50) {
                 // A multi-row upsert cannot touch the same key twice (PostgreSQL rejects it),
                 // so collapse duplicate GUIDs: highest version wins, later entry wins ties.
@@ -343,21 +342,6 @@ impl CharacterRepository {
                 qb.push(" ");
                 qb.push(conflict_sql.as_ref());
                 qb.build().execute(&mut *conn).await?;
-
-                // Mirror latest position into `characters` with one batched UPDATE ... FROM VALUES.
-                let mut cb = sqlx::QueryBuilder::new(
-                    "WITH v(guid, pos_x, pos_y, pos_z, rotation, updated_at) AS (",
-                );
-                cb.push_values(rows.iter(), |mut b, (snap, _)| {
-                    b.push_bind(snap.guid as i64)
-                        .push_bind(snap.position.0)
-                        .push_bind(snap.position.1)
-                        .push_bind(snap.position.2)
-                        .push_bind(snap.rotation)
-                        .push_bind(snap.timestamp as i64);
-                });
-                cb.push(") UPDATE characters SET pos_x = v.pos_x, pos_y = v.pos_y, pos_z = v.pos_z, rotation = v.rotation, updated_at = v.updated_at FROM v WHERE characters.guid = v.guid");
-                cb.build().execute(&mut *conn).await?;
             }
 
             Ok(snapshots.len())
@@ -910,6 +894,37 @@ mod tests {
         assert_eq!(loaded_v2.position, (10.0, 20.0, 30.0));
         assert_eq!(loaded_v2.version, 2);
         assert_eq!(loaded_v2.state_blob, Some(vec![4, 5, 6]));
+    }
+
+    #[tokio::test]
+    async fn test_save_snapshot_batch_non_character_entities() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+
+        // Batch persist snapshots for entity GUIDs that do NOT exist in characters table
+        let world_obj_snap = EntitySnapshot {
+            guid: 9001,
+            position: (100.0, 50.0, -20.0),
+            rotation: 0.5,
+            attributes: serde_json::json!({"durability": 500}),
+            state_blob: Some(vec![10, 20, 30]),
+            version: 1,
+            timestamp: 5000,
+        };
+
+        let count = repo
+            .save_snapshot_batch(&[world_obj_snap])
+            .await
+            .expect("Saving snapshot batch for non-character entities must succeed");
+        assert_eq!(count, 1);
+
+        let retrieved = repo.get_snapshot(9001).await.unwrap().unwrap();
+        assert_eq!(retrieved.position, (100.0, 50.0, -20.0));
+        assert_eq!(retrieved.attributes["durability"], 500);
+
+        // Verify that no row was created in characters table
+        let char_lookup = repo.get_character(9001).await.unwrap();
+        assert!(char_lookup.is_none());
     }
 
     #[tokio::test]
