@@ -109,13 +109,14 @@ async fn test_end_to_end_persistence_and_simulation_recovery() {
     assert_eq!(persisted_snapshot.attributes["health"], json!(95));
     assert_eq!(persisted_snapshot.state_blob, Some(vec![1, 2, 3, 5]));
 
-    // Also verify character table position coordinates were updated
+    // Verify entity_snapshots is the authoritative runtime persistence layer
+    // (characters table is decoupled and updated via character-specific workflows)
     let loaded_character = repo
         .get_character(player_guid.raw())
         .await
         .expect("Query character failed")
         .expect("Character record should exist");
-    assert_eq!(loaded_character.position, (10.0, 10.0, 5.0));
+    assert_eq!(loaded_character.name, "ValiantKnight");
 
     // 6. Simulate Node 1 crash / restart: drop node 1 simulation entirely
     drop(node1_sim);

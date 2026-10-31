@@ -1,6 +1,7 @@
 pub mod action;
 pub mod attribute;
 pub mod collision;
+pub mod combat;
 pub mod container;
 pub mod entity;
 pub mod guid;
@@ -17,6 +18,7 @@ pub mod world;
 pub use collision::{
     AabbCollisionWorld, CollisionWorld, EmptyCollisionWorld, RayHit, SpatialQueryFilter, SweepHit,
 };
+pub use combat::{CombatEffectOutcome, CombatResolver};
 
 pub use action::{
     resolve_boundary_sphere_aoe, AbilityDefinition, AbilityTickSystem, ActionCompletedEvent,

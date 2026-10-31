@@ -307,12 +307,6 @@ impl CharacterRepository {
                     timestamp = excluded.timestamp
                 WHERE excluded.version >= entity_snapshots.version
                 "#);
-            let char_query = q!(r#"
-                UPDATE characters
-                SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
-                WHERE guid = ?
-                "#);
-
             for chunk in snapshots.chunks(50) {
                 for snap in chunk {
                     let attrs_str = serde_json::to_string(&snap.attributes)?;
@@ -326,16 +320,6 @@ impl CharacterRepository {
                         .bind(snap.state_blob.as_deref())
                         .bind(snap.version as i64)
                         .bind(snap.timestamp as i64)
-                        .execute(&mut *conn)
-                        .await?;
-
-                    sqlx::query(&char_query)
-                        .bind(snap.position.0)
-                        .bind(snap.position.1)
-                        .bind(snap.position.2)
-                        .bind(snap.rotation)
-                        .bind(snap.timestamp as i64)
-                        .bind(snap.guid as i64)
                         .execute(&mut *conn)
                         .await?;
                 }
@@ -891,6 +875,37 @@ mod tests {
         assert_eq!(loaded_v2.position, (10.0, 20.0, 30.0));
         assert_eq!(loaded_v2.version, 2);
         assert_eq!(loaded_v2.state_blob, Some(vec![4, 5, 6]));
+    }
+
+    #[tokio::test]
+    async fn test_save_snapshot_batch_non_character_entities() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db);
+
+        // Batch persist snapshots for entity GUIDs that do NOT exist in characters table
+        let world_obj_snap = EntitySnapshot {
+            guid: 9001,
+            position: (100.0, 50.0, -20.0),
+            rotation: 0.5,
+            attributes: serde_json::json!({"durability": 500}),
+            state_blob: Some(vec![10, 20, 30]),
+            version: 1,
+            timestamp: 5000,
+        };
+
+        let count = repo
+            .save_snapshot_batch(&[world_obj_snap])
+            .await
+            .expect("Saving snapshot batch for non-character entities must succeed");
+        assert_eq!(count, 1);
+
+        let retrieved = repo.get_snapshot(9001).await.unwrap().unwrap();
+        assert_eq!(retrieved.position, (100.0, 50.0, -20.0));
+        assert_eq!(retrieved.attributes["durability"], 500);
+
+        // Verify that no row was created in characters table
+        let char_lookup = repo.get_character(9001).await.unwrap();
+        assert!(char_lookup.is_none());
     }
 
     #[tokio::test]

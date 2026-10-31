@@ -4,7 +4,7 @@ use mmo_schema::client::ClientPacket;
 use std::sync::Arc;
 
 use super::sink::SessionSink;
-use crate::marketplace::GatewayMarketplaceService;
+use crate::interceptor::{EdgeInterceptOutcome, EdgePacketInterceptor};
 use crate::router::SessionRouter;
 use crate::social::GatewaySubscriptionManager;
 
@@ -12,7 +12,7 @@ use crate::social::GatewaySubscriptionManager;
 pub struct GatewayInterceptHandler {
     pub router: Arc<SessionRouter>,
     pub subscription_manager: Arc<GatewaySubscriptionManager>,
-    pub marketplace_service: Option<Arc<GatewayMarketplaceService>>,
+    pub interceptors: Vec<Arc<dyn EdgePacketInterceptor>>,
     pub social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
     pub session_sinks: Arc<DashMap<u64, SessionSink>>,
     pub active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
@@ -23,7 +23,7 @@ impl GatewayInterceptHandler {
     pub fn new(
         router: Arc<SessionRouter>,
         subscription_manager: Arc<GatewaySubscriptionManager>,
-        marketplace_service: Option<Arc<GatewayMarketplaceService>>,
+        interceptors: Vec<Arc<dyn EdgePacketInterceptor>>,
         social_bus: Option<Arc<dyn mmo_storage::SocialBus>>,
         session_sinks: Arc<DashMap<u64, SessionSink>>,
         active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
@@ -31,7 +31,7 @@ impl GatewayInterceptHandler {
         Self {
             router,
             subscription_manager,
-            marketplace_service,
+            interceptors,
             social_bus,
             session_sinks,
             active_bus_subscriptions,
@@ -137,7 +137,7 @@ impl GatewayInterceptHandler {
         }
     }
 
-    /// Attempts to intercept and process a packet if it belongs to social pub/sub or marketplace.
+    /// Attempts to intercept and process a packet if it belongs to social pub/sub or a registered [`EdgePacketInterceptor`].
     ///
     /// Returns `true` if intercepted (do not route to simulation node), `false` otherwise.
     pub async fn handle_packet(&self, session_id: u64, packet: &ClientPacket) -> bool {
@@ -268,91 +268,20 @@ impl GatewayInterceptHandler {
                 self.subscription_manager.unsubscribe(session_id, &topic);
                 true
             }
-            ClientPacket::MarketListRequest(req) => {
+            _ => {
                 let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
-                let resp = match (player_guid, &self.marketplace_service) {
-                    (Some(guid), Some(service)) => service.handle_list(guid, req.clone()).await,
-                    (None, _) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 1,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
-                        error_message: "Unauthenticated session".to_string(),
-                        listings: Vec::new(),
-                    },
-                    (_, None) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 1,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
-                        error_message: "Marketplace service unavailable".to_string(),
-                        listings: Vec::new(),
-                    },
-                };
-                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
-                true
+                for interceptor in &self.interceptors {
+                    match interceptor.intercept(player_guid, packet).await {
+                        EdgeInterceptOutcome::Pass => continue,
+                        EdgeInterceptOutcome::Handled => return true,
+                        EdgeInterceptOutcome::Respond(resp) => {
+                            self.send_packet_to_session(session_id, &resp);
+                            return true;
+                        }
+                    }
+                }
+                false
             }
-            ClientPacket::MarketBuyRequest(req) => {
-                let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
-                let resp = match (player_guid, &self.marketplace_service) {
-                    (Some(guid), Some(service)) => service.handle_buy(guid, req.clone()).await,
-                    (None, _) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 2,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
-                        error_message: "Unauthenticated session".to_string(),
-                        listings: Vec::new(),
-                    },
-                    (_, None) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 2,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
-                        error_message: "Marketplace service unavailable".to_string(),
-                        listings: Vec::new(),
-                    },
-                };
-                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
-                true
-            }
-            ClientPacket::MarketCancelRequest(req) => {
-                let player_guid = self.router.get_guid_by_session(session_id).map(|g| g.raw());
-                let resp = match (player_guid, &self.marketplace_service) {
-                    (Some(guid), Some(service)) => service.handle_cancel(guid, req.clone()).await,
-                    (None, _) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 3,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
-                        error_message: "Unauthenticated session".to_string(),
-                        listings: Vec::new(),
-                    },
-                    (_, None) => mmo_schema::client::MarketResponsePacket {
-                        request_type: 3,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
-                        error_message: "Marketplace service unavailable".to_string(),
-                        listings: Vec::new(),
-                    },
-                };
-                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
-                true
-            }
-            ClientPacket::MarketQueryRequest(req) => {
-                let resp = match &self.marketplace_service {
-                    Some(service) => service.handle_query(req.clone()).await,
-                    None => mmo_schema::client::MarketResponsePacket {
-                        request_type: 4,
-                        success: false,
-                        error_code: mmo_schema::client::market_error_codes::INTERNAL_ERROR,
-                        error_message: "Marketplace service unavailable".to_string(),
-                        listings: Vec::new(),
-                    },
-                };
-                self.send_packet_to_session(session_id, &ClientPacket::MarketResponse(resp));
-                true
-            }
-            ClientPacket::MarketResponse(_) => {
-                // Intercept and drop any unsolicited MarketResponse from client
-                true
-            }
-            _ => false,
         }
     }
 }
@@ -383,7 +312,7 @@ mod tests {
         let handler = GatewayInterceptHandler::new(
             router.clone(),
             subscription_manager.clone(),
-            None,
+            Vec::new(),
             None,
             session_sinks.clone(),
             active_bus_subscriptions,
@@ -612,7 +541,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_market_requests_unauthenticated_and_unavailable_errors() {
-        let (handler, _router, _sub_mgr, sinks) = create_test_handler();
+        let (mut handler, _router, _sub_mgr, sinks) = create_test_handler();
+        let db = mmo_storage::Database::connect_memory().await.unwrap();
+        let repo = Arc::new(mmo_storage::MarketplaceRepository::new(db));
+        handler.interceptors.push(Arc::new(
+            crate::marketplace::GatewayMarketplaceService::new(repo),
+        ));
         let s1 = 42u64;
         let (stx, mut srx) = mpsc::channel(16);
         let (dtx, _drx) = mpsc::channel(16);
@@ -672,7 +606,7 @@ mod tests {
             other => panic!("expected MarketResponse, got {other:?}"),
         }
 
-        // 4. MarketQueryRequest with service None -> INTERNAL_ERROR
+        // 4. MarketQueryRequest is answered by the registered interceptor
         let query_pkt = ClientPacket::MarketQueryRequest(MarketQueryRequestPacket {
             item_def_id: 1,
             min_price: 10,
@@ -686,10 +620,13 @@ mod tests {
         match resp {
             ClientPacket::MarketResponse(m) => {
                 assert_eq!(m.request_type, 4);
-                assert_eq!(m.error_code, market_error_codes::INTERNAL_ERROR);
             }
             other => panic!("expected MarketResponse, got {other:?}"),
         }
+
+        // 4b. Without any registered interceptor, market packets are forwarded untouched
+        let (bare, _r, _s, _k) = create_test_handler();
+        assert!(!bare.handle_packet(s1, &query_pkt).await);
 
         // 5. Unsolicited MarketResponse from client intercepted & dropped
         let unsolicited = ClientPacket::MarketResponse(MarketResponsePacket {

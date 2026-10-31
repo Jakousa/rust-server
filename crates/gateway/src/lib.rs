@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod backhaul;
 pub mod handover;
+pub mod interceptor;
 pub mod marketplace;
 pub mod probe;
 pub mod quic;
@@ -17,6 +18,7 @@ pub mod webtransport;
 pub use auth::{AuthError, AuthResult, EdgeAuthenticator, JwtClaims, TokenValidator};
 pub use backhaul::{BackhaulChannel, BackhaulError, BackhaulPool, BackhaulState};
 pub use handover::{HandoverError, HandoverRateLimiter, HandoverTicket};
+pub use interceptor::{EdgeInterceptOutcome, EdgePacketInterceptor, InterceptFuture};
 pub use marketplace::GatewayMarketplaceService;
 pub use social::GatewaySubscriptionManager;
 

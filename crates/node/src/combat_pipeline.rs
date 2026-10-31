@@ -1,31 +1,158 @@
 //! Unified combat effect and damage mitigation pipeline for local and remote abilities.
 
+pub use mmo_core::combat::{CombatEffectOutcome, CombatResolver};
 use mmo_core::entity::state_flags;
 use mmo_core::plugin::EntityIncapacitatedEvent;
-use mmo_core::{
-    canonical_id_for_name, ActionQueue, AttributeId, AttributeSet, Entity, EventQueue, Guid,
-    InterruptReason,
-};
+use mmo_core::{ActionQueue, AttributeId, AttributeSet, Entity, EventQueue, Guid, InterruptReason};
 
-/// Outcome report of applying combat damage or healing to an entity.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CombatEffectOutcome {
-    /// Resulting health points of the target entity.
-    pub current_health: u32,
-    /// Damage applied after mitigation.
-    pub effective_damage: f32,
-    /// Healing applied.
-    pub effective_healing: f32,
-    /// Whether the target entity transitioned from alive to dead.
-    pub died: bool,
+/// Default unopinionated combat resolver applying direct primary vitality changes without genre curves.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultCombatResolver;
+
+impl CombatResolver for DefaultCombatResolver {
+    fn resolve_combat_effect(
+        &self,
+        target_ent: &mut Entity,
+        target_guid: Guid,
+        caster_guid: Option<Guid>,
+        damage: u32,
+        healing: u32,
+        event_queue: &mut EventQueue,
+    ) -> Result<CombatEffectOutcome, &'static str> {
+        if target_ent.is_incapacitated() {
+            return Err("Target entity is dead");
+        }
+
+        let mut current_health = 0u32;
+        let effective_damage = damage as f32;
+        let mut effective_healing = 0.0f32;
+        let mut died = false;
+
+        if damage > 0 {
+            if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
+                let res = attrs
+                    .modify_current("vitality", -effective_damage)
+                    .or_else(|_| attrs.modify_current("health", -effective_damage));
+
+                if let Ok(new_hp) = res {
+                    current_health = new_hp.round().max(0.0) as u32;
+                    if new_hp <= 0.0 || current_health == 0 {
+                        died = true;
+                        target_ent.state_flags |= state_flags::INCAPACITATED;
+                    }
+                }
+            } else if let Some(v) = target_ent
+                .properties
+                .get("vitality")
+                .or_else(|| target_ent.properties.get("health"))
+                .and_then(|v| v.as_i64())
+            {
+                let new_hp = (v as f32 - effective_damage).max(0.0);
+                current_health = new_hp.round() as u32;
+                if target_ent.properties.get("vitality").is_some() {
+                    target_ent.properties.set("vitality", new_hp as i64);
+                } else {
+                    target_ent.properties.set("health", new_hp as i64);
+                }
+                if new_hp <= 0.0 || current_health == 0 {
+                    died = true;
+                    target_ent.state_flags |= state_flags::INCAPACITATED;
+                }
+            }
+
+            if died {
+                event_queue.push(EntityIncapacitatedEvent {
+                    entity: target_guid,
+                    instigator: caster_guid,
+                });
+            }
+
+            // Interrupt active action if configured with cancel_on_damage
+            if let Some(queue) = target_ent.components.get_component_mut::<ActionQueue>() {
+                let should_interrupt = queue
+                    .current()
+                    .map(|a| a.interrupt_flags.cancel_on_damage)
+                    .unwrap_or(false);
+                if should_interrupt {
+                    queue.interrupt(target_guid, InterruptReason::Damage, event_queue);
+                }
+            }
+        } else if healing > 0 {
+            effective_healing = healing as f32;
+            if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
+                let res = attrs
+                    .modify_current("vitality", effective_healing)
+                    .or_else(|_| attrs.modify_current("health", effective_healing));
+
+                if let Ok(new_hp) = res {
+                    current_health = new_hp.round() as u32;
+                }
+            } else if let Some(v) = target_ent
+                .properties
+                .get("vitality")
+                .or_else(|| target_ent.properties.get("health"))
+                .and_then(|v| v.as_i64())
+            {
+                let max_hp = target_ent
+                    .properties
+                    .get("max_vitality")
+                    .or_else(|| target_ent.properties.get("max_health"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(100);
+                let new_hp = (v + healing as i64).min(max_hp);
+                current_health = new_hp as u32;
+                if target_ent.properties.get("vitality").is_some() {
+                    target_ent.properties.set("vitality", new_hp);
+                } else {
+                    target_ent.properties.set("health", new_hp);
+                }
+            }
+        } else if let Some(attrs) = target_ent.components.get_component::<AttributeSet>() {
+            current_health = attrs
+                .get_current_by_id(AttributeId::PRIMARY_VITALITY)
+                .or_else(|| attrs.get_current("vitality"))
+                .or_else(|| attrs.get_current("health"))
+                .unwrap_or(0.0)
+                .round() as u32;
+        } else if let Some(v) = target_ent
+            .properties
+            .get("vitality")
+            .or_else(|| target_ent.properties.get("health"))
+            .and_then(|v| v.as_i64())
+        {
+            current_health = v as u32;
+        }
+
+        Ok(CombatEffectOutcome {
+            current_health,
+            effective_damage,
+            effective_healing,
+            died,
+        })
+    }
 }
 
-/// Authoritatively applies damage or healing to a target entity, executing:
-/// 1. Dead target validation via [`Entity::is_incapacitated`].
-/// 2. Armor and resistance mitigation via [`AttributeSet`] or properties.
-/// 3. Health adjustment on [`AttributeSet`] / properties.
-/// 4. Entity death notification via [`EntityIncapacitatedEvent`].
-/// 5. Damage-triggered action interruption via [`ActionQueue::interrupt`].
+/// Applies combat effect using a specific [`CombatResolver`].
+pub fn apply_combat_effect_with_resolver(
+    resolver: &dyn CombatResolver,
+    target_ent: &mut Entity,
+    target_guid: Guid,
+    caster_guid: Option<Guid>,
+    damage: u32,
+    healing: u32,
+    event_queue: &mut EventQueue,
+) -> Result<CombatEffectOutcome, &'static str> {
+    resolver.resolve_combat_effect(
+        target_ent,
+        target_guid,
+        caster_guid,
+        damage,
+        healing,
+        event_queue,
+    )
+}
+
+/// Authoritatively applies damage or healing to a target entity via [`DefaultCombatResolver`].
 pub fn apply_combat_effect(
     target_ent: &mut Entity,
     target_guid: Guid,
@@ -34,136 +161,14 @@ pub fn apply_combat_effect(
     healing: u32,
     event_queue: &mut EventQueue,
 ) -> Result<CombatEffectOutcome, &'static str> {
-    if target_ent.is_incapacitated() {
-        return Err("Target entity is dead");
-    }
-
-    let mut current_health = 0u32;
-    let mut effective_damage = 0.0f32;
-    let mut effective_healing = 0.0f32;
-    let mut died = false;
-
-    if damage > 0 {
-        // Read armor / mitigation from AttributeSet or properties
-        let armor = target_ent
-            .components
-            .get_component::<AttributeSet>()
-            .and_then(|a| {
-                a.get_current_by_id(AttributeId::MITIGATION)
-                    .or_else(|| a.get_current("armor"))
-            })
-            .or_else(|| {
-                target_ent
-                    .properties
-                    .get("armor")
-                    .and_then(|v| v.as_f64().map(|f| f as f32))
-            })
-            .unwrap_or(0.0);
-
-        let mitigation_factor = if armor > 0.0 {
-            armor / (armor + 100.0)
-        } else {
-            0.0
-        };
-        effective_damage = (damage as f32) * (1.0 - mitigation_factor.clamp(0.0, 0.9));
-
-        if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
-            let res = attrs
-                .modify_current("health", -effective_damage)
-                .or_else(|_| {
-                    if let Some(name) = attrs
-                        .attributes
-                        .keys()
-                        .find(|k| canonical_id_for_name(k) == Some(AttributeId::PRIMARY_VITALITY))
-                        .cloned()
-                    {
-                        attrs.modify_current(&name, -effective_damage)
-                    } else {
-                        Err("no health attribute")
-                    }
-                });
-
-            if let Ok(new_hp) = res {
-                current_health = new_hp.round().max(0.0) as u32;
-                if new_hp <= 0.0 || current_health == 0 {
-                    died = true;
-                    target_ent.state_flags |= state_flags::INCAPACITATED;
-                }
-            }
-        } else if let Some(v) = target_ent.properties.get("health").and_then(|v| v.as_i64()) {
-            let new_hp = (v as f32 - effective_damage).max(0.0);
-            current_health = new_hp.round() as u32;
-            target_ent.properties.set("health", new_hp as i64);
-            if new_hp <= 0.0 || current_health == 0 {
-                died = true;
-                target_ent.state_flags |= state_flags::INCAPACITATED;
-            }
-        }
-
-        if died {
-            event_queue.push(EntityIncapacitatedEvent {
-                entity: target_guid,
-                instigator: caster_guid,
-            });
-        }
-
-        // Interrupt active action if configured with cancel_on_damage
-        if let Some(queue) = target_ent.components.get_component_mut::<ActionQueue>() {
-            let should_interrupt = queue
-                .current()
-                .map(|a| a.interrupt_flags.cancel_on_damage)
-                .unwrap_or(false);
-            if should_interrupt {
-                queue.interrupt(target_guid, InterruptReason::Damage, event_queue);
-            }
-        }
-    } else if healing > 0 {
-        effective_healing = healing as f32;
-        if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
-            let res = attrs
-                .modify_current("health", effective_healing)
-                .or_else(|_| {
-                    if let Some(name) = attrs
-                        .attributes
-                        .keys()
-                        .find(|k| canonical_id_for_name(k) == Some(AttributeId::PRIMARY_VITALITY))
-                        .cloned()
-                    {
-                        attrs.modify_current(&name, effective_healing)
-                    } else {
-                        Err("no health attribute")
-                    }
-                });
-
-            if let Ok(new_hp) = res {
-                current_health = new_hp.round() as u32;
-            }
-        } else if let Some(v) = target_ent.properties.get("health").and_then(|v| v.as_i64()) {
-            let max_hp = target_ent
-                .properties
-                .get("max_health")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(100);
-            let new_hp = (v + healing as i64).min(max_hp);
-            current_health = new_hp as u32;
-            target_ent.properties.set("health", new_hp);
-        }
-    } else if let Some(attrs) = target_ent.components.get_component::<AttributeSet>() {
-        current_health = attrs
-            .get_current_by_id(AttributeId::PRIMARY_VITALITY)
-            .or_else(|| attrs.get_current("health"))
-            .unwrap_or(0.0)
-            .round() as u32;
-    } else if let Some(v) = target_ent.properties.get("health").and_then(|v| v.as_i64()) {
-        current_health = v as u32;
-    }
-
-    Ok(CombatEffectOutcome {
-        current_health,
-        effective_damage,
-        effective_healing,
-        died,
-    })
+    DefaultCombatResolver.resolve_combat_effect(
+        target_ent,
+        target_guid,
+        caster_guid,
+        damage,
+        healing,
+        event_queue,
+    )
 }
 
 #[cfg(test)]
@@ -210,9 +215,9 @@ mod tests {
         )
         .expect("applied effect");
 
-        // 30 damage with 33.3% mitigation = 20 damage
-        assert!(outcome.effective_damage < 30.0);
-        assert_eq!(outcome.current_health, 80);
+        // In DefaultCombatResolver, unmitigated direct damage = 30
+        assert_eq!(outcome.effective_damage, 30.0);
+        assert_eq!(outcome.current_health, 70);
         assert!(!outcome.died);
 
         // Action queue should have been interrupted
@@ -221,7 +226,7 @@ mod tests {
 
         // Attributes should be synced
         let a = entity.get_component::<AttributeSet>().unwrap();
-        assert_eq!(a.get_current("health"), Some(80.0));
+        assert_eq!(a.get_current("health"), Some(70.0));
     }
 
     #[test]

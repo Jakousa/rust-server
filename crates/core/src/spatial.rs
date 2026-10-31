@@ -9,67 +9,8 @@
 use crate::guid::Guid;
 use crate::octree::{BoundingBox3D, Octree};
 
-/// 3D Vector primitive for spatial math calculations.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Vec3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl Vec3 {
-    pub fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-
-    pub fn length_squared(&self) -> f32 {
-        self.x * self.x + self.y * self.y + self.z * self.z
-    }
-
-    pub fn length(&self) -> f32 {
-        self.length_squared().sqrt()
-    }
-
-    pub fn normalized(&self) -> Option<Self> {
-        let len = self.length();
-        if len > 1e-6 {
-            Some(Self {
-                x: self.x / len,
-                y: self.y / len,
-                z: self.z / len,
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn dot(&self, other: &Self) -> f32 {
-        self.x * other.x + self.y * other.y + self.z * other.z
-    }
-
-    pub fn distance_squared(&self, other: &Self) -> f32 {
-        let dx = self.x - other.x;
-        let dy = self.y - other.y;
-        let dz = self.z - other.z;
-        dx * dx + dy * dy + dz * dz
-    }
-
-    pub fn distance(&self, other: &Self) -> f32 {
-        self.distance_squared(other).sqrt()
-    }
-}
-
-impl From<(f32, f32, f32)> for Vec3 {
-    fn from(coords: (f32, f32, f32)) -> Self {
-        Self::new(coords.0, coords.1, coords.2)
-    }
-}
-
-impl From<Vec3> for (f32, f32, f32) {
-    fn from(v: Vec3) -> Self {
-        (v.x, v.y, v.z)
-    }
-}
+/// Unified 3D Vector primitive re-exported from `mmo-schema`.
+pub use mmo_schema::client::Vec3;
 
 /// Error returned when a spatial query validation fails.
 #[derive(Debug, Clone, PartialEq, Eq)]

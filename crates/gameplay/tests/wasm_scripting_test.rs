@@ -216,6 +216,7 @@ fn test_plugin_veto_and_fail_closed_pipeline() {
     let mut event_queue = EventQueue::new();
     let mut packets = ModularPacketRouter::new();
     let mut tick_systems = Vec::new();
+    let mut combat_resolver = None;
 
     let mut plugin_mgr = PluginManager::new();
     plugin_mgr.add_plugin(Box::new(WasmScriptPlugin::new(runtime)));
@@ -225,6 +226,7 @@ fn test_plugin_veto_and_fail_closed_pipeline() {
         &mut event_queue,
         &mut packets,
         &mut tick_systems,
+        &mut combat_resolver,
     );
 
     let mut entities = EntityStore::new();

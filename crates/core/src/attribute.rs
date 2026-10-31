@@ -7,6 +7,7 @@
 //! - Timed modifier (aura) lifecycles with expiration event dispatch.
 
 use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,19 +27,93 @@ impl AttributeId {
     pub const MITIGATION: Self = Self(6);
 }
 
-/// Maps canonical attribute names to compact [`AttributeId`]s.
-pub fn canonical_id_for_name(name: &str) -> Option<AttributeId> {
-    match name {
-        "health" | "vitality" | "hull" => Some(AttributeId::PRIMARY_VITALITY),
-        "max_health" | "max_vitality" | "max_hull" => Some(AttributeId::MAX_PRIMARY_VITALITY),
-        "mana" | "energy" | "capacitor" | "stamina" => Some(AttributeId::SECONDARY_RESOURCE),
-        "max_mana" | "max_energy" | "max_capacitor" | "max_stamina" => {
-            Some(AttributeId::MAX_SECONDARY_RESOURCE)
+/// Dynamic registry mapping string attribute aliases to compact [`AttributeId`]s.
+pub struct AttributeRegistry {
+    mappings: RwLock<HashMap<String, AttributeId>>,
+}
+
+impl AttributeRegistry {
+    /// Creates a new `AttributeRegistry` pre-populated with standard mathematical and canonical mappings.
+    pub fn new() -> Self {
+        let mut map = HashMap::new();
+        // Canonical mathematical substrates
+        map.insert("vitality".to_string(), AttributeId::PRIMARY_VITALITY);
+        map.insert(
+            "max_vitality".to_string(),
+            AttributeId::MAX_PRIMARY_VITALITY,
+        );
+        map.insert(
+            "secondary_resource".to_string(),
+            AttributeId::SECONDARY_RESOURCE,
+        );
+        map.insert(
+            "max_secondary_resource".to_string(),
+            AttributeId::MAX_SECONDARY_RESOURCE,
+        );
+        map.insert(
+            "move_speed_scale".to_string(),
+            AttributeId::MOVE_SPEED_SCALE,
+        );
+        map.insert("mitigation".to_string(), AttributeId::MITIGATION);
+
+        // Common domain aliases for backward compatibility
+        map.insert("health".to_string(), AttributeId::PRIMARY_VITALITY);
+        map.insert("max_health".to_string(), AttributeId::MAX_PRIMARY_VITALITY);
+        map.insert("hull".to_string(), AttributeId::PRIMARY_VITALITY);
+        map.insert("max_hull".to_string(), AttributeId::MAX_PRIMARY_VITALITY);
+        map.insert("mana".to_string(), AttributeId::SECONDARY_RESOURCE);
+        map.insert("max_mana".to_string(), AttributeId::MAX_SECONDARY_RESOURCE);
+        map.insert("energy".to_string(), AttributeId::SECONDARY_RESOURCE);
+        map.insert(
+            "max_energy".to_string(),
+            AttributeId::MAX_SECONDARY_RESOURCE,
+        );
+        map.insert("capacitor".to_string(), AttributeId::SECONDARY_RESOURCE);
+        map.insert(
+            "max_capacitor".to_string(),
+            AttributeId::MAX_SECONDARY_RESOURCE,
+        );
+        map.insert("stamina".to_string(), AttributeId::SECONDARY_RESOURCE);
+        map.insert(
+            "max_stamina".to_string(),
+            AttributeId::MAX_SECONDARY_RESOURCE,
+        );
+        map.insert("armor".to_string(), AttributeId::MITIGATION);
+        map.insert("resistance".to_string(), AttributeId::MITIGATION);
+
+        Self {
+            mappings: RwLock::new(map),
         }
-        "move_speed_scale" => Some(AttributeId::MOVE_SPEED_SCALE),
-        "armor" | "mitigation" | "resistance" => Some(AttributeId::MITIGATION),
-        _ => None,
     }
+
+    /// Registers a new alias for a given `AttributeId`.
+    pub fn register(&self, name: impl Into<String>, id: AttributeId) {
+        if let Ok(mut lock) = self.mappings.write() {
+            lock.insert(name.into(), id);
+        }
+    }
+
+    /// Looks up the `AttributeId` associated with the given name.
+    pub fn get(&self, name: &str) -> Option<AttributeId> {
+        self.mappings.read().ok()?.get(name).copied()
+    }
+}
+
+impl Default for AttributeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global shared attribute registry.
+pub fn global_attribute_registry() -> &'static AttributeRegistry {
+    static REGISTRY: OnceLock<AttributeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(AttributeRegistry::new)
+}
+
+/// Maps attribute names to compact [`AttributeId`]s via the global attribute registry.
+pub fn canonical_id_for_name(name: &str) -> Option<AttributeId> {
+    global_attribute_registry().get(name)
 }
 
 /// Representation of a single numerical attribute with bounds and regeneration.
@@ -481,5 +556,19 @@ mod tests {
 
         let indexed: Vec<_> = set.iter_indexed().collect();
         assert_eq!(indexed.len(), 2);
+    }
+
+    #[test]
+    fn test_attribute_registry_dynamic_aliases() {
+        let registry = AttributeRegistry::new();
+        assert_eq!(
+            registry.get("vitality"),
+            Some(AttributeId::PRIMARY_VITALITY)
+        );
+        assert_eq!(registry.get("health"), Some(AttributeId::PRIMARY_VITALITY));
+        assert_eq!(registry.get("custom_shield"), None);
+
+        registry.register("custom_shield", AttributeId::MITIGATION);
+        assert_eq!(registry.get("custom_shield"), Some(AttributeId::MITIGATION));
     }
 }

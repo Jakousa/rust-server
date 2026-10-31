@@ -5,6 +5,7 @@
 //! and interaction actions).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -143,7 +144,7 @@ impl Opcode {
 }
 
 /// 3D Vector for coordinates and velocities.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Vec3 {
     pub x: f32,
     pub y: f32,
@@ -159,6 +160,10 @@ impl Vec3 {
 
     pub fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
+    }
+
+    pub fn dot(&self, other: &Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
     }
 
     pub fn distance_squared(&self, other: &Self) -> f32 {
@@ -219,6 +224,18 @@ impl Vec3 {
             ));
         }
         Ok(Self { x, y, z })
+    }
+}
+
+impl From<(f32, f32, f32)> for Vec3 {
+    fn from(coords: (f32, f32, f32)) -> Self {
+        Self::new(coords.0, coords.1, coords.2)
+    }
+}
+
+impl From<Vec3> for (f32, f32, f32) {
+    fn from(v: Vec3) -> Self {
+        (v.x, v.y, v.z)
     }
 }
 

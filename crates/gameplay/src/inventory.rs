@@ -385,12 +385,14 @@ mod tests {
         let mut event_queue = mmo_core::EventQueue::new();
         let mut packets = ModularPacketRouter::new();
         let mut tick_systems = Vec::new();
+        let mut combat_resolver = None;
         mgr.build_all(
             &mut hooks,
             &mut codecs,
             &mut event_queue,
             &mut packets,
             &mut tick_systems,
+            &mut combat_resolver,
         );
 
         let handler = EncumbranceHookHandler;

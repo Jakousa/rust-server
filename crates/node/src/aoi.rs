@@ -5,6 +5,7 @@
 //! dynamic density-based radius throttling, and produces binary broadcast packets.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use mmo_core::guid::Guid;
 use mmo_core::octree::calculate_throttled_aoi;
@@ -297,6 +298,23 @@ pub fn compute_visible_sectors(center: (f32, f32, f32), radius: f32) -> HashSet<
     visible
 }
 
+/// Pluggable strategy extracting replicated scalar attributes and state flags from an entity.
+///
+/// Returns `(primary_vitality, max_primary_vitality, state_flags, scalar_attributes)`.
+pub trait AoiAttributeExtractor: Send + Sync {
+    fn extract(&self, ent: &mmo_core::Entity) -> (u32, u32, u32, Vec<ScalarAttributeDelta>);
+}
+
+/// Default genre-agnostic extractor reading `AttributeSet` primary vitality and dynamic properties.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultAoiAttributeExtractor;
+
+impl AoiAttributeExtractor for DefaultAoiAttributeExtractor {
+    fn extract(&self, ent: &mmo_core::Entity) -> (u32, u32, u32, Vec<ScalarAttributeDelta>) {
+        extract_entity_attributes(ent)
+    }
+}
+
 /// Extracts generic scalar attributes and state flags for an entity.
 ///
 /// Follows the engine's unopinionated prime directive: reads generic properties without hardcoding
@@ -375,6 +393,7 @@ pub struct AoiBroadcastJob {
 pub struct AoiManager {
     observers: HashMap<u64, ObserverState>,
     guid_to_session: HashMap<Guid, u64>,
+    attribute_extractor: Arc<dyn AoiAttributeExtractor>,
     // Reusable scratch buffers to eliminate per-tick heap allocations
     scratch_query: Vec<(Guid, (f32, f32, f32), f32)>,
     scratch_visible_guids: HashSet<Guid>,
@@ -394,11 +413,17 @@ impl AoiManager {
         Self {
             observers: HashMap::new(),
             guid_to_session: HashMap::new(),
+            attribute_extractor: Arc::new(DefaultAoiAttributeExtractor),
             scratch_query: Vec::with_capacity(512),
             scratch_visible_guids: HashSet::with_capacity(512),
             scratch_session_ids: Vec::with_capacity(64),
             scratch_exited_guids: Vec::with_capacity(128),
         }
+    }
+
+    /// Replaces the attribute extractor used to build replicated entity state.
+    pub fn set_attribute_extractor(&mut self, extractor: Arc<dyn AoiAttributeExtractor>) {
+        self.attribute_extractor = extractor;
     }
 
     /// Registers a new player session as an AoI observer, evicting any previous session for this player.
@@ -625,7 +650,8 @@ impl AoiManager {
                         None => continue,
                     };
 
-                    let (health, max_health, state_flags, attrs) = extract_entity_attributes(ent);
+                    let (health, max_health, state_flags, attrs) =
+                        self.attribute_extractor.extract(ent);
 
                     let yaw = ent.rotation;
                     let pitch = 0.0;
@@ -823,7 +849,8 @@ impl AoiManager {
                         None => continue,
                     };
 
-                    let (health, max_health, state_flags, attrs) = extract_entity_attributes(ent);
+                    let (health, max_health, state_flags, attrs) =
+                        self.attribute_extractor.extract(ent);
 
                     let yaw = ent.rotation;
                     let pitch = 0.0;

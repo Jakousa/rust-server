@@ -6,6 +6,10 @@
 
 use std::sync::Arc;
 
+use mmo_schema::client::ClientPacket;
+
+use crate::interceptor::{EdgeInterceptOutcome, EdgePacketInterceptor, InterceptFuture};
+
 use mmo_schema::client::{
     MarketBuyRequestPacket, MarketCancelRequestPacket, MarketListRequestPacket, MarketListingWire,
     MarketQueryRequestPacket, MarketResponsePacket,
@@ -28,6 +32,46 @@ pub const MARKET_ERROR_GENERIC: u32 = 1;
 pub const MARKET_ERROR_UNAUTHORIZED: u32 = 2;
 pub const MARKET_ERROR_NOT_FOUND: u32 = 3;
 pub const MARKET_ERROR_NOT_ACTIVE: u32 = 4;
+
+fn unauthenticated_response(request_type: u8) -> MarketResponsePacket {
+    MarketResponsePacket {
+        request_type,
+        success: false,
+        error_code: mmo_schema::client::market_error_codes::UNAUTHORIZED,
+        error_message: "Unauthenticated session".to_string(),
+        listings: Vec::new(),
+    }
+}
+
+impl EdgePacketInterceptor for GatewayMarketplaceService {
+    fn intercept<'a>(
+        &'a self,
+        player_guid: Option<u64>,
+        packet: &'a ClientPacket,
+    ) -> InterceptFuture<'a> {
+        Box::pin(async move {
+            let resp = match packet {
+                ClientPacket::MarketListRequest(req) => match player_guid {
+                    Some(g) => self.handle_list(g, req.clone()).await,
+                    None => unauthenticated_response(REQUEST_TYPE_LIST),
+                },
+                ClientPacket::MarketBuyRequest(req) => match player_guid {
+                    Some(g) => self.handle_buy(g, req.clone()).await,
+                    None => unauthenticated_response(REQUEST_TYPE_BUY),
+                },
+                ClientPacket::MarketCancelRequest(req) => match player_guid {
+                    Some(g) => self.handle_cancel(g, req.clone()).await,
+                    None => unauthenticated_response(REQUEST_TYPE_CANCEL),
+                },
+                ClientPacket::MarketQueryRequest(req) => self.handle_query(req.clone()).await,
+                // Unsolicited client-originated responses are forged; drop them.
+                ClientPacket::MarketResponse(_) => return EdgeInterceptOutcome::Handled,
+                _ => return EdgeInterceptOutcome::Pass,
+            };
+            EdgeInterceptOutcome::Respond(ClientPacket::MarketResponse(resp))
+        })
+    }
+}
 
 /// Asynchronous marketplace service operating at the edge gateway.
 pub struct GatewayMarketplaceService {

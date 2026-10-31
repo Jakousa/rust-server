@@ -42,6 +42,7 @@ fn test_e2e_authoritative_mining_and_delta_replication() {
     let mut event_queue = EventQueue::new();
     let mut packets = ModularPacketRouter::new();
     let mut tick_systems = Vec::new();
+    let mut combat_resolver = None;
 
     manager.build_all(
         &mut hooks,
@@ -49,6 +50,7 @@ fn test_e2e_authoritative_mining_and_delta_replication() {
         &mut event_queue,
         &mut packets,
         &mut tick_systems,
+        &mut combat_resolver,
     );
 
     // Spawn player at (5.0, 5.0, 5.0)
@@ -191,6 +193,7 @@ fn test_voxel_tick_system_persistence_events_and_pruning() {
     let mut event_queue = EventQueue::new();
     let mut packets = ModularPacketRouter::new();
     let mut tick_systems = Vec::new();
+    let mut combat_resolver = None;
 
     manager.build_all(
         &mut hooks,
@@ -198,6 +201,7 @@ fn test_voxel_tick_system_persistence_events_and_pruning() {
         &mut event_queue,
         &mut packets,
         &mut tick_systems,
+        &mut combat_resolver,
     );
 
     assert_eq!(tick_systems.len(), 1);
