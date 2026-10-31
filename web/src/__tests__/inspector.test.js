@@ -360,16 +360,31 @@ describe("UIController Village HUD", () => {
       textContent: "",
       value: "",
       disabled: false,
+      attributes: {},
+      setAttribute(name, val) {
+        this.attributes[name] = String(val);
+      },
+      getAttribute(name) {
+        return this.attributes[name] || null;
+      },
+      replaceChildren(...newChildren) {
+        this.children = [...newChildren];
+      },
       _innerHTML: "",
       get innerHTML() {
-        return this._innerHTML;
+        if (this._innerHTML) return this._innerHTML;
+        return this.children
+          .map((c) => {
+            if (c.className) {
+              return `<span class="${c.className}">${c.textContent || c.innerHTML}</span>`;
+            }
+            return c.textContent || c.innerHTML;
+          })
+          .join("");
       },
       set innerHTML(val) {
         this._innerHTML = val;
-        if (typeof val === "string" && val.includes("<button")) {
-          const btn = createMockElement("", "barter-action-btn");
-          this.children = [btn];
-        }
+        this.children = [];
       },
       appendChild(child) {
         this.children.push(child);
@@ -384,7 +399,19 @@ describe("UIController Village HUD", () => {
         }
       },
       querySelector(sel) {
-        return this.children[0] || createMockElement();
+        if (!sel) return null;
+        const targetClass = sel.startsWith(".") ? sel.slice(1) : sel;
+        const findRecursive = (node) => {
+          if (node.className && node.className.split(" ").includes(targetClass)) {
+            return node;
+          }
+          for (const child of node.children) {
+            const found = findRecursive(child);
+            if (found) return found;
+          }
+          return null;
+        };
+        return findRecursive(this) || createMockElement();
       },
     };
   }
@@ -404,14 +431,16 @@ describe("UIController Village HUD", () => {
     };
   });
 
-  it("updates gold, weight, and inventory slots", () => {
+  it("updates gold, weight, and inventory slots safely without innerHTML XSS", () => {
     const ui = new UIController();
+    const xssPayload = "<script>alert('pwn')</script><img src=x onerror=alert(1)>";
     const inv = {
       currency: 85,
       current_weight: 15.5,
       max_weight: 100.0,
       slots: [
         { item_id: 1001, name: "Iron Ore", quantity: 3, unit_weight: 2.0 },
+        { item_id: 9999, name: xssPayload, quantity: 1, unit_weight: 0.5 },
         null,
       ],
     };
@@ -421,13 +450,30 @@ describe("UIController Village HUD", () => {
     expect(document.getElementById("val-gold").textContent).toBe(85);
     expect(document.getElementById("val-weight").textContent).toBe("15.5 / 100.0 kg");
     const grid = document.getElementById("inventory-grid");
-    expect(grid.children.length).toBe(2);
+    expect(grid.children.length).toBe(3);
     expect(grid.children[0].className).toContain("occupied");
-    expect(grid.children[0].innerHTML).toContain("Iron Ore");
-    expect(grid.children[1].className).toContain("empty");
+    
+    // Normal slot DOM nodes
+    const slot1 = grid.children[0];
+    expect(slot1.children.length).toBe(3);
+    expect(slot1.children[0].className).toBe("slot-item-name");
+    expect(slot1.children[0].textContent).toBe("Iron Ore");
+    expect(slot1.children[1].className).toBe("slot-item-qty");
+    expect(slot1.children[1].textContent).toBe("x3");
+    expect(slot1.children[2].className).toBe("slot-item-weight");
+    expect(slot1.children[2].textContent).toBe("6.0kg");
+
+    // XSS slot must use textContent and NOT raw innerHTML
+    const slotXss = grid.children[1];
+    expect(slotXss.children[0].className).toBe("slot-item-name");
+    expect(slotXss.children[0].textContent).toBe(xssPayload);
+    // Verified slot element did not set innerHTML directly
+    expect(slotXss._innerHTML).toBe("");
+
+    expect(grid.children[2].className).toContain("empty");
   });
 
-  it("shows and populates NPC barter modal with recipe barter action callbacks", () => {
+  it("shows and populates NPC barter modal safely with recipe barter action callbacks", () => {
     const ui = new UIController();
     let barterRecipeId = null;
 
@@ -438,7 +484,7 @@ describe("UIController Village HUD", () => {
       recipes: [
         {
           recipe_id: 1,
-          required_items: [{ name: "Iron Ore", quantity: 2 }],
+          required_items: [{ name: "<img src=x onerror=alert(1)>", quantity: 2 }],
           required_currency: 0,
           reward_items: [{ name: "Iron Pickaxe", quantity: 1 }],
           reward_currency: 0,
@@ -458,10 +504,15 @@ describe("UIController Village HUD", () => {
     const recipesList = document.getElementById("barter-recipes-list");
     expect(recipesList.children.length).toBe(1);
     const card = recipesList.children[0];
-    expect(card.innerHTML).toContain("2x Iron Ore");
-    expect(card.innerHTML).toContain("1x Iron Pickaxe");
+    
+    // Safe textContent check for recipe exchange with XSS payload
+    const reqsSpan = card.querySelector(".recipe-reqs");
+    expect(reqsSpan.textContent).toContain("2x <img src=x onerror=alert(1)>");
+    // Card was built programmatically via createElement, not innerHTML
+    expect(card._innerHTML).toBe("");
 
     const barterBtn = card.querySelector(".barter-action-btn");
+    expect(barterBtn.getAttribute("data-recipe-id")).toBe("1");
     barterBtn.click();
     expect(barterRecipeId).toBe(1);
 

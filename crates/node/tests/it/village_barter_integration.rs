@@ -308,12 +308,23 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         .await
         .unwrap();
 
-    // P1 final accept (sub-opcode 5) -> atomic swap!
+    // P1 accept now that both are locked (sub-opcode 5)
     service
         .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
             session_id: 101,
             guid: p1_guid.raw(),
             packet_data: accept_pkt.encode(),
+            session_epoch: 1,
+        }))
+        .await
+        .unwrap();
+
+    // P2 accept now that both are locked (sub-opcode 5) -> atomic swap!
+    service
+        .forward_client_packet(tonic::Request::new(ForwardClientPacketRequest {
+            session_id: 102,
+            guid: p2_guid.raw(),
+            packet_data: accept_p2_pkt.encode(),
             session_epoch: 1,
         }))
         .await
