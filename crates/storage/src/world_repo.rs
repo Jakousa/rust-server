@@ -175,24 +175,181 @@ impl WorldObjectRepository {
             return Ok(());
         }
 
-        let query_str = sql_for_dialect(UPSERT_QUERY, self.db.is_postgres());
+        const CHUNK_SIZE: usize = 1000;
+        let is_postgres = self.db.is_postgres();
 
         match self.db.backend() {
             DbBackend::Sqlite(pool) => {
                 let mut tx = pool.begin().await?;
-                for record in records {
-                    Self::bind_upsert_sqlite(sqlx::query(&query_str), record)
-                        .execute(&mut *tx)
-                        .await?;
+                for chunk in records.chunks(CHUNK_SIZE) {
+                    let mut qb = sqlx::QueryBuilder::new(
+                        "INSERT INTO world_objects (
+                            world_id, object_id, sector_x, sector_y, sector_z, prefab_id,
+                            pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w,
+                            scale_x, scale_y, scale_z,
+                            bounds_min_x, bounds_min_y, bounds_min_z, bounds_max_x, bounds_max_y, bounds_max_z,
+                            state_flags, owner_type, owner_id, health, max_health,
+                            properties_json, dirty_revision, updated_at
+                        ) "
+                    );
+                    qb.push_values(chunk, |mut b, r| {
+                        b.push_bind(r.world_id as i64)
+                            .push_bind(r.object_id as i64)
+                            .push_bind(r.sector_x)
+                            .push_bind(r.sector_y)
+                            .push_bind(r.sector_z)
+                            .push_bind(r.prefab_id as i32)
+                            .push_bind(r.pos_x)
+                            .push_bind(r.pos_y)
+                            .push_bind(r.pos_z)
+                            .push_bind(r.rot_x)
+                            .push_bind(r.rot_y)
+                            .push_bind(r.rot_z)
+                            .push_bind(r.rot_w)
+                            .push_bind(r.scale_x)
+                            .push_bind(r.scale_y)
+                            .push_bind(r.scale_z)
+                            .push_bind(r.bounds_min_x)
+                            .push_bind(r.bounds_min_y)
+                            .push_bind(r.bounds_min_z)
+                            .push_bind(r.bounds_max_x)
+                            .push_bind(r.bounds_max_y)
+                            .push_bind(r.bounds_max_z)
+                            .push_bind(r.state_flags as i32)
+                            .push_bind(&r.owner_type)
+                            .push_bind(&r.owner_id)
+                            .push_bind(r.health)
+                            .push_bind(r.max_health)
+                            .push_bind(&r.properties_json)
+                            .push_bind(r.dirty_revision as i64)
+                            .push_bind(r.updated_at);
+                    });
+
+                    let conflict_sql = r#"
+                        ON CONFLICT (world_id, object_id) DO UPDATE SET
+                            sector_x = excluded.sector_x,
+                            sector_y = excluded.sector_y,
+                            sector_z = excluded.sector_z,
+                            prefab_id = excluded.prefab_id,
+                            pos_x = excluded.pos_x,
+                            pos_y = excluded.pos_y,
+                            pos_z = excluded.pos_z,
+                            rot_x = excluded.rot_x,
+                            rot_y = excluded.rot_y,
+                            rot_z = excluded.rot_z,
+                            rot_w = excluded.rot_w,
+                            scale_x = excluded.scale_x,
+                            scale_y = excluded.scale_y,
+                            scale_z = excluded.scale_z,
+                            bounds_min_x = excluded.bounds_min_x,
+                            bounds_min_y = excluded.bounds_min_y,
+                            bounds_min_z = excluded.bounds_min_z,
+                            bounds_max_x = excluded.bounds_max_x,
+                            bounds_max_y = excluded.bounds_max_y,
+                            bounds_max_z = excluded.bounds_max_z,
+                            state_flags = excluded.state_flags,
+                            owner_type = excluded.owner_type,
+                            owner_id = excluded.owner_id,
+                            health = excluded.health,
+                            max_health = excluded.max_health,
+                            properties_json = excluded.properties_json,
+                            dirty_revision = excluded.dirty_revision,
+                            updated_at = excluded.updated_at
+                        WHERE excluded.dirty_revision >= world_objects.dirty_revision
+                    "#;
+
+                    let conflict_sql = sql_for_dialect(conflict_sql, is_postgres);
+                    qb.push(" ");
+                    qb.push(conflict_sql);
+
+                    qb.build().execute(&mut *tx).await?;
                 }
                 tx.commit().await?;
             }
             DbBackend::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                for record in records {
-                    Self::bind_upsert_postgres(sqlx::query(&query_str), record)
-                        .execute(&mut *tx)
-                        .await?;
+                for chunk in records.chunks(CHUNK_SIZE) {
+                    let mut qb = sqlx::QueryBuilder::new(
+                        "INSERT INTO world_objects (
+                            world_id, object_id, sector_x, sector_y, sector_z, prefab_id,
+                            pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w,
+                            scale_x, scale_y, scale_z,
+                            bounds_min_x, bounds_min_y, bounds_min_z, bounds_max_x, bounds_max_y, bounds_max_z,
+                            state_flags, owner_type, owner_id, health, max_health,
+                            properties_json, dirty_revision, updated_at
+                        ) "
+                    );
+                    qb.push_values(chunk, |mut b, r| {
+                        b.push_bind(r.world_id as i64)
+                            .push_bind(r.object_id as i64)
+                            .push_bind(r.sector_x)
+                            .push_bind(r.sector_y)
+                            .push_bind(r.sector_z)
+                            .push_bind(r.prefab_id as i32)
+                            .push_bind(r.pos_x)
+                            .push_bind(r.pos_y)
+                            .push_bind(r.pos_z)
+                            .push_bind(r.rot_x)
+                            .push_bind(r.rot_y)
+                            .push_bind(r.rot_z)
+                            .push_bind(r.rot_w)
+                            .push_bind(r.scale_x)
+                            .push_bind(r.scale_y)
+                            .push_bind(r.scale_z)
+                            .push_bind(r.bounds_min_x)
+                            .push_bind(r.bounds_min_y)
+                            .push_bind(r.bounds_min_z)
+                            .push_bind(r.bounds_max_x)
+                            .push_bind(r.bounds_max_y)
+                            .push_bind(r.bounds_max_z)
+                            .push_bind(r.state_flags as i32)
+                            .push_bind(&r.owner_type)
+                            .push_bind(&r.owner_id)
+                            .push_bind(r.health)
+                            .push_bind(r.max_health)
+                            .push_bind(&r.properties_json)
+                            .push_bind(r.dirty_revision as i64)
+                            .push_bind(r.updated_at);
+                    });
+
+                    let conflict_sql = r#"
+                        ON CONFLICT (world_id, object_id) DO UPDATE SET
+                            sector_x = excluded.sector_x,
+                            sector_y = excluded.sector_y,
+                            sector_z = excluded.sector_z,
+                            prefab_id = excluded.prefab_id,
+                            pos_x = excluded.pos_x,
+                            pos_y = excluded.pos_y,
+                            pos_z = excluded.pos_z,
+                            rot_x = excluded.rot_x,
+                            rot_y = excluded.rot_y,
+                            rot_z = excluded.rot_z,
+                            rot_w = excluded.rot_w,
+                            scale_x = excluded.scale_x,
+                            scale_y = excluded.scale_y,
+                            scale_z = excluded.scale_z,
+                            bounds_min_x = excluded.bounds_min_x,
+                            bounds_min_y = excluded.bounds_min_y,
+                            bounds_min_z = excluded.bounds_min_z,
+                            bounds_max_x = excluded.bounds_max_x,
+                            bounds_max_y = excluded.bounds_max_y,
+                            bounds_max_z = excluded.bounds_max_z,
+                            state_flags = excluded.state_flags,
+                            owner_type = excluded.owner_type,
+                            owner_id = excluded.owner_id,
+                            health = excluded.health,
+                            max_health = excluded.max_health,
+                            properties_json = excluded.properties_json,
+                            dirty_revision = excluded.dirty_revision,
+                            updated_at = excluded.updated_at
+                        WHERE excluded.dirty_revision >= world_objects.dirty_revision
+                    "#;
+
+                    let conflict_sql = sql_for_dialect(conflict_sql, is_postgres);
+                    qb.push(" ");
+                    qb.push(conflict_sql);
+
+                    qb.build().execute(&mut *tx).await?;
                 }
                 tx.commit().await?;
             }
