@@ -110,4 +110,33 @@ proptest! {
         let found_after = octree.query_radius(pos, 1.0);
         prop_assert!(!found_after.contains(&guid));
     }
+
+    #[test]
+    fn prop_test_octree_len_invariant_against_oracle(
+        entities in proptest::collection::vec(arb_entity_entry(), 10..100),
+    ) {
+        let world_bounds = BoundingBox3D::new((-1000.0, -1000.0, -1000.0), (1000.0, 1000.0, 1000.0));
+        let mut octree = Octree::new(world_bounds);
+
+        let mut inserted = HashSet::new();
+        for (guid, pos) in &entities {
+            if inserted.insert(*guid) {
+                octree.insert(*guid, *pos);
+            }
+            prop_assert_eq!(octree.len(), inserted.len());
+        }
+
+        let to_remove: Vec<(Guid, (f32, f32, f32))> =
+            entities.iter().take(entities.len() / 2).copied().collect();
+        for (guid, pos) in to_remove {
+            if inserted.remove(&guid) {
+                octree.remove(guid, pos);
+            }
+            prop_assert_eq!(octree.len(), inserted.len());
+        }
+
+        octree.clear();
+        prop_assert_eq!(octree.len(), 0);
+        prop_assert!(octree.is_empty());
+    }
 }

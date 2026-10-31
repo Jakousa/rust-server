@@ -1,17 +1,24 @@
 //! WASM execution runtime with deterministic fuel metering and host context injection.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use mmo_core::{EntityStore, FuelMeteredExecutor, Guid, ScriptError, ScriptValue};
-use wasmtime::{Linker, Store};
+use wasmtime::{InstancePre, Linker, Module, Store};
 
 use super::engine::WasmScriptEngine;
 use super::host_api::{register_host_api, HostContext};
+
+/// Module paired with the pre-linked instance template built from it.
+type CachedPre = (Arc<Module>, InstancePre<HostContext>);
 
 /// Execution runtime managing module instantiations, typed function execution, and fuel budgeting.
 pub struct WasmRuntime {
     engine: Arc<WasmScriptEngine>,
     linker: Linker<HostContext>,
+    /// Pre-linked instantiation templates keyed by module ID. Each entry remembers the exact
+    /// `Module` it was linked from so hot-reloaded modules transparently invalidate it.
+    pre_cache: RwLock<HashMap<String, CachedPre>>,
 }
 
 impl WasmRuntime {
@@ -19,7 +26,11 @@ impl WasmRuntime {
     pub fn new(engine: Arc<WasmScriptEngine>) -> Result<Self, ScriptError> {
         let mut linker = Linker::<HostContext>::new(engine.engine());
         register_host_api(&mut linker)?;
-        Ok(WasmRuntime { engine, linker })
+        Ok(WasmRuntime {
+            engine,
+            linker,
+            pre_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Returns a reference to the shared `WasmScriptEngine`.
@@ -56,6 +67,30 @@ impl WasmRuntime {
         self.execute_function_internal(module_id, func_name, args, host_ctx, fuel_limit)
     }
 
+    /// Returns the cached pre-linked instance template for `module`, linking it on first use
+    /// (or after the module has been replaced by a hot reload).
+    fn instance_pre(
+        &self,
+        module_id: &str,
+        module: &Arc<Module>,
+    ) -> Result<InstancePre<HostContext>, ScriptError> {
+        if let Ok(cache) = self.pre_cache.read() {
+            if let Some((cached_module, pre)) = cache.get(module_id) {
+                if Arc::ptr_eq(cached_module, module) {
+                    return Ok(pre.clone());
+                }
+            }
+        }
+        let pre = self
+            .linker
+            .instantiate_pre(module)
+            .map_err(|e| ScriptError::ExecutionError(format!("Instantiate error: {e}")))?;
+        if let Ok(mut cache) = self.pre_cache.write() {
+            cache.insert(module_id.to_string(), (Arc::clone(module), pre.clone()));
+        }
+        Ok(pre)
+    }
+
     fn execute_function_internal(
         &self,
         module_id: &str,
@@ -75,8 +110,8 @@ impl WasmRuntime {
             .map_err(|e| ScriptError::ExecutionError(format!("Failed to set fuel: {e}")))?;
 
         let instance = self
-            .linker
-            .instantiate(&mut store, &module)
+            .instance_pre(module_id, &module)?
+            .instantiate(&mut store)
             .map_err(|e| ScriptError::ExecutionError(format!("Instantiate error: {e}")))?;
 
         let func = instance

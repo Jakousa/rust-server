@@ -1373,7 +1373,6 @@ mod tests {
 
         {
             let mut s = sim.write().await;
-            s.spawn_entity(guid, (0.0, 0.0, 0.0));
             s.session_epochs.insert(guid, 2);
         }
 
@@ -1401,8 +1400,10 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(!resp_stale.success);
-        assert!(resp_stale.error_message.contains("Stale session epoch"));
+        // Ingress only enqueues; epoch fencing happens when the simulation drains the queue.
+        assert!(resp_stale.success);
+        sim.write().await.drain_client_inputs();
+        assert!(!sim.read().await.entity_store.contains_guid(guid));
 
         // Current epoch 2 succeeds
         let resp_ok = service
@@ -1416,6 +1417,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp_ok.success);
+        sim.write().await.drain_client_inputs();
+        assert!(sim.read().await.entity_store.contains_guid(guid));
     }
 
     #[tokio::test]
@@ -1453,7 +1456,7 @@ mod tests {
             .into_inner();
 
         assert!(!resp.success);
-        assert!(resp.error_message.contains("finite"));
+        assert!(resp.error_message.contains("Non-finite") || resp.error_message.contains("finite"));
     }
 
     #[tokio::test]
@@ -1502,7 +1505,8 @@ mod tests {
         assert!(resp.success);
 
         // Verify pending broadcast jobs has WorldObjectSpawn
-        let s = sim.read().await;
+        let mut s = sim.write().await;
+        s.drain_client_inputs();
         assert_eq!(s.pending_broadcast_jobs.len(), 1);
         let job = &s.pending_broadcast_jobs[0];
         assert_eq!(job.session_id, 55);
@@ -1562,8 +1566,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(!resp_spoofed.success);
-        assert!(resp_spoofed.error_message.contains("Spoofed"));
+        assert!(resp_spoofed.success);
+        sim.write().await.drain_client_inputs();
+        assert!(sim.read().await.pending_broadcast_jobs.is_empty());
 
         // 2. Valid interaction dispatched to module
         let valid_pkt =
@@ -1588,7 +1593,8 @@ mod tests {
         assert!(resp_valid.success);
 
         // Verify response packet queued
-        let s = sim.read().await;
+        let mut s = sim.write().await;
+        s.drain_client_inputs();
         assert_eq!(s.pending_broadcast_jobs.len(), 1);
         let job = &s.pending_broadcast_jobs[0];
         if let mmo_schema::client::ClientPacket::InteractionResult(ref res) = job.packets[0] {
@@ -1643,8 +1649,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(!resp_non_player.success);
-        assert!(resp_non_player.error_message.contains("not found on node"));
+        assert!(resp_non_player.success);
+        sim.write().await.drain_client_inputs();
+        assert!(!sim.read().await.entity_store.contains_guid(non_player));
 
         // 2. Newly arriving Player entity is auto-hydrated
         let player_move_pkt =
@@ -1674,7 +1681,8 @@ mod tests {
         );
 
         // Verify entity is now stored, AoI observer is registered, and spawn hook was triggered
-        let s = sim.read().await;
+        let mut s = sim.write().await;
+        s.drain_client_inputs();
         assert!(s.entity_store.contains_guid(new_player));
         assert!(s.aoi.get_observer(3).is_some());
         assert_eq!(spawn_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1710,6 +1718,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.success);
+        sim.write().await.drain_client_inputs();
+        assert!(sim.read().await.entity_store.contains_guid(player));
 
         // 2. Entity migrates / despawns cleanly from this node
         {
@@ -1742,10 +1752,10 @@ mod tests {
             .into_inner();
 
         // Late packet must be rejected and must NOT resurrect duplicate entity
-        assert!(!late_resp.success);
-        assert!(late_resp.error_message.contains("migrated or despawned"));
+        assert!(late_resp.success);
 
-        let s = sim.read().await;
+        let mut s = sim.write().await;
+        s.drain_client_inputs();
         assert!(!s.entity_store.contains_guid(player));
     }
 }

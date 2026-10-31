@@ -1,6 +1,11 @@
 import * as THREE from "three";
 import { WorldObjectRenderer } from "./world.js";
 
+// Third-person camera follow offset (module constants avoid a per-frame Vector3 allocation).
+const CAMERA_OFFSET_X = 0;
+const CAMERA_OFFSET_Y = 18;
+const CAMERA_OFFSET_Z = 26;
+
 /**
  * Three.js 3D Viewport Renderer for OpenSpec MMO.
  */
@@ -115,15 +120,26 @@ export class WorldRenderer {
    */
   syncEntities(renderBuffer, localPlayerGuid = null) {
     if (!renderBuffer || renderBuffer.length === 0) return;
-    const activeGuids = new Set();
+    // Reuse the same Set / typed-array view across frames to avoid per-frame garbage.
+    const activeGuids = (this._activeGuids ??= new Set());
+    activeGuids.clear();
     const entityStride = 9;
     const count = Math.floor(renderBuffer.length / entityStride);
     const localBigInt = localPlayerGuid !== null ? BigInt(localPlayerGuid) : null;
-    const uint32View = new Uint32Array(
-      renderBuffer.buffer,
-      renderBuffer.byteOffset,
-      renderBuffer.length
-    );
+    let uint32View = this._entityU32View;
+    if (
+      !uint32View ||
+      uint32View.buffer !== renderBuffer.buffer ||
+      uint32View.byteOffset !== renderBuffer.byteOffset ||
+      uint32View.length !== renderBuffer.length
+    ) {
+      uint32View = new Uint32Array(
+        renderBuffer.buffer,
+        renderBuffer.byteOffset,
+        renderBuffer.length
+      );
+      this._entityU32View = uint32View;
+    }
 
     for (let i = 0; i < count; i++) {
       const offset = i * entityStride;
@@ -266,11 +282,10 @@ export class WorldRenderer {
     this.aoiRing.position.z = targetPos.z;
 
     // Third-person smooth follow
-    const offset = new THREE.Vector3(0, 18, 26);
     this.camera.position.set(
-      targetPos.x + offset.x,
-      targetPos.y + offset.y,
-      targetPos.z + offset.z
+      targetPos.x + CAMERA_OFFSET_X,
+      targetPos.y + CAMERA_OFFSET_Y,
+      targetPos.z + CAMERA_OFFSET_Z
     );
     this.camera.lookAt(targetPos.x, targetPos.y + 1.5, targetPos.z);
   }

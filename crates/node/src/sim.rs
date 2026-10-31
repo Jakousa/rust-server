@@ -46,16 +46,14 @@ pub struct TickSimulation {
     pub tombstoned_entities: std::collections::HashSet<Guid>,
     pub current_time: Instant,
     pub last_tick_duration: Duration,
-    pub ack_sender: tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket>,
-    pub ack_receiver: tokio::sync::mpsc::UnboundedReceiver<mmo_schema::client::ClientAckPacket>,
-    pub input_sender: tokio::sync::mpsc::UnboundedSender<QueuedClientInput>,
-    pub input_receiver: tokio::sync::mpsc::UnboundedReceiver<QueuedClientInput>,
-    pub ability_compensation_sender: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
-    pub ability_compensation_receiver: tokio::sync::mpsc::UnboundedReceiver<AbilityCompensation>,
-    pub container_transfer_sender:
-        tokio::sync::mpsc::UnboundedSender<ContainerTransferNotification>,
-    pub container_transfer_receiver:
-        tokio::sync::mpsc::UnboundedReceiver<ContainerTransferNotification>,
+    pub ack_sender: tokio::sync::mpsc::Sender<mmo_schema::client::ClientAckPacket>,
+    pub ack_receiver: tokio::sync::mpsc::Receiver<mmo_schema::client::ClientAckPacket>,
+    pub input_sender: tokio::sync::mpsc::Sender<QueuedClientInput>,
+    pub input_receiver: tokio::sync::mpsc::Receiver<QueuedClientInput>,
+    pub ability_compensation_sender: tokio::sync::mpsc::Sender<AbilityCompensation>,
+    pub ability_compensation_receiver: tokio::sync::mpsc::Receiver<AbilityCompensation>,
+    pub container_transfer_sender: tokio::sync::mpsc::Sender<ContainerTransferNotification>,
+    pub container_transfer_receiver: tokio::sync::mpsc::Receiver<ContainerTransferNotification>,
     pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
     pub snapshot_interval_ticks: u64,
     pub history: crate::history::SpatialHistoryBuffer,
@@ -70,6 +68,17 @@ pub struct QueuedClientInput {
     pub entity_guid: u64,
     pub session_epoch: u64,
     pub packet: mmo_schema::client::ClientPacket,
+}
+
+/// Non-blocking enqueue into a bounded ingress channel; counts dropped packets on overflow.
+#[allow(clippy::result_large_err)]
+pub fn try_enqueue_client_input(
+    sender: &tokio::sync::mpsc::Sender<QueuedClientInput>,
+    input: QueuedClientInput,
+) -> Result<(), tokio::sync::mpsc::error::TrySendError<QueuedClientInput>> {
+    sender.try_send(input).inspect_err(|_| {
+        metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "input").increment(1);
+    })
 }
 
 /// Compensation event for refunding caster resources and resetting cooldowns if a cross-node ability fails.
@@ -101,6 +110,14 @@ impl TickSimulation {
     pub const TICK_INTERVAL: Duration = Duration::from_millis(50);
     /// Tick delta time in seconds: 0.05s.
     pub const TICK_DT_SEC: f32 = 0.05;
+    /// Bounded capacity of the client packet ingress queue (excess packets are dropped).
+    pub const INPUT_CHANNEL_CAPACITY: usize = 8192;
+    /// Bounded capacity of the client ACK queue (excess ACKs are dropped).
+    pub const ACK_CHANNEL_CAPACITY: usize = 8192;
+    /// Bounded capacity of the ability compensation queue.
+    pub const COMPENSATION_CHANNEL_CAPACITY: usize = 4096;
+    /// Bounded capacity of the container transfer notification queue.
+    pub const TRANSFER_CHANNEL_CAPACITY: usize = 4096;
 
     /// Creates a new `TickSimulation` instance with default kinematic validation.
     pub fn new(node_id: u16, bounds: BoundingBox3D) -> Self {
@@ -124,12 +141,13 @@ impl TickSimulation {
             Box::new(mmo_core::action::ActionCooldownSystem),
         ];
 
-        let (ack_sender, ack_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (input_sender, input_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (ack_sender, ack_receiver) = tokio::sync::mpsc::channel(Self::ACK_CHANNEL_CAPACITY);
+        let (input_sender, input_receiver) =
+            tokio::sync::mpsc::channel(Self::INPUT_CHANNEL_CAPACITY);
         let (ability_compensation_sender, ability_compensation_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(Self::COMPENSATION_CHANNEL_CAPACITY);
         let (container_transfer_sender, container_transfer_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
+            tokio::sync::mpsc::channel(Self::TRANSFER_CHANNEL_CAPACITY);
 
         Self {
             node_id,
@@ -176,147 +194,250 @@ impl TickSimulation {
     }
 
     /// Returns a cloned sender for pushing client input packets into the simulation ingress queue.
-    pub fn input_sender(&self) -> tokio::sync::mpsc::UnboundedSender<QueuedClientInput> {
+    pub fn input_sender(&self) -> tokio::sync::mpsc::Sender<QueuedClientInput> {
         self.input_sender.clone()
     }
 
     /// Enqueues an inbound client packet for processing on the next simulation tick.
+    ///
+    /// Never blocks: returns an error (and increments a drop metric) if the bounded queue is full.
     #[allow(clippy::result_large_err)]
     pub fn queue_client_input(
         &self,
         input: QueuedClientInput,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<QueuedClientInput>> {
-        self.input_sender.send(input)
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<QueuedClientInput>> {
+        try_enqueue_client_input(&self.input_sender, input)
     }
 
     /// Drains and processes all queued client input packets.
+    ///
+    /// This is the single authoritative client packet handler: epoch fencing, tombstone checks,
+    /// lazy player hydration, anti-spoofing and plugin hook fallbacks all live here so the network
+    /// layer only has to enqueue into the bounded ingress channel.
     pub fn drain_client_inputs(&mut self) {
         while let Ok(input) = self.input_receiver.try_recv() {
-            let guid = Guid::from_raw(input.entity_guid);
-            if !self.is_valid_upstream_epoch(guid, input.session_epoch) {
-                metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
-                continue;
-            }
-            if !self.entity_store.contains_guid(guid) {
-                continue;
-            }
-            if self.is_migrating(guid) {
-                continue;
-            }
+            self.handle_client_input(input);
+        }
+    }
 
-            match input.packet {
-                mmo_schema::client::ClientPacket::ClientAck(ack) => {
-                    self.aoi.process_ack(
-                        ack.session_id,
-                        ack.observed_tick,
-                        ack.ack_mask,
-                        self.tick_counter,
-                    );
+    fn handle_client_input(&mut self, input: QueuedClientInput) {
+        let guid = Guid::from_raw(input.entity_guid);
+        if !self.is_valid_upstream_epoch(guid, input.session_epoch) {
+            metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+            return;
+        }
+
+        if !self.entity_store.contains_guid(guid) {
+            if self.tombstoned_entities.contains(&guid) {
+                metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
+                return;
+            }
+            if guid.entity_type() != mmo_core::EntityType::Player
+                || matches!(input.packet, mmo_schema::client::ClientPacket::ClientAck(_))
+            {
+                return;
+            }
+            let initial_snapshot = match &input.packet {
+                mmo_schema::client::ClientPacket::Movement(m)
+                    if self
+                        .octree
+                        .bounds
+                        .contains((m.position.x, m.position.y, m.position.z)) =>
+                {
+                    Some(mmo_storage::EntitySnapshot {
+                        guid: guid.raw(),
+                        position: (m.position.x, m.position.y, m.position.z),
+                        rotation: m.yaw,
+                        attributes: serde_json::Value::Null,
+                        state_blob: None,
+                        version: 1,
+                        timestamp: 0,
+                    })
                 }
-                mmo_schema::client::ClientPacket::Movement(m) => {
-                    if input.entity_guid != 0 && m.entity_id != input.entity_guid {
-                        tracing::warn!("Spoofed movement entity_id rejected");
-                        metrics::counter!("mmo_node_spoofed_packets_dropped_total").increment(1);
-                        continue;
+                _ => None,
+            };
+            let pos = self.hydrate_player_session(
+                guid,
+                input.session_id,
+                input.session_epoch,
+                initial_snapshot.as_ref(),
+                80.0,
+            );
+            self.hooks.dispatch_with_entities(
+                &mmo_core::Event::OnSpawn {
+                    entity: guid,
+                    position: pos,
+                },
+                &mut self.entity_store,
+            );
+        }
+
+        if self.is_migrating(guid) {
+            return;
+        }
+
+        match input.packet {
+            mmo_schema::client::ClientPacket::ClientAck(ack) => {
+                self.aoi.process_ack(
+                    ack.session_id,
+                    ack.observed_tick,
+                    ack.ack_mask,
+                    self.tick_counter,
+                );
+            }
+            mmo_schema::client::ClientPacket::Movement(m) => {
+                if input.entity_guid != 0 && m.entity_id != input.entity_guid {
+                    tracing::warn!("Spoofed movement entity_id rejected");
+                    metrics::counter!("mmo_node_spoofed_packets_dropped_total").increment(1);
+                    return;
+                }
+                match self.process_client_move_with_seq(
+                    guid,
+                    (m.position.x, m.position.y, m.position.z),
+                    m.sequence,
+                ) {
+                    Ok(_) => {
+                        metrics::counter!("mmo_node_client_movements_processed_total").increment(1);
                     }
-                    match self.process_client_move_with_seq(
-                        guid,
-                        (m.position.x, m.position.y, m.position.z),
-                        m.sequence,
-                    ) {
-                        Ok(_) => {
-                            metrics::counter!("mmo_node_client_movements_processed_total")
-                                .increment(1);
-                        }
-                        Err(snap_back) => {
-                            let correction = mmo_schema::client::MovementCorrectionPacket {
-                                entity_id: guid.raw(),
-                                corrected_position: mmo_schema::client::Vec3::new(
-                                    snap_back.0,
-                                    snap_back.1,
-                                    snap_back.2,
-                                ),
-                                corrected_velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
-                                sequence: m.sequence,
-                                reason:
-                                    mmo_schema::client::MovementCorrectionReason::KinematicViolation
-                                        .into(),
-                            };
-                            self.pending_broadcast_jobs
-                                .push(crate::aoi::AoiBroadcastJob {
-                                    session_id: input.session_id,
-                                    player_guid: guid,
-                                    packets: vec![
-                                        mmo_schema::client::ClientPacket::MovementCorrection(
-                                            correction,
-                                        ),
-                                    ],
-                                });
-                            metrics::counter!("mmo_node_movement_corrections_total").increment(1);
-                        }
-                    }
-                }
-                mmo_schema::client::ClientPacket::PlaceObject(po) => {
-                    let _ = self.handle_place_object(guid, &po);
-                }
-                mmo_schema::client::ClientPacket::InteractObject(io) => {
-                    let _ = self.handle_interact_object(guid, &io);
-                }
-                mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
-                    if let Some(spawn) = self.handle_world_object_resync(guid, &resync) {
+                    Err(snap_back) => {
+                        let correction = mmo_schema::client::MovementCorrectionPacket {
+                            entity_id: guid.raw(),
+                            corrected_position: mmo_schema::client::Vec3::new(
+                                snap_back.0,
+                                snap_back.1,
+                                snap_back.2,
+                            ),
+                            corrected_velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                            sequence: m.sequence,
+                            reason:
+                                mmo_schema::client::MovementCorrectionReason::KinematicViolation
+                                    .into(),
+                        };
                         self.pending_broadcast_jobs
                             .push(crate::aoi::AoiBroadcastJob {
                                 session_id: input.session_id,
                                 player_guid: guid,
-                                packets: vec![mmo_schema::client::ClientPacket::WorldObjectSpawn(
-                                    spawn,
-                                )],
+                                packets: vec![
+                                    mmo_schema::client::ClientPacket::MovementCorrection(
+                                        correction,
+                                    ),
+                                ],
                             });
+                        metrics::counter!("mmo_node_movement_corrections_total").increment(1);
                     }
                 }
-                mmo_schema::client::ClientPacket::Interaction(interact) => {
-                    let (module_id, sub_opcode) = if interact.action_id > 0xFFFF {
-                        (
-                            (interact.action_id >> 16) as u16,
-                            (interact.action_id & 0xFFFF) as u16,
-                        )
-                    } else {
-                        (
-                            interact.action_id as u16,
-                            match interact.interaction_type {
-                                mmo_schema::client::InteractionType::Custom(sub) => sub as u16,
-                                _ => 0,
-                            },
-                        )
-                    };
-                    if self.packets.has_module(module_id) {
-                        if let Ok(Some(payload)) = self.packets.dispatch(
-                            module_id,
-                            sub_opcode,
-                            guid,
-                            &interact.payload,
-                            &mut self.entity_store,
-                        ) {
-                            self.pending_broadcast_jobs
-                                .push(crate::aoi::AoiBroadcastJob {
-                                    session_id: input.session_id,
-                                    player_guid: guid,
-                                    packets: vec![
-                                        mmo_schema::client::ClientPacket::InteractionResult(
-                                            mmo_schema::client::InteractionResultPacket {
-                                                action_id: interact.action_id,
-                                                success: true,
-                                                error_code: 0,
-                                                payload,
-                                            },
-                                        ),
-                                    ],
-                                });
+            }
+            mmo_schema::client::ClientPacket::PlaceObject(po) => {
+                match self.handle_place_object(guid, &po) {
+                    Ok(_) => {
+                        metrics::counter!("mmo_node_place_object_success_total").increment(1);
+                    }
+                    Err(_) => {
+                        metrics::counter!("mmo_node_place_object_failed_total").increment(1);
+                    }
+                }
+            }
+            mmo_schema::client::ClientPacket::InteractObject(io) => {
+                if self.handle_interact_object(guid, &io) {
+                    metrics::counter!("mmo_node_interact_object_success_total").increment(1);
+                } else {
+                    metrics::counter!("mmo_node_interact_object_failed_total").increment(1);
+                }
+            }
+            mmo_schema::client::ClientPacket::WorldObjectResync(resync) => {
+                if let Some(spawn) = self.handle_world_object_resync(guid, &resync) {
+                    self.pending_broadcast_jobs
+                        .push(crate::aoi::AoiBroadcastJob {
+                            session_id: input.session_id,
+                            player_guid: guid,
+                            packets: vec![mmo_schema::client::ClientPacket::WorldObjectSpawn(
+                                spawn,
+                            )],
+                        });
+                    metrics::counter!("mmo_node_world_object_resync_success_total").increment(1);
+                } else {
+                    metrics::counter!("mmo_node_world_object_resync_dropped_total").increment(1);
+                }
+            }
+            mmo_schema::client::ClientPacket::Interaction(interact) => {
+                if input.entity_guid != 0
+                    && interact.source_guid != 0
+                    && interact.source_guid != input.entity_guid
+                {
+                    tracing::warn!("Spoofed interaction source_guid rejected");
+                    metrics::counter!("mmo_node_spoofed_packets_dropped_total").increment(1);
+                    return;
+                }
+                let (module_id, sub_opcode) = if interact.action_id > 0xFFFF {
+                    (
+                        (interact.action_id >> 16) as u16,
+                        (interact.action_id & 0xFFFF) as u16,
+                    )
+                } else {
+                    (
+                        interact.action_id as u16,
+                        match interact.interaction_type {
+                            mmo_schema::client::InteractionType::Custom(sub) => sub as u16,
+                            _ => 0,
+                        },
+                    )
+                };
+                if self.packets.has_module(module_id) {
+                    match self.packets.dispatch(
+                        module_id,
+                        sub_opcode,
+                        guid,
+                        &interact.payload,
+                        &mut self.entity_store,
+                    ) {
+                        Ok(response_payload) => {
+                            if let Some(payload) = response_payload {
+                                self.pending_broadcast_jobs
+                                    .push(crate::aoi::AoiBroadcastJob {
+                                        session_id: input.session_id,
+                                        player_guid: guid,
+                                        packets: vec![
+                                            mmo_schema::client::ClientPacket::InteractionResult(
+                                                mmo_schema::client::InteractionResultPacket {
+                                                    action_id: interact.action_id,
+                                                    success: true,
+                                                    error_code: 0,
+                                                    payload,
+                                                },
+                                            ),
+                                        ],
+                                    });
+                            }
+                            metrics::counter!("mmo_node_modular_packet_success_total").increment(1);
+                        }
+                        Err(_) => {
+                            metrics::counter!("mmo_node_modular_packet_error_total").increment(1);
                         }
                     }
+                } else {
+                    let target = Guid::from_raw(interact.target_guid);
+                    let ctx = self.hooks.dispatch_with_entities(
+                        &mmo_core::Event::BeforeInteract {
+                            initiator: guid,
+                            target,
+                            action_id: interact.action_id,
+                        },
+                        &mut self.entity_store,
+                    );
+                    if ctx.is_canceled() {
+                        return;
+                    }
+                    self.hooks.dispatch_with_entities(
+                        &mmo_core::Event::OnInteract {
+                            initiator: guid,
+                            target,
+                            action_id: interact.action_id,
+                        },
+                        &mut self.entity_store,
+                    );
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -361,39 +482,43 @@ impl TickSimulation {
     }
 
     /// Returns a cloned sender for pushing client ACKs into the non-blocking channel.
-    pub fn ack_sender(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<mmo_schema::client::ClientAckPacket> {
+    pub fn ack_sender(&self) -> tokio::sync::mpsc::Sender<mmo_schema::client::ClientAckPacket> {
         self.ack_sender.clone()
     }
 
     /// Returns a cloned sender for container transfer notifications.
     pub fn container_transfer_sender(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<ContainerTransferNotification> {
+    ) -> tokio::sync::mpsc::Sender<ContainerTransferNotification> {
         self.container_transfer_sender.clone()
     }
 
     /// Enqueues a container transfer notification into the simulation node's non-blocking channel.
     pub fn queue_container_transfer(&self, notif: ContainerTransferNotification) {
-        let _ = self.container_transfer_sender.send(notif);
+        if self.container_transfer_sender.try_send(notif).is_err() {
+            metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "container_transfer")
+                .increment(1);
+        }
     }
 
     /// Queues a client ACK into the simulation's non-blocking channel.
     pub fn queue_client_ack(&self, ack: mmo_schema::client::ClientAckPacket) {
-        let _ = self.ack_sender.send(ack);
+        if self.ack_sender.try_send(ack).is_err() {
+            metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "ack").increment(1);
+        }
     }
 
     /// Returns a cloned sender for pushing ability compensation events into the non-blocking channel.
-    pub fn ability_compensation_sender(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<AbilityCompensation> {
+    pub fn ability_compensation_sender(&self) -> tokio::sync::mpsc::Sender<AbilityCompensation> {
         self.ability_compensation_sender.clone()
     }
 
     /// Queues an ability compensation event into the simulation's non-blocking channel.
     pub fn queue_ability_compensation(&self, comp: AbilityCompensation) {
-        let _ = self.ability_compensation_sender.send(comp);
+        if self.ability_compensation_sender.try_send(comp).is_err() {
+            metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "compensation")
+                .increment(1);
+        }
     }
 
     /// Sets or attaches the asynchronous snapshot sender pipeline.
@@ -1261,22 +1386,15 @@ impl TickSimulation {
         if !state.initialized {
             state.initialized = true;
             state.last_move_time = now;
+            state.time_credit = 0.2;
             return Self::TICK_DT_SEC;
         }
 
         let elapsed = now.duration_since(state.last_move_time).as_secs_f32();
         state.last_move_time = now;
+        state.time_credit = (state.time_credit + elapsed).min(0.2);
 
-        if elapsed > 1.0 {
-            // Idle gap clamping: prevent banking idle time
-            Self::TICK_DT_SEC
-        } else if elapsed < Self::TICK_DT_SEC {
-            // Jitter tolerance: packets arriving compressed by network buffer flushes
-            // floor to nominal tick duration per sequence increment, capped at 0.2s
-            (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2)
-        } else {
-            elapsed
-        }
+        (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2)
     }
 
     /// Validates and processes a client-reported movement packet with sequence monotonicity checking.
@@ -1303,17 +1421,13 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
-        // 2. Monotonic sequence check (if sequence is specified and entity was already initialized)
-        let seq_delta = if sequence > 0 {
-            if let Some(state) = self.kinematic_states.get(&guid) {
-                if state.initialized && sequence <= state.last_sequence {
+        // 2. Monotonic sequence check (all packets subject to monotonicity if entity was initialized)
+        let seq_delta = if let Some(state) = self.kinematic_states.get(&guid) {
+            if state.initialized {
+                if sequence <= state.last_sequence {
                     return Err(current_pos);
                 }
-                if state.initialized && state.last_sequence > 0 {
-                    sequence - state.last_sequence
-                } else {
-                    1
-                }
+                sequence - state.last_sequence
             } else {
                 1
             }
@@ -1321,8 +1435,31 @@ impl TickSimulation {
             1
         };
 
-        // 3. Compute server-authoritative delta time with sequence jitter tolerance
-        let dt_sec = self.compute_server_dt_with_seq(guid, seq_delta);
+        // 3. Compute server-authoritative delta time and verify replenishing time credit
+        let now = self.current_time;
+        let dt_nominal = (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2);
+        {
+            let state = self
+                .kinematic_states
+                .entry(guid)
+                .or_insert_with(|| EntityKinematicState::new(now));
+
+            if !state.initialized {
+                state.initialized = true;
+                state.last_move_time = now;
+                state.time_credit = 0.2;
+            } else {
+                let elapsed = now.duration_since(state.last_move_time).as_secs_f32();
+                state.last_move_time = now;
+                state.time_credit = (state.time_credit + elapsed).min(0.2);
+            }
+
+            if state.time_credit < dt_nominal {
+                // Rate limit packet bursts exceeding accumulated time credit without draining credit
+                return Err(current_pos);
+            }
+        }
+        let dt_sec = dt_nominal;
 
         // 4. Kinematic & Collision validation (speed caps, teleport threshold, NaN/Inf, dt bounds, obstacle collision)
         let kin_state = self.kinematic_states.get_mut(&guid);
@@ -1401,11 +1538,10 @@ impl TickSimulation {
         }
         self.octree.insert(guid, new_pos);
 
-        // 9. Update kinematic sequence
+        // 9. Update kinematic sequence and deduct consumed time credit
         if let Some(state) = self.kinematic_states.get_mut(&guid) {
-            if sequence > 0 {
-                state.last_sequence = sequence;
-            }
+            state.last_sequence = sequence;
+            state.time_credit = (state.time_credit - dt_nominal).max(0.0);
         }
 
         // 9.5. Update parent-child hierarchy
@@ -1462,7 +1598,12 @@ impl TickSimulation {
         new_pos: (f32, f32, f32),
         _client_dt_sec: f32,
     ) -> Result<(f32, f32, f32), (f32, f32, f32)> {
-        self.process_client_move_with_seq(guid, new_pos, 0)
+        let next_seq = self
+            .kinematic_states
+            .get(&guid)
+            .map(|s| s.last_sequence.saturating_add(1))
+            .unwrap_or(1);
+        self.process_client_move_with_seq(guid, new_pos, next_seq)
     }
 
     /// Explicit deterministic move validation bypassing server monotonic clocks.
@@ -1895,7 +2036,7 @@ mod tests {
         // Out-of-order sequence = 0 (or smaller than 1) should be rejected
         assert_eq!(
             sim.process_client_move_with_seq(guid, replay_pos, 0),
-            Ok(replay_pos)
+            Err(pos1)
         );
 
         // Advance 50ms and send monotonic sequence = 2
@@ -2007,6 +2148,51 @@ mod tests {
         sim.advance_time(std::time::Duration::from_millis(1));
         let res2 = sim.process_client_move_with_seq(guid, (51.0, 50.0, 0.0), 2);
         assert_eq!(res2, Ok((51.0, 50.0, 0.0)));
+    }
+
+    #[test]
+    fn test_process_client_move_high_frequency_burst_rate_limiting() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let guid = Guid::new(EntityType::Player, 1, 994);
+        assert!(sim.spawn_entity(guid, (10.0, 10.0, 0.0)));
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        let mut current_x = 10.0;
+
+        // Client attempts 100 packets spaced 2ms apart (200ms total elapsed real time)
+        // Each packet attempts to advance by 0.5 units (at 10 m/s nominal speed)
+        for seq in 1..=100 {
+            sim.advance_time(std::time::Duration::from_millis(2));
+            let target_x = current_x + 0.5;
+            match sim.process_client_move_with_seq(guid, (target_x, 10.0, 0.0), seq) {
+                Ok(pos) => {
+                    accepted += 1;
+                    current_x = pos.0;
+                }
+                Err(_) => {
+                    rejected += 1;
+                }
+            }
+        }
+
+        // Over 200ms, with 0.2s initial burst credit + 0.2s elapsed = 0.4s total budget,
+        // at 0.05s per nominal step, at most 8 steps (4.0 units) can succeed.
+        assert!(
+            accepted <= 8,
+            "Expected <= 8 accepted packets, got {accepted}"
+        );
+        assert!(
+            rejected >= 92,
+            "Expected >= 92 rejected packets, got {rejected}"
+        );
+        let final_pos = sim.entity_store.get_by_guid(guid).unwrap().position;
+        assert!(
+            final_pos.0 <= 14.5,
+            "Final position x={:.2} exceeded bounded movement distance (14.5)",
+            final_pos.0
+        );
     }
 
     #[test]

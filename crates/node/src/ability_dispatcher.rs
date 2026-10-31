@@ -87,7 +87,7 @@ impl CrossNodeDispatcher {
         &self,
         req: RemoteAbilityRequest,
         endpoint: String,
-        compensation_tx: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
+        compensation_tx: tokio::sync::mpsc::Sender<AbilityCompensation>,
         resource_refund: Option<(String, f32)>,
     ) {
         let timeout = self.timeout;
@@ -117,7 +117,10 @@ impl CrossNodeDispatcher {
                     resource_name: resource_refund.as_ref().map(|(n, _)| n.clone()),
                     resource_amount: resource_refund.as_ref().map(|(_, a)| *a).unwrap_or(0.0),
                 };
-                let _ = compensation_tx.send(comp);
+                if compensation_tx.try_send(comp).is_err() {
+                    metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "compensation")
+                        .increment(1);
+                }
             }
         });
     }
@@ -127,7 +130,7 @@ impl CrossNodeDispatcher {
         &self,
         req: BatchRemoteAbilityRequest,
         endpoint: String,
-        compensation_tx: tokio::sync::mpsc::UnboundedSender<AbilityCompensation>,
+        compensation_tx: tokio::sync::mpsc::Sender<AbilityCompensation>,
         resource_refund: Option<(String, f32)>,
     ) {
         let timeout = self.timeout;
@@ -157,7 +160,10 @@ impl CrossNodeDispatcher {
                     resource_name: resource_refund.as_ref().map(|(n, _)| n.clone()),
                     resource_amount: resource_refund.as_ref().map(|(_, a)| *a).unwrap_or(0.0),
                 };
-                let _ = compensation_tx.send(comp);
+                if compensation_tx.try_send(comp).is_err() {
+                    metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "compensation")
+                        .increment(1);
+                }
             }
         });
     }
@@ -338,11 +344,16 @@ pub fn cast_boundary_sphere_aoe(
     // 1. Gather all candidates: local entities in octree + replicated ghosts in ghost_store
     let mut candidates = Vec::new();
 
-    // Local entities
-    for (_k, entity) in sim.entity_store.iter() {
-        if entity.guid == caster_guid {
+    let center_pos = (center.x, center.y, center.z);
+
+    // Local entities (spatial index query instead of a full entity_store scan)
+    for guid in sim.octree.query_radius(center_pos, radius) {
+        if guid == caster_guid {
             continue; // Caster excluded from harmful cleave
         }
+        let Some(entity) = sim.entity_store.get_by_guid(guid) else {
+            continue;
+        };
         let is_alive = !entity.is_incapacitated();
         candidates.push(mmo_core::spatial::SpatialTargetCandidate::new(
             entity.guid,
@@ -354,13 +365,13 @@ pub fn cast_boundary_sphere_aoe(
     }
 
     // Ghost replicas
-    for (guid, ghost) in sim.ghost_store.iter() {
+    for ghost in sim.ghost_store.query_radius(center_pos, radius) {
         // Zero duplication check: ensure ghost isn't accidentally in entity_store
-        if sim.entity_store.contains_guid(*guid) {
+        if sim.entity_store.contains_guid(ghost.guid) {
             continue;
         }
         candidates.push(mmo_core::spatial::SpatialTargetCandidate::new(
-            *guid,
+            ghost.guid,
             ghost.source_node_id,
             mmo_core::Vec3::new(ghost.position.0, ghost.position.1, ghost.position.2),
             true, // Assume alive unless known otherwise
