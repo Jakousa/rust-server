@@ -85,11 +85,11 @@ impl TickSystem for PerceptionScanSystem {
         // Perform spatial queries and faction filtering
         let mut events_to_emit: Vec<HostileSpottedEvent> = Vec::new();
 
-        for (observer_guid, observer_pos, sight_radius, hostile_factions) in scans {
-            let candidates = ctx.octree.query_radius(observer_pos, sight_radius);
+        for (observer_guid, observer_pos, sight_radius, hostile_factions) in &scans {
+            let candidates = ctx.octree.query_radius(*observer_pos, *sight_radius);
 
             for candidate_guid in candidates {
-                if candidate_guid == observer_guid {
+                if candidate_guid == *observer_guid {
                     continue;
                 }
 
@@ -125,11 +125,41 @@ impl TickSystem for PerceptionScanSystem {
                         let distance = (dx * dx + dy * dy + dz * dz).sqrt();
 
                         events_to_emit.push(HostileSpottedEvent {
-                            observer: observer_guid,
+                            observer: *observer_guid,
                             spotted: candidate_guid,
                             distance,
                         });
                     }
+                }
+            }
+        }
+
+        // Prune stale targets for observers that performed a scan
+        for (observer_guid, observer_pos, sight_radius, _hostile_factions) in scans {
+            let mut valid_targets = Vec::new();
+            if let Some(observer_ent) = ctx.entities.get_by_guid(observer_guid) {
+                if let Some(perception) = observer_ent.get_component::<PerceptionComponent>() {
+                    for &target_guid in &perception.spotted_targets {
+                        if let Some(target_ent) = ctx.entities.get_by_guid(target_guid) {
+                            let is_dead = target_ent
+                                .get_component::<HealthComponent>()
+                                .map(|h| h.is_dead)
+                                .unwrap_or(false);
+                            let dx = target_ent.position.0 - observer_pos.0;
+                            let dy = target_ent.position.1 - observer_pos.1;
+                            let dz = target_ent.position.2 - observer_pos.2;
+                            let dist_sq = dx * dx + dy * dy + dz * dz;
+                            if !is_dead && dist_sq <= sight_radius * sight_radius {
+                                valid_targets.push(target_guid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(observer_ent) = ctx.entities.get_mut_by_guid(observer_guid) {
+                if let Some(perception) = observer_ent.get_component_mut::<PerceptionComponent>() {
+                    perception.spotted_targets = valid_targets;
                 }
             }
         }
@@ -253,5 +283,30 @@ mod tests {
                 .spotted_targets,
             vec![player_guid]
         );
+
+        // Kill the player and tick again -> monster should prune dead player from spotted_targets
+        store
+            .get_mut(player_key)
+            .unwrap()
+            .get_component_mut::<HealthComponent>()
+            .unwrap()
+            .is_dead = true;
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 1.0,
+                tick: 2,
+                collision_world: None,
+            };
+            scan_system.update(&mut ctx);
+        }
+        let monster_ent = store.get(monster_key).unwrap();
+        assert!(monster_ent
+            .get_component::<PerceptionComponent>()
+            .unwrap()
+            .spotted_targets
+            .is_empty());
     }
 }

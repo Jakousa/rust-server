@@ -29,6 +29,18 @@ use crate::registry::{GatewayDescriptor, GatewayRegistry, NodeRegistry};
 pub fn proto_bbox_to_bounding_box_3d(bbox: &BoundingBox) -> Option<BoundingBox3D> {
     let min = bbox.min.as_ref()?;
     let max = bbox.max.as_ref()?;
+    if !min.x.is_finite()
+        || !min.y.is_finite()
+        || !min.z.is_finite()
+        || !max.x.is_finite()
+        || !max.y.is_finite()
+        || !max.z.is_finite()
+        || min.x > max.x
+        || min.y > max.y
+        || min.z > max.z
+    {
+        return None;
+    }
     Some(BoundingBox3D::new(
         (min.x, min.y, min.z),
         (max.x, max.y, max.z),
@@ -59,9 +71,19 @@ pub struct DirectorServiceImpl {
     pub gateway_registry: Arc<RwLock<GatewayRegistry>>,
     pub instance_registry: Arc<RwLock<InstanceRegistry>>,
     pub federation_authority: Arc<RwLock<RealmFederationAuthority>>,
+    pub fallback_gateway_addr: String,
 }
 
 impl DirectorServiceImpl {
+    /// Initializes `fallback_gateway_addr` from `GATEWAY_GRPC_ADDR` environment variable,
+    /// falling back to `"127.0.0.1:50051"` when absent or empty.
+    pub fn fallback_gateway_addr_from_env() -> String {
+        std::env::var("GATEWAY_GRPC_ADDR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:50051".to_string())
+    }
+
     /// Initializes `RealmFederationAuthority` from `REALM_ID` and `FEDERATION_HMAC_SECRET`
     /// environment variables, falling back to safe defaults when absent or empty.
     pub fn federation_authority_from_env() -> RealmFederationAuthority {
@@ -89,6 +111,7 @@ impl DirectorServiceImpl {
             gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
             instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
             federation_authority: Arc::new(RwLock::new(auth)),
+            fallback_gateway_addr: Self::fallback_gateway_addr_from_env(),
         }
     }
 
@@ -105,6 +128,7 @@ impl DirectorServiceImpl {
             gateway_registry,
             instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
             federation_authority: Arc::new(RwLock::new(auth)),
+            fallback_gateway_addr: Self::fallback_gateway_addr_from_env(),
         }
     }
 
@@ -122,6 +146,7 @@ impl DirectorServiceImpl {
             gateway_registry,
             instance_registry,
             federation_authority,
+            fallback_gateway_addr: Self::fallback_gateway_addr_from_env(),
         }
     }
 
@@ -134,6 +159,7 @@ impl DirectorServiceImpl {
             gateway_registry: Arc::new(RwLock::new(GatewayRegistry::new())),
             instance_registry: Arc::new(RwLock::new(InstanceRegistry::new())),
             federation_authority: Arc::new(RwLock::new(auth)),
+            fallback_gateway_addr: Self::fallback_gateway_addr_from_env(),
         }
     }
 
@@ -378,12 +404,23 @@ impl DirectorService for DirectorServiceImpl {
 
         let original_bounds = proto_bbox_to_bounding_box_3d(&orig_proto)
             .ok_or_else(|| Status::invalid_argument("Invalid coordinates in original_bounds"))?;
+        if let Err(e) = crate::instance::validate_instance_bounds(&original_bounds) {
+            return Err(Status::invalid_argument(format!(
+                "Invalid original_bounds: {e}"
+            )));
+        }
 
-        let child_bounds: Vec<BoundingBox3D> = req
-            .child_bounds
-            .iter()
-            .filter_map(proto_bbox_to_bounding_box_3d)
-            .collect();
+        let mut child_bounds = Vec::new();
+        for cb in &req.child_bounds {
+            let bbox = proto_bbox_to_bounding_box_3d(cb)
+                .ok_or_else(|| Status::invalid_argument("Invalid coordinates in child_bounds"))?;
+            if let Err(e) = crate::instance::validate_instance_bounds(&bbox) {
+                return Err(Status::invalid_argument(format!(
+                    "Invalid child_bounds: {e}"
+                )));
+            }
+            child_bounds.push(bbox);
+        }
 
         let mut reg = self.registry.write().await;
         let mut coord = self.coordinator.write().await;
@@ -558,8 +595,8 @@ impl DirectorService for DirectorServiceImpl {
         request: Request<IssueRealmTransferClaimRequest>,
     ) -> Result<Response<IssueRealmTransferClaimResponse>, Status> {
         let req = request.into_inner();
-        let ttl =
-            std::time::Duration::from_millis(if req.ttl_ms == 0 { 60_000 } else { req.ttl_ms });
+        let raw_ttl_ms = if req.ttl_ms == 0 { 60_000 } else { req.ttl_ms };
+        let ttl = std::time::Duration::from_millis(raw_ttl_ms.min(86_400_000));
 
         let mut auth = self.federation_authority.write().await;
         let claim = auth.issue_claim(req.guid, &req.target_realm_id, req.session_epoch, ttl);
@@ -657,7 +694,8 @@ impl DirectorService for DirectorServiceImpl {
         drop(inst_reg);
 
         if !events.is_empty() {
-            self.broadcast_route_reassignments(&events, "").await;
+            self.broadcast_route_reassignments(&events, &self.fallback_gateway_addr)
+                .await;
         }
 
         println!(
@@ -711,6 +749,36 @@ mod tests {
             max: None,
         };
         assert!(proto_bbox_to_bounding_box_3d(&invalid_proto).is_none());
+
+        // NaN coordinates
+        let nan_proto = BoundingBox {
+            min: Some(Vector3 {
+                x: f32::NAN,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max: Some(Vector3 {
+                x: 10.0,
+                y: 10.0,
+                z: 10.0,
+            }),
+        };
+        assert!(proto_bbox_to_bounding_box_3d(&nan_proto).is_none());
+
+        // Inverted min/max (min.x > max.x)
+        let inverted_proto = BoundingBox {
+            min: Some(Vector3 {
+                x: 20.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            max: Some(Vector3 {
+                x: 10.0,
+                y: 10.0,
+                z: 10.0,
+            }),
+        };
+        assert!(proto_bbox_to_bounding_box_3d(&inverted_proto).is_none());
     }
 
     #[tokio::test]
@@ -805,9 +873,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_report_split() {
-        let service = DirectorServiceImpl::default_service();
-
         let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let service = DirectorServiceImpl::new(
+            Arc::new(RwLock::new(NodeRegistry::new())),
+            Arc::new(RwLock::new(GlobalOctreeCoordinator::new(bounds))),
+        );
 
         // Register node 1 and node 2
         service
@@ -852,8 +922,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_check_and_recover_dead_nodes_with_epoch_tracking() {
-        let service = DirectorServiceImpl::default_service();
         let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let service = DirectorServiceImpl::new(
+            Arc::new(RwLock::new(NodeRegistry::new())),
+            Arc::new(RwLock::new(GlobalOctreeCoordinator::new(bounds))),
+        );
 
         // 1. Register node 1 (authoritative for root bounds)
         let reg_resp1 = service

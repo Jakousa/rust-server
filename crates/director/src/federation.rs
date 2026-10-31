@@ -102,11 +102,13 @@ impl RealmFederationAuthority {
         session_epoch: u64,
         ttl: Duration,
     ) -> RealmTransferClaim {
+        let max_ttl = Duration::from_secs(86_400);
+        let safe_ttl = ttl.min(max_ttl);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let expires_at_epoch_ms = now_ms + ttl.as_millis() as u64;
+        let expires_at_epoch_ms = now_ms.saturating_add(safe_ttl.as_millis() as u64);
 
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.wrapping_add(1);
@@ -178,7 +180,18 @@ impl RealmFederationAuthority {
             .map_err(|_| FederationError::InvalidSignature)?;
 
         let remaining_ms = claim.expires_at_epoch_ms.saturating_sub(now_ms);
-        let expiry_instant = Instant::now() + Duration::from_millis(remaining_ms);
+        let max_ttl = Duration::from_secs(86_400);
+        let safe_remaining = Duration::from_millis(remaining_ms).min(max_ttl);
+        let expiry_instant = Instant::now()
+            .checked_add(safe_remaining)
+            .unwrap_or_else(|| Instant::now() + max_ttl);
+
+        if self.redeemed_nonces.len() >= 100_000 {
+            self.clean_expired_nonces();
+            if self.redeemed_nonces.len() >= 100_000 {
+                self.redeemed_nonces.clear();
+            }
+        }
         self.redeemed_nonces.insert(claim.nonce, expiry_instant);
 
         Ok(())

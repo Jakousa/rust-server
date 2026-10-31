@@ -70,10 +70,17 @@ impl ModularPacketHandler for VoxelPacketHandler {
                 })?;
 
                 // Extract player position from EntityStore
-                let player_pos = entities
-                    .get_by_guid(entity_guid)
-                    .map(|e| e.position)
-                    .unwrap_or((0.0, 0.0, 0.0));
+                let player_pos = match entities.get_by_guid(entity_guid) {
+                    Some(e) => e.position,
+                    None => {
+                        let resp = VoxelModifyResponsePacket {
+                            status: 1, // OutOfReach
+                            target_voxel: req.target_voxel,
+                            new_voxel: req.new_voxel,
+                        };
+                        return Ok(Some(resp.encode()));
+                    }
+                };
 
                 let now_ms = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -154,8 +161,11 @@ impl TickSystem for VoxelTickSystem {
             if let Some(chunk_arc) = self.world.get_chunk(coord) {
                 let mut chunk = chunk_arc.write().unwrap_or_else(|e| e.into_inner());
                 if chunk.is_dirty() {
-                    self.write_behind.enqueue(coord, &chunk);
-                    chunk.mark_clean();
+                    if self.write_behind.enqueue(coord, &chunk) {
+                        chunk.mark_clean();
+                    } else {
+                        self.world.mark_chunk_dirty(coord);
+                    }
                 }
             }
         }
@@ -299,5 +309,66 @@ mod tests {
         let mod_resp = VoxelModifyResponsePacket::decode(&mod_resp_bytes).expect("decode");
         assert_eq!(mod_resp.status, 0); // Success
         assert_eq!(mod_resp.new_voxel, 99);
+
+        // Unknown entity GUID modification rejected with status 1 (OutOfReach)
+        let unknown_guid = Guid::new(EntityType::Player, 1, 999);
+        let mod_unknown_resp_bytes = packets
+            .dispatch(
+                VOXEL_MODULE_ID,
+                SUB_OPCODE_MODIFY_REQUEST,
+                unknown_guid,
+                &mod_pkt.encode(),
+                &mut entities,
+            )
+            .expect("dispatch")
+            .expect("response");
+        let mod_unknown_resp =
+            VoxelModifyResponsePacket::decode(&mod_unknown_resp_bytes).expect("decode");
+        assert_eq!(mod_unknown_resp.status, 1);
+    }
+
+    #[test]
+    fn test_voxel_write_behind_retry_on_full_capacity() {
+        use mmo_core::{BoundingBox3D, Octree};
+
+        let world = VoxelWorld::default();
+        let chunk_coord = VoxelChunkCoord::new(0, 0, 0);
+        let mut chunk = PaletteChunk::new_homogeneous(1);
+        chunk.set(0, 2);
+        assert!(chunk.is_dirty());
+        world.insert_chunk(chunk_coord, chunk);
+
+        // Create write-behind service with 0 capacity so enqueue fails
+        let write_behind = VoxelWriteBehindService::new(0);
+        let mut tick_system =
+            VoxelTickSystem::with_write_behind(world.clone(), write_behind.clone());
+
+        let mut entities = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut ctx = TickContext {
+            entities: &mut entities,
+            octree: &mut octree,
+            events: &mut events,
+            dt_sec: 0.1,
+            tick: 1,
+            collision_world: None,
+        };
+
+        // First tick: enqueue fails due to full capacity (0), chunk remains dirty
+        tick_system.update(&mut ctx);
+        let chunk_ref = world.get_chunk(chunk_coord).unwrap();
+        assert!(chunk_ref.read().unwrap().is_dirty());
+        assert_eq!(write_behind.pending_count(), 0);
+
+        // Now replace write_behind with ample capacity
+        tick_system.write_behind = VoxelWriteBehindService::new(100);
+        // Second tick: chunk was re-queued in dirty_chunks and now enqueues successfully
+        tick_system.update(&mut ctx);
+        assert!(!chunk_ref.read().unwrap().is_dirty());
+        assert_eq!(tick_system.write_behind.pending_count(), 1);
     }
 }

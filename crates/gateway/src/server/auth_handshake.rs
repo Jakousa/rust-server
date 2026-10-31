@@ -106,6 +106,7 @@ pub async fn authenticate_and_register_session(
         };
 
     router.register_session(session_id, auth_res.guid, initial_node.clone());
+    router.set_session_epoch(session_id, auth_res.session_epoch);
 
     if let Some(c) = cache {
         let cache_clone = (*c).clone();

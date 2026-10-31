@@ -31,7 +31,7 @@ pub fn is_teleport_delta(dx: f32, dy: f32, dz: f32) -> bool {
 /// Clamps to `[i16::MIN, i16::MAX]` without arithmetic overflow or panicking on NaN/Inf.
 #[inline]
 pub fn quantize_delta_i16(val: f32) -> i16 {
-    if val.is_nan() {
+    if !val.is_finite() {
         return 0;
     }
     let scaled = (val * DELTA_POS_SCALE).round();
@@ -67,7 +67,7 @@ pub fn dequantize_delta_vec3(qx: i16, qy: i16, qz: i16) -> (f32, f32, f32) {
 /// Quantizes a yaw angle (in radians) into an 8-bit unsigned integer (256 discrete angles, ~1.41°).
 #[inline]
 pub fn quantize_yaw_u8(yaw: f32) -> u8 {
-    if yaw.is_nan() {
+    if !yaw.is_finite() {
         return 0;
     }
     let two_pi = 2.0 * PI;
@@ -87,7 +87,7 @@ pub fn dequantize_yaw_u8(quantized: u8) -> f32 {
 /// Quantizes a pitch angle (in radians, nominally [-π/2, π/2]) into an 8-bit signed integer.
 #[inline]
 pub fn quantize_pitch_i8(pitch: f32) -> i8 {
-    if pitch.is_nan() {
+    if !pitch.is_finite() {
         return 0;
     }
     let half_pi = PI * 0.5;
@@ -106,7 +106,7 @@ pub fn dequantize_pitch_i8(quantized: i8) -> f32 {
 /// Quantizes a 1D velocity component (in m/s) into a signed 16-bit integer (1 cm/s resolution).
 #[inline]
 pub fn quantize_velocity_i16(val: f32) -> i16 {
-    if val.is_nan() {
+    if !val.is_finite() {
         return 0;
     }
     let scaled = (val * VELOCITY_SCALE).round();

@@ -715,3 +715,55 @@ async fn test_edge_auth_webtransport_lifecycle() {
 
     assert_eq!(routed.guid, Some(player_guid));
 }
+
+#[tokio::test]
+async fn test_tcp_pre_auth_buffer_overflow_dropped() {
+    let router = Arc::new(SessionRouter::new());
+    let (packet_tx, _packet_rx) = mpsc::channel(16);
+    let auth = Arc::new(
+        EdgeAuthenticator::new_hs256(
+            TEST_SECRET,
+            Some("mmo-auth".to_string()),
+            Some("mmo-gateway".to_string()),
+        )
+        .with_auth_timeout(Duration::from_secs(3)),
+    );
+
+    let server = Arc::new(
+        GatewayServer::with_packet_channel(router.clone(), packet_tx)
+            .with_authenticator(auth)
+            .with_default_node_address("127.0.0.1:50051"),
+    );
+
+    let listener = server.bind("127.0.0.1:0").await.expect("bind tcp");
+    let local_addr = listener.local_addr().expect("local addr");
+
+    let srv = server.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let s = srv.clone();
+            let sid = s.next_session_id();
+            tokio::spawn(async move {
+                let _ = s.handle_connection(socket, sid).await;
+            });
+        }
+    });
+
+    let mut stream = TcpStream::connect(local_addr).await.expect("connect tcp");
+
+    // Send garbage / junk bytes exceeding MAX_PACKET_PAYLOAD_SIZE (65,536 bytes)
+    let junk = vec![0x4Du8; 70_000];
+    let _ = stream.write_all(&junk).await;
+
+    // Server must reject and close connection (read returns 0 / EOF)
+    let mut buf = [0u8; 128];
+    let res = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+    match res {
+        Ok(Ok(n)) => assert_eq!(
+            n, 0,
+            "Server must close connection on pre-auth buffer overflow"
+        ),
+        Ok(Err(_)) => {} // Connection reset / closed is also valid
+        Err(_) => panic!("Timed out waiting for server to close connection"),
+    }
+}

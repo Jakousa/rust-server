@@ -236,20 +236,107 @@ impl TickSystem for ActionTickSystem {
     }
 
     fn update(&mut self, ctx: &mut TickContext) {
-        // Collect entities with ActionQueue to update their actions
-        let mut completed = Vec::new();
+        enum ActionDecision {
+            Interrupt(u32, InterruptReason),
+            Progress,
+        }
 
-        for (_key, entity) in ctx.entities.iter_mut() {
-            let entity_guid = entity.guid;
-            if let Some(queue) = entity.get_component_mut::<ActionQueue>() {
-                if let Some(ref mut action) = queue.current {
-                    action.elapsed_sec += ctx.dt_sec;
-                    if action.is_finished() {
-                        let finished_action = queue.current.take().unwrap();
-                        completed.push((entity_guid, finished_action));
+        let mut decisions: Vec<(Guid, ActionDecision)> = Vec::new();
+
+        // Pass 1: Immutable inspect pass determining whether actions are interrupted or advanced
+        for (_key, entity) in ctx.entities.iter() {
+            if let Some(queue) = entity.get_component::<ActionQueue>() {
+                if let Some(action) = queue.current() {
+                    let mut interrupt_reason = None;
+
+                    // 1. cancel_on_movement: non-zero velocity
+                    if action.interrupt_flags.cancel_on_movement {
+                        let (vx, vy, vz) = entity.velocity;
+                        if vx.abs() > 1e-4 || vy.abs() > 1e-4 || vz.abs() > 1e-4 {
+                            interrupt_reason = Some(InterruptReason::Movement);
+                        }
+                    }
+
+                    // 2. cancel_on_stun: entity is incapacitated
+                    if interrupt_reason.is_none()
+                        && action.interrupt_flags.cancel_on_stun
+                        && entity.is_incapacitated()
+                    {
+                        interrupt_reason = Some(InterruptReason::CrowdControl);
+                    }
+
+                    // 3. cancel_on_target_lost: target is missing or incapacitated
+                    if interrupt_reason.is_none() && action.interrupt_flags.cancel_on_target_lost {
+                        if let Some(tgt_guid) = action.target_guid {
+                            match ctx.entities.get_by_guid(tgt_guid) {
+                                None => {
+                                    interrupt_reason = Some(InterruptReason::TargetLost);
+                                }
+                                Some(tgt_ent) => {
+                                    if tgt_ent.is_incapacitated() {
+                                        interrupt_reason = Some(InterruptReason::TargetLost);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = interrupt_reason {
+                        decisions.push((
+                            entity.guid,
+                            ActionDecision::Interrupt(action.action_id, reason),
+                        ));
+                    } else {
+                        decisions.push((entity.guid, ActionDecision::Progress));
                     }
                 }
             }
+        }
+
+        // Pass 2: Mutable update pass applying decisions
+        let mut completed = Vec::new();
+        let mut interrupted = Vec::new();
+        let mut progressed = Vec::new();
+
+        for (entity_guid, decision) in decisions {
+            if let Some(entity) = ctx.entities.get_mut_by_guid(entity_guid) {
+                if let Some(queue) = entity.get_component_mut::<ActionQueue>() {
+                    match decision {
+                        ActionDecision::Interrupt(action_id, reason) => {
+                            queue.current = None;
+                            interrupted.push((entity_guid, action_id, reason));
+                        }
+                        ActionDecision::Progress => {
+                            if let Some(ref mut action) = queue.current {
+                                action.elapsed_sec += ctx.dt_sec;
+                                if action.is_finished() {
+                                    let finished_action = queue.current.take().unwrap();
+                                    completed.push((entity_guid, finished_action));
+                                } else {
+                                    progressed.push(ActionProgressEvent {
+                                        entity: entity_guid,
+                                        action_id: action.action_id,
+                                        elapsed_sec: action.elapsed_sec,
+                                        duration_sec: action.duration_sec,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (entity, action_id, reason) in interrupted {
+            ctx.events.push(ActionInterruptedEvent {
+                entity,
+                action_id,
+                reason,
+            });
+        }
+
+        for ev in progressed {
+            ctx.events.push(ev);
         }
 
         // Emit ActionCompletedEvent for completed actions
@@ -526,5 +613,119 @@ mod tests {
         assert_eq!(interrupted.len(), 1);
         assert_eq!(interrupted[0].action_id, 1);
         assert_eq!(interrupted[0].reason, InterruptReason::Replaced);
+    }
+
+    #[test]
+    fn test_action_tick_system_progress_and_interrupt_conditions() {
+        use crate::entity::{state_flags, EntityStore};
+
+        let bounds =
+            crate::octree::BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut events = EventQueue::new();
+        let mut entities = EntityStore::new();
+
+        let caster_guid = Guid::new(EntityType::Player, 1, 500);
+        let target_guid = Guid::new(EntityType::Player, 1, 501);
+
+        let caster_key = entities.spawn(caster_guid, (0.0, 0.0, 0.0));
+        let target_key = entities.spawn(target_guid, (10.0, 0.0, 0.0));
+
+        let mut queue = ActionQueue::new();
+        let action = TimedAction::new(99, 1.0, ActionInterruptFlags::default(), Some(target_guid));
+        queue
+            .start_action(caster_guid, action, QueuePolicy::RejectIfBusy, &mut events)
+            .unwrap();
+        entities.get_mut(caster_key).unwrap().add_component(queue);
+
+        let mut tick_system = ActionTickSystem;
+
+        // Tick 1: dt = 0.2s -> Emits ActionProgressEvent
+        {
+            let mut ctx = TickContext {
+                entities: &mut entities,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.2,
+                tick: 1,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let progress = events.drain::<ActionProgressEvent>();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].action_id, 99);
+        assert!((progress[0].elapsed_sec - 0.2).abs() < 1e-4);
+
+        // Tick 2: Caster moves (velocity != 0) -> ActionInterruptedEvent(Movement)
+        entities.get_mut(caster_key).unwrap().velocity = (1.0, 0.0, 0.0);
+        {
+            let mut ctx = TickContext {
+                entities: &mut entities,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.2,
+                tick: 2,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let interrupted = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].reason, InterruptReason::Movement);
+
+        // Reset velocity, start new action with target
+        entities.get_mut(caster_key).unwrap().velocity = (0.0, 0.0, 0.0);
+        let action2 =
+            TimedAction::new(100, 1.0, ActionInterruptFlags::default(), Some(target_guid));
+        entities
+            .get_mut(caster_key)
+            .unwrap()
+            .get_component_mut::<ActionQueue>()
+            .unwrap()
+            .start_action(caster_guid, action2, QueuePolicy::Replace, &mut events)
+            .unwrap();
+
+        // Target becomes incapacitated -> ActionInterruptedEvent(TargetLost)
+        entities.get_mut(target_key).unwrap().state_flags |= state_flags::INCAPACITATED;
+        {
+            let mut ctx = TickContext {
+                entities: &mut entities,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.2,
+                tick: 3,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let interrupted2 = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted2.len(), 1);
+        assert_eq!(interrupted2[0].reason, InterruptReason::TargetLost);
+
+        // Start action 3, caster becomes incapacitated -> ActionInterruptedEvent(CrowdControl)
+        let action3 = TimedAction::new(101, 1.0, ActionInterruptFlags::default(), None);
+        entities
+            .get_mut(caster_key)
+            .unwrap()
+            .get_component_mut::<ActionQueue>()
+            .unwrap()
+            .start_action(caster_guid, action3, QueuePolicy::Replace, &mut events)
+            .unwrap();
+        entities.get_mut(caster_key).unwrap().state_flags |= state_flags::INCAPACITATED;
+        {
+            let mut ctx = TickContext {
+                entities: &mut entities,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.2,
+                tick: 4,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let interrupted3 = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted3.len(), 1);
+        assert_eq!(interrupted3[0].reason, InterruptReason::CrowdControl);
     }
 }

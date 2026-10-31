@@ -113,22 +113,28 @@ impl NodeRegistry {
         if let Some(node) = self.nodes.get_mut(&request.node_id) {
             node.last_heartbeat = Instant::now();
             node.entity_count = request.entity_count;
-            node.cpu_percent = request.cpu_percent;
+            if request.cpu_percent.is_finite() && request.cpu_percent >= 0.0 {
+                node.cpu_percent = request.cpu_percent;
+            }
             node.memory_bytes = request.memory_bytes;
-            if node.tick_duration_ms == 0.0 {
-                node.tick_duration_ms = request.tick_duration_ms;
-            } else {
-                node.tick_duration_ms =
-                    0.8 * node.tick_duration_ms + 0.2 * request.tick_duration_ms;
+            if request.tick_duration_ms.is_finite() && request.tick_duration_ms >= 0.0 {
+                if node.tick_duration_ms == 0.0 {
+                    node.tick_duration_ms = request.tick_duration_ms;
+                } else {
+                    node.tick_duration_ms =
+                        0.8 * node.tick_duration_ms + 0.2 * request.tick_duration_ms;
+                }
             }
             if let Some(c) = &request.entity_centroid {
-                let mut centroid = (c.x, c.y, c.z);
-                if let Some(bound) = node.assigned_bounds.first() {
-                    centroid.0 = centroid.0.clamp(bound.min.0, bound.max.0);
-                    centroid.1 = centroid.1.clamp(bound.min.1, bound.max.1);
-                    centroid.2 = centroid.2.clamp(bound.min.2, bound.max.2);
+                if c.x.is_finite() && c.y.is_finite() && c.z.is_finite() {
+                    let mut centroid = (c.x, c.y, c.z);
+                    if let Some(bound) = node.assigned_bounds.first() {
+                        centroid.0 = centroid.0.clamp(bound.min.0, bound.max.0);
+                        centroid.1 = centroid.1.clamp(bound.min.1, bound.max.1);
+                        centroid.2 = centroid.2.clamp(bound.min.2, bound.max.2);
+                    }
+                    node.entity_centroid = centroid;
                 }
-                node.entity_centroid = centroid;
             }
             true
         } else {
@@ -338,6 +344,64 @@ mod tests {
             entity_centroid: None,
         };
         assert!(!registry.record_heartbeat(&unknown_hb));
+    }
+
+    #[test]
+    fn test_heartbeat_rejects_non_finite_floats() {
+        let mut registry = NodeRegistry::new();
+        let id = registry.register_node("127.0.0.1:50051".to_string(), vec![]);
+
+        // 1. Initial valid heartbeat
+        let valid_hb = HeartbeatRequest {
+            node_id: id,
+            tick_rate: 20.0,
+            entity_count: 10,
+            cpu_percent: 25.0,
+            memory_bytes: 1024,
+            timestamp: 100,
+            tick_duration_ms: 12.0,
+            entity_centroid: Some(mmo_schema::cluster::Vector3 {
+                x: 10.0,
+                y: 20.0,
+                z: 30.0,
+            }),
+        };
+        assert!(registry.record_heartbeat(&valid_hb));
+        let node = registry.get_node(id).unwrap();
+        assert_eq!(node.cpu_percent, 25.0);
+        assert_eq!(node.tick_duration_ms, 12.0);
+        assert_eq!(node.entity_centroid, (10.0, 20.0, 30.0));
+
+        // 2. Malformed heartbeat with NaN and Infinity values
+        let malformed_hb = HeartbeatRequest {
+            node_id: id,
+            tick_rate: 20.0,
+            entity_count: 15,
+            cpu_percent: f32::NAN,
+            memory_bytes: 2048,
+            timestamp: 200,
+            tick_duration_ms: f32::INFINITY,
+            entity_centroid: Some(mmo_schema::cluster::Vector3 {
+                x: f32::NAN,
+                y: 20.0,
+                z: 30.0,
+            }),
+        };
+        assert!(registry.record_heartbeat(&malformed_hb));
+
+        // State must remain unpoisoned
+        let node_after = registry.get_node(id).unwrap();
+        assert_eq!(node_after.entity_count, 15);
+        assert_eq!(node_after.cpu_percent, 25.0, "NaN CPU must be ignored");
+        assert_eq!(
+            node_after.tick_duration_ms, 12.0,
+            "Infinity tick duration must be ignored"
+        );
+        assert_eq!(
+            node_after.entity_centroid,
+            (10.0, 20.0, 30.0),
+            "NaN centroid must be ignored"
+        );
     }
 
     #[test]

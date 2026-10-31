@@ -46,6 +46,7 @@ pub struct SessionDropGuard {
     pub cache: Option<Arc<dyn SessionCacheBackend>>,
     pub subscription_manager: Option<Arc<GatewaySubscriptionManager>>,
     pub writer_handle: Option<tokio::task::JoinHandle<()>>,
+    pub intercept_handler: Option<Arc<crate::server::intercept::GatewayInterceptHandler>>,
 }
 
 impl Drop for SessionDropGuard {
@@ -53,7 +54,9 @@ impl Drop for SessionDropGuard {
         let _ = self.router.remove_session(self.session_id);
         self.session_sinks.remove(&self.session_id);
         metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
-        if let Some(ref sub_mgr) = self.subscription_manager {
+        if let Some(ref intercept) = self.intercept_handler {
+            intercept.remove_session(self.session_id);
+        } else if let Some(ref sub_mgr) = self.subscription_manager {
             sub_mgr.remove_session(self.session_id);
         }
         if let Some(ref handle) = self.writer_handle {
