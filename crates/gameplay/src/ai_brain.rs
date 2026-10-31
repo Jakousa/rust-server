@@ -61,7 +61,19 @@ impl FsmBrainComponent {
 
 /// Batch tick system that evaluates FSM states and executes transitions.
 #[derive(Default)]
-pub struct FsmBrainSystem;
+pub struct FsmBrainSystem {
+    /// Reused per-tick target position lookup buffer (cleared, never reallocated once warm).
+    entity_positions: std::collections::HashMap<Guid, (f32, f32, f32)>,
+    /// Last A* request per entity: `(destination, seconds since request)`; used to throttle repathing.
+    last_path_request: std::collections::HashMap<Guid, ((f32, f32, f32), f32)>,
+}
+
+impl FsmBrainSystem {
+    /// Minimum seconds between A* recomputations toward a (nearly) unchanged destination.
+    const REPATH_INTERVAL_SECS: f32 = 0.5;
+    /// Destination drift (world units) above which a path is recomputed immediately.
+    const REPATH_DRIFT: f32 = 1.0;
+}
 
 impl TickSystem for FsmBrainSystem {
     fn name(&self) -> &'static str {
@@ -70,11 +82,18 @@ impl TickSystem for FsmBrainSystem {
 
     fn update(&mut self, ctx: &mut TickContext) {
         // Collect snapshots of target positions to query during Chase/Attack without borrowing conflicts
-        let mut entity_positions: std::collections::HashMap<Guid, (f32, f32, f32)> =
-            std::collections::HashMap::new();
+        let Self {
+            entity_positions,
+            last_path_request,
+        } = self;
+        entity_positions.clear();
         for (_, ent) in ctx.entities.iter() {
             entity_positions.insert(ent.guid, ent.position);
         }
+        for (_, age) in last_path_request.values_mut() {
+            *age += ctx.dt_sec;
+        }
+        last_path_request.retain(|guid, _| entity_positions.contains_key(guid));
 
         let mut damage_events_to_emit: Vec<DamageEvent> = Vec::new();
 
@@ -260,7 +279,24 @@ impl TickSystem for FsmBrainSystem {
             if let Some(target_pos_opt) = set_nav_target {
                 if let Some(agent) = entity.get_component_mut::<NavAgentComponent>() {
                     match target_pos_opt {
+                        Some(dest)
+                            if (agent.target_position.is_some()
+                                || !agent.path_waypoints.is_empty())
+                                && last_path_request.get(&entity_guid).is_some_and(
+                                    |&(prev_dest, age)| {
+                                        let dx = prev_dest.0 - dest.0;
+                                        let dy = prev_dest.1 - dest.1;
+                                        let dz = prev_dest.2 - dest.2;
+                                        age < Self::REPATH_INTERVAL_SECS
+                                            && dx * dx + dy * dy + dz * dz
+                                                <= Self::REPATH_DRIFT * Self::REPATH_DRIFT
+                                    },
+                                ) =>
+                        {
+                            // Throttled: keep following the existing path toward ~the same goal.
+                        }
                         Some(dest) => {
+                            last_path_request.insert(entity_guid, (dest, 0.0));
                             let mut path_set = false;
                             if let Some(cw) = ctx.collision_world {
                                 let start_v = mmo_core::spatial::Vec3::new(
@@ -287,6 +323,7 @@ impl TickSystem for FsmBrainSystem {
                             }
                         }
                         None => {
+                            last_path_request.remove(&entity_guid);
                             agent.target_position = None;
                             agent.path_waypoints.clear();
                         }
@@ -312,7 +349,7 @@ impl GameplayPlugin for MonsterAiPlugin {
 
     fn build(&self, ctx: &mut PluginContext) {
         ctx.codecs.register::<FsmBrainComponent>("fsm_brain");
-        ctx.tick_systems.push(Box::new(FsmBrainSystem));
+        ctx.tick_systems.push(Box::new(FsmBrainSystem::default()));
     }
 }
 
@@ -358,7 +395,7 @@ mod tests {
             .unwrap()
             .add_component(HealthComponent::new(100.0, 0.0));
 
-        let mut brain_system = FsmBrainSystem;
+        let mut brain_system = FsmBrainSystem::default();
 
         // 1. Initial tick with no threat -> stays in Idle
         {
@@ -525,7 +562,7 @@ mod tests {
         store.get_mut(monster_key).unwrap().add_component(threat);
         store.get_mut(monster_key).unwrap().add_component(nav);
 
-        let mut brain_system = FsmBrainSystem;
+        let mut brain_system = FsmBrainSystem::default();
         let mut nav_system = NavSteeringSystem;
 
         // 3. Tick brain system with collision_world: should compute path around wall

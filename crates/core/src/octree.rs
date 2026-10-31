@@ -312,6 +312,8 @@ pub struct Octree {
     pub node: OctreeNode,
     pub max_entities_per_leaf: usize,
     pub min_entities_to_merge: usize,
+    /// Cached number of entities stored in this subtree (O(1) `len()`).
+    pub count: usize,
 }
 
 impl Octree {
@@ -337,6 +339,7 @@ impl Octree {
             },
             max_entities_per_leaf,
             min_entities_to_merge,
+            count: 0,
         }
     }
 
@@ -350,7 +353,7 @@ impl Octree {
         }
 
         let bounds = self.bounds;
-        match &mut self.node {
+        let inserted = match &mut self.node {
             OctreeNode::Leaf { entities } => {
                 let (dx, dy, dz) = bounds.dimensions();
                 let min_dim = dx.min(dy).min(dz);
@@ -360,23 +363,24 @@ impl Octree {
                     true
                 } else {
                     self.subdivide();
-                    self.insert(guid, pos)
+                    return self.insert(guid, pos);
                 }
             }
             OctreeNode::Branch { children } => {
                 let idx = bounds.child_index(pos);
                 if children[idx].insert(guid, pos) {
-                    return true;
+                    true
+                } else {
+                    // Fallback for boundary/precision edge cases
+                    children.iter_mut().any(|child| child.insert(guid, pos))
                 }
-                // Fallback for boundary/precision edge cases
-                for child in children.iter_mut() {
-                    if child.insert(guid, pos) {
-                        return true;
-                    }
-                }
-                false
             }
+        };
+
+        if inserted {
+            self.count += 1;
         }
+        inserted
     }
 
     /// Removes an entity with the given GUID and position from the octree.
@@ -415,6 +419,7 @@ impl Octree {
         };
 
         if removed {
+            self.count = self.count.saturating_sub(1);
             self.try_merge();
         }
 
@@ -447,6 +452,7 @@ impl Octree {
         };
 
         if removed {
+            self.count = self.count.saturating_sub(1);
             self.try_merge();
         }
 
@@ -519,16 +525,15 @@ impl Octree {
     }
 
     /// Returns the total number of entities stored across this octree node and its descendants.
+    #[inline]
     pub fn len(&self) -> usize {
-        match &self.node {
-            OctreeNode::Leaf { entities } => entities.len(),
-            OctreeNode::Branch { children } => children.iter().map(|c| c.len()).sum(),
-        }
+        self.count
     }
 
     /// Returns `true` if the octree contains no entities.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.count == 0
     }
 
     /// Returns `true` if this node is a `Leaf`.
@@ -564,6 +569,7 @@ impl Octree {
         self.node = OctreeNode::Leaf {
             entities: Vec::new(),
         };
+        self.count = 0;
     }
 
     /// Finds the leaf octree node enclosing the specified position, if within bounds.
@@ -846,6 +852,8 @@ impl Octree {
         self.node = OctreeNode::Branch {
             children: children_box,
         };
+        // Re-insertion below recounts every entity.
+        self.count = 0;
 
         for (g, p) in entities {
             self.insert(g, p);
@@ -854,7 +862,7 @@ impl Octree {
 
     fn try_merge(&mut self) {
         if let OctreeNode::Branch { children } = &mut self.node {
-            let total: usize = children.iter().map(|c| c.len()).sum();
+            let total = self.count;
             if total <= self.min_entities_to_merge {
                 let mut merged = Vec::with_capacity(total);
                 for child in children.iter_mut() {

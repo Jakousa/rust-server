@@ -537,8 +537,10 @@ impl EntityStore {
             return Vec::new();
         }
         let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         results.push(root_guid);
+        seen.insert(root_guid);
         queue.push_back(root_guid);
 
         while let Some(curr_guid) = queue.pop_front() {
@@ -546,7 +548,7 @@ impl EntityStore {
                 continue;
             };
             for &child_guid in &entity.children {
-                if self.contains_guid(child_guid) && !results.contains(&child_guid) {
+                if self.contains_guid(child_guid) && seen.insert(child_guid) {
                     results.push(child_guid);
                     queue.push_back(child_guid);
                 }

@@ -293,9 +293,7 @@ impl CharacterRepository {
         }
 
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
-            let snap_query = q!(r#"
-                INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            let conflict_sql = q!(r#"
                 ON CONFLICT(guid) DO UPDATE SET
                     pos_x = excluded.pos_x,
                     pos_y = excluded.pos_y,
@@ -307,38 +305,59 @@ impl CharacterRepository {
                     timestamp = excluded.timestamp
                 WHERE excluded.version >= entity_snapshots.version
                 "#);
-            let char_query = q!(r#"
-                UPDATE characters
-                SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ?
-                WHERE guid = ?
-                "#);
 
             for chunk in snapshots.chunks(50) {
-                for snap in chunk {
-                    let attrs_str = serde_json::to_string(&snap.attributes)?;
-                    sqlx::query(&snap_query)
-                        .bind(snap.guid as i64)
-                        .bind(snap.position.0)
-                        .bind(snap.position.1)
-                        .bind(snap.position.2)
-                        .bind(snap.rotation)
-                        .bind(&attrs_str)
-                        .bind(snap.state_blob.as_deref())
-                        .bind(snap.version as i64)
-                        .bind(snap.timestamp as i64)
-                        .execute(&mut *conn)
-                        .await?;
-
-                    sqlx::query(&char_query)
-                        .bind(snap.position.0)
-                        .bind(snap.position.1)
-                        .bind(snap.position.2)
-                        .bind(snap.rotation)
-                        .bind(snap.timestamp as i64)
-                        .bind(snap.guid as i64)
-                        .execute(&mut *conn)
-                        .await?;
+                // A multi-row upsert cannot touch the same key twice (PostgreSQL rejects it),
+                // so collapse duplicate GUIDs: highest version wins, later entry wins ties.
+                let mut latest: std::collections::HashMap<u64, usize> =
+                    std::collections::HashMap::with_capacity(chunk.len());
+                for (i, snap) in chunk.iter().enumerate() {
+                    match latest.get(&snap.guid) {
+                        Some(&j) if chunk[j].version > snap.version => {}
+                        _ => {
+                            latest.insert(snap.guid, i);
+                        }
+                    }
                 }
+                let rows: Vec<(&EntitySnapshot, String)> = chunk
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| latest.get(&s.guid) == Some(i))
+                    .map(|(_, s)| Ok((s, serde_json::to_string(&s.attributes)?)))
+                    .collect::<Result<_, StorageError>>()?;
+
+                let mut qb = sqlx::QueryBuilder::new(
+                    "INSERT INTO entity_snapshots (guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp) ",
+                );
+                qb.push_values(rows.iter(), |mut b, (snap, attrs_str)| {
+                    b.push_bind(snap.guid as i64)
+                        .push_bind(snap.position.0)
+                        .push_bind(snap.position.1)
+                        .push_bind(snap.position.2)
+                        .push_bind(snap.rotation)
+                        .push_bind(attrs_str.as_str())
+                        .push_bind(snap.state_blob.as_deref())
+                        .push_bind(snap.version as i64)
+                        .push_bind(snap.timestamp as i64);
+                });
+                qb.push(" ");
+                qb.push(conflict_sql.as_ref());
+                qb.build().execute(&mut *conn).await?;
+
+                // Mirror latest position into `characters` with one batched UPDATE ... FROM VALUES.
+                let mut cb = sqlx::QueryBuilder::new(
+                    "WITH v(guid, pos_x, pos_y, pos_z, rotation, updated_at) AS (",
+                );
+                cb.push_values(rows.iter(), |mut b, (snap, _)| {
+                    b.push_bind(snap.guid as i64)
+                        .push_bind(snap.position.0)
+                        .push_bind(snap.position.1)
+                        .push_bind(snap.position.2)
+                        .push_bind(snap.rotation)
+                        .push_bind(snap.timestamp as i64);
+                });
+                cb.push(") UPDATE characters SET pos_x = v.pos_x, pos_y = v.pos_y, pos_z = v.pos_z, rotation = v.rotation, updated_at = v.updated_at FROM v WHERE characters.guid = v.guid");
+                cb.build().execute(&mut *conn).await?;
             }
 
             Ok(snapshots.len())

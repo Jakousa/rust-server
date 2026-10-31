@@ -162,6 +162,9 @@ async fn test_e2e_forward_client_packet_and_movement_correction_snapback() {
         .into_inner();
     assert!(resp.success);
 
+    // Drain simulation inputs to apply queued movement
+    sim_arc.write().await.drain_client_inputs();
+
     // Verify entity position updated in sim
     {
         let s = sim_arc.read().await;
@@ -193,8 +196,10 @@ async fn test_e2e_forward_client_packet_and_movement_correction_snapback() {
         .expect("forward invalid movement")
         .into_inner();
 
-    assert!(!resp_invalid.success);
-    assert_eq!(resp_invalid.error_message, "Movement corrected");
+    assert!(resp_invalid.success);
+
+    // Drain simulation inputs to detect kinematic violation and emit snapback correction
+    sim_arc.write().await.drain_client_inputs();
 
     // 4. Verify snapback MovementCorrection was queued in pending_broadcast_jobs
     {

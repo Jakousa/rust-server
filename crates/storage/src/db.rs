@@ -97,9 +97,9 @@ pub enum DbBackend {
 
 /// Helper function to adapt standard ANSI SQL queries with `?` parameters
 /// to PostgreSQL's `$1, $2, ...` positional parameter requirements.
-pub fn sql_for_dialect(query: &str, is_postgres: bool) -> String {
+pub fn sql_for_dialect(query: &str, is_postgres: bool) -> std::borrow::Cow<'_, str> {
     if !is_postgres {
-        return query.to_string();
+        return std::borrow::Cow::Borrowed(query);
     }
     let mut result = String::with_capacity(query.len() + 16);
     let mut param_idx = 1;
@@ -116,7 +116,7 @@ pub fn sql_for_dialect(query: &str, is_postgres: bool) -> String {
             result.push(c);
         }
     }
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Current UTC timestamp in milliseconds since Unix epoch without panicking.
@@ -242,7 +242,7 @@ pub struct Database {
 
 impl Database {
     /// Adapts the given SQL statement with `?` parameter placeholders to the active backend dialect.
-    pub fn sql(&self, query: &str) -> String {
+    pub fn sql<'a>(&self, query: &'a str) -> std::borrow::Cow<'a, str> {
         sql_for_dialect(query, self.is_postgres())
     }
 

@@ -308,18 +308,45 @@ impl SectorSpatialIndex {
 
     /// Gathers all world objects within an Axis-Aligned Bounding Box.
     pub fn query_aabb(&self, aabb: &BoundingBox3D) -> Vec<&WorldObject> {
+        if aabb.min.0 > aabb.max.0 || aabb.min.1 > aabb.max.1 || aabb.min.2 > aabb.max.2 {
+            return Vec::new();
+        }
         let min_sector = SectorCoord3D::from_world_pos(aabb.min);
         let max_sector = SectorCoord3D::from_world_pos(aabb.max);
 
+        let span = |lo: i32, hi: i32| (i64::from(hi) - i64::from(lo) + 1).max(0) as u64;
+        let volume = span(min_sector.x, max_sector.x)
+            .saturating_mul(span(min_sector.y, max_sector.y))
+            .saturating_mul(span(min_sector.z, max_sector.z));
+
         let mut results = Vec::new();
-        for sx in min_sector.x..=max_sector.x {
-            for sy in min_sector.y..=max_sector.y {
-                for sz in min_sector.z..=max_sector.z {
-                    let sector_coord = SectorCoord3D::new(sx, sy, sz);
-                    if let Some(sector_map) = self.sectors.get(&sector_coord) {
-                        for object in sector_map.values() {
-                            if object.bounds.intersects(aabb) {
-                                results.push(object);
+        if volume > self.sectors.len() as u64 {
+            // Query volume exceeds populated sectors: scan populated sectors only (O(K)).
+            for (coord, sector_map) in &self.sectors {
+                if coord.x >= min_sector.x
+                    && coord.x <= max_sector.x
+                    && coord.y >= min_sector.y
+                    && coord.y <= max_sector.y
+                    && coord.z >= min_sector.z
+                    && coord.z <= max_sector.z
+                {
+                    for object in sector_map.values() {
+                        if object.bounds.intersects(aabb) {
+                            results.push(object);
+                        }
+                    }
+                }
+            }
+        } else {
+            for sx in min_sector.x..=max_sector.x {
+                for sy in min_sector.y..=max_sector.y {
+                    for sz in min_sector.z..=max_sector.z {
+                        let sector_coord = SectorCoord3D::new(sx, sy, sz);
+                        if let Some(sector_map) = self.sectors.get(&sector_coord) {
+                            for object in sector_map.values() {
+                                if object.bounds.intersects(aabb) {
+                                    results.push(object);
+                                }
                             }
                         }
                     }
@@ -357,6 +384,13 @@ impl SectorSpatialIndex {
         if max_dist <= 0.0 {
             return None;
         }
+
+        let len_sq = dir.0 * dir.0 + dir.1 * dir.1 + dir.2 * dir.2;
+        if len_sq <= 1e-8 || !len_sq.is_finite() {
+            return None;
+        }
+        let inv_len = 1.0 / len_sq.sqrt();
+        let dir = (dir.0 * inv_len, dir.1 * inv_len, dir.2 * inv_len);
 
         let target = (
             origin.0 + dir.0 * max_dist,
