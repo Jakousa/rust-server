@@ -288,7 +288,14 @@ impl DataStore {
     /// - An array of objects (each must contain an `"id"`).
     /// - An object map whose values are sub-objects (keys are IDs).
     pub fn load_file(&self, path: impl AsRef<Path>) -> Result<usize, DataStoreError> {
-        let path = path.as_ref();
+        let docs = Self::parse_file_documents(path.as_ref())?;
+        let count = docs.len();
+        self.commit_documents(docs);
+        Ok(count)
+    }
+
+    /// Parses all documents from a single file without touching the store.
+    fn parse_file_documents(path: &Path) -> Result<Vec<DataDocument>, DataStoreError> {
         let path_str = path.to_string_lossy().to_string();
 
         let ext = path
@@ -333,10 +340,14 @@ impl DataStore {
             }
         };
 
-        let docs =
-            Self::extract_documents(parsed_value, &default_collection, &file_stem, &path_str)?;
-        let count = docs.len();
+        Self::extract_documents(parsed_value, &default_collection, &file_stem, &path_str)
+    }
 
+    /// Inserts a batch of documents using a single snapshot clone.
+    fn commit_documents(&self, docs: Vec<DataDocument>) {
+        if docs.is_empty() {
+            return;
+        }
         let _guard = self.write_lock.lock().unwrap();
         let mut new_snap = (**self.snapshot.load()).clone();
         for doc in docs {
@@ -347,8 +358,6 @@ impl DataStore {
             col.insert(doc.id.clone(), Arc::new(doc));
         }
         self.snapshot.store(Arc::new(new_snap));
-
-        Ok(count)
     }
 
     /// Recursively scans a directory tree, parsing all valid `.json`, `.mpk`, and `.msgpack` files.
@@ -360,6 +369,7 @@ impl DataStore {
         let mut file_paths = Vec::new();
         Self::collect_files_recursive(dir_path.as_ref(), &mut file_paths);
 
+        let mut all_docs = Vec::new();
         for path in file_paths {
             let ext = path
                 .extension()
@@ -368,12 +378,18 @@ impl DataStore {
                 .to_ascii_lowercase();
 
             if ext == "json" || ext == "mpk" || ext == "msgpack" {
-                match self.load_file(&path) {
-                    Ok(n) => report.loaded += n,
+                match Self::parse_file_documents(&path) {
+                    Ok(docs) => {
+                        report.loaded += docs.len();
+                        all_docs.extend(docs);
+                    }
                     Err(err) => report.errors.push(err),
                 }
             }
         }
+
+        // Single snapshot clone + swap for the whole directory.
+        self.commit_documents(all_docs);
 
         report
     }

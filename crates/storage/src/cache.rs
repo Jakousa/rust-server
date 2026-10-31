@@ -74,14 +74,29 @@ impl SessionCacheBackend for MemoryCache {
     }
 
     async fn get_session(&self, session_id: u64) -> Result<Option<SessionData>, StorageError> {
-        let mut map = self.sessions.write().await;
-        if let Some((data, expire)) = map.get(&session_id) {
-            if Instant::now() <= *expire {
-                return Ok(Some(data.clone()));
+        // Fast path: shared read lock for hits and misses.
+        {
+            let map = self.sessions.read().await;
+            match map.get(&session_id) {
+                None => return Ok(None),
+                Some((data, expire)) if Instant::now() <= *expire => {
+                    return Ok(Some(data.clone()));
+                }
+                Some(_) => {}
             }
         }
-        map.remove(&session_id);
-        Ok(None)
+
+        // Slow path: evict the expired entry, re-verifying under the write lock
+        // in case it was refreshed between the two lock acquisitions.
+        let mut map = self.sessions.write().await;
+        match map.get(&session_id) {
+            Some((data, expire)) if Instant::now() <= *expire => Ok(Some(data.clone())),
+            Some(_) => {
+                map.remove(&session_id);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 
     async fn remove_session(&self, session_id: u64) -> Result<bool, StorageError> {

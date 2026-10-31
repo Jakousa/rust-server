@@ -51,6 +51,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         .await
         .unwrap()
         .into_inner();
+    sim.write().await.drain_client_inputs();
 
     assert!(resp.success, "Inspect failed: {}", resp.error_message);
 
@@ -117,6 +118,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         .await
         .unwrap()
         .into_inner();
+    sim.write().await.drain_client_inputs();
 
     assert!(
         resp_barter.success,
@@ -170,6 +172,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // Move P2 near P1
     {
@@ -202,6 +205,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     let session_id = {
         let s = sim.read().await;
@@ -239,6 +243,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // P2 offers 3x Wild Herbs and 15 Gold (sub-opcode 4)
     let offer_p2_pkt =
@@ -265,6 +270,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // P1 locks offer (sub-opcode 5)
     let accept_pkt =
@@ -286,6 +292,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // P2 locks and accepts (sub-opcode 5)
     let accept_p2_pkt =
@@ -307,6 +314,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // P1 accept now that both are locked (sub-opcode 5)
     service
@@ -318,6 +326,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // P2 accept now that both are locked (sub-opcode 5) -> atomic swap!
     service
@@ -329,6 +338,7 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
         }))
         .await
         .unwrap();
+    sim.write().await.drain_client_inputs();
 
     // 7. Verify atomic swap between P1 and P2
     {

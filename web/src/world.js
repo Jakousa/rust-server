@@ -70,7 +70,8 @@ export class WorldObjectRenderer {
 
     const STRIDE = 16;
     const count = Math.floor(buffer.length / STRIDE);
-    const activeIds = new Set();
+    const activeIds = (this._activeIds ??= new Set());
+    activeIds.clear();
     const uint32View = new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.length);
 
     for (let i = 0; i < count; i++) {

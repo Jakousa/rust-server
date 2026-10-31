@@ -544,34 +544,28 @@ impl CollisionWorld for AabbCollisionWorld {
                 break;
             }
 
-            let mut neighbors: Vec<((i32, i32, i32), f32)> = vec![
-                ((curr_coord.0 + 1, curr_coord.1, curr_coord.2), 1.0),
-                ((curr_coord.0 - 1, curr_coord.1, curr_coord.2), 1.0),
-                ((curr_coord.0, curr_coord.1, curr_coord.2 + 1), 1.0),
-                ((curr_coord.0, curr_coord.1, curr_coord.2 - 1), 1.0),
-                (
-                    (curr_coord.0 + 1, curr_coord.1, curr_coord.2 + 1),
-                    std::f32::consts::SQRT_2,
-                ),
-                (
-                    (curr_coord.0 - 1, curr_coord.1, curr_coord.2 + 1),
-                    std::f32::consts::SQRT_2,
-                ),
-                (
-                    (curr_coord.0 + 1, curr_coord.1, curr_coord.2 - 1),
-                    std::f32::consts::SQRT_2,
-                ),
-                (
-                    (curr_coord.0 - 1, curr_coord.1, curr_coord.2 - 1),
-                    std::f32::consts::SQRT_2,
-                ),
-            ];
+            let (cx, cy, cz) = curr_coord;
+            let diag = std::f32::consts::SQRT_2;
+            // Stack-allocated neighbor buffer (8 planar + up to 2 vertical); no per-expansion heap alloc.
+            let mut neighbors = [((0i32, 0i32, 0i32), 0.0f32); 10];
+            neighbors[..8].copy_from_slice(&[
+                ((cx + 1, cy, cz), 1.0),
+                ((cx - 1, cy, cz), 1.0),
+                ((cx, cy, cz + 1), 1.0),
+                ((cx, cy, cz - 1), 1.0),
+                ((cx + 1, cy, cz + 1), diag),
+                ((cx - 1, cy, cz + 1), diag),
+                ((cx + 1, cy, cz - 1), diag),
+                ((cx - 1, cy, cz - 1), diag),
+            ]);
+            let mut neighbor_count = 8;
             if check_vertical {
-                neighbors.push(((curr_coord.0, curr_coord.1 + 1, curr_coord.2), 1.0));
-                neighbors.push(((curr_coord.0, curr_coord.1 - 1, curr_coord.2), 1.0));
+                neighbors[8] = ((cx, cy + 1, cz), 1.0);
+                neighbors[9] = ((cx, cy - 1, cz), 1.0);
+                neighbor_count = 10;
             }
 
-            for (next_coord, cost) in neighbors {
+            for &(next_coord, cost) in &neighbors[..neighbor_count] {
                 let next_pos = cell_pos(next_coord);
                 if !self.is_point_traversable(next_pos) {
                     continue;

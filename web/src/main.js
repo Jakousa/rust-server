@@ -298,13 +298,21 @@ export class ClientWorldBridge {
     return floatBuffer;
   }
 
+  /**
+   * Returns a reused telemetry object (no per-frame allocation or JSON round-trip).
+   * The returned object is overwritten on the next call; do not retain it.
+   */
+  getTelemetry() {
+    const t = (this._telemetry ??= {});
+    t.entity_count = this.entities.size + 1;
+    t.latest_server_tick = this.latestServerTick;
+    t.latest_baseline_tick = this.latestBaselineTick;
+    t.received_packets = this.receivedPackets;
+    return t;
+  }
+
   getTelemetryJson() {
-    return JSON.stringify({
-      entity_count: this.entities.size + 1,
-      latest_server_tick: this.latestServerTick,
-      latest_baseline_tick: this.latestBaselineTick,
-      received_packets: this.receivedPackets,
-    });
+    return JSON.stringify(this.getTelemetry());
   }
 }
 
@@ -599,7 +607,7 @@ if (typeof window !== "undefined") {
 
     // 5. Update HUD Telemetry
     ui.updateTelemetry(
-      world.getTelemetryJson(),
+      world.getTelemetry(),
       transport.pingMs,
       transport.bandwidthBps,
       controls.position

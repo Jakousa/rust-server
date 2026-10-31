@@ -5,6 +5,7 @@
 //! dynamic density-based radius throttling, and produces binary broadcast packets.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use mmo_core::guid::Guid;
 use mmo_core::octree::calculate_throttled_aoi;
@@ -112,7 +113,7 @@ pub struct CachedEntityState {
     pub max_health: u32,
     pub state_flags: u32,
     pub last_sent_tick: u64,
-    pub attributes: Vec<ScalarAttributeDelta>,
+    pub attributes: Arc<[ScalarAttributeDelta]>,
 }
 
 /// Historical snapshot of all visible entity states sent to an observer at a specific tick.
@@ -702,7 +703,7 @@ impl AoiManager {
                             if state_flags != base_state.state_flags {
                                 field_mask |= delta_flags::MASK_STATE_FLAGS;
                             }
-                            if attrs != base_state.attributes {
+                            if attrs[..] != *base_state.attributes {
                                 field_mask |= delta_flags::MASK_ATTRIBUTES;
                             }
 
@@ -742,7 +743,7 @@ impl AoiManager {
                             let attr_changed = health != last_sent.health
                                 || max_health != last_sent.max_health
                                 || state_flags != last_sent.state_flags
-                                || attrs != last_sent.attributes;
+                                || attrs[..] != *last_sent.attributes;
                             let refresh_due = current_tick.saturating_sub(last_sent.last_sent_tick)
                                 >= observer.config.full_refresh_interval_ticks;
                             moved || attr_changed || refresh_due
@@ -789,7 +790,7 @@ impl AoiManager {
                                 max_health,
                                 state_flags,
                                 last_sent_tick: current_tick,
-                                attributes: attrs,
+                                attributes: Arc::from(attrs),
                             },
                         );
                     }
@@ -839,7 +840,7 @@ impl AoiManager {
                         let health_changed =
                             cached.health != health || cached.max_health != max_health;
                         let flags_changed = cached.state_flags != state_flags;
-                        let attrs_changed = cached.attributes != attrs;
+                        let attrs_changed = *cached.attributes != attrs[..];
                         let periodic_refresh = current_tick.saturating_sub(cached.last_sent_tick)
                             >= observer.config.full_refresh_interval_ticks;
 
@@ -856,7 +857,7 @@ impl AoiManager {
                             cached.max_health = max_health;
                             cached.state_flags = state_flags;
                             cached.last_sent_tick = current_tick;
-                            cached.attributes = attrs;
+                            cached.attributes = Arc::from(attrs);
 
                             packets.push(ClientPacket::EntityState(EntityStatePacket {
                                 entity_id: visible_guid.raw(),
@@ -881,7 +882,7 @@ impl AoiManager {
                                 max_health,
                                 state_flags,
                                 last_sent_tick: current_tick,
-                                attributes: attrs,
+                                attributes: Arc::from(attrs),
                             },
                         );
 
@@ -1286,7 +1287,7 @@ mod tests {
                 max_health: 100,
                 state_flags: 0,
                 last_sent_tick: 1,
-                attributes: Vec::new(),
+                attributes: Arc::from(Vec::new()),
             },
         );
 
