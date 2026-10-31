@@ -156,3 +156,90 @@ impl PacketDispatcher {
         Ok(routed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mmo_schema::client::Opcode;
+
+    #[test]
+    fn test_ephemeral_valid_opcodes() {
+        let opcodes = [
+            Opcode::Movement as u16,
+            Opcode::MovementCorrection as u16,
+            Opcode::EntityState as u16,
+            Opcode::EntityDespawn as u16,
+            Opcode::EntityDeltaBatch as u16,
+            Opcode::Ping as u16,
+            Opcode::Pong as u16,
+        ];
+
+        for opcode in opcodes {
+            let [b1, b2] = opcode.to_le_bytes();
+            let buf = [0x4D, 0x4D, b1, b2];
+            assert!(
+                is_ephemeral_packet(&buf),
+                "Opcode {:#06x} should be ephemeral",
+                opcode
+            );
+        }
+    }
+
+    #[test]
+    fn test_ephemeral_non_ephemeral_opcodes() {
+        let opcodes = [
+            Opcode::Interaction as u16,
+            Opcode::InteractionResult as u16,
+            Opcode::ClientAck as u16,
+            Opcode::AuthRequest as u16,
+            Opcode::AuthResponse as u16,
+        ];
+
+        for opcode in opcodes {
+            let [b1, b2] = opcode.to_le_bytes();
+            let buf = [0x4D, 0x4D, b1, b2];
+            assert!(
+                !is_ephemeral_packet(&buf),
+                "Opcode {:#06x} should NOT be ephemeral",
+                opcode
+            );
+        }
+    }
+
+    #[test]
+    fn test_ephemeral_invalid_header() {
+        let [b1, b2] = (Opcode::Movement as u16).to_le_bytes();
+
+        // Invalid first byte
+        assert!(!is_ephemeral_packet(&[0x4C, 0x4D, b1, b2]));
+
+        // Invalid second byte
+        assert!(!is_ephemeral_packet(&[0x4D, 0x4E, b1, b2]));
+
+        // Both invalid
+        assert!(!is_ephemeral_packet(&[0x00, 0x00, b1, b2]));
+    }
+
+    #[test]
+    fn test_ephemeral_buffer_too_short() {
+        assert!(!is_ephemeral_packet(&[]));
+        assert!(!is_ephemeral_packet(&[0x4D]));
+        assert!(!is_ephemeral_packet(&[0x4D, 0x4D]));
+        assert!(!is_ephemeral_packet(&[0x4D, 0x4D, 0x01]));
+    }
+
+    #[test]
+    fn test_ephemeral_invalid_opcode() {
+        // Unknown opcode (e.g., 0xFFFF)
+        let [b1, b2] = 0xFFFFu16.to_le_bytes();
+        let buf = [0x4D, 0x4D, b1, b2];
+        assert!(!is_ephemeral_packet(&buf));
+    }
+
+    #[test]
+    fn test_ephemeral_longer_buffer() {
+        let [b1, b2] = (Opcode::Movement as u16).to_le_bytes();
+        let buf = [0x4D, 0x4D, b1, b2, 0x00, 0xFF, 0xAA]; // Extra payload
+        assert!(is_ephemeral_packet(&buf));
+    }
+}
