@@ -7,7 +7,7 @@ const CAMERA_OFFSET_Y = 18;
 const CAMERA_OFFSET_Z = 26;
 
 /**
- * Recursively disposes GPU resources (geometries and materials) in a Three.js hierarchy.
+ * Recursively disposes GPU resources (geometries, materials, textures) in a Three.js hierarchy.
  */
 export function disposeHierarchy(node) {
   if (!node) return;
@@ -16,10 +16,16 @@ export function disposeHierarchy(node) {
       child.geometry.dispose();
     }
     if (child.material) {
-      if (Array.isArray(child.material)) {
-        child.material.forEach((m) => m.dispose());
-      } else {
-        child.material.dispose();
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of materials) {
+        if (!m) continue;
+        for (const key of Object.keys(m)) {
+          const value = m[key];
+          if (value && typeof value.dispose === "function" && value.isTexture) {
+            value.dispose();
+          }
+        }
+        m.dispose();
       }
     }
   });
@@ -341,5 +347,16 @@ export class WorldRenderer {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  /**
+   * Removes all entity meshes and disposes their GPU resources.
+   */
+  clear() {
+    for (const mesh of this.entities.values()) {
+      this.scene.remove(mesh);
+      disposeHierarchy(mesh);
+    }
+    this.entities.clear();
   }
 }

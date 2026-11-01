@@ -110,4 +110,14 @@ export class PlayerControls {
     this.position.y = y;
     this.position.z = z;
   }
+
+  /**
+   * Reconciles authoritative movement correction from server.
+   */
+  reconcile(sequence, x, y, z) {
+    this.setPosition(x, y, z);
+    if (this.sequence <= sequence) {
+      this.sequence = sequence + 1;
+    }
+  }
 }

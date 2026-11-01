@@ -147,6 +147,15 @@ impl PredictionBuffer {
                 return self.current_sim_pos;
             }
         } else {
+            // Stale or out-of-order ACK older than the oldest retained input: ignore to avoid wiping active inputs
+            if ack_sequence > 0 {
+                if let Some(front) = self.unacknowledged_inputs.front() {
+                    if ack_sequence < front.sequence {
+                        return self.current_sim_pos;
+                    }
+                }
+            }
+
             let dx = server_pos.0 - self.current_sim_pos.0;
             let dy = server_pos.1 - self.current_sim_pos.1;
             let dz = server_pos.2 - self.current_sim_pos.2;
@@ -158,15 +167,6 @@ impl PredictionBuffer {
                 self.visual_error_offset = (0.0, 0.0, 0.0);
                 self.current_sim_pos = server_pos;
                 return server_pos;
-            }
-
-            // Stale or out-of-order ACK within normal bounds: ignore to avoid wiping active inputs
-            if ack_sequence > 0 {
-                if let Some(front) = self.unacknowledged_inputs.front() {
-                    if ack_sequence < front.sequence {
-                        return self.current_sim_pos;
-                    }
-                }
             }
 
             if distance > self.tolerance {
@@ -307,6 +307,12 @@ mod tests {
 
         // Must NOT wipe queue or snap back to (5.0, 0.0, 0.0)
         assert_eq!(pos, (12.0, 0.0, 0.0));
+        assert_eq!(buffer.unacknowledged_inputs.len(), 3);
+        assert_eq!(buffer.unacknowledged_inputs[0].sequence, 10);
+
+        // Even an extreme divergence (> hard_snap_threshold 20m) from a stale ACK must NOT wipe queue
+        let pos_extreme = buffer.reconcile(4, (-100.0, 0.0, 0.0));
+        assert_eq!(pos_extreme, (12.0, 0.0, 0.0));
         assert_eq!(buffer.unacknowledged_inputs.len(), 3);
         assert_eq!(buffer.unacknowledged_inputs[0].sequence, 10);
     }

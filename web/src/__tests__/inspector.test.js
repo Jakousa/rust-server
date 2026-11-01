@@ -137,6 +137,23 @@ describe("PlayerControls", () => {
     expect(dist).toBeCloseTo(controls.speed * dt, 5);
   });
 
+  it("reconciles server movement correction and updates sequence", () => {
+    const controls = new PlayerControls();
+    controls.setPosition(1.0, 0.0, 1.0);
+    controls.sequence = 5;
+
+    controls.reconcile(10, 20.0, 5.0, -15.0);
+    expect(controls.position.x).toBe(20.0);
+    expect(controls.position.y).toBe(5.0);
+    expect(controls.position.z).toBe(-15.0);
+    expect(controls.sequence).toBe(11);
+
+    // Stale sequence correction does not decrement sequence
+    controls.reconcile(8, 25.0, 5.0, -15.0);
+    expect(controls.position.x).toBe(25.0);
+    expect(controls.sequence).toBe(11);
+  });
+
   it("rotates yaw with q and e keys and increments sequence monotonically", () => {
     const controls = new PlayerControls();
     const initialYaw = controls.yaw;
@@ -263,6 +280,20 @@ describe("WorldRenderer Entities", () => {
 
     expect(geoDispose).toHaveBeenCalledTimes(1);
     expect(matDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes texture references recursively on material disposal", () => {
+    const group = new THREE.Group();
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const mat = new THREE.MeshBasicMaterial();
+    const tex = new THREE.Texture();
+    mat.map = tex;
+    const mesh = new THREE.Mesh(geo, mat);
+    group.add(mesh);
+
+    const texDispose = vi.spyOn(tex, "dispose");
+    disposeHierarchy(group);
+    expect(texDispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -573,6 +604,49 @@ describe("ClientWorldBridge", () => {
     const objRenderer = new WorldObjectRenderer(scene);
     objRenderer.updateFromBuffer(objRenderBuf);
     expect(objRenderer.objects.has(objectGuid)).toBe(true);
+
+    // Test WorldRenderer.clear releases all GPU meshes
+    worldRenderer.clear();
+    expect(worldRenderer.entities.size).toBe(0);
+  });
+
+  it("ingests MOVEMENT_CORRECTION (0x0002) packet and fires callback with full precision", () => {
+    const bridge = new ClientWorldBridge();
+    const frame = new Uint8Array(8 + 37);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.MOVEMENT_CORRECTION, true);
+    view.setUint32(4, 37, true);
+
+    const targetGuid = (0x0001n << 48n) | 123456789n; // High entity type bits
+    view.setBigUint64(8, targetGuid, true);
+    view.setFloat32(16, 12.5, true);  // x
+    view.setFloat32(20, 1.0, true);   // y
+    view.setFloat32(24, -30.5, true); // z
+    view.setFloat32(28, 0.5, true);   // vx
+    view.setFloat32(32, 0.0, true);   // vy
+    view.setFloat32(36, -0.5, true);  // vz
+    view.setUint32(40, 42, true);     // sequence
+    frame[8 + 36] = 1;                // reason: Reconciliation
+
+    let receivedCorr = null;
+    bridge.onMovementCorrection((corr) => {
+      receivedCorr = corr;
+    });
+
+    bridge.processPacket(frame);
+
+    expect(receivedCorr).not.toBeNull();
+    expect(BigInt(receivedCorr.entityId)).toBe(targetGuid);
+    expect(receivedCorr.x).toBeCloseTo(12.5, 4);
+    expect(receivedCorr.y).toBeCloseTo(1.0, 4);
+    expect(receivedCorr.z).toBeCloseTo(-30.5, 4);
+    expect(receivedCorr.vx).toBeCloseTo(0.5, 4);
+    expect(receivedCorr.vy).toBeCloseTo(0.0, 4);
+    expect(receivedCorr.vz).toBeCloseTo(-0.5, 4);
+    expect(receivedCorr.sequence).toBe(42);
+    expect(receivedCorr.reason).toBe(1);
   });
 });
 
