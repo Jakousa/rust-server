@@ -143,6 +143,7 @@ async fn test_e2e_cross_partition_targeted_ability() {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
     }
 
@@ -260,6 +261,7 @@ async fn test_e2e_cross_partition_boundary_aoe() {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
     }
 
@@ -366,6 +368,7 @@ async fn test_e2e_migration_lease_veto_and_compensation() {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
     }
 
@@ -472,6 +475,7 @@ async fn test_e2e_out_of_range_revalidation_veto_and_compensation() {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
     }
 

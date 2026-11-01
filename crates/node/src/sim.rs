@@ -954,6 +954,23 @@ impl TickSimulation {
         Some(snapshot)
     }
 
+    /// Disconnects a session by session ID, resolving its player GUID and session epoch.
+    /// Captures a snapshot, cleans up all tracking stores, and tombstones the entity.
+    pub fn disconnect_session_by_id(
+        &mut self,
+        session_id: u64,
+    ) -> Option<mmo_storage::EntitySnapshot> {
+        let obs = self.unregister_aoi_observer(session_id)?;
+        let player_guid = obs.player_guid;
+        let epoch = self.session_epochs.get(&player_guid).copied().unwrap_or(0);
+        if let Some(snap) = self.disconnect_player_session(player_guid, epoch) {
+            Some(snap)
+        } else {
+            self.despawn_entity(player_guid);
+            None
+        }
+    }
+
     /// Executes a single simulation step.
     ///
     /// Registers a gameplay plugin to be initialized in this simulation node.
@@ -1059,6 +1076,10 @@ impl TickSimulation {
         let now = self.current_time;
         self.migrating_leases
             .retain(|_guid, start| now.saturating_duration_since(*start) <= Duration::from_secs(5));
+
+        // 0.26 Advance ghost store tick and prune stale ghosts older than 20 ticks (1 sec at 20 Hz)
+        self.ghost_store.advance_tick(self.tick_counter);
+        self.ghost_store.prune_stale(self.tick_counter, 20);
 
         // 0.3 Reap idle instance domains and evict remaining non-player entities
         let reaped_instances = self.instances.reap_idle_instances();
@@ -1605,7 +1626,7 @@ impl TickSimulation {
         let next_seq = self
             .kinematic_states
             .get(&guid)
-            .map(|s| s.last_sequence.saturating_add(1))
+            .map(|s| s.last_sequence.wrapping_add(1))
             .unwrap_or(1);
         self.process_client_move_with_seq(guid, new_pos, next_seq)
     }
@@ -2052,6 +2073,64 @@ mod tests {
         sim.advance_time(Duration::from_millis(50));
         let pos3 = (0.8, 0.0, 0.0);
         assert_eq!(sim.process_client_move_with_seq(guid, pos3, 2), Err(pos2));
+    }
+
+    #[test]
+    fn test_process_client_move_sequence_wraparound_rfc1982() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let guid = Guid::new(EntityType::Player, 1, 994);
+        sim.spawn_entity(guid, (0.0, 0.0, 0.0));
+
+        // 1. Initialize near u32::MAX
+        let init_pos = (0.1, 0.0, 0.0);
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, init_pos, u32::MAX - 1),
+            Ok(init_pos)
+        );
+
+        // 2. Advance and step to u32::MAX
+        sim.advance_time(Duration::from_millis(50));
+        let pos_max = (0.2, 0.0, 0.0);
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, pos_max, u32::MAX),
+            Ok(pos_max)
+        );
+
+        // 3. Advance and wrap around to sequence 0 (diff: 0.wrapping_sub(u32::MAX) as i32 = 1 > 0)
+        sim.advance_time(Duration::from_millis(50));
+        let pos_wrapped_0 = (0.3, 0.0, 0.0);
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, pos_wrapped_0, 0),
+            Ok(pos_wrapped_0)
+        );
+
+        // 4. Stale sequence replay of u32::MAX or u32::MAX - 1 must be rejected
+        let stale_pos = (0.35, 0.0, 0.0);
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, stale_pos, u32::MAX),
+            Err(pos_wrapped_0)
+        );
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, stale_pos, 0),
+            Err(pos_wrapped_0)
+        );
+
+        // 5. Advance and step to sequence 1
+        sim.advance_time(Duration::from_millis(50));
+        let pos_wrapped_1 = (0.4, 0.0, 0.0);
+        assert_eq!(
+            sim.process_client_move_with_seq(guid, pos_wrapped_1, 1),
+            Ok(pos_wrapped_1)
+        );
+
+        // 6. Test process_client_move with wrapping_add(1)
+        // Set last_sequence back to u32::MAX
+        sim.kinematic_states.get_mut(&guid).unwrap().last_sequence = u32::MAX;
+        sim.advance_time(Duration::from_millis(50));
+        let auto_pos = (0.5, 0.0, 0.0);
+        assert_eq!(sim.process_client_move(guid, auto_pos, 0.05), Ok(auto_pos));
+        // Sequence wrapped to 0
+        assert_eq!(sim.kinematic_states.get(&guid).unwrap().last_sequence, 0);
     }
 
     #[test]
@@ -2837,5 +2916,40 @@ mod tests {
         // Verify expired lease was swept, while active lease remains
         assert!(!sim.is_migrating(expired_guid));
         assert!(sim.is_migrating(active_guid));
+    }
+
+    #[test]
+    fn test_disconnect_session_by_id_captures_snapshot_and_tombstones() {
+        let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        sim.set_snapshot_sender(tx);
+
+        let player_guid = Guid::new(EntityType::Player, 1, 777);
+        let session_id = 4242;
+        let session_epoch = 1;
+
+        sim.hydrate_player_session(player_guid, session_id, session_epoch, None, 50.0);
+        assert!(sim.entity_store.get_by_guid(player_guid).is_some());
+        assert!(sim.aoi.get_observer(session_id).is_some());
+        assert!(!sim.tombstoned_entities.contains(&player_guid));
+
+        // Disconnect by session ID
+        let snap = sim
+            .disconnect_session_by_id(session_id)
+            .expect("must return snapshot on session disconnect");
+        assert_eq!(snap.guid, player_guid.0);
+
+        // Verify entity despawned, observer unregistered, snapshot enqueued, and tombstoned
+        assert!(sim.entity_store.get_by_guid(player_guid).is_none());
+        assert!(sim.aoi.get_observer(session_id).is_none());
+        assert!(!sim.kinematic_states.contains_key(&player_guid));
+        assert!(sim.tombstoned_entities.contains(&player_guid));
+
+        let payload = rx.try_recv().expect("snapshot payload must be sent");
+        assert_eq!(payload.guid, player_guid);
+
+        // Second disconnect on already removed session returns None
+        assert!(sim.disconnect_session_by_id(session_id).is_none());
     }
 }

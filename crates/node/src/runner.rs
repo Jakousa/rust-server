@@ -279,10 +279,7 @@ pub async fn run_node_daemon_with_sim(
                         if !inner.disconnected_sessions.is_empty() {
                             let mut sim_guard = sim_for_cleanup.write().await;
                             for sid in inner.disconnected_sessions {
-                                if let Some(obs) = sim_guard.unregister_aoi_observer(sid) {
-                                    sim_guard.entity_store.despawn_by_guid(obs.player_guid);
-                                    sim_guard.octree.remove_by_guid(obs.player_guid);
-                                }
+                                sim_guard.disconnect_session_by_id(sid);
                             }
                         }
                     }

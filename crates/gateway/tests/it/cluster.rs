@@ -47,7 +47,7 @@ async fn test_end_to_end_cluster_player_movement_and_boundary_handover() {
     let mut node1_sim = node1_sim_arc.write().await;
     let mut node2_sim = node2_sim_arc.write().await;
     let node2_ghost_store_arc = cluster.node_ghost_store(2);
-    let mut node2_ghost_store = node2_ghost_store_arc.write().await;
+    let node2_ghost_store = node2_ghost_store_arc.write().await;
 
     let session_id = 9001u64;
     let player_guid = Guid::new(EntityType::Player, 1, 42);

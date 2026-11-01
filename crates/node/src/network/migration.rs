@@ -573,6 +573,7 @@ mod tests {
             component_data: vec![],
             last_tick: 10,
             source_node_id: 2,
+            local_tick: 0,
         };
         sim.ghost_store.insert_or_update(ghost);
         assert!(sim.ghost_store.contains(guid));

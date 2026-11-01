@@ -4,6 +4,8 @@
 //! ability invocations with non-blocking compensation pipelines on tick loops.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mmo_core::action::{resolve_boundary_sphere_aoe, AbilityDefinition, CooldownTracker};
@@ -126,12 +128,14 @@ impl CrossNodeDispatcher {
     }
 
     /// Asynchronously forwards a batched ability request for boundary multi-target AoE.
+    ///
+    /// If an [`Arc<BoundaryAoeCompensationAggregator>`] is provided, completion is recorded
+    /// with the aggregator, which only emits a refund if zero hits were scored across all remote batches.
     pub fn dispatch_remote_batch(
         &self,
         req: BatchRemoteAbilityRequest,
         endpoint: String,
-        compensation_tx: tokio::sync::mpsc::Sender<AbilityCompensation>,
-        resource_refund: Option<(String, f32)>,
+        aggregator: Option<Arc<BoundaryAoeCompensationAggregator>>,
     ) {
         let timeout = self.timeout;
         let pool = self.pool.clone();
@@ -147,25 +151,76 @@ impl CrossNodeDispatcher {
             })
             .await;
 
-            let all_failed = match res {
-                Ok(Ok(resp)) => resp.results.iter().all(|r| !r.success),
-                Ok(Err(_)) => true,
-                Err(_) => true,
+            let hit_count = match res {
+                Ok(Ok(resp)) => resp.results.iter().filter(|r| r.success).count(),
+                Ok(Err(_)) => 0,
+                Err(_) => 0,
             };
 
-            if all_failed {
+            if let Some(agg) = aggregator {
+                agg.record_batch_completion(hit_count);
+            }
+        });
+    }
+}
+
+/// Atomic aggregator coordinating multi-node boundary AoE compensation.
+///
+/// Ensures resource compensation is issued at most once across all remote batches,
+/// and only if zero targets were hit across all nodes.
+pub struct BoundaryAoeCompensationAggregator {
+    remaining_batches: AtomicUsize,
+    any_hit_scored: AtomicBool,
+    caster_guid: Guid,
+    ability_id: u32,
+    resource_name: Option<String>,
+    resource_amount: f32,
+    compensation_tx: tokio::sync::mpsc::Sender<AbilityCompensation>,
+}
+
+impl BoundaryAoeCompensationAggregator {
+    /// Creates a new `BoundaryAoeCompensationAggregator`.
+    pub fn new(
+        total_batches: usize,
+        caster_guid: Guid,
+        ability_id: u32,
+        resource_name: Option<String>,
+        resource_amount: f32,
+        compensation_tx: tokio::sync::mpsc::Sender<AbilityCompensation>,
+    ) -> Self {
+        Self {
+            remaining_batches: AtomicUsize::new(total_batches),
+            any_hit_scored: AtomicBool::new(false),
+            caster_guid,
+            ability_id,
+            resource_name,
+            resource_amount,
+            compensation_tx,
+        }
+    }
+
+    /// Records the completion of a remote batch.
+    pub fn record_batch_completion(&self, hits: usize) {
+        if hits > 0 {
+            self.any_hit_scored.store(true, Ordering::Release);
+        }
+
+        let prev = self.remaining_batches.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            // Last batch finished.
+            if !self.any_hit_scored.load(Ordering::Acquire) {
                 let comp = AbilityCompensation {
-                    caster_guid: Guid::from_raw(req.caster_guid),
-                    ability_id: req.ability_id,
-                    resource_name: resource_refund.as_ref().map(|(n, _)| n.clone()),
-                    resource_amount: resource_refund.as_ref().map(|(_, a)| *a).unwrap_or(0.0),
+                    caster_guid: self.caster_guid,
+                    ability_id: self.ability_id,
+                    resource_name: self.resource_name.clone(),
+                    resource_amount: self.resource_amount,
                 };
-                if compensation_tx.try_send(comp).is_err() {
+                if self.compensation_tx.try_send(comp).is_err() {
                     metrics::counter!("mmo_node_ingress_dropped_total", "queue" => "compensation")
                         .increment(1);
                 }
             }
-        });
+        }
     }
 }
 
@@ -447,18 +502,57 @@ pub fn cast_boundary_sphere_aoe(
     }
 
     // 5. Concurrently dispatch remote batches to peer nodes
-    let mut remote_nodes = Vec::new();
-    for (node_id, remote_candidates) in &targeting.remote_batches {
-        let endpoint = match dispatcher.peer_endpoint(*node_id) {
-            Some(ep) => ep.to_string(),
-            None => continue,
-        };
+    let eligible_remote_batches: Vec<(
+        u32,
+        &Vec<mmo_core::spatial::SpatialTargetCandidate>,
+        String,
+    )> = targeting
+        .remote_batches
+        .iter()
+        .filter_map(|(node_id, remote_candidates)| {
+            dispatcher
+                .peer_endpoint(*node_id)
+                .map(|ep| (*node_id, remote_candidates, ep.to_string()))
+        })
+        .collect();
 
+    let total_batches = eligible_remote_batches.len();
+
+    if local_hit_count == 0 && total_batches == 0 {
+        // Zero local hits and zero reachable remote partitions -> immediate refund
+        if let Some((ref res_name, cost)) = ability.resource_cost {
+            let comp = AbilityCompensation {
+                caster_guid,
+                ability_id: ability.id,
+                resource_name: Some(res_name.clone()),
+                resource_amount: cost,
+            };
+            let _ = sim.ability_compensation_sender().try_send(comp);
+        }
+    }
+
+    let aggregator = if local_hit_count == 0 && total_batches > 0 {
+        ability.resource_cost.as_ref().map(|(res_name, cost)| {
+            Arc::new(BoundaryAoeCompensationAggregator::new(
+                total_batches,
+                caster_guid,
+                ability.id,
+                Some(res_name.clone()),
+                *cost,
+                sim.ability_compensation_sender(),
+            ))
+        })
+    } else {
+        None
+    };
+
+    let mut remote_nodes = Vec::with_capacity(total_batches);
+    for (node_id, remote_candidates, endpoint) in eligible_remote_batches {
         let req = BatchRemoteAbilityRequest {
             ability_id: ability.id,
             caster_guid: caster_guid.raw(),
             source_node_id: sim.node_id as u32,
-            target_node_id: *node_id,
+            target_node_id: node_id,
             caster_position: Some(Vector3 {
                 x: caster_pos.0,
                 y: caster_pos.1,
@@ -471,14 +565,8 @@ pub fn cast_boundary_sphere_aoe(
             cast_id: sim.tick_counter,
         };
 
-        let refund = if local_hit_count == 0 {
-            ability.resource_cost.clone()
-        } else {
-            None
-        };
-
-        dispatcher.dispatch_remote_batch(req, endpoint, sim.ability_compensation_sender(), refund);
-        remote_nodes.push(*node_id);
+        dispatcher.dispatch_remote_batch(req, endpoint, aggregator.clone());
+        remote_nodes.push(node_id);
     }
 
     Ok(BoundaryAoeOutcome {
@@ -537,6 +625,7 @@ mod tests {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
 
         let mut dispatcher = CrossNodeDispatcher::new(1);
@@ -633,6 +722,7 @@ mod tests {
             component_data: Vec::new(),
             last_tick: 1,
             source_node_id: 2,
+            local_tick: 0,
         });
 
         let mut dispatcher = CrossNodeDispatcher::new(1);
@@ -786,5 +876,127 @@ mod tests {
         assert_eq!(death_events.len(), 1);
         assert_eq!(death_events[0].entity, target);
         assert_eq!(death_events[0].instigator, Some(caster));
+    }
+
+    #[tokio::test]
+    async fn test_boundary_aoe_aggregator_multiple_fails_single_refund() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let caster = Guid::new(EntityType::Player, 1, 100);
+        let aggregator = Arc::new(BoundaryAoeCompensationAggregator::new(
+            2,
+            caster,
+            42,
+            Some("mana".to_string()),
+            50.0,
+            tx,
+        ));
+
+        // First remote batch fails (0 hits)
+        aggregator.record_batch_completion(0);
+        // No refund yet because 1 batch remains
+        assert!(rx.try_recv().is_err());
+
+        // Second remote batch fails (0 hits)
+        aggregator.record_batch_completion(0);
+        // Now exactly one refund must be sent
+        let refund = rx.try_recv().expect("must receive refund when all fail");
+        assert_eq!(refund.caster_guid, caster);
+        assert_eq!(refund.ability_id, 42);
+        assert_eq!(refund.resource_name, Some("mana".to_string()));
+        assert_eq!(refund.resource_amount, 50.0);
+
+        // No subsequent refund
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_boundary_aoe_aggregator_one_success_one_fail_no_refund() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let caster = Guid::new(EntityType::Player, 1, 101);
+        let aggregator = Arc::new(BoundaryAoeCompensationAggregator::new(
+            2,
+            caster,
+            42,
+            Some("mana".to_string()),
+            50.0,
+            tx,
+        ));
+
+        // First remote batch succeeds with 2 hits
+        aggregator.record_batch_completion(2);
+        assert!(rx.try_recv().is_err());
+
+        // Second remote batch fails (0 hits)
+        aggregator.record_batch_completion(0);
+        // Even though second batch failed, targets were struck on first batch -> NO refund!
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_boundary_aoe_zero_local_zero_reachable_immediate_refund() {
+        let mut sim = TickSimulation::new(1, test_bounds());
+        let caster = Guid::new(EntityType::Player, 1, 102);
+        let ghost_target = Guid::new(EntityType::Player, 2, 202);
+
+        sim.spawn_entity(caster, (0.0, 0.0, 0.0));
+        let ent = sim.entity_store.get_mut_by_guid(caster).unwrap();
+        let mut attrs = AttributeSet::new();
+        attrs.add_attribute("energy", 100.0, 0.0, 100.0, 0.0);
+        ent.add_component(attrs);
+        ent.add_component(CooldownTracker::new());
+
+        sim.ghost_store.insert_or_update(GhostRecord {
+            guid: ghost_target,
+            position: (4.0, 0.0, 0.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: Vec::new(),
+            last_tick: 1,
+            source_node_id: 2,
+            local_tick: 0,
+        });
+
+        // Dispatcher has NO configured endpoint for Node 2
+        let dispatcher = CrossNodeDispatcher::new(1);
+
+        let ability = AbilityDefinition {
+            id: 99,
+            name: "Nova".into(),
+            cast_time_sec: 0.0,
+            cooldown_sec: 5.0,
+            gcd_sec: 1.0,
+            range: 10.0,
+            resource_cost: Some(("energy".into(), 30.0)),
+            interrupt_flags: ActionInterruptFlags::default(),
+        };
+
+        let outcome = cast_boundary_sphere_aoe(
+            &mut sim,
+            &dispatcher,
+            caster,
+            &ability,
+            mmo_core::Vec3::new(0.0, 0.0, 0.0),
+            10.0,
+            5,
+            50,
+            0,
+        )
+        .expect("aoe succeeds");
+
+        assert_eq!(outcome.local_hit_count, 0);
+        assert!(outcome.remote_dispatched_nodes.is_empty());
+
+        // Stepping the simulation processes the immediate compensation refund
+        sim.step(0.05);
+
+        let ent = sim.entity_store.get_by_guid(caster).unwrap();
+        let energy = ent
+            .get_component::<AttributeSet>()
+            .unwrap()
+            .get_current("energy")
+            .unwrap();
+        // Paid 30 energy, refunded 30 energy -> back to 100.0
+        assert_eq!(energy, 100.0);
     }
 }

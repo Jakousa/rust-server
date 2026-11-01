@@ -193,6 +193,7 @@ impl TestClusterBuilder {
                 config.bounds.clone(),
             );
 
+            let node_ghost_store = sim.try_read().unwrap().ghost_store.clone();
             nodes.insert(
                 config.id,
                 TestNode {
@@ -201,7 +202,7 @@ impl TestClusterBuilder {
                     addr: addr_str,
                     socket_addr,
                     sim,
-                    ghost_store: Arc::new(tokio::sync::RwLock::new(GhostStore::new())),
+                    ghost_store: Arc::new(tokio::sync::RwLock::new(node_ghost_store)),
                 },
             );
         }
