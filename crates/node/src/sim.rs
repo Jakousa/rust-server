@@ -2940,7 +2940,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_disconnect_session_by_id_captures_snapshot_and_tombstones() {
         let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
         let mut sim = TickSimulation::new(1, bounds);
@@ -3005,6 +3004,5 @@ mod tests {
             progress_events.is_empty(),
             "ActionProgressEvent must be cleared at tick boundary"
         );
-    }
     }
 }
