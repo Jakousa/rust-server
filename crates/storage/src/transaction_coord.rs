@@ -346,6 +346,34 @@ impl TransactionCoordinator {
         let now_secs = current_time_secs();
 
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
+            // Check if already committed or aborted (idempotent sequential retry check)
+            let existing_tx = sqlx::query(&q!(
+                "SELECT tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms FROM container_transactions WHERE tx_id = ?"
+            ))
+            .bind(tx_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+            if let Some(row) = existing_tx {
+                let status: String = row.try_get("status")?;
+                if status == "committed" {
+                    let src_cid: i64 = row.try_get("src_container_id")?;
+                    let dst_cid: i64 = row.try_get("dst_container_id")?;
+                    let item_id: String = row.try_get("item_instance_id")?;
+                    let ts: i64 = row.try_get("timestamp_epoch_ms")?;
+                    return Ok(ContainerTransactionRecord {
+                        tx_id: tx_id.to_string(),
+                        src_container_id: src_cid as u64,
+                        dst_container_id: dst_cid as u64,
+                        item_instance_id: item_id,
+                        status,
+                        timestamp_epoch_ms: ts,
+                    });
+                } else {
+                    return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
+                }
+            }
+
             // 1. Fetch reservation details
             let rows = sqlx::query(&q!(
                 "SELECT reservation_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms FROM container_reservations WHERE tx_id = ?"
@@ -355,6 +383,30 @@ impl TransactionCoordinator {
             .await?;
 
             if rows.len() != 2 {
+                // Re-query container_transactions in case of concurrent commit race
+                let race_tx = sqlx::query(&q!(
+                    "SELECT tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms FROM container_transactions WHERE tx_id = ?"
+                ))
+                .bind(tx_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if let Some(row) = race_tx {
+                    let status: String = row.try_get("status")?;
+                    if status == "committed" {
+                        let src_cid: i64 = row.try_get("src_container_id")?;
+                        let dst_cid: i64 = row.try_get("dst_container_id")?;
+                        let item_id: String = row.try_get("item_instance_id")?;
+                        let ts: i64 = row.try_get("timestamp_epoch_ms")?;
+                        return Ok(ContainerTransactionRecord {
+                            tx_id: tx_id.to_string(),
+                            src_container_id: src_cid as u64,
+                            dst_container_id: dst_cid as u64,
+                            item_instance_id: item_id,
+                            status,
+                            timestamp_epoch_ms: ts,
+                        });
+                    }
+                }
                 return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
             }
 
@@ -390,6 +442,30 @@ impl TransactionCoordinator {
             .rows_affected();
 
             if deleted < 2 {
+                // Re-query container_transactions in case of concurrent commit race
+                let race_tx = sqlx::query(&q!(
+                    "SELECT tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms FROM container_transactions WHERE tx_id = ?"
+                ))
+                .bind(tx_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if let Some(row) = race_tx {
+                    let status: String = row.try_get("status")?;
+                    if status == "committed" {
+                        let src_cid: i64 = row.try_get("src_container_id")?;
+                        let dst_cid: i64 = row.try_get("dst_container_id")?;
+                        let item_id: String = row.try_get("item_instance_id")?;
+                        let ts: i64 = row.try_get("timestamp_epoch_ms")?;
+                        return Ok(ContainerTransactionRecord {
+                            tx_id: tx_id.to_string(),
+                            src_container_id: src_cid as u64,
+                            dst_container_id: dst_cid as u64,
+                            item_instance_id: item_id,
+                            status,
+                            timestamp_epoch_ms: ts,
+                        });
+                    }
+                }
                 return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
             }
 
@@ -624,9 +700,10 @@ mod tests {
         assert_eq!(item_after.container_id, c2);
         assert_eq!(item_after.slot, 5);
 
-        // 5. Subsequent commit attempt fails
-        let second_commit = coord.commit_transfer("tx_success_1").await;
-        assert!(second_commit.is_err());
+        // 5. Subsequent commit attempt succeeds idempotently (returning the committed record)
+        let second_commit = coord.commit_transfer("tx_success_1").await.unwrap();
+        assert_eq!(second_commit.status, "committed");
+        assert_eq!(second_commit.tx_id, "tx_success_1");
     }
 
     #[tokio::test]
@@ -1079,6 +1156,118 @@ mod tests {
             res_c2_2.is_some(),
             "Orthogonal reservation on (C2, 2) must not be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_2pc_commit_idempotency_sequential_and_concurrent() {
+        let db = Database::connect_memory().await.unwrap();
+        let (c1, c2) = setup_test_containers(&db).await;
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        let item = ItemRecord {
+            item_instance_id: "idempotent_item".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 42,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item).await.unwrap();
+
+        // 1. Prepare transfer
+        coord
+            .prepare_transfer("tx_idem_seq", c1, 0, c2, 1, 5000)
+            .await
+            .unwrap();
+
+        // First commit
+        let rec1 = coord.commit_transfer("tx_idem_seq").await.unwrap();
+        assert_eq!(rec1.status, "committed");
+        assert_eq!(rec1.tx_id, "tx_idem_seq");
+        assert_eq!(rec1.src_container_id, c1);
+        assert_eq!(rec1.dst_container_id, c2);
+        assert_eq!(rec1.item_instance_id, "idempotent_item");
+
+        // 2. Sequential retry must return the same committed record without error
+        let rec2 = coord.commit_transfer("tx_idem_seq").await.unwrap();
+        assert_eq!(rec2.status, "committed");
+        assert_eq!(rec2.tx_id, "tx_idem_seq");
+        assert_eq!(rec2.src_container_id, c1);
+        assert_eq!(rec2.dst_container_id, c2);
+        assert_eq!(rec2.item_instance_id, "idempotent_item");
+        assert_eq!(rec1.timestamp_epoch_ms, rec2.timestamp_epoch_ms);
+
+        // 3. Verify aborted transaction retried commit returns ReservationExpiredOrAborted
+        let item_abort = ItemRecord {
+            item_instance_id: "abort_item".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 43,
+            slot: 3,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item_abort).await.unwrap();
+        coord
+            .prepare_transfer("tx_idem_abort", c1, 3, c2, 4, 5000)
+            .await
+            .unwrap();
+        coord.abort_transfer("tx_idem_abort").await.unwrap();
+
+        let abort_commit_res = coord.commit_transfer("tx_idem_abort").await;
+        assert!(matches!(
+            abort_commit_res,
+            Err(StorageError::ReservationExpiredOrAborted(_))
+        ));
+
+        // 4. Concurrent duplicate commit race: 10 tasks calling commit_transfer simultaneously
+        let item_race = ItemRecord {
+            item_instance_id: "race_item".to_string(),
+            character_guid: 1001,
+            container_id: c1,
+            item_def_id: 44,
+            slot: 5,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        char_repo.add_item(&item_race).await.unwrap();
+        coord
+            .prepare_transfer("tx_idem_race", c1, 5, c2, 6, 5000)
+            .await
+            .unwrap();
+
+        let coord_arc = std::sync::Arc::new(coord);
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = std::sync::Arc::clone(&coord_arc);
+            handles.push(tokio::spawn(async move {
+                c.commit_transfer("tx_idem_race").await
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert!(
+                res.is_ok(),
+                "Concurrent commit_transfer must succeed idempotently without false-abort, got: {:?}",
+                res
+            );
+            let rec = res.unwrap();
+            assert_eq!(rec.status, "committed");
+            assert_eq!(rec.tx_id, "tx_idem_race");
+            assert_eq!(rec.item_instance_id, "race_item");
+        }
     }
 
     #[test]

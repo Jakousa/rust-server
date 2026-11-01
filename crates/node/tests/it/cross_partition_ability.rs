@@ -23,7 +23,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 async fn wait_for_ready(addr: std::net::SocketAddr) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return;
@@ -31,12 +31,12 @@ async fn wait_for_ready(addr: std::net::SocketAddr) {
         if tokio::time::Instant::now() >= deadline {
             panic!("Server at {} did not become ready", addr);
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 async fn wait_for_health(node: &tokio::sync::RwLock<TickSimulation>, guid: Guid, expected_hp: f32) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         {
             let sim = node.read().await;

@@ -106,6 +106,7 @@ pub async fn run_node_daemon_with_sim(
     });
 
     // 2. Connect and register with Director (with retry backoff)
+    let (fenced_tx, mut fenced_rx) = tokio::sync::mpsc::channel::<String>(1);
     let director_endpoint = director_addr.clone();
     let sim_clone = Arc::clone(&sim);
     let telemetry_clone = telemetry.clone();
@@ -196,19 +197,7 @@ pub async fn run_node_daemon_with_sim(
             match client.heartbeat(hb).await {
                 Ok(resp) => {
                     let inner = resp.into_inner();
-                    if !inner.acknowledged {
-                        let reg_req = RegisterNodeRequest {
-                            node_id: u32::from(node_id),
-                            listen_addr: listen_addr.to_string(),
-                            bounds: proto_bounds,
-                        };
-                        if let Ok(reg_resp) = client.register_node(reg_req).await {
-                            println!(
-                                "[Node {node_id}] Re-registered with Director after unacknowledged heartbeat: success={}",
-                                reg_resp.into_inner().success
-                            );
-                        }
-                    } else if inner.should_split {
+                    if inner.should_split {
                         let proto_bounds = Some(BoundingBox {
                             min: Some(Vector3 {
                                 x: bounds.min.0,
@@ -237,6 +226,13 @@ pub async fn run_node_daemon_with_sim(
                 }
                 Err(e) => {
                     eprintln!("[Node {node_id}] Heartbeat send failed: {e}");
+                    if e.code() == tonic::Code::FailedPrecondition {
+                        eprintln!(
+                            "[Node {node_id}] Fenced by Director (split-brain prevention): {e}. Halting simulation."
+                        );
+                        let _ = fenced_tx.send(e.to_string()).await;
+                        break;
+                    }
                 }
             }
         }
@@ -315,6 +311,10 @@ pub async fn run_node_daemon_with_sim(
                     println!("[Node {node_id}] Shutdown signal received, initiating drain...");
                     break;
                 }
+                reason = fenced_rx.recv() => {
+                    println!("[Node {node_id}] Simulation halted due to node fencing: {:?}", reason);
+                    break;
+                }
                 _ = tokio::time::sleep_until(next_tick) => {}
             }
         } else {
@@ -322,6 +322,10 @@ pub async fn run_node_daemon_with_sim(
                 biased;
                 _ = &mut shutdown_fut => {
                     println!("[Node {node_id}] Shutdown signal received, initiating drain...");
+                    break;
+                }
+                reason = fenced_rx.recv() => {
+                    println!("[Node {node_id}] Simulation halted due to node fencing: {:?}", reason);
                     break;
                 }
                 _ = std::future::ready(()) => {}

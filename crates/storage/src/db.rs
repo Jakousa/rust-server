@@ -768,4 +768,86 @@ mod tests {
         assert!(pg_db.is_postgres());
         assert_eq!(pg_db.for_update_suffix(), " FOR UPDATE");
     }
+
+    #[tokio::test]
+    async fn test_sqlite_foreign_key_enforcement() {
+        // 1. Verify foreign keys pragma is ON for in-memory database
+        let db_mem = Database::connect_memory().await.unwrap();
+        let fk_status: (i32,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(db_mem.pool())
+            .await
+            .unwrap();
+        assert_eq!(fk_status.0, 1, "PRAGMA foreign_keys must be enabled (1)");
+
+        // 2. Reject inserting into container_reservations referencing a non-existent container_id
+        let insert_bad_res = sqlx::query(
+            "INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms) VALUES ('res_orphan', 'tx_orphan', 999999, 0, NULL, 'transfer_in', 2000, 1000)"
+        )
+        .execute(db_mem.pool())
+        .await;
+        assert!(
+            insert_bad_res.is_err(),
+            "Inserting reservation with non-existent container_id must fail foreign key constraint"
+        );
+
+        // 3. Reject inserting into characters referencing a non-existent account_id
+        let insert_bad_char = sqlx::query(
+            "INSERT INTO characters (guid, account_id, name, race, class, level, xp, x, y, z, orientation, health, max_health, mana, max_mana, created_at, updated_at) VALUES (8888, 'non_existent_account', 'OrphanChar', 1, 1, 1, 0, 0, 0, 0, 0, 100, 100, 50, 50, 1000, 1000)"
+        )
+        .execute(db_mem.pool())
+        .await;
+        assert!(
+            insert_bad_char.is_err(),
+            "Inserting character with non-existent account_id must fail foreign key constraint"
+        );
+
+        // 4. Verify cascade delete behavior
+        // Create container
+        sqlx::query(
+            "INSERT INTO containers (container_id, owner_type, owner_id, name, capacity, access_policy, version, created_at, updated_at) VALUES (5555, 'character', '101', 'Bag', 10, 'owner_only', 1, 1000, 1000)"
+        )
+        .execute(db_mem.pool())
+        .await
+        .unwrap();
+
+        // Insert reservation referencing container 5555
+        sqlx::query(
+            "INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms) VALUES ('res_valid', 'tx_valid', 5555, 0, NULL, 'transfer_in', 2000, 1000)"
+        )
+        .execute(db_mem.pool())
+        .await
+        .unwrap();
+
+        // Delete container 5555
+        sqlx::query("DELETE FROM containers WHERE container_id = 5555")
+            .execute(db_mem.pool())
+            .await
+            .unwrap();
+
+        // Reservation must be cascaded and deleted
+        let res_check =
+            sqlx::query("SELECT 1 FROM container_reservations WHERE reservation_id = 'res_valid'")
+                .fetch_optional(db_mem.pool())
+                .await
+                .unwrap();
+        assert!(
+            res_check.is_none(),
+            "Cascade delete on containers must delete referencing reservations"
+        );
+
+        // 5. Verify file-based SQLite also has foreign keys enabled
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_fk.db");
+        let file_url = format!("sqlite://{}", db_path.display());
+        let db_file = Database::connect(&file_url).await.unwrap();
+
+        let fk_file_status: (i32,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(db_file.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fk_file_status.0, 1,
+            "File-based SQLite must have PRAGMA foreign_keys enabled"
+        );
+    }
 }
