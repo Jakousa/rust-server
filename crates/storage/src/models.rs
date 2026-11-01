@@ -418,6 +418,7 @@ pub enum ListingStatus {
     Sold,
     Cancelled,
     Expired,
+    ExpiredPendingClaim,
 }
 
 impl std::fmt::Display for ListingStatus {
@@ -427,6 +428,7 @@ impl std::fmt::Display for ListingStatus {
             ListingStatus::Sold => write!(f, "Sold"),
             ListingStatus::Cancelled => write!(f, "Cancelled"),
             ListingStatus::Expired => write!(f, "Expired"),
+            ListingStatus::ExpiredPendingClaim => write!(f, "ExpiredPendingClaim"),
         }
     }
 }
@@ -440,6 +442,7 @@ impl std::str::FromStr for ListingStatus {
             "Sold" => Ok(ListingStatus::Sold),
             "Cancelled" => Ok(ListingStatus::Cancelled),
             "Expired" => Ok(ListingStatus::Expired),
+            "ExpiredPendingClaim" => Ok(ListingStatus::ExpiredPendingClaim),
             other => Err(format!("Unknown listing status: {}", other)),
         }
     }
@@ -711,6 +714,7 @@ mod tests {
             (ListingStatus::Sold, "Sold"),
             (ListingStatus::Cancelled, "Cancelled"),
             (ListingStatus::Expired, "Expired"),
+            (ListingStatus::ExpiredPendingClaim, "ExpiredPendingClaim"),
         ];
 
         for (status, expected_str) in pairs {

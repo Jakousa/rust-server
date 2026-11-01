@@ -384,11 +384,11 @@ impl DirectorService for DirectorServiceImpl {
                 topology_epoch,
             }))
         } else {
-            Ok(Response::new(HeartbeatResponse {
-                acknowledged: false,
-                should_split: false,
-                topology_epoch,
-            }))
+            metrics::counter!("mmo_director_node_fenced_total").increment(1);
+            Err(Status::failed_precondition(format!(
+                "Node {} is evicted or not registered in director topology (node fenced to prevent split-brain simulation)",
+                req.node_id
+            )))
         }
     }
 
@@ -866,9 +866,9 @@ mod tests {
             tick_duration_ms: 5.0,
             entity_centroid: None,
         });
-        let resp_unknown = service.heartbeat(hb_unknown).await.unwrap().into_inner();
-        assert!(!resp_unknown.acknowledged);
-        assert!(!resp_unknown.should_split);
+        let err_unknown = service.heartbeat(hb_unknown).await.unwrap_err();
+        assert_eq!(err_unknown.code(), tonic::Code::FailedPrecondition);
+        assert!(err_unknown.message().contains("fenced"));
     }
 
     #[tokio::test]
@@ -1016,6 +1016,23 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(hb_node2.topology_epoch, 3);
+
+        // 8. Evicted node 1 heartbeat must be rejected with FailedPrecondition (split-brain fencing)
+        let hb_node1_evicted = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 1,
+                tick_rate: 20.0,
+                entity_count: 5,
+                cpu_percent: 10.0,
+                memory_bytes: 1024,
+                timestamp: 2500,
+                tick_duration_ms: 10.0,
+                entity_centroid: None,
+            }))
+            .await;
+        let err = hb_node1_evicted.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("fenced"));
     }
 
     #[tokio::test]

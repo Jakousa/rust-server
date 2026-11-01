@@ -279,6 +279,7 @@ impl MarketplaceRepository {
                 .await?
                 .ok_or_else(|| StorageError::ListingNotFound(listing_id.to_string()))?;
 
+            // 2. Verify listing is Active and unexpired
             let status_str: String = list_row.try_get("status")?;
             if status_str != "Active" {
                 return Err(StorageError::ListingNotActive(
@@ -286,7 +287,6 @@ impl MarketplaceRepository {
                     status_str,
                 ));
             }
-
             let expires_at: i64 = list_row.try_get("expires_at_epoch_ms")?;
             if expires_at <= now_ms {
                 return Err(StorageError::ListingNotActive(
@@ -450,7 +450,7 @@ impl MarketplaceRepository {
             }
 
             let status_str: String = list_row.try_get("status")?;
-            if status_str != "Active" {
+            if status_str != "Active" && status_str != "ExpiredPendingClaim" {
                 return Err(StorageError::ListingNotActive(
                     listing_id.to_string(),
                     status_str,
@@ -638,6 +638,7 @@ impl MarketplaceRepository {
             SELECT listing_id, seller_guid, seller_container_id, item_instance_id, escrow_container_id
             FROM market_listings
             WHERE status = 'Active' AND expires_at_epoch_ms <= ?
+            ORDER BY expires_at_epoch_ms ASC
             LIMIT ?
         "#;
         let query_str = self.db.sql(query);
@@ -692,6 +693,13 @@ impl MarketplaceRepository {
                         .await?;
 
                     let Some(c_row) = c_seller else {
+                        sqlx::query(&q!(
+                            "UPDATE market_listings SET status = 'ExpiredPendingClaim', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'"
+                        ))
+                        .bind(now_ms)
+                        .bind(&r.listing_id)
+                        .execute(&mut *conn)
+                        .await?;
                         return Ok(false);
                     };
                     let cap: i32 = c_row.try_get("capacity")?;
@@ -707,6 +715,13 @@ impl MarketplaceRepository {
                         .collect();
 
                     let Some(free_slot) = find_first_free_slot(&occupied_slots, cap as u32) else {
+                        sqlx::query(&q!(
+                            "UPDATE market_listings SET status = 'ExpiredPendingClaim', updated_at_epoch_ms = ? WHERE listing_id = ? AND status = 'Active'"
+                        ))
+                        .bind(now_ms)
+                        .bind(&r.listing_id)
+                        .execute(&mut *conn)
+                        .await?;
                         return Ok(false);
                     };
 
@@ -1133,19 +1148,59 @@ mod tests {
             "Must not reap when seller container has no free slot"
         );
 
-        // Listing status must still be Active
+        // Listing status must transition to ExpiredPendingClaim (preventing reaper starvation)
         let fetched = repo
             .get_listing(&listing.listing_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fetched.status, ListingStatus::Active);
+        assert_eq!(fetched.status, ListingStatus::ExpiredPendingClaim);
 
         // Item must remain safely in escrow
         let crepo = crate::container_repo::ContainerRepository::new(db.clone());
         let escrow_items = crepo.get_container_items(escrow_container).await.unwrap();
         assert_eq!(escrow_items.len(), 1);
         assert_eq!(escrow_items[0].item_instance_id, "item-exp-full");
+
+        // Verify reaper is NOT starved for subsequent expired listings:
+        // Create second seller with space in container
+        let seller2_guid = 1002;
+        let seller2_container = 11;
+        create_container(&db, seller2_container, "1002", 10).await;
+        create_item(&db, "item-exp-avail", seller2_container, 0, 701).await;
+        let listing2 = repo
+            .create_listing(seller2_guid, seller2_container, 0, 100, 0, escrow_container)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Second reap sweep should successfully process listing2 without being blocked by listing 1
+        let reaped2 = repo.reap_expired_listings(10).await.unwrap();
+        assert_eq!(reaped2, 1, "Subsequent unblocked listing must be reaped");
+        let fetched2 = repo
+            .get_listing(&listing2.listing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched2.status, ListingStatus::Expired);
+
+        // Verify seller 1 can reclaim the ExpiredPendingClaim listing once bag space is cleared
+        sqlx::query("DELETE FROM items WHERE item_instance_id = 'seller-fill-0'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let reclaimed = repo
+            .cancel_listing(seller_guid, &listing.listing_id, seller_container)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.status, ListingStatus::Cancelled);
+
+        let s1_items = crepo.get_container_items(seller_container).await.unwrap();
+        assert!(s1_items
+            .iter()
+            .any(|i| i.item_instance_id == "item-exp-full"));
     }
 
     #[tokio::test]
