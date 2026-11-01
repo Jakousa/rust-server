@@ -2082,7 +2082,7 @@ impl MarketResponsePacket {
             .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
 
         let count = src.get_u16_le() as usize;
-        const MIN_LISTING_WIRE_SIZE: usize = 38;
+        const MIN_LISTING_WIRE_SIZE: usize = 40;
         if count > src.remaining() / MIN_LISTING_WIRE_SIZE {
             return Err(ClientCodecError::BufferTooShort {
                 expected: count * MIN_LISTING_WIRE_SIZE,
@@ -4317,6 +4317,18 @@ mod tests {
         buf2.put_u16_le(5); // claims 5 listings
                             // No listing bytes follow
         assert!(MarketResponsePacket::decode(&mut buf2.freeze()).is_err());
+
+        // Adversarial huge count DoS prevention
+        let mut buf_dos = BytesMut::new();
+        buf_dos.put_u8(1);
+        buf_dos.put_u8(1);
+        buf_dos.put_u32_le(0);
+        buf_dos.put_u16_le(0); // empty message
+        buf_dos.put_u16_le(u16::MAX); // claims 65535 listings with 0 listing bytes
+        let err = MarketResponsePacket::decode(&mut buf_dos.freeze()).unwrap_err();
+        assert!(
+            matches!(err, ClientCodecError::BufferTooShort { expected, got } if expected == 65535 * 40 && got == 0)
+        );
     }
 
     #[test]

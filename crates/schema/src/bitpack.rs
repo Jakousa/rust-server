@@ -40,6 +40,20 @@ pub fn get_varint_u64<B: Buf>(src: &mut B) -> Result<u64, ClientCodecError> {
             });
         }
         let byte = src.get_u8();
+
+        if byte_count == MAX_VARINT_U64_BYTES - 1 {
+            if (byte & 0x80) != 0 {
+                return Err(ClientCodecError::InvalidData(
+                    "Varint u64 exceeds maximum allowed 10 bytes".to_string(),
+                ));
+            }
+            if (byte & 0x7E) != 0 {
+                return Err(ClientCodecError::InvalidData(
+                    "Varint u64 overflow on byte 10: non-canonical or out of range".to_string(),
+                ));
+            }
+        }
+
         result |= ((byte & 0x7F) as u64) << shift;
 
         if (byte & 0x80) == 0 {
@@ -64,15 +78,46 @@ pub fn put_varint_u32<B: BufMut>(dst: &mut B, mut val: u32) {
 }
 
 /// Deserializes an unsigned 32-bit integer from a buffer using LEB128 varint encoding.
+///
+/// Enforces a strict 5-byte maximum and rejects non-canonical or overflowing values.
 #[inline]
 pub fn get_varint_u32<B: Buf>(src: &mut B) -> Result<u32, ClientCodecError> {
-    let val = get_varint_u64(src)?;
-    if val > u32::MAX as u64 {
-        return Err(ClientCodecError::InvalidData(
-            "Varint value exceeds u32::MAX".to_string(),
-        ));
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+
+    for byte_count in 0..MAX_VARINT_U32_BYTES {
+        if !src.has_remaining() {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: byte_count + 1,
+                got: byte_count,
+            });
+        }
+        let byte = src.get_u8();
+
+        if byte_count == MAX_VARINT_U32_BYTES - 1 {
+            if (byte & 0x80) != 0 {
+                return Err(ClientCodecError::InvalidData(
+                    "Varint u32 exceeds maximum allowed 5 bytes".to_string(),
+                ));
+            }
+            if (byte & 0x70) != 0 {
+                return Err(ClientCodecError::InvalidData(
+                    "Varint u32 overflow on byte 5: non-canonical or out of range".to_string(),
+                ));
+            }
+        }
+
+        result |= ((byte & 0x7F) as u32) << shift;
+
+        if (byte & 0x80) == 0 {
+            return Ok(result);
+        }
+        shift += 7;
     }
-    Ok(val as u32)
+
+    Err(ClientCodecError::InvalidData(
+        "Varint u32 exceeds maximum allowed 5 bytes".to_string(),
+    ))
 }
 
 /// Bit-level stream writer for compact arbitrary bit-width serialization.
@@ -562,6 +607,66 @@ mod tests {
             get_varint_u64(&mut buf),
             Err(ClientCodecError::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn test_varint_u64_byte10_overflow_and_continuation_rejected() {
+        // 9 continuation bytes (0x80), and 10th byte has bit 1 set (0x02) -> overflow
+        let mut bad_byte10 = [0x80u8; 10];
+        bad_byte10[9] = 0x02;
+        let mut buf = BytesMut::from(&bad_byte10[..]);
+        let err = get_varint_u64(&mut buf).unwrap_err();
+        assert!(
+            matches!(err, ClientCodecError::InvalidData(msg) if msg.contains("overflow on byte 10"))
+        );
+
+        // 10th byte has MSB set (0x80 or 0x81) -> exceeds 10 bytes
+        let mut cont_byte10 = [0x80u8; 10];
+        cont_byte10[9] = 0x81;
+        let mut buf2 = BytesMut::from(&cont_byte10[..]);
+        let err2 = get_varint_u64(&mut buf2).unwrap_err();
+        assert!(
+            matches!(err2, ClientCodecError::InvalidData(msg) if msg.contains("exceeds maximum allowed 10 bytes"))
+        );
+
+        // Valid 10th byte with bit 0 set (u64::MAX) -> succeeds
+        let mut max_bytes = [0xFFu8; 10];
+        max_bytes[9] = 0x01;
+        let mut buf_max = BytesMut::from(&max_bytes[..]);
+        let val = get_varint_u64(&mut buf_max).unwrap();
+        assert_eq!(val, u64::MAX);
+    }
+
+    #[test]
+    fn test_varint_u32_strict_5_byte_limit_and_overflow() {
+        // 4 continuation bytes (0x80), 5th byte has MSB set (0x80) -> exceeds 5 bytes
+        let cont_byte5 = [0x80u8; 5];
+        let mut buf = BytesMut::from(&cont_byte5[..]);
+        let err = get_varint_u32(&mut buf).unwrap_err();
+        assert!(
+            matches!(err, ClientCodecError::InvalidData(msg) if msg.contains("exceeds maximum allowed 5 bytes"))
+        );
+
+        // 5th byte has overflow bits set (0x10) -> exceeds 32 bits
+        let mut overflow_byte5 = [0x80u8; 5];
+        overflow_byte5[4] = 0x10;
+        let mut buf2 = BytesMut::from(&overflow_byte5[..]);
+        let err2 = get_varint_u32(&mut buf2).unwrap_err();
+        assert!(
+            matches!(err2, ClientCodecError::InvalidData(msg) if msg.contains("overflow on byte 5"))
+        );
+
+        // 10-byte encoding of 0 (non-canonical padded) rejected by 5-byte limit
+        let padded_zero = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        let mut buf3 = BytesMut::from(&padded_zero[..]);
+        let err3 = get_varint_u32(&mut buf3).unwrap_err();
+        assert!(matches!(err3, ClientCodecError::InvalidData(_)));
+
+        // u32::MAX encoded in 5 bytes -> succeeds
+        let max_u32_bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        let mut buf_max = BytesMut::from(&max_u32_bytes[..]);
+        let val = get_varint_u32(&mut buf_max).unwrap();
+        assert_eq!(val, u32::MAX);
     }
 
     #[test]
