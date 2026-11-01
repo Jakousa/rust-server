@@ -89,11 +89,19 @@ impl TimedAction {
 
     /// Returns the progress ratio from 0.0 to 1.0.
     pub fn progress(&self) -> f32 {
-        if self.duration_sec <= 0.0 {
+        if self.duration_sec <= 0.0 || !self.duration_sec.is_finite() {
             1.0
+        } else if !self.elapsed_sec.is_finite() || self.elapsed_sec <= 0.0 {
+            0.0
         } else {
-            (self.elapsed_sec / self.duration_sec).clamp(0.0, 1.0)
+            crate::attribute::safe_clamp(self.elapsed_sec / self.duration_sec, 0.0, 1.0)
         }
+    }
+
+    /// Alias for [`progress`] providing semantic consistency for progress fraction queries.
+    #[inline]
+    pub fn progress_fraction(&self) -> f32 {
+        self.progress()
     }
 
     /// Returns `true` if the action has completed its elapsed duration.
@@ -230,12 +238,26 @@ impl ActionQueue {
 /// Batch system executed during the simulation tick to advance active actions.
 pub struct ActionTickSystem;
 
+impl ActionTickSystem {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ActionTickSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TickSystem for ActionTickSystem {
     fn name(&self) -> &'static str {
         "ActionTickSystem"
     }
 
     fn update(&mut self, ctx: &mut TickContext) {
+        ctx.events.register_ephemeral::<ActionProgressEvent>();
+
         enum ActionDecision {
             Interrupt(u32, InterruptReason),
             Progress,
@@ -727,5 +749,36 @@ mod tests {
         let interrupted3 = events.drain::<ActionInterruptedEvent>();
         assert_eq!(interrupted3.len(), 1);
         assert_eq!(interrupted3[0].reason, InterruptReason::CrowdControl);
+    }
+
+    #[test]
+    fn test_timed_action_progress_clamping_and_nan_resilience() {
+        let mut action = TimedAction::new(1, 2.0, ActionInterruptFlags::default(), None);
+        assert_eq!(action.progress(), 0.0);
+        assert_eq!(action.progress_fraction(), 0.0);
+
+        action.elapsed_sec = 1.0;
+        assert_eq!(action.progress(), 0.5);
+        assert_eq!(action.progress_fraction(), 0.5);
+
+        action.elapsed_sec = 3.0;
+        assert_eq!(action.progress(), 1.0);
+        assert_eq!(action.progress_fraction(), 1.0);
+
+        // NaN duration or zero duration must return 1.0 without panic
+        let zero_dur = TimedAction::new(1, 0.0, ActionInterruptFlags::default(), None);
+        assert_eq!(zero_dur.progress(), 1.0);
+
+        let nan_dur = TimedAction::new(1, f32::NAN, ActionInterruptFlags::default(), None);
+        assert_eq!(nan_dur.progress(), 1.0);
+
+        // Negative duration
+        let neg_dur = TimedAction::new(1, -5.0, ActionInterruptFlags::default(), None);
+        assert_eq!(neg_dur.progress(), 1.0);
+
+        // NaN elapsed
+        let mut nan_elapsed = TimedAction::new(1, 2.0, ActionInterruptFlags::default(), None);
+        nan_elapsed.elapsed_sec = f32::NAN;
+        assert_eq!(nan_elapsed.progress(), 0.0);
     }
 }

@@ -260,12 +260,26 @@ impl TradeManager {
             .get_mut(&session_id)
             .ok_or("Trade session not found")?;
 
-        let inv1 = e1
-            .get_component_mut::<InventoryComponent>()
-            .ok_or("Player 1 has no inventory")?;
-        let inv2 = e2
-            .get_component_mut::<InventoryComponent>()
-            .ok_or("Player 2 has no inventory")?;
+        let inv1 = match e1.get_component_mut::<InventoryComponent>() {
+            Some(inv) => inv,
+            None => {
+                session.accepted_a = false;
+                session.accepted_b = false;
+                session.locked_a = false;
+                session.locked_b = false;
+                return Err("Player 1 has no inventory");
+            }
+        };
+        let inv2 = match e2.get_component_mut::<InventoryComponent>() {
+            Some(inv) => inv,
+            None => {
+                session.accepted_a = false;
+                session.accepted_b = false;
+                session.locked_a = false;
+                session.locked_b = false;
+                return Err("Player 2 has no inventory");
+            }
+        };
 
         // Validate staging inventories with bilateral lock reset on validation failure
         let validation_res: Result<(InventoryComponent, InventoryComponent), &'static str> =
@@ -893,5 +907,90 @@ mod tests {
             trade_mgr.execute_atomic_swap(sid2, &mut store),
             Err("Player A would exceed max weight")
         );
+    }
+
+    #[test]
+    fn test_execute_atomic_swap_validation_failure_resets_bilateral_locks() {
+        let mut store = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 601);
+        let p2 = Guid::new(EntityType::Player, 1, 602);
+
+        let k1 = store.spawn(p1, (0.0, 0.0, 0.0));
+        let k2 = store.spawn(p2, (1.0, 0.0, 0.0));
+
+        // Player 1 has full inventory (capacity 1, 1 item)
+        let mut inv1 = InventoryComponent::new(1, 100.0);
+        inv1.add_item(ItemStack::new(1, "Ore", 1, 1.0)).unwrap();
+
+        // Player 2 has 2 items
+        let mut inv2 = InventoryComponent::new(2, 100.0);
+        let item_a = ItemStack::new(10, "Gem", 1, 1.0);
+        let item_b = ItemStack::new(11, "Ruby", 1, 1.0);
+        inv2.add_item(item_a.clone()).unwrap();
+        inv2.add_item(item_b.clone()).unwrap();
+
+        store.get_mut(k1).unwrap().add_component(inv1);
+        store.get_mut(k2).unwrap().add_component(inv2);
+
+        let mut trade_mgr = TradeManager::new();
+        let sid = trade_mgr.start_session(p1, p2, &store).unwrap();
+
+        // Player 2 offers 2 items, but Player 1 has only 1 slot and offers 0 items (insufficient slots)
+        let session = trade_mgr.get_session_mut(sid).unwrap();
+        session
+            .set_offer(
+                p2,
+                TradeOffer {
+                    items: vec![item_a, item_b],
+                    currency: 0,
+                },
+            )
+            .unwrap();
+        session.lock(p1).unwrap();
+        session.lock(p2).unwrap();
+        session.accept(p1).unwrap();
+        session.accept(p2).unwrap();
+
+        assert!(session.locked_a && session.locked_b);
+        assert!(session.accepted_a && session.accepted_b);
+
+        // Validation failure due to insufficient slots
+        let err = trade_mgr.execute_atomic_swap(sid, &mut store);
+        assert_eq!(
+            err,
+            Err("Player A has insufficient inventory slots for trade")
+        );
+
+        // Both players' acceptance AND locks MUST be reset to false
+        let session = trade_mgr.get_session(sid).unwrap();
+        assert!(!session.accepted_a, "Player A acceptance should be reset");
+        assert!(!session.accepted_b, "Player B acceptance should be reset");
+        assert!(!session.locked_a, "Player A lock should be reset");
+        assert!(!session.locked_b, "Player B lock should be reset");
+
+        // Now test pre-validation missing inventory component resets locks
+        trade_mgr.cancel_session(sid);
+        let sid2 = trade_mgr.start_session(p1, p2, &store).unwrap();
+        let session2 = trade_mgr.get_session_mut(sid2).unwrap();
+        session2.lock(p1).unwrap();
+        session2.lock(p2).unwrap();
+        session2.accept(p1).unwrap();
+        session2.accept(p2).unwrap();
+
+        // Remove Player 1's inventory component
+        store
+            .get_mut(k1)
+            .unwrap()
+            .components
+            .remove_component::<InventoryComponent>();
+
+        let err2 = trade_mgr.execute_atomic_swap(sid2, &mut store);
+        assert_eq!(err2, Err("Player 1 has no inventory"));
+
+        let session2 = trade_mgr.get_session(sid2).unwrap();
+        assert!(!session2.accepted_a);
+        assert!(!session2.accepted_b);
+        assert!(!session2.locked_a);
+        assert!(!session2.locked_b);
     }
 }

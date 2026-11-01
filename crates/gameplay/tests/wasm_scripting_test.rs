@@ -497,3 +497,59 @@ fn test_wasm_entity_modify_health_syncs_attributes_and_emits_death() {
     assert_eq!(death_events[0].entity, guid);
     assert_eq!(death_events[0].killer, None);
 }
+
+#[test]
+fn test_wasm_memory_limiter_caps_growth_at_32mb() {
+    let engine = Arc::new(WasmScriptEngine::new().expect("Failed to create engine"));
+    let runtime = Arc::new(WasmRuntime::new(engine.clone()).expect("Failed to create runtime"));
+
+    let wat_growth = r#"
+    (module
+        (memory 1)
+        (func (export "test_limit") (result i32)
+            ;; Growth from 1 to 512 pages (32MB) succeeds (returns previous size 1)
+            (if (i32.ne (memory.grow (i32.const 511)) (i32.const 1))
+                (then (return (i32.const 101)))
+            )
+            ;; Current size is 512 pages (32MB)
+            (if (i32.ne (memory.size) (i32.const 512))
+                (then (return (i32.const 102)))
+            )
+            ;; Growing by 1 more page (exceeding 32MB limit) MUST return -1
+            (if (i32.ne (memory.grow (i32.const 1)) (i32.const -1))
+                (then (return (i32.const 103)))
+            )
+            ;; Size remains 512 pages
+            (if (i32.ne (memory.size) (i32.const 512))
+                (then (return (i32.const 104)))
+            )
+            ;; Attempting massive 4GB allocation (65536 pages) MUST return -1 without host OOM
+            (if (i32.ne (memory.grow (i32.const 65536)) (i32.const -1))
+                (then (return (i32.const 105)))
+            )
+            (i32.const 0)
+        )
+    )
+    "#;
+    let wasm_bytes = wat::parse_str(wat_growth).unwrap();
+    engine.load_module("memory_growth", &wasm_bytes).unwrap();
+
+    let (res, _) = runtime
+        .execute_function("memory_growth", "test_limit", &[], None, 100_000)
+        .unwrap();
+    assert_eq!(res, vec![ScriptValue::I32(0)]);
+
+    // Instantiating a module with initial memory exceeding 32MB (600 pages = 38.4MB) fails instantiation
+    let wat_oversized = r#"
+    (module
+        (memory 600)
+    )
+    "#;
+    let oversized_bytes = wat::parse_str(wat_oversized).unwrap();
+    engine.load_module("oversized", &oversized_bytes).unwrap();
+
+    let err = runtime.execute_function("oversized", "noop", &[], None, 10_000);
+    assert!(
+        matches!(err, Err(ScriptError::ExecutionError(msg)) if msg.contains("Instantiate error"))
+    );
+}

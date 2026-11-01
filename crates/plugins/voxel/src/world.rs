@@ -13,8 +13,8 @@ use crate::mesh::{
     VoxelMesh,
 };
 use crate::modify::{
-    affected_neighbor_chunks, is_boundary_voxel, validate_and_apply_modification, ExcavationConfig,
-    ExcavationRateLimiter, VoxelChangeEvent, VoxelModifyResult,
+    affected_neighbor_chunks, apply_modification, is_boundary_voxel, validate_rate_limit,
+    validate_reach, ExcavationConfig, ExcavationRateLimiter, VoxelChangeEvent, VoxelModifyResult,
 };
 
 /// High-concurrency spatial container managing voxel chunks.
@@ -123,25 +123,29 @@ impl VoxelWorld {
             None => return (VoxelModifyResult::ChunkNotLoaded, None),
         };
 
+        // 1. Lock-free reach validation
+        if let Err(result) = validate_reach(player_pos, target, &self.config) {
+            return (result, None);
+        }
+
+        // 2. Validate and advance rate limiter under scoped mutex, immediately dropped
+        {
+            let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(result) =
+                validate_rate_limit(entity, &mut rate_limiter, now_ms, self.config.cooldown_ms)
+            {
+                return (result, None);
+            }
+        }
+
+        // 3. Acquire per-chunk write lock independently for chunk-level concurrency
         let idx = index_from_local(lx, ly, lz);
-        let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         let mut chunk = match chunk_arc.write() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
 
-        let result = validate_and_apply_modification(
-            player_pos,
-            &mut chunk,
-            idx,
-            new_voxel,
-            &self.config,
-            &mut rate_limiter,
-            entity,
-            chunk_coord,
-            target,
-            now_ms,
-        );
+        let result = apply_modification(&mut chunk, idx, new_voxel);
 
         match result {
             VoxelModifyResult::Success {
@@ -323,5 +327,47 @@ mod tests {
 
         let mesh = world.build_mesh(coord).expect("mesh");
         assert_eq!(mesh.vertex_count(), 36);
+    }
+
+    #[test]
+    fn test_concurrent_multi_chunk_modifications() {
+        let world = VoxelWorld::default();
+
+        // Populate 8 chunks
+        for cx in 0..2 {
+            for cy in 0..2 {
+                for cz in 0..2 {
+                    let coord = VoxelChunkCoord::new(cx, cy, cz);
+                    let chunk = PaletteChunk::new_homogeneous(1);
+                    world.insert_chunk(coord, chunk);
+                }
+            }
+        }
+
+        // Spawn 8 concurrent threads, each modifying a distinct chunk
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let world_clone = world.clone();
+            let handle = std::thread::spawn(move || {
+                let cx = (i >> 2) & 1;
+                let cy = (i >> 1) & 1;
+                let cz = i & 1;
+                let entity = Guid::new(EntityType::Player, 1, 100 + i as u32);
+                let target = VoxelCoord::new(cx * 16 + 5, cy * 16 + 5, cz * 16 + 5);
+                let pos = (target.x as f32, target.y as f32, target.z as f32);
+
+                let (res, event) =
+                    world_clone.modify_voxel(entity, target, 2, pos, 1000 + i as u64);
+                assert!(matches!(res, VoxelModifyResult::Success { .. }));
+                assert!(event.is_some());
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        assert_eq!(world.drain_dirty_chunks().len(), 8);
     }
 }

@@ -102,6 +102,65 @@ impl ExcavationRateLimiter {
     }
 }
 
+/// Validates player reach against configured reach bounds.
+pub fn validate_reach(
+    player_pos: (f32, f32, f32),
+    voxel_coord: VoxelCoord,
+    config: &ExcavationConfig,
+) -> Result<(), VoxelModifyResult> {
+    let target_center = voxel_coord.center_world_pos();
+    let dx = player_pos.0 - target_center.0;
+    let dy = player_pos.1 - target_center.1;
+    let dz = player_pos.2 - target_center.2;
+    let dist_sq = dx * dx + dy * dy + dz * dz;
+
+    let allowed_radius = config.max_reach + config.reach_tolerance;
+    let allowed_sq = allowed_radius * allowed_radius;
+
+    if dist_sq > allowed_sq {
+        return Err(VoxelModifyResult::OutOfReach {
+            distance: dist_sq.sqrt(),
+            max_reach: config.max_reach,
+        });
+    }
+    Ok(())
+}
+
+/// Validates and advances rate limiting for an entity.
+pub fn validate_rate_limit(
+    entity_guid: Guid,
+    rate_limiter: &mut ExcavationRateLimiter,
+    now_ms: u64,
+    cooldown_ms: u64,
+) -> Result<(), VoxelModifyResult> {
+    if !rate_limiter.check_and_update(entity_guid, now_ms, cooldown_ms) {
+        let last = rate_limiter.last_time(entity_guid).unwrap_or(0);
+        let elapsed = now_ms.saturating_sub(last);
+        return Err(VoxelModifyResult::RateLimited {
+            elapsed_ms: elapsed,
+            min_interval_ms: cooldown_ms,
+        });
+    }
+    Ok(())
+}
+
+/// Applies the voxel modification to a chunk palette.
+pub fn apply_modification(
+    chunk: &mut PaletteChunk,
+    idx: usize,
+    new_voxel: u16,
+) -> VoxelModifyResult {
+    let old_voxel = chunk.get(idx);
+    if chunk.set(idx, new_voxel) {
+        VoxelModifyResult::Success {
+            old_voxel,
+            new_voxel,
+        }
+    } else {
+        VoxelModifyResult::NoChange
+    }
+}
+
 /// Validates player reach, rate limits, and applies the voxel modification.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_and_apply_modification(
@@ -116,40 +175,13 @@ pub fn validate_and_apply_modification(
     voxel_coord: VoxelCoord,
     now_ms: u64,
 ) -> VoxelModifyResult {
-    let target_center = voxel_coord.center_world_pos();
-    let dx = player_pos.0 - target_center.0;
-    let dy = player_pos.1 - target_center.1;
-    let dz = player_pos.2 - target_center.2;
-    let dist_sq = dx * dx + dy * dy + dz * dz;
-
-    let allowed_radius = config.max_reach + config.reach_tolerance;
-    let allowed_sq = allowed_radius * allowed_radius;
-
-    if dist_sq > allowed_sq {
-        return VoxelModifyResult::OutOfReach {
-            distance: dist_sq.sqrt(),
-            max_reach: config.max_reach,
-        };
+    if let Err(res) = validate_reach(player_pos, voxel_coord, config) {
+        return res;
     }
-
-    if !rate_limiter.check_and_update(entity_guid, now_ms, config.cooldown_ms) {
-        let last = rate_limiter.last_time(entity_guid).unwrap_or(0);
-        let elapsed = now_ms.saturating_sub(last);
-        return VoxelModifyResult::RateLimited {
-            elapsed_ms: elapsed,
-            min_interval_ms: config.cooldown_ms,
-        };
+    if let Err(res) = validate_rate_limit(entity_guid, rate_limiter, now_ms, config.cooldown_ms) {
+        return res;
     }
-
-    let old_voxel = chunk.get(idx);
-    if chunk.set(idx, new_voxel) {
-        VoxelModifyResult::Success {
-            old_voxel,
-            new_voxel,
-        }
-    } else {
-        VoxelModifyResult::NoChange
-    }
+    apply_modification(chunk, idx, new_voxel)
 }
 
 /// Returns `true` if the local coordinate lies along a chunk boundary.

@@ -245,24 +245,105 @@ impl ModularPacketHandler for InventoryPacketHandler {
                     }
                 };
 
-                let old_item = equip.equip(equip_slot, item);
+                let old_item = equip.equip(equip_slot, item.clone());
                 if let Some(old) = old_item {
                     // Put previous equipped item directly back into the vacated inventory slot
-                    if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
-                        if inv_slot < inv.slots.len() && inv.slots[inv_slot].is_none() {
-                            inv.slots[inv_slot] = Some(old);
+                    let store_res =
+                        if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
+                            if inv_slot < inv.slots.len() && inv.slots[inv_slot].is_none() {
+                                inv.slots[inv_slot] = Some(old.clone());
+                                Ok(())
+                            } else {
+                                inv.add_item(old.clone())
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            }
                         } else {
-                            inv.add_item(old).map_err(|e| {
-                                PacketHandlerError::Custom(format!(
-                                    "Failed to store unequipped item: {}",
-                                    e
-                                ))
-                            })?;
+                            Err("No InventoryComponent on entity".to_string())
+                        };
+
+                    if let Err(err) = store_res {
+                        // Rollback: restore old item to equip, restore equipping item to inv_slot
+                        if let Some(eq) = entity.get_component_mut::<EquipmentComponent>() {
+                            eq.equip(equip_slot, old);
                         }
+                        if let Some(inv) = entity.get_component_mut::<InventoryComponent>() {
+                            if inv_slot < inv.slots.len() {
+                                inv.slots[inv_slot] = Some(item);
+                            } else {
+                                let _ = inv.add_item(item);
+                            }
+                        }
+                        return Err(PacketHandlerError::Custom(format!(
+                            "Failed to store unequipped item: {}",
+                            err
+                        )));
                     }
                 }
 
                 Ok(Some(vec![1])) // Success response
+            }
+            // Sub-opcode 2: Unequip item from equipment slot into inventory
+            2 => {
+                if payload.is_empty() {
+                    return Err(PacketHandlerError::MalformedPayload {
+                        module_id: 0x01,
+                        message: "Unequip payload must contain equip slot index".to_string(),
+                    });
+                }
+                let equip_slot = match payload[0] {
+                    0 => EquipSlot::Head,
+                    1 => EquipSlot::Chest,
+                    2 => EquipSlot::MainHand,
+                    3 => EquipSlot::OffHand,
+                    4 => EquipSlot::Boots,
+                    other => {
+                        return Err(PacketHandlerError::MalformedPayload {
+                            module_id: 0x01,
+                            message: format!("Invalid equipment slot index {}", other),
+                        });
+                    }
+                };
+
+                let equip = entity
+                    .get_component_mut::<EquipmentComponent>()
+                    .ok_or_else(|| {
+                        PacketHandlerError::Custom("No EquipmentComponent on entity".to_string())
+                    })?;
+                if equip.get_equipped(&equip_slot).is_none() {
+                    return Err(PacketHandlerError::Custom(
+                        "No item equipped in specified slot".to_string(),
+                    ));
+                }
+
+                let inv = entity
+                    .get_component_mut::<InventoryComponent>()
+                    .ok_or_else(|| {
+                        PacketHandlerError::Custom("No InventoryComponent on entity".to_string())
+                    })?;
+                if !inv.slots.iter().any(|s| s.is_none()) {
+                    return Err(PacketHandlerError::Custom("Inventory is full".to_string()));
+                }
+
+                let item = entity
+                    .get_component_mut::<EquipmentComponent>()
+                    .unwrap()
+                    .unequip(&equip_slot)
+                    .unwrap();
+
+                let inv = entity.get_component_mut::<InventoryComponent>().unwrap();
+                if let Err(e) = inv.add_item(item.clone()) {
+                    // Rollback
+                    if let Some(eq) = entity.get_component_mut::<EquipmentComponent>() {
+                        eq.equip(equip_slot, item);
+                    }
+                    return Err(PacketHandlerError::Custom(format!(
+                        "Failed to store unequipped item: {}",
+                        e
+                    )));
+                }
+
+                Ok(Some(vec![2])) // Success response
             }
             _ => Err(PacketHandlerError::MalformedPayload {
                 module_id: 0x01,
@@ -568,5 +649,111 @@ mod tests {
         assert!(inv.remove_item_stack(&query));
         assert_eq!(inv.slots[0], None);
         assert_eq!(inv.slots[1].as_ref().unwrap().quantity, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_equip_swap_full_inventory_and_rollback() {
+        use mmo_core::EntityType;
+
+        let handler = InventoryPacketHandler;
+        let mut entities = EntityStore::new();
+        let guid = Guid::new(EntityType::Player, 1, 999);
+        let key = entities.spawn(guid, (0.0, 0.0, 0.0));
+
+        // Create inventory of capacity 2 with 2 items (100% full)
+        let mut inv = InventoryComponent::new(2, 100.0);
+        let sword_a = ItemStack::new(10, "Sword A", 1, 5.0);
+        let dagger = ItemStack::new(20, "Dagger", 1, 2.0);
+        inv.add_item(sword_a).unwrap();
+        inv.add_item(dagger).unwrap();
+
+        // Create equipment with sword B in MainHand (2)
+        let mut equip = EquipmentComponent::new();
+        let sword_b = ItemStack::new(11, "Sword B", 1, 6.0);
+        equip.equip(EquipSlot::MainHand, sword_b);
+
+        let entity = entities.get_mut(key).unwrap();
+        entity.add_component(inv);
+        entity.add_component(equip);
+
+        // Equip slot 0 (Sword A) into MainHand (2) -> Should swap: Sword B returns into slot 0
+        let res = handler.handle(guid, 1, &[0, 2], &mut entities);
+        assert_eq!(res.unwrap(), Some(vec![1]));
+
+        let entity = entities.get_by_guid(guid).unwrap();
+        let eq = entity.get_component::<EquipmentComponent>().unwrap();
+        let inv = entity.get_component::<InventoryComponent>().unwrap();
+        assert_eq!(
+            eq.get_equipped(&EquipSlot::MainHand).unwrap().name,
+            "Sword A"
+        );
+        assert_eq!(inv.slots[0].as_ref().unwrap().name, "Sword B");
+        assert_eq!(inv.slots[1].as_ref().unwrap().name, "Dagger");
+    }
+
+    #[test]
+    fn test_unequip_handler_flows() {
+        use mmo_core::EntityType;
+
+        let handler = InventoryPacketHandler;
+        let mut entities = EntityStore::new();
+        let guid = Guid::new(EntityType::Player, 1, 888);
+        let key = entities.spawn(guid, (0.0, 0.0, 0.0));
+
+        let inv = InventoryComponent::new(1, 100.0);
+        let mut equip = EquipmentComponent::new();
+        let helm = ItemStack::new(1, "Helm", 1, 5.0);
+        equip.equip(EquipSlot::Head, helm);
+
+        let entity = entities.get_mut(key).unwrap();
+        entity.add_component(inv);
+        entity.add_component(equip);
+
+        // 1. Malformed payload (empty)
+        let err = handler.handle(guid, 2, &[], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
+
+        // 2. Malformed payload (invalid equip slot index 9)
+        let err = handler.handle(guid, 2, &[9], &mut entities);
+        assert!(matches!(
+            err,
+            Err(PacketHandlerError::MalformedPayload { .. })
+        ));
+
+        // 3. Unequip from empty slot (Chest = 1) -> Custom error
+        let err = handler.handle(guid, 2, &[1], &mut entities);
+        assert!(matches!(err, Err(PacketHandlerError::Custom(_))));
+
+        // 4. Fill inventory to capacity so unequip must fail without losing item
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+        inv_mut
+            .add_item(ItemStack::new(99, "Filler", 1, 1.0))
+            .unwrap();
+
+        let err = handler.handle(guid, 2, &[0], &mut entities);
+        assert!(matches!(err, Err(PacketHandlerError::Custom(_))));
+
+        // Verify Helm remains equipped and inventory unchanged
+        let entity = entities.get_by_guid(guid).unwrap();
+        let eq = entity.get_component::<EquipmentComponent>().unwrap();
+        assert_eq!(eq.get_equipped(&EquipSlot::Head).unwrap().name, "Helm");
+
+        // 5. Empty inventory slot and perform successful unequip
+        let entity = entities.get_mut_by_guid(guid).unwrap();
+        let inv_mut = entity.get_component_mut::<InventoryComponent>().unwrap();
+        inv_mut.remove_item(0);
+
+        let ok = handler.handle(guid, 2, &[0], &mut entities);
+        assert_eq!(ok.unwrap(), Some(vec![2]));
+
+        let entity = entities.get_by_guid(guid).unwrap();
+        let eq = entity.get_component::<EquipmentComponent>().unwrap();
+        let inv = entity.get_component::<InventoryComponent>().unwrap();
+        assert!(eq.get_equipped(&EquipSlot::Head).is_none());
+        assert_eq!(inv.slots[0].as_ref().unwrap().name, "Helm");
     }
 }

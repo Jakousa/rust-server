@@ -642,4 +642,148 @@ mod tests {
             dist_to_player
         );
     }
+
+    #[test]
+    fn test_fsm_brain_threat_retargeting_preserves_aggro() {
+        let mut store = EntityStore::new();
+        let mut octree = mmo_core::Octree::new(mmo_core::BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+
+        let mob = Guid::new(EntityType::Npc, 1, 10);
+        let p1 = Guid::new(EntityType::Player, 1, 21);
+        let p2 = Guid::new(EntityType::Player, 1, 22);
+
+        let mob_key = store.spawn(mob, (0.0, 0.0, 0.0));
+        let _p1_key = store.spawn(p1, (10.0, 0.0, 0.0));
+        let _p2_key = store.spawn(p2, (0.0, 15.0, 0.0));
+
+        let brain = FsmBrainComponent::new(FsmState::Idle { timer_secs: 1.0 }, 2.0, 1.0, 1.0, 25.0);
+        let mut threat = ThreatTableComponent::default_combat();
+        threat.add_threat(p1, 50.0);
+        let nav = NavAgentComponent::new(5.0, 0.5);
+
+        store.get_mut(mob_key).unwrap().add_component(brain);
+        store.get_mut(mob_key).unwrap().add_component(threat);
+        store.get_mut(mob_key).unwrap().add_component(nav);
+
+        let mut brain_system = FsmBrainSystem::default();
+
+        // 1. Initial tick: Mob in Idle detects P1 as highest threat -> transitions to Chase { target: P1 }
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 1,
+                collision_world: None,
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let mob_ent = store.get(mob_key).unwrap();
+        let brain = mob_ent.get_component::<FsmBrainComponent>().unwrap();
+        assert_eq!(brain.current_state, FsmState::Chase { target: p1 });
+
+        // 2. Second tick: Mob updates nav target to P1 (10, 0, 0)
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 2,
+                collision_world: None,
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let mob_ent = store.get(mob_key).unwrap();
+        let nav = mob_ent.get_component::<NavAgentComponent>().unwrap();
+        assert_eq!(nav.target_position, Some((10.0, 0.0, 0.0)));
+
+        // 3. Threat leadership changes to P2 (100.0 > 50.0)
+        let mob_mut = store.get_mut(mob_key).unwrap();
+        mob_mut
+            .get_component_mut::<ThreatTableComponent>()
+            .unwrap()
+            .add_threat(p2, 100.0);
+
+        // 4. Tick: Mob MUST seamlessly switch to Chase { target: P2 } without evading to spawn
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 3,
+                collision_world: None,
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let mob_ent = store.get(mob_key).unwrap();
+        let brain = mob_ent.get_component::<FsmBrainComponent>().unwrap();
+        let nav = mob_ent.get_component::<NavAgentComponent>().unwrap();
+        assert_eq!(
+            brain.current_state,
+            FsmState::Chase { target: p2 },
+            "Mob should retarget to P2 instead of dropping aggro"
+        );
+        assert_eq!(nav.target_position, Some((0.0, 15.0, 0.0)));
+
+        // 5. Move mob into attack range of P2 (dist = 1.0 <= attack_range 2.0)
+        store.get_mut(mob_key).unwrap().position = (0.0, 14.0, 0.0);
+
+        // 6. Tick: Mob transitions to Attack { target: P2 }
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 4,
+                collision_world: None,
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let mob_ent = store.get(mob_key).unwrap();
+        let brain = mob_ent.get_component::<FsmBrainComponent>().unwrap();
+        assert!(matches!(brain.current_state, FsmState::Attack { target, .. } if target == p2));
+
+        // 7. Threat leadership shifts back to P1 (200.0 > 100.0)
+        store
+            .get_mut(mob_key)
+            .unwrap()
+            .get_component_mut::<ThreatTableComponent>()
+            .unwrap()
+            .add_threat(p1, 150.0); // 50 + 150 = 200 > 100
+
+        // 8. Tick: Mob transitions from Attack directly to Chase { target: P1 }
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 5,
+                collision_world: None,
+            };
+            brain_system.update(&mut ctx);
+        }
+
+        let mob_ent = store.get(mob_key).unwrap();
+        let brain = mob_ent.get_component::<FsmBrainComponent>().unwrap();
+        let nav = mob_ent.get_component::<NavAgentComponent>().unwrap();
+        assert_eq!(
+            brain.current_state,
+            FsmState::Chase { target: p1 },
+            "Mob in Attack state should switch to Chase(P1) when P1 surpasses threat"
+        );
+        assert_eq!(nav.target_position, Some((10.0, 0.0, 0.0)));
+    }
 }

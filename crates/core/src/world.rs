@@ -189,6 +189,34 @@ impl WorldObject {
         SectorCoord3D::from_world_pos(self.transform.position)
     }
 
+    /// Computes the maximum radial reach (extent) of this object's bounding box
+    /// relative to its transform origin across all three coordinate axes.
+    ///
+    /// Returns `0.0` if any coordinate in position or bounds is non-finite or `NaN`.
+    pub fn max_extent(&self) -> f32 {
+        let (px, py, pz) = self.transform.position;
+        let (min_x, min_y, min_z) = self.bounds.min;
+        let (max_x, max_y, max_z) = self.bounds.max;
+
+        if !px.is_finite()
+            || !py.is_finite()
+            || !pz.is_finite()
+            || !min_x.is_finite()
+            || !min_y.is_finite()
+            || !min_z.is_finite()
+            || !max_x.is_finite()
+            || !max_y.is_finite()
+            || !max_z.is_finite()
+        {
+            return 0.0;
+        }
+
+        let dx = (max_x - px).abs().max((px - min_x).abs());
+        let dy = (max_y - py).abs().max((py - min_y).abs());
+        let dz = (max_z - pz).abs().max((pz - min_z).abs());
+        dx.max(dy).max(dz)
+    }
+
     /// Returns `true` if the object has the specified state flag set.
     #[inline]
     pub fn has_flag(&self, flag: u32) -> bool {
@@ -212,6 +240,8 @@ impl WorldObject {
 pub struct SectorSpatialIndex {
     sectors: HashMap<SectorCoord3D, HashMap<Guid, WorldObject>>,
     object_to_sector: HashMap<Guid, SectorCoord3D>,
+    object_extents: HashMap<Guid, f32>,
+    max_extent: f32,
 }
 
 impl SectorSpatialIndex {
@@ -220,6 +250,8 @@ impl SectorSpatialIndex {
         Self {
             sectors: HashMap::new(),
             object_to_sector: HashMap::new(),
+            object_extents: HashMap::new(),
+            max_extent: 0.0,
         }
     }
 
@@ -233,6 +265,20 @@ impl SectorSpatialIndex {
         self.object_to_sector.is_empty()
     }
 
+    /// Maximum spatial extent across all currently indexed world objects.
+    #[inline]
+    pub fn max_extent(&self) -> f32 {
+        self.max_extent
+    }
+
+    /// Clears all indexed world objects and resets spatial metrics.
+    pub fn clear(&mut self) {
+        self.sectors.clear();
+        self.object_to_sector.clear();
+        self.object_extents.clear();
+        self.max_extent = 0.0;
+    }
+
     /// Inserts or updates a world object in the spatial index.
     ///
     /// Automatically handles movement across sector boundaries.
@@ -240,6 +286,14 @@ impl SectorSpatialIndex {
     pub fn insert(&mut self, object: WorldObject) -> Option<WorldObject> {
         let object_id = object.object_id;
         let new_sector = object.sector();
+        let new_extent = object.max_extent();
+
+        let old_extent = self.object_extents.insert(object_id, new_extent);
+        if new_extent >= self.max_extent {
+            self.max_extent = new_extent;
+        } else if old_extent == Some(self.max_extent) {
+            self.max_extent = self.object_extents.values().copied().fold(0.0f32, f32::max);
+        }
 
         let prev = if let Some(&old_sector) = self.object_to_sector.get(&object_id) {
             if old_sector != new_sector {
@@ -273,6 +327,11 @@ impl SectorSpatialIndex {
     /// Removes a world object by its GUID, returning the removed instance.
     pub fn remove(&mut self, object_id: Guid) -> Option<WorldObject> {
         let sector = self.object_to_sector.remove(&object_id)?;
+        if let Some(extent) = self.object_extents.remove(&object_id) {
+            if (extent - self.max_extent).abs() < f32::EPSILON {
+                self.max_extent = self.object_extents.values().copied().fold(0.0f32, f32::max);
+            }
+        }
         if let Some(sector_map) = self.sectors.get_mut(&sector) {
             let removed = sector_map.remove(&object_id);
             if sector_map.is_empty() {
@@ -308,11 +367,32 @@ impl SectorSpatialIndex {
 
     /// Gathers all world objects within an Axis-Aligned Bounding Box.
     pub fn query_aabb(&self, aabb: &BoundingBox3D) -> Vec<&WorldObject> {
-        if aabb.min.0 > aabb.max.0 || aabb.min.1 > aabb.max.1 || aabb.min.2 > aabb.max.2 {
+        if !aabb.min.0.is_finite()
+            || !aabb.min.1.is_finite()
+            || !aabb.min.2.is_finite()
+            || !aabb.max.0.is_finite()
+            || !aabb.max.1.is_finite()
+            || !aabb.max.2.is_finite()
+            || aabb.min.0 > aabb.max.0
+            || aabb.min.1 > aabb.max.1
+            || aabb.min.2 > aabb.max.2
+        {
             return Vec::new();
         }
-        let min_sector = SectorCoord3D::from_world_pos(aabb.min);
-        let max_sector = SectorCoord3D::from_world_pos(aabb.max);
+
+        let expanded_min = (
+            aabb.min.0 - self.max_extent,
+            aabb.min.1 - self.max_extent,
+            aabb.min.2 - self.max_extent,
+        );
+        let expanded_max = (
+            aabb.max.0 + self.max_extent,
+            aabb.max.1 + self.max_extent,
+            aabb.max.2 + self.max_extent,
+        );
+
+        let min_sector = SectorCoord3D::from_world_pos(expanded_min);
+        let max_sector = SectorCoord3D::from_world_pos(expanded_max);
 
         let span = |lo: i32, hi: i32| (i64::from(hi) - i64::from(lo) + 1).max(0) as u64;
         let volume = span(min_sector.x, max_sector.x)
@@ -568,5 +648,123 @@ mod tests {
 
         obj.set_flag(world_object_flags::LOCKED, false);
         assert!(!obj.has_flag(world_object_flags::LOCKED));
+    }
+
+    #[test]
+    fn test_multi_sector_cross_boundary_query_completeness() {
+        let mut index = SectorSpatialIndex::new();
+        let obj_id = Guid::new(EntityType::DynamicObject, 1, 42);
+
+        // Position is at X=60.0 (inside Sector (0, 0, 0), since sector width is 64.0m)
+        // Bounds reach from X=50.0 to X=75.0 (crossing into Sector (1, 0, 0))
+        let obj = WorldObject::new(
+            obj_id,
+            1,
+            Transform3D::from_position((60.0, 10.0, 10.0)),
+            BoundingBox3D::new((50.0, 0.0, 0.0), (75.0, 20.0, 20.0)),
+            ContainerOwner::System("system".into()),
+        );
+        index.insert(obj);
+
+        assert_eq!(
+            index
+                .objects_in_sector(SectorCoord3D::new(0, 0, 0))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(index
+            .objects_in_sector(SectorCoord3D::new(1, 0, 0))
+            .is_none());
+        assert_eq!(index.max_extent(), 15.0);
+
+        // Query AABB strictly within Sector (1, 0, 0) overlapping the object's boundary reach [68.0, 72.0]
+        let query_in_sector_1 = BoundingBox3D::new((68.0, 5.0, 5.0), (72.0, 15.0, 15.0));
+        let results = index.query_aabb(&query_in_sector_1);
+        assert_eq!(
+            results.len(),
+            1,
+            "Must find cross-boundary object via expanded sector bounds"
+        );
+        assert_eq!(results[0].object_id, obj_id);
+
+        // Sphere query strictly within Sector 1
+        let sphere_hits = index.query_sphere((70.0, 10.0, 10.0), 3.0);
+        assert_eq!(sphere_hits.len(), 1);
+        assert_eq!(sphere_hits[0].object_id, obj_id);
+    }
+
+    #[test]
+    fn test_dynamic_max_extent_on_shrink_and_remove() {
+        let mut index = SectorSpatialIndex::new();
+        let id1 = Guid::new(EntityType::DynamicObject, 1, 101);
+        let id2 = Guid::new(EntityType::DynamicObject, 1, 102);
+
+        // obj1: extent = 20.0 (position 0, bounds [-20, 20])
+        let obj1 = WorldObject::new(
+            id1,
+            1,
+            Transform3D::from_position((0.0, 0.0, 0.0)),
+            BoundingBox3D::new((-20.0, -20.0, -20.0), (20.0, 20.0, 20.0)),
+            ContainerOwner::System("system".into()),
+        );
+        index.insert(obj1);
+        assert_eq!(index.max_extent(), 20.0);
+
+        // obj2: extent = 10.0
+        let obj2 = WorldObject::new(
+            id2,
+            1,
+            Transform3D::from_position((50.0, 50.0, 50.0)),
+            BoundingBox3D::new((40.0, 40.0, 40.0), (60.0, 60.0, 60.0)),
+            ContainerOwner::System("system".into()),
+        );
+        index.insert(obj2);
+        assert_eq!(index.max_extent(), 20.0);
+
+        // Shrink obj1: extent = 5.0
+        let obj1_shrunk = WorldObject::new(
+            id1,
+            1,
+            Transform3D::from_position((0.0, 0.0, 0.0)),
+            BoundingBox3D::new((-5.0, -5.0, -5.0), (5.0, 5.0, 5.0)),
+            ContainerOwner::System("system".into()),
+        );
+        index.insert(obj1_shrunk);
+        assert_eq!(
+            index.max_extent(),
+            10.0,
+            "max_extent must drop to obj2's extent when obj1 shrinks"
+        );
+
+        // Remove obj2: max_extent should drop to obj1's extent (5.0)
+        index.remove(id2);
+        assert_eq!(
+            index.max_extent(),
+            5.0,
+            "max_extent must drop to remaining obj1's extent"
+        );
+
+        // Clear resets to 0.0
+        index.clear();
+        assert_eq!(index.max_extent(), 0.0);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_world_object_max_extent_nan_resilience() {
+        let mut index = SectorSpatialIndex::new();
+        let nan_obj = WorldObject::new(
+            Guid::new(EntityType::DynamicObject, 1, 999),
+            1,
+            Transform3D::from_position((f32::NAN, 0.0, 0.0)),
+            BoundingBox3D::new((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)),
+            ContainerOwner::System("system".into()),
+        );
+        assert_eq!(nan_obj.max_extent(), 0.0);
+        index.insert(nan_obj);
+
+        let nan_query = BoundingBox3D::new((f32::NAN, 0.0, 0.0), (10.0, 10.0, 10.0));
+        assert!(index.query_aabb(&nan_query).is_empty());
     }
 }

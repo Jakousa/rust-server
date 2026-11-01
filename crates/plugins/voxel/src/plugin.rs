@@ -10,7 +10,7 @@ use mmo_core::plugin::{
 };
 
 use crate::codec::encode_rle;
-use crate::modify::VoxelModifyResult;
+use crate::modify::{VoxelChangeEvent, VoxelModifyResult};
 use crate::net::{
     VoxelChunkDataPacket, VoxelChunkRequestPacket, VoxelModifyRequestPacket,
     VoxelModifyResponsePacket, SUB_OPCODE_CHUNK_REQUEST, SUB_OPCODE_MODIFY_REQUEST,
@@ -151,6 +151,8 @@ impl TickSystem for VoxelTickSystem {
     }
 
     fn update(&mut self, ctx: &mut TickContext) {
+        ctx.events.register_ephemeral::<VoxelChangeEvent>();
+
         // 1. Drain buffered VoxelChangeEvents into ctx.events
         for ev in self.world.drain_events() {
             ctx.events.push(ev);
@@ -212,6 +214,9 @@ impl GameplayPlugin for VoxelTerrainPlugin {
     }
 
     fn build(&self, ctx: &mut PluginContext) {
+        // 0. Register ephemeral events for simulation memory hygiene
+        ctx.event_queue.register_ephemeral::<VoxelChangeEvent>();
+
         // 1. Register modular packet router under assigned VOXEL_MODULE_ID (0x00A0)
         ctx.packets.register(
             VOXEL_MODULE_ID,

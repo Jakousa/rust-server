@@ -1,9 +1,19 @@
 //! Authoritative Host API bindings for sandboxed WASM scripts.
 
 use mmo_core::{EntityStore, Guid, ScriptError};
-use wasmtime::{Caller, Linker, Memory};
+use wasmtime::{Caller, Linker, Memory, StoreLimits, StoreLimitsBuilder};
 
 use crate::combat::HealthComponent;
+
+/// Default maximum memory allocation per WASM guest script (32 MB).
+pub const DEFAULT_MAX_WASM_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Generates default store resource limits.
+pub fn default_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(DEFAULT_MAX_WASM_MEMORY_BYTES)
+        .build()
+}
 
 /// Host execution context passed into guest WASM invocations.
 pub struct HostContext {
@@ -12,6 +22,7 @@ pub struct HostContext {
     pub(crate) events_ptr: *mut mmo_core::EventQueue,
     pub logs: Vec<(i32, String)>,
     pub dispatched_events: Vec<(i32, u64, Vec<u8>)>,
+    pub limiter: StoreLimits,
 }
 
 impl HostContext {
@@ -23,6 +34,7 @@ impl HostContext {
             events_ptr: std::ptr::null_mut(),
             logs: Vec::new(),
             dispatched_events: Vec::new(),
+            limiter: default_store_limits(),
         }
     }
 
@@ -34,6 +46,7 @@ impl HostContext {
             events_ptr: std::ptr::null_mut(),
             logs: Vec::new(),
             dispatched_events: Vec::new(),
+            limiter: default_store_limits(),
         }
     }
 
@@ -45,6 +58,7 @@ impl HostContext {
             events_ptr: std::ptr::null_mut(),
             logs: Vec::new(),
             dispatched_events: Vec::new(),
+            limiter: default_store_limits(),
         }
     }
 
@@ -60,7 +74,14 @@ impl HostContext {
             events_ptr: events as *mut mmo_core::EventQueue,
             logs: Vec::new(),
             dispatched_events: Vec::new(),
+            limiter: default_store_limits(),
         }
+    }
+
+    /// Overrides the maximum linear memory allowed for guest script execution.
+    pub fn with_memory_limit(mut self, max_bytes: usize) -> Self {
+        self.limiter = StoreLimitsBuilder::new().memory_size(max_bytes).build();
+        self
     }
 }
 
