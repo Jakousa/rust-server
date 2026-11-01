@@ -1073,6 +1073,9 @@ impl TickSimulation {
             );
         }
 
+        // 0.4 Prune unhandled high-frequency events to prevent unbounded EventQueue growth
+        self.event_queue.retain_recent(1024);
+
         // 1. Run batch tick systems registered by plugins
         {
             let collision_guard = self.collision_world.read().ok();
@@ -1421,13 +1424,14 @@ impl TickSimulation {
             None => return Err(new_pos),
         };
 
-        // 2. Monotonic sequence check (all packets subject to monotonicity if entity was initialized)
+        // 2. Monotonic sequence check using RFC 1982 modular sequence arithmetic
         let seq_delta = if let Some(state) = self.kinematic_states.get(&guid) {
             if state.initialized {
-                if sequence <= state.last_sequence {
+                let diff = sequence.wrapping_sub(state.last_sequence) as i32;
+                if diff <= 0 {
                     return Err(current_pos);
                 }
-                sequence - state.last_sequence
+                diff as u32
             } else {
                 1
             }

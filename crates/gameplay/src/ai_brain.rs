@@ -192,31 +192,42 @@ impl TickSystem for FsmBrainSystem {
                     FsmState::Chase { target } => {
                         pause_waypoints = Some(true);
                         let target_guid = *target;
-                        if current_threat_target != Some(target_guid) {
-                            brain.current_state = FsmState::Evade {
-                                return_position: spawn_origin,
-                            };
-                            set_nav_target = Some(Some(spawn_origin));
-                        } else if let Some(&target_pos) = entity_positions.get(&target_guid) {
-                            let dx = target_pos.0 - entity_pos.0;
-                            let dy = target_pos.1 - entity_pos.1;
-                            let dz = target_pos.2 - entity_pos.2;
-                            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-
-                            if dist <= brain.attack_range {
-                                brain.current_state = FsmState::Attack {
-                                    target: target_guid,
-                                    cooldown_timer: 0.0,
+                        match current_threat_target {
+                            None => {
+                                brain.current_state = FsmState::Evade {
+                                    return_position: spawn_origin,
                                 };
-                                set_nav_target = Some(None); // Stop movement
-                            } else {
-                                set_nav_target = Some(Some(target_pos));
+                                set_nav_target = Some(Some(spawn_origin));
                             }
-                        } else {
-                            brain.current_state = FsmState::Evade {
-                                return_position: spawn_origin,
-                            };
-                            set_nav_target = Some(Some(spawn_origin));
+                            Some(new_target) if new_target != target_guid => {
+                                brain.current_state = FsmState::Chase { target: new_target };
+                                if let Some(&target_pos) = entity_positions.get(&new_target) {
+                                    set_nav_target = Some(Some(target_pos));
+                                }
+                            }
+                            Some(_) => {
+                                if let Some(&target_pos) = entity_positions.get(&target_guid) {
+                                    let dx = target_pos.0 - entity_pos.0;
+                                    let dy = target_pos.1 - entity_pos.1;
+                                    let dz = target_pos.2 - entity_pos.2;
+                                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                                    if dist <= brain.attack_range {
+                                        brain.current_state = FsmState::Attack {
+                                            target: target_guid,
+                                            cooldown_timer: 0.0,
+                                        };
+                                        set_nav_target = Some(None); // Stop movement
+                                    } else {
+                                        set_nav_target = Some(Some(target_pos));
+                                    }
+                                } else {
+                                    brain.current_state = FsmState::Evade {
+                                        return_position: spawn_origin,
+                                    };
+                                    set_nav_target = Some(Some(spawn_origin));
+                                }
+                            }
                         }
                     }
 
@@ -226,38 +237,49 @@ impl TickSystem for FsmBrainSystem {
                     } => {
                         pause_waypoints = Some(true);
                         let target_guid = *target;
-                        if current_threat_target != Some(target_guid) {
-                            brain.current_state = FsmState::Evade {
-                                return_position: spawn_origin,
-                            };
-                            set_nav_target = Some(Some(spawn_origin));
-                        } else if let Some(&target_pos) = entity_positions.get(&target_guid) {
-                            let dx = target_pos.0 - entity_pos.0;
-                            let dy = target_pos.1 - entity_pos.1;
-                            let dz = target_pos.2 - entity_pos.2;
-                            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-
-                            if dist > brain.attack_range * 1.5 {
-                                brain.current_state = FsmState::Chase {
-                                    target: target_guid,
+                        match current_threat_target {
+                            None => {
+                                brain.current_state = FsmState::Evade {
+                                    return_position: spawn_origin,
                                 };
-                            } else {
-                                set_nav_target = Some(None); // Remain stationary while in melee attack range
-                                *cooldown_timer -= ctx.dt_sec;
-                                if *cooldown_timer <= 0.0 {
-                                    *cooldown_timer = brain.attack_cooldown_secs;
-                                    damage_events_to_emit.push(DamageEvent {
-                                        source: entity_guid,
-                                        target: target_guid,
-                                        raw_damage: brain.auto_attack_damage,
-                                    });
+                                set_nav_target = Some(Some(spawn_origin));
+                            }
+                            Some(new_target) if new_target != target_guid => {
+                                brain.current_state = FsmState::Chase { target: new_target };
+                                if let Some(&target_pos) = entity_positions.get(&new_target) {
+                                    set_nav_target = Some(Some(target_pos));
                                 }
                             }
-                        } else {
-                            brain.current_state = FsmState::Evade {
-                                return_position: spawn_origin,
-                            };
-                            set_nav_target = Some(Some(spawn_origin));
+                            Some(_) => {
+                                if let Some(&target_pos) = entity_positions.get(&target_guid) {
+                                    let dx = target_pos.0 - entity_pos.0;
+                                    let dy = target_pos.1 - entity_pos.1;
+                                    let dz = target_pos.2 - entity_pos.2;
+                                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                                    if dist > brain.attack_range * 1.5 {
+                                        brain.current_state = FsmState::Chase {
+                                            target: target_guid,
+                                        };
+                                    } else {
+                                        set_nav_target = Some(None); // Remain stationary while in melee attack range
+                                        *cooldown_timer -= ctx.dt_sec;
+                                        if *cooldown_timer <= 0.0 {
+                                            *cooldown_timer = brain.attack_cooldown_secs;
+                                            damage_events_to_emit.push(DamageEvent {
+                                                source: entity_guid,
+                                                target: target_guid,
+                                                raw_damage: brain.auto_attack_damage,
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    brain.current_state = FsmState::Evade {
+                                        return_position: spawn_origin,
+                                    };
+                                    set_nav_target = Some(Some(spawn_origin));
+                                }
+                            }
                         }
                     }
                 }

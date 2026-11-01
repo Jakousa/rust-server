@@ -252,7 +252,12 @@ impl ModularPacketHandler for InventoryPacketHandler {
                         if inv_slot < inv.slots.len() && inv.slots[inv_slot].is_none() {
                             inv.slots[inv_slot] = Some(old);
                         } else {
-                            let _ = inv.add_item(old);
+                            inv.add_item(old).map_err(|e| {
+                                PacketHandlerError::Custom(format!(
+                                    "Failed to store unequipped item: {}",
+                                    e
+                                ))
+                            })?;
                         }
                     }
                 }

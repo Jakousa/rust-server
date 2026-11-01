@@ -498,7 +498,9 @@ impl EntityStore {
         root_guid: Guid,
     ) -> Vec<HierarchyTransformUpdate> {
         let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
+        seen.insert(root_guid);
         queue.push_back(root_guid);
 
         while let Some(parent_guid) = queue.pop_front() {
@@ -510,6 +512,9 @@ impl EntityStore {
             let children = parent.children.clone();
 
             for child_guid in children {
+                if !seen.insert(child_guid) {
+                    continue;
+                }
                 let Some(child) = self.get_mut_by_guid(child_guid) else {
                     continue;
                 };
@@ -1083,5 +1088,27 @@ mod tests {
         // Despawning an entity cleans up parent and children links
         store.despawn_by_guid(b);
         assert_eq!(store.get_by_guid(d).unwrap().parent_guid, None);
+    }
+
+    #[test]
+    fn test_propagate_hierarchy_transforms_cycle_safety() {
+        let mut store = EntityStore::new();
+        let a = Guid::new(EntityType::Player, 1, 1);
+        let b = Guid::new(EntityType::Player, 1, 2);
+        store.spawn(a, (0.0, 0.0, 0.0));
+        store.spawn(b, (1.0, 0.0, 0.0));
+
+        // Manually introduce a cycle into children lists to simulate corrupted state
+        if let Some(ea) = store.get_mut_by_guid(a) {
+            ea.children.push(b);
+        }
+        if let Some(eb) = store.get_mut_by_guid(b) {
+            eb.children.push(a);
+        }
+
+        // Must terminate safely and not loop indefinitely
+        let updates = store.propagate_hierarchy_transforms(a);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, b);
     }
 }

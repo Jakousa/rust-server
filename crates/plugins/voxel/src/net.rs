@@ -19,6 +19,8 @@ pub enum VoxelPacketError {
     InvalidDeltaCount(usize),
     #[error("Unknown sub-opcode: {0}")]
     UnknownSubOpcode(u16),
+    #[error("Invalid local voxel coordinate ({lx}, {ly}, {lz})")]
+    InvalidCoordinate { lx: u8, ly: u8, lz: u8 },
 }
 
 /// Client request to fetch full compressed data for a chunk.
@@ -99,10 +101,19 @@ impl VoxelDeltaEntry {
         if bytes.len() < 5 {
             return Err(VoxelPacketError::PayloadTruncated(bytes.len(), 5));
         }
+        let lx = bytes[0];
+        let ly = bytes[1];
+        let lz = bytes[2];
+        if lx >= crate::CHUNK_SIZE as u8
+            || ly >= crate::CHUNK_SIZE as u8
+            || lz >= crate::CHUNK_SIZE as u8
+        {
+            return Err(VoxelPacketError::InvalidCoordinate { lx, ly, lz });
+        }
         Ok(Self {
-            lx: bytes[0],
-            ly: bytes[1],
-            lz: bytes[2],
+            lx,
+            ly,
+            lz,
             new_voxel: u16::from_le_bytes([bytes[3], bytes[4]]),
         })
     }
@@ -314,5 +325,40 @@ mod tests {
         let encoded = req.encode();
         assert!(VoxelModifyRequestPacket::decode(&encoded[..25]).is_err());
         assert!(VoxelChunkRequestPacket::decode(&encoded[..11]).is_err());
+    }
+
+    #[test]
+    fn test_voxel_delta_entry_coordinate_bounds_rejection() {
+        // lx = 16 (CHUNK_SIZE is 16, valid indices are 0..=15)
+        let invalid_lx = [16, 5, 5, 1, 0];
+        let err = VoxelDeltaEntry::decode(&invalid_lx).unwrap_err();
+        assert_eq!(
+            err,
+            VoxelPacketError::InvalidCoordinate {
+                lx: 16,
+                ly: 5,
+                lz: 5
+            }
+        );
+
+        // ly = 255
+        let invalid_ly = [0, 255, 0, 1, 0];
+        assert!(matches!(
+            VoxelDeltaEntry::decode(&invalid_ly),
+            Err(VoxelPacketError::InvalidCoordinate { ly: 255, .. })
+        ));
+
+        // lz = 16
+        let invalid_lz = [0, 0, 16, 1, 0];
+        assert!(matches!(
+            VoxelDeltaEntry::decode(&invalid_lz),
+            Err(VoxelPacketError::InvalidCoordinate { lz: 16, .. })
+        ));
+
+        // valid 0..=15
+        let valid = [15, 15, 15, 42, 0];
+        let entry = VoxelDeltaEntry::decode(&valid).expect("valid coordinates must decode");
+        assert_eq!(entry.lx, 15);
+        assert_eq!(entry.new_voxel, 42);
     }
 }

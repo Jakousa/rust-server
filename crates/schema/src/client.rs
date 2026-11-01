@@ -2082,7 +2082,14 @@ impl MarketResponsePacket {
             .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
 
         let count = src.get_u16_le() as usize;
-        let mut listings = Vec::with_capacity(count);
+        const MIN_LISTING_WIRE_SIZE: usize = 38;
+        if count > src.remaining() / MIN_LISTING_WIRE_SIZE {
+            return Err(ClientCodecError::BufferTooShort {
+                expected: count * MIN_LISTING_WIRE_SIZE,
+                got: src.remaining(),
+            });
+        }
+        let mut listings = Vec::with_capacity(count.min(512));
         for _ in 0..count {
             listings.push(MarketListingWire::decode(src)?);
         }

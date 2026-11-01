@@ -432,6 +432,7 @@ pub async fn execute_batch_entity_migration_pooled(
             sim_guard.release_migration_lease(guid);
             sim_guard.kinematic_states.remove(&guid);
             sim_guard.last_migration_ticks.remove(&guid);
+            sim_guard.tombstoned_entities.insert(guid);
             sim_guard.session_epochs.remove(&guid);
             sim_guard.aoi.unregister_by_guid(guid);
             sim_guard.sectors.clear_rate_limit(guid);

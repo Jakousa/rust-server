@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { disposeHierarchy } from "./renderer.js";
 
 /**
  * Three.js World Object Renderer for OpenSpec MMO.
@@ -126,10 +127,11 @@ export class WorldObjectRenderer {
       }
     }
 
-    // Remove despawned object meshes
+    // Remove despawned object meshes and release GPU memory
     for (const [id, group] of this.objects.entries()) {
       if (!activeIds.has(id)) {
         this.scene.remove(group);
+        disposeHierarchy(group);
         this.objects.delete(id);
       }
     }
@@ -184,6 +186,7 @@ export class WorldObjectRenderer {
   clear() {
     for (const group of this.objects.values()) {
       this.scene.remove(group);
+      disposeHierarchy(group);
     }
     this.objects.clear();
   }

@@ -54,8 +54,10 @@ export class ClientWorldBridge {
     if (opcode === OPCODES.AUTH_RESPONSE && view.byteLength >= 33) {
       const success = view.getUint8(8) === 1;
       const errorCode = view.getUint32(9, true);
-      const sessionId = Number(view.getBigUint64(13, true));
-      const playerGuid = Number(view.getBigUint64(21, true));
+      const rawSessionId = view.getBigUint64(13, true);
+      const rawPlayerGuid = view.getBigUint64(21, true);
+      const sessionId = rawSessionId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawSessionId) : rawSessionId;
+      const playerGuid = rawPlayerGuid <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawPlayerGuid) : rawPlayerGuid;
       if (success) {
         this.sessionId = sessionId;
         this.localPlayerGuid = playerGuid;
@@ -97,7 +99,8 @@ export class ClientWorldBridge {
 
     // Opcode 0x0005: EntityState
     if (opcode === OPCODES.ENTITY_STATE && view.byteLength >= 68) {
-      const entityId = Number(view.getBigUint64(8, true));
+      const rawEntityId = view.getBigUint64(8, true);
+      const entityId = rawEntityId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawEntityId) : rawEntityId;
       const x = view.getFloat32(16, true);
       const y = view.getFloat32(20, true);
       const z = view.getFloat32(24, true);
@@ -105,7 +108,7 @@ export class ClientWorldBridge {
       const health = view.getUint32(48, true);
       const maxHealth = view.getUint32(52, true);
 
-      const entityType = Number((BigInt(entityId) >> 48n) & 0xffffn);
+      const entityType = Number((rawEntityId >> 48n) & 0xffffn);
 
       this.entities.set(entityId, {
         id: entityId,
@@ -122,7 +125,8 @@ export class ClientWorldBridge {
 
     // Opcode 0x0006: EntityDespawn
     if (opcode === OPCODES.ENTITY_DESPAWN && view.byteLength >= 16) {
-      const entityId = Number(view.getBigUint64(8, true));
+      const rawEntityId = view.getBigUint64(8, true);
+      const entityId = rawEntityId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawEntityId) : rawEntityId;
       this.entities.delete(entityId);
       return;
     }
