@@ -36,7 +36,7 @@ impl HealthComponent {
 
     /// Applies raw damage to health. Returns `true` if damage resulted in death.
     pub fn take_damage(&mut self, amount: f32) -> bool {
-        if self.is_dead || amount <= 0.0 {
+        if self.is_dead || !amount.is_finite() || amount <= 0.0 {
             return false;
         }
 
@@ -51,7 +51,7 @@ impl HealthComponent {
 
     /// Restores health, up to max_hp. Does nothing if dead.
     pub fn heal(&mut self, amount: f32) {
-        if !self.is_dead && amount > 0.0 {
+        if !self.is_dead && amount.is_finite() && amount > 0.0 {
             self.current_hp = (self.current_hp + amount).min(self.max_hp);
         }
     }

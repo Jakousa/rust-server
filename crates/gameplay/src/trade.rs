@@ -267,63 +267,82 @@ impl TradeManager {
             .get_component_mut::<InventoryComponent>()
             .ok_or("Player 2 has no inventory")?;
 
-        // 1. Verify currency balances
-        if inv1.currency < session.offer_a.currency {
-            return Err("Player A has insufficient currency");
-        }
-        if inv2.currency < session.offer_b.currency {
-            return Err("Player B has insufficient currency");
-        }
+        // Validate staging inventories with bilateral lock reset on validation failure
+        let validation_res: Result<(InventoryComponent, InventoryComponent), &'static str> =
+            (|| {
+                // 1. Verify currency balances
+                if inv1.currency < session.offer_a.currency {
+                    return Err("Player A has insufficient currency");
+                }
+                if inv2.currency < session.offer_b.currency {
+                    return Err("Player B has insufficient currency");
+                }
 
-        // 2. Verify item ownership and remove offered items on cloned staging inventories
-        let mut test_inv1 = inv1.clone();
-        let mut test_inv2 = inv2.clone();
+                // 2. Verify item ownership and remove offered items on cloned staging inventories
+                let mut test_inv1 = inv1.clone();
+                let mut test_inv2 = inv2.clone();
 
-        for item in &session.offer_a.items {
-            if !test_inv1.remove_item_stack(item) {
-                return Err("Player A no longer possesses offered item");
+                for item in &session.offer_a.items {
+                    if !test_inv1.remove_item_stack(item) {
+                        return Err("Player A no longer possesses offered item");
+                    }
+                }
+                for item in &session.offer_b.items {
+                    if !test_inv2.remove_item_stack(item) {
+                        return Err("Player B no longer possesses offered item");
+                    }
+                }
+
+                // 3. Verify weight limits
+                let weight_a_to_b: f32 =
+                    session.offer_a.items.iter().map(|i| i.total_weight()).sum();
+                let weight_b_to_a: f32 =
+                    session.offer_b.items.iter().map(|i| i.total_weight()).sum();
+
+                if test_inv1.current_weight() + weight_b_to_a > test_inv1.max_weight {
+                    return Err("Player A would exceed max weight");
+                }
+                if test_inv2.current_weight() + weight_a_to_b > test_inv2.max_weight {
+                    return Err("Player B would exceed max weight");
+                }
+
+                // 4. Verify slot capacities and add incoming items
+                for item in &session.offer_b.items {
+                    if test_inv1.add_item(item.clone()).is_err() {
+                        return Err("Player A has insufficient inventory slots for trade");
+                    }
+                }
+                for item in &session.offer_a.items {
+                    if test_inv2.add_item(item.clone()).is_err() {
+                        return Err("Player B has insufficient inventory slots for trade");
+                    }
+                }
+
+                // 5. Settle currency
+                test_inv1.currency = test_inv1
+                    .currency
+                    .checked_sub(session.offer_a.currency)
+                    .and_then(|c| c.checked_add(session.offer_b.currency))
+                    .ok_or("Currency overflow")?;
+                test_inv2.currency = test_inv2
+                    .currency
+                    .checked_sub(session.offer_b.currency)
+                    .and_then(|c| c.checked_add(session.offer_a.currency))
+                    .ok_or("Currency overflow")?;
+
+                Ok((test_inv1, test_inv2))
+            })();
+
+        let (test_inv1, test_inv2) = match validation_res {
+            Ok(invs) => invs,
+            Err(err) => {
+                session.accepted_a = false;
+                session.accepted_b = false;
+                session.locked_a = false;
+                session.locked_b = false;
+                return Err(err);
             }
-        }
-        for item in &session.offer_b.items {
-            if !test_inv2.remove_item_stack(item) {
-                return Err("Player B no longer possesses offered item");
-            }
-        }
-
-        // 3. Verify weight limits
-        let weight_a_to_b: f32 = session.offer_a.items.iter().map(|i| i.total_weight()).sum();
-        let weight_b_to_a: f32 = session.offer_b.items.iter().map(|i| i.total_weight()).sum();
-
-        if test_inv1.current_weight() + weight_b_to_a > test_inv1.max_weight {
-            return Err("Player A would exceed max weight");
-        }
-        if test_inv2.current_weight() + weight_a_to_b > test_inv2.max_weight {
-            return Err("Player B would exceed max weight");
-        }
-
-        // 4. Verify slot capacities and add incoming items
-        for item in &session.offer_b.items {
-            if test_inv1.add_item(item.clone()).is_err() {
-                return Err("Player A has insufficient inventory slots for trade");
-            }
-        }
-        for item in &session.offer_a.items {
-            if test_inv2.add_item(item.clone()).is_err() {
-                return Err("Player B has insufficient inventory slots for trade");
-            }
-        }
-
-        // 5. Settle currency
-        test_inv1.currency = test_inv1
-            .currency
-            .checked_sub(session.offer_a.currency)
-            .and_then(|c| c.checked_add(session.offer_b.currency))
-            .ok_or("Currency overflow")?;
-        test_inv2.currency = test_inv2
-            .currency
-            .checked_sub(session.offer_b.currency)
-            .and_then(|c| c.checked_add(session.offer_a.currency))
-            .ok_or("Currency overflow")?;
+        };
 
         // 6. Commit verified state back to entity components
         *inv1 = test_inv1;

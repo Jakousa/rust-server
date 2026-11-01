@@ -276,7 +276,8 @@ impl Database {
         } else if url.starts_with("sqlite:") || url.contains(".db") || url.contains(":memory:") {
             let mut opts = SqliteConnectOptions::from_str(url)?
                 .create_if_missing(true)
-                .busy_timeout(Duration::from_secs(5));
+                .busy_timeout(Duration::from_secs(5))
+                .pragma("foreign_keys", "ON");
 
             if !url.contains(":memory:") {
                 opts = opts
@@ -301,8 +302,9 @@ impl Database {
 
     /// Creates an in-memory SQLite database for unit tests and local isolation.
     pub async fn connect_memory() -> Result<Self, StorageError> {
-        let opts =
-            SqliteConnectOptions::from_str("sqlite::memory:")?.busy_timeout(Duration::from_secs(5));
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("foreign_keys", "ON");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)

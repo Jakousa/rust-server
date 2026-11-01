@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as THREE from "three";
 import { PlayerControls } from "../controls.js";
 import { WorldObjectRenderer } from "../world.js";
-import { WorldRenderer } from "../renderer.js";
+import { WorldRenderer, disposeHierarchy } from "../renderer.js";
 import { ClientWorldBridge } from "../main.js";
 import { UIController } from "../ui.js";
 import { WebTransportClient } from "../transport.js";
@@ -247,6 +247,22 @@ describe("WorldRenderer Entities", () => {
     // Local player
     const localGroup = WorldRenderer.prototype.createEntityMesh(1, true);
     expect(localGroup.userData.marker).toBeUndefined();
+  });
+
+  it("disposes geometries and materials recursively on entity hierarchy disposal", () => {
+    const group = new THREE.Group();
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const mat = new THREE.MeshBasicMaterial();
+    const mesh = new THREE.Mesh(geo, mat);
+    group.add(mesh);
+
+    const geoDispose = vi.spyOn(geo, "dispose");
+    const matDispose = vi.spyOn(mat, "dispose");
+
+    disposeHierarchy(group);
+
+    expect(geoDispose).toHaveBeenCalledTimes(1);
+    expect(matDispose).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -404,15 +404,25 @@ impl TransactionCoordinator {
             .execute(&mut *conn)
             .await?;
 
-            // 4. Increment container versions
+            // 4. Increment container versions in deterministic ascending order to prevent deadlocks
+            let (c_low, c_high) = (src_cid.min(dst_cid), src_cid.max(dst_cid));
             sqlx::query(&q!(
-                "UPDATE containers SET version = version + 1, updated_at = ? WHERE container_id IN (?, ?)"
+                "UPDATE containers SET version = version + 1, updated_at = ? WHERE container_id = ?"
             ))
             .bind(now_secs)
-            .bind(src_cid as i64)
-            .bind(dst_cid as i64)
+            .bind(c_low as i64)
             .execute(&mut *conn)
             .await?;
+
+            if c_low != c_high {
+                sqlx::query(&q!(
+                    "UPDATE containers SET version = version + 1, updated_at = ? WHERE container_id = ?"
+                ))
+                .bind(now_secs)
+                .bind(c_high as i64)
+                .execute(&mut *conn)
+                .await?;
+            }
 
             // 5. Insert transaction audit log
             sqlx::query(&q!(

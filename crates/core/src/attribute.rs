@@ -126,9 +126,21 @@ pub struct AttributeValue {
     pub regen_per_sec: f32,
 }
 
+/// Robust clamp routine that safely handles NaN, Inf, and inverted bounds without panicking.
+#[inline]
+pub fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
+    if !val.is_finite() {
+        return if min.is_finite() { min } else { 0.0 };
+    }
+    if !min.is_finite() || !max.is_finite() || min > max {
+        return val;
+    }
+    val.clamp(min, max)
+}
+
 impl AttributeValue {
     pub fn new(base: f32, min: f32, max: f32, regen_per_sec: f32) -> Self {
-        let clamped_current = base.clamp(min, max);
+        let clamped_current = safe_clamp(base, min, max);
         Self {
             base,
             current: clamped_current,
@@ -225,7 +237,7 @@ impl AttributeSet {
     pub fn get_current(&self, name: &str) -> Option<f32> {
         let attr = self.attributes.get(name)?;
         let effective_max = self.get_effective_max(name)?;
-        Some(attr.current.clamp(attr.min, effective_max))
+        Some(safe_clamp(attr.current, attr.min, effective_max))
     }
 
     /// Modifies the current value by `delta` (positive for heal/gain, negative for damage/loss),
@@ -239,7 +251,7 @@ impl AttributeSet {
             .get_mut(name)
             .ok_or("Attribute not found in AttributeSet")?;
 
-        attr.current = (attr.current + delta).clamp(attr.min, effective_max);
+        attr.current = safe_clamp(attr.current + delta, attr.min, effective_max);
         Ok(attr.current)
     }
 
@@ -253,7 +265,7 @@ impl AttributeSet {
             .get_mut(name)
             .ok_or("Attribute not found in AttributeSet")?;
 
-        attr.current = value.clamp(attr.min, effective_max);
+        attr.current = safe_clamp(value, attr.min, effective_max);
         Ok(attr.current)
     }
 
@@ -321,7 +333,7 @@ impl AttributeSet {
             if attr.regen_per_sec != 0.0 {
                 let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
                 let delta = attr.regen_per_sec * dt_sec;
-                attr.current = (attr.current + delta).clamp(attr.min, effective_max);
+                attr.current = safe_clamp(attr.current + delta, attr.min, effective_max);
             }
         }
 
@@ -570,5 +582,20 @@ mod tests {
 
         registry.register("custom_shield", AttributeId::MITIGATION);
         assert_eq!(registry.get("custom_shield"), Some(AttributeId::MITIGATION));
+    }
+
+    #[test]
+    fn test_safe_clamp_resilience_to_nan_and_inverted_bounds() {
+        assert_eq!(safe_clamp(50.0, 0.0, 100.0), 50.0);
+        assert_eq!(safe_clamp(-10.0, 0.0, 100.0), 0.0);
+        assert_eq!(safe_clamp(150.0, 0.0, 100.0), 100.0);
+
+        // NaN inputs or inverted bounds must not panic
+        assert_eq!(safe_clamp(f32::NAN, 0.0, 100.0), 0.0);
+        assert_eq!(safe_clamp(50.0, 100.0, 0.0), 50.0); // inverted bounds
+        assert_eq!(safe_clamp(50.0, f32::NAN, 100.0), 50.0);
+
+        let attr = AttributeValue::new(f32::NAN, 0.0, 100.0, 0.0);
+        assert_eq!(attr.current, 0.0);
     }
 }

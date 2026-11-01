@@ -147,11 +147,27 @@ impl PredictionBuffer {
                 return self.current_sim_pos;
             }
         } else {
-            // Sequence not found in buffer (older than buffer capacity)
             let dx = server_pos.0 - self.current_sim_pos.0;
             let dy = server_pos.1 - self.current_sim_pos.1;
             let dz = server_pos.2 - self.current_sim_pos.2;
             let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+            // Teleport or extreme desync: always hard snap
+            if distance > self.hard_snap_threshold {
+                self.unacknowledged_inputs.clear();
+                self.visual_error_offset = (0.0, 0.0, 0.0);
+                self.current_sim_pos = server_pos;
+                return server_pos;
+            }
+
+            // Stale or out-of-order ACK within normal bounds: ignore to avoid wiping active inputs
+            if ack_sequence > 0 {
+                if let Some(front) = self.unacknowledged_inputs.front() {
+                    if ack_sequence < front.sequence {
+                        return self.current_sim_pos;
+                    }
+                }
+            }
 
             if distance > self.tolerance {
                 self.unacknowledged_inputs.clear();
@@ -276,5 +292,22 @@ mod tests {
         assert_eq!(pos, (50.0, 0.0, 0.0));
         assert!(buffer.unacknowledged_inputs.is_empty());
         assert_eq!(buffer.visual_error_offset, (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_stale_or_out_of_order_ack_does_not_snapback() {
+        let mut buffer = PredictionBuffer::new();
+        // Suppose buffer pruned sequences 1..9, now holding 10..12
+        buffer.push_input(10, (10.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.05, 0.50);
+        buffer.push_input(11, (11.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.05, 0.55);
+        buffer.push_input(12, (12.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.05, 0.60);
+
+        // A delayed/stale ACK for sequence 5 arrives with old position (5.0, 0.0, 0.0)
+        let pos = buffer.reconcile(5, (5.0, 0.0, 0.0));
+
+        // Must NOT wipe queue or snap back to (5.0, 0.0, 0.0)
+        assert_eq!(pos, (12.0, 0.0, 0.0));
+        assert_eq!(buffer.unacknowledged_inputs.len(), 3);
+        assert_eq!(buffer.unacknowledged_inputs[0].sequence, 10);
     }
 }

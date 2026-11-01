@@ -93,14 +93,14 @@ pub fn quantize_pitch_i8(pitch: f32) -> i8 {
     let half_pi = PI * 0.5;
     let clamped = pitch.clamp(-half_pi, half_pi);
     let step = 127.0 / half_pi;
-    (clamped * step).round().clamp(-128.0, 127.0) as i8
+    (clamped * step).round().clamp(-127.0, 127.0) as i8
 }
 
 /// Dequantizes an 8-bit signed integer back into a pitch angle in radians [-π/2, π/2].
 #[inline]
 pub fn dequantize_pitch_i8(quantized: i8) -> f32 {
     let half_pi = PI * 0.5;
-    (quantized as f32 / 127.0) * half_pi
+    (quantized.clamp(-127, 127) as f32 / 127.0) * half_pi
 }
 
 /// Quantizes a 1D velocity component (in m/s) into a signed 16-bit integer (1 cm/s resolution).

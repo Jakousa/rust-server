@@ -299,9 +299,20 @@ impl EventQueue {
         self.queues.values().map(|v| v.len()).sum()
     }
 
-    /// Clears all queued events.
+    /// Clears all queued events across all types, releasing all allocated event buffers.
     pub fn clear(&mut self) {
         self.queues.clear();
+    }
+
+    /// Retains at most `max_per_type` most recent events per type, pruning older unhandled events
+    /// to prevent unbounded memory growth in long-running simulation loops.
+    pub fn retain_recent(&mut self, max_per_type: usize) {
+        for queue in self.queues.values_mut() {
+            if queue.len() > max_per_type {
+                let to_drop = queue.len() - max_per_type;
+                queue.drain(0..to_drop);
+            }
+        }
     }
 }
 

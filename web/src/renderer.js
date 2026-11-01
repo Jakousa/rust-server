@@ -7,6 +7,25 @@ const CAMERA_OFFSET_Y = 18;
 const CAMERA_OFFSET_Z = 26;
 
 /**
+ * Recursively disposes GPU resources (geometries and materials) in a Three.js hierarchy.
+ */
+export function disposeHierarchy(node) {
+  if (!node) return;
+  node.traverse((child) => {
+    if (child.geometry) {
+      child.geometry.dispose();
+    }
+    if (child.material) {
+      if (Array.isArray(child.material)) {
+        child.material.forEach((m) => m.dispose());
+      } else {
+        child.material.dispose();
+      }
+    }
+  });
+}
+
+/**
  * Three.js 3D Viewport Renderer for OpenSpec MMO.
  */
 export class WorldRenderer {
@@ -173,10 +192,11 @@ export class WorldRenderer {
       }
     }
 
-    // Remove despawned entity meshes
+    // Remove despawned entity meshes and release GPU memory
     for (const [guid, mesh] of this.entities.entries()) {
       if (!activeGuids.has(guid)) {
         this.scene.remove(mesh);
+        disposeHierarchy(mesh);
         this.entities.delete(guid);
       }
     }
