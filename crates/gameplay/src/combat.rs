@@ -26,11 +26,21 @@ pub struct HealthComponent {
 
 impl HealthComponent {
     pub fn new(max_hp: f32, regen_per_sec: f32) -> Self {
+        let safe_max = if max_hp.is_finite() && max_hp > 0.0 {
+            max_hp
+        } else {
+            100.0
+        };
+        let safe_regen = if regen_per_sec.is_finite() {
+            regen_per_sec
+        } else {
+            0.0
+        };
         Self {
-            current_hp: max_hp,
-            max_hp,
+            current_hp: safe_max,
+            max_hp: safe_max,
             is_dead: false,
-            regen_per_sec,
+            regen_per_sec: safe_regen,
         }
     }
 
@@ -59,7 +69,17 @@ impl HealthComponent {
     /// Resurrects a dead entity with the specified initial HP.
     pub fn respawn(&mut self, initial_hp: f32) {
         self.is_dead = false;
-        self.current_hp = initial_hp.clamp(1.0, self.max_hp);
+        let safe_max = if self.max_hp.is_finite() && self.max_hp > 0.0 {
+            self.max_hp
+        } else {
+            100.0
+        };
+        let hp = if initial_hp.is_finite() {
+            initial_hp
+        } else {
+            safe_max
+        };
+        self.current_hp = hp.clamp(1.0, safe_max);
     }
 }
 
@@ -179,12 +199,21 @@ impl CombatResolver for RpgCombatResolver {
                     .unwrap_or(0.0)
             };
 
+            let armor = if armor.is_finite() && armor > 0.0 {
+                armor
+            } else {
+                0.0
+            };
+
             let mitigation_factor = if armor > 0.0 {
                 armor / (armor + 100.0)
             } else {
                 0.0
             };
             effective_damage = (damage as f32) * (1.0 - mitigation_factor.clamp(0.0, 0.9));
+            if !effective_damage.is_finite() || effective_damage <= 0.0 {
+                effective_damage = 0.0;
+            }
 
             if let Some(health_comp) = target_ent.get_component_mut::<HealthComponent>() {
                 if health_comp.take_damage(effective_damage) {
@@ -335,6 +364,9 @@ pub fn process_damage_events(
             .and_then(|attacker| attacker.get_property_f64("bonus_damage"))
             .unwrap_or(0.0) as f32;
         let raw_damage = dmg.raw_damage + bonus_damage;
+        if !raw_damage.is_finite() || raw_damage <= 0.0 {
+            continue;
+        }
 
         let target_entity = match entities.get_mut_by_guid(dmg.target) {
             Some(e) => e,
@@ -353,6 +385,9 @@ pub fn process_damage_events(
         }
         if let Some(reduction) = target_entity.get_property_f64("damage_reduction") {
             effective_damage = (effective_damage - reduction as f32).max(0.0);
+        }
+        if !effective_damage.is_finite() || effective_damage <= 0.0 {
+            continue;
         }
 
         if let Some(health) = target_entity.get_component_mut::<HealthComponent>() {
@@ -638,5 +673,76 @@ mod tests {
             .unwrap()
             .current_hp;
         assert_eq!(hp, 65.0);
+    }
+
+    #[test]
+    fn test_non_finite_damage_heal_respawn_hardening() {
+        // 1. Initializer sanitizes NaN max_hp and regen
+        let mut health = HealthComponent::new(f32::NAN, f32::NAN);
+        assert_eq!(health.max_hp, 100.0);
+        assert_eq!(health.current_hp, 100.0);
+        assert_eq!(health.regen_per_sec, 0.0);
+        assert!(!health.is_dead);
+
+        // 2. Reject NaN, Infinity, -Infinity, and negative damage
+        assert!(!health.take_damage(f32::NAN));
+        assert_eq!(health.current_hp, 100.0);
+        assert!(!health.is_dead);
+
+        assert!(!health.take_damage(f32::INFINITY));
+        assert_eq!(health.current_hp, 100.0);
+
+        assert!(!health.take_damage(f32::NEG_INFINITY));
+        assert_eq!(health.current_hp, 100.0);
+
+        assert!(!health.take_damage(-25.0));
+        assert_eq!(health.current_hp, 100.0);
+
+        // 3. Reject NaN heal
+        health.current_hp = 50.0;
+        health.heal(f32::NAN);
+        assert_eq!(health.current_hp, 50.0);
+        health.heal(f32::INFINITY);
+        assert_eq!(health.current_hp, 50.0);
+
+        // 4. Respawn with NaN initial HP safely sets finite health
+        health.is_dead = true;
+        health.respawn(f32::NAN);
+        assert!(!health.is_dead);
+        assert_eq!(health.current_hp, 100.0);
+
+        // 5. Normal lethal damage still kills entity after rejected NaN attempts
+        assert!(health.take_damage(100.0));
+        assert_eq!(health.current_hp, 0.0);
+        assert!(health.is_dead);
+
+        // 6. DamageEvent with NaN raw_damage is safely ignored by process_damage_events
+        let mut store = EntityStore::new();
+        let mut queue = EventQueue::new();
+        let att = Guid::new(EntityType::Player, 1, 101);
+        let def = Guid::new(EntityType::Player, 1, 102);
+
+        store.spawn(att, (0.0, 0.0, 0.0));
+        let def_key = store.spawn(def, (0.0, 0.0, 0.0));
+        store
+            .get_mut(def_key)
+            .unwrap()
+            .add_component(HealthComponent::new(100.0, 0.0));
+
+        queue.push(DamageEvent {
+            source: att,
+            target: def,
+            raw_damage: f32::NAN,
+        });
+
+        let died = process_damage_events(&mut queue, &mut store);
+        assert!(died.is_empty());
+        let def_comp = store
+            .get(def_key)
+            .unwrap()
+            .get_component::<HealthComponent>()
+            .unwrap();
+        assert_eq!(def_comp.current_hp, 100.0);
+        assert!(!def_comp.is_dead);
     }
 }

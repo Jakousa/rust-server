@@ -105,6 +105,7 @@ impl WasmRuntime {
             .ok_or_else(|| ScriptError::ModuleNotFound(module_id.to_string()))?;
 
         let mut store = Store::new(self.engine.engine(), host_ctx);
+        store.limiter(|ctx| &mut ctx.limiter);
         store
             .set_fuel(fuel_limit)
             .map_err(|e| ScriptError::ExecutionError(format!("Failed to set fuel: {e}")))?;

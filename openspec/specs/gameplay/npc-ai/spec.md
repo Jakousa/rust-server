@@ -56,3 +56,7 @@ The system SHALL support state-driven AI brains that transition entities through
 #### Scenario: Transition from chase to attack in combat range
 - **WHEN** an entity in `Chase` state closes within melee or spell attack range of its current target
 - **THEN** the FSM brain SHALL transition to `Attack` state and emit combat actions in accordance with attack cooldowns
+
+#### Scenario: Seamless target switching upon threat table leadership change
+- **WHEN** an entity in `Chase` or `Attack` state observes a new highest-threat target surpassing the current target
+- **THEN** the FSM brain SHALL transition directly to `Chase` targeting the new highest-threat entity without entering `Evade` or dropping aggro.

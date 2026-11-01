@@ -73,3 +73,15 @@ The engine SHALL support live hot-reloading of compiled script modules at tick b
 - **GIVEN** an active simulation running a valid script
 - **WHEN** a hot-reload request provides invalid WASM bytecode or unresolvable imports
 - **THEN** the compilation/linking SHALL fail with an error, the existing valid module SHALL remain active without interruption, and the error SHALL be logged.
+
+---
+
+### Requirement: Linear Memory Resource Bounds and Limiter
+The scripting runtime SHALL enforce a strict upper limit on guest WASM linear memory growth using a `wasmtime::ResourceLimiter` / `StoreLimits` mechanism to prevent Out-Of-Memory denial of service.
+
+#### Scenario: Script memory allocation capped at 32MB
+- **GIVEN** a guest script executing within the runtime sandbox
+- **WHEN** the script invokes `memory.grow` requesting total pages within 32MB (512 pages * 64KiB)
+- **THEN** page growth SHALL succeed
+- **WHEN** the script invokes `memory.grow` exceeding 32MB or attempts massive 4GB memory exhaustion
+- **THEN** the growth SHALL fail, returning `-1` to the guest script, and host physical memory SHALL remain protected without process termination.
