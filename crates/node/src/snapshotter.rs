@@ -618,10 +618,16 @@ mod tests {
 
         let handle = snapshotter.clone().start_worker();
 
-        // Allow worker to debounce and flush
-        sleep(Duration::from_millis(80)).await;
-
-        let loaded = repo.get_snapshot(guid.raw()).await.unwrap().unwrap();
+        // Allow worker to debounce and flush with retry loop
+        let mut loaded = None;
+        for _ in 0..100 {
+            if let Ok(Some(snap)) = repo.get_snapshot(guid.raw()).await {
+                loaded = Some(snap);
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let loaded = loaded.expect("snapshot must be flushed by worker");
         assert_eq!(loaded.position, (10.0, 20.0, 30.0));
         assert_eq!(loaded.state_blob, Some(vec![10, 20, 30]));
 

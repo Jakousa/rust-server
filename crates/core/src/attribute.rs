@@ -293,7 +293,7 @@ impl AttributeSet {
             .iter()
             .find(|(k, _)| canonical_id_for_name(k) == Some(id))?;
         let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
-        Some(attr.current.clamp(attr.min, effective_max))
+        Some(safe_clamp(attr.current, attr.min, effective_max))
     }
 
     /// Directly sets the current value for the attribute matching the given [`AttributeId`].
@@ -597,5 +597,28 @@ mod tests {
 
         let attr = AttributeValue::new(f32::NAN, 0.0, 100.0, 0.0);
         assert_eq!(attr.current, 0.0);
+
+        // Test get_current_by_id safe clamp on NaN current and NaN max
+        let mut set = AttributeSet::new();
+        let mut nan_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0);
+        nan_val.current = f32::NAN;
+        set.attributes.insert("health".to_string(), nan_val);
+        // Must not panic on NaN current
+        assert_eq!(
+            set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(0.0)
+        );
+
+        // Test NaN max: compute_effective_max_for yields 0.0 (via .max(min)), safe_clamp clamps to min without panicking
+        let mut nan_max_set = AttributeSet::new();
+        let mut nan_max_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0);
+        nan_max_val.max = f32::NAN;
+        nan_max_set
+            .attributes
+            .insert("health".to_string(), nan_max_val);
+        assert_eq!(
+            nan_max_set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(0.0)
+        );
     }
 }

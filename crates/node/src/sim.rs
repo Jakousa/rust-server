@@ -149,6 +149,9 @@ impl TickSimulation {
         let (container_transfer_sender, container_transfer_receiver) =
             tokio::sync::mpsc::channel(Self::TRANSFER_CHANNEL_CAPACITY);
 
+        let mut event_queue = EventQueue::new();
+        event_queue.register_ephemeral::<mmo_core::ActionProgressEvent>();
+
         Self {
             node_id,
             entity_store: EntityStore::new(),
@@ -161,7 +164,7 @@ impl TickSimulation {
             tick_counter: 0,
             ghost_store: GhostStore::new(),
             codecs,
-            event_queue: EventQueue::new(),
+            event_queue,
             packets: ModularPacketRouter::new(),
             tick_systems,
             plugin_manager: PluginManager::new(),
@@ -1200,6 +1203,24 @@ impl TickSimulation {
             })
         });
         history.push_frame(tick_counter, current_time, now_ms, entity_records);
+
+        // 3.7. Execute end-of-tick lifecycle hooks and clear ephemeral events
+        {
+            let collision_guard = self.collision_world.read().ok();
+            let collision_ref = collision_guard.as_deref();
+            let mut tick_ctx = TickContext {
+                entities: &mut self.entity_store,
+                octree: &mut self.octree,
+                events: &mut self.event_queue,
+                dt_sec,
+                tick: self.tick_counter,
+                collision_world: collision_ref,
+            };
+            for system in &mut self.tick_systems {
+                system.end_of_tick(&mut tick_ctx);
+            }
+        }
+        self.event_queue.clear_ephemeral();
 
         // 4. Record simulation loop metrics
         let duration = start.elapsed();
@@ -2837,5 +2858,37 @@ mod tests {
         // Verify expired lease was swept, while active lease remains
         assert!(!sim.is_migrating(expired_guid));
         assert!(sim.is_migrating(active_guid));
+    }
+
+    #[test]
+    fn test_sim_step_ephemeral_events_cleared_at_tick_boundary() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let guid = Guid::new(EntityType::Player, 1, 1001);
+        assert!(sim.spawn_entity(guid, (0.0, 0.0, 0.0)));
+
+        // Add action queue with channeling action
+        let mut queue = mmo_core::ActionQueue::new();
+        let action =
+            mmo_core::TimedAction::new(1, 2.0, mmo_core::ActionInterruptFlags::default(), None);
+        let mut events = mmo_core::EventQueue::new();
+        queue
+            .start_action(guid, action, mmo_core::QueuePolicy::Replace, &mut events)
+            .unwrap();
+        sim.entity_store
+            .get_mut_by_guid(guid)
+            .unwrap()
+            .add_component(queue);
+
+        // Step simulation: ActionTickSystem advances action and emits ActionProgressEvent
+        sim.step(0.05);
+
+        // At end of tick, ephemeral ActionProgressEvent should be purged from event_queue
+        let progress_events = sim.event_queue.drain::<mmo_core::ActionProgressEvent>();
+        assert!(
+            progress_events.is_empty(),
+            "ActionProgressEvent must be cleared at tick boundary"
+        );
     }
 }

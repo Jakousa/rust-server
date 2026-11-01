@@ -70,9 +70,12 @@ impl PaletteChunk {
     }
 
     /// Retrieves the voxel type at flat index `idx` (0..4095).
+    /// Returns 0 (Air) if `idx` is out of bounds or data is corrupted.
     #[inline]
     pub fn get(&self, idx: usize) -> u16 {
-        assert!(idx < CHUNK_VOXELS, "Voxel index out of bounds");
+        if idx >= CHUNK_VOXELS {
+            return 0;
+        }
         if self.bits_per_entry == 0 {
             return self.palette.first().copied().unwrap_or(0);
         }
@@ -81,15 +84,21 @@ impl PaletteChunk {
         let word_idx = idx / epw;
         let bit_offset = (idx % epw) * self.bits_per_entry as usize;
         let mask = (1u64 << self.bits_per_entry) - 1;
-        let pal_idx = ((self.data[word_idx] >> bit_offset) & mask) as usize;
+        let Some(&word) = self.data.get(word_idx) else {
+            return 0;
+        };
+        let pal_idx = ((word >> bit_offset) & mask) as usize;
         self.palette.get(pal_idx).copied().unwrap_or(0)
     }
 
     /// Sets the voxel type at flat index `idx` (0..4095).
     ///
-    /// Returns `true` if the voxel changed, or `false` if it was already `voxel_type`.
+    /// Returns `true` if the voxel changed, or `false` if it was already `voxel_type`
+    /// or if `idx` is out of bounds.
     pub fn set(&mut self, idx: usize, voxel_type: u16) -> bool {
-        assert!(idx < CHUNK_VOXELS, "Voxel index out of bounds");
+        if idx >= CHUNK_VOXELS {
+            return false;
+        }
         let current = self.get(idx);
         if current == voxel_type {
             return false;
@@ -121,8 +130,10 @@ impl PaletteChunk {
             let word_idx = idx / epw;
             let bit_offset = (idx % epw) * self.bits_per_entry as usize;
             let mask = (1u64 << self.bits_per_entry) - 1;
-            self.data[word_idx] = (self.data[word_idx] & !(mask << bit_offset))
-                | ((pal_idx as u64 & mask) << bit_offset);
+            let Some(word) = self.data.get_mut(word_idx) else {
+                return false;
+            };
+            *word = (*word & !(mask << bit_offset)) | ((pal_idx as u64 & mask) << bit_offset);
         }
 
         self.revision += 1;
@@ -337,5 +348,15 @@ mod tests {
         assert_eq!(chunk.bits_per_entry(), 4); // 7 unique types fits in 4 bits
         let unpacked = chunk.unpack_all();
         assert_eq!(*unpacked, raw);
+    }
+
+    #[test]
+    fn test_palette_chunk_out_of_bounds_safe_rejection() {
+        let mut chunk = PaletteChunk::new_empty();
+        // Index >= 4096 (CHUNK_VOXELS) must not panic
+        assert_eq!(chunk.get(CHUNK_VOXELS), 0);
+        assert_eq!(chunk.get(usize::MAX), 0);
+        assert!(!chunk.set(CHUNK_VOXELS, 1));
+        assert!(!chunk.set(usize::MAX, 1));
     }
 }

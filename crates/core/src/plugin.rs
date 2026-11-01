@@ -8,7 +8,7 @@
 //! - [`ModularPacketRouter`]: Opcode-based network packet routing to plugin handlers.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -259,6 +259,7 @@ impl DomainEvent for EntityIncapacitatedEvent {}
 #[derive(Default)]
 pub struct EventQueue {
     queues: HashMap<TypeId, Vec<Box<dyn Any + Send + Sync>>>,
+    ephemeral_types: HashSet<TypeId>,
 }
 
 impl EventQueue {
@@ -314,6 +315,33 @@ impl EventQueue {
             }
         }
     }
+
+    /// Registers the specified domain event type `E` as ephemeral.
+    ///
+    /// Ephemeral events are per-tick notifications that are cleared at tick boundaries
+    /// via [`clear_ephemeral`] to prevent memory leaks in simulation loops.
+    pub fn register_ephemeral<E: DomainEvent>(&mut self) {
+        self.ephemeral_types.insert(TypeId::of::<E>());
+    }
+
+    /// Returns `true` if event type `E` is registered as ephemeral.
+    pub fn is_ephemeral<E: DomainEvent>(&self) -> bool {
+        self.ephemeral_types.contains(&TypeId::of::<E>())
+    }
+
+    /// Clears all queued events for registered ephemeral types while preserving buffer capacity.
+    pub fn clear_ephemeral(&mut self) {
+        for type_id in &self.ephemeral_types {
+            if let Some(queue) = self.queues.get_mut(type_id) {
+                queue.clear();
+            }
+        }
+    }
+
+    /// Clears all queued events of the specified type `E`.
+    pub fn clear_type<E: DomainEvent>(&mut self) {
+        self.queues.remove(&TypeId::of::<E>());
+    }
 }
 
 /// Context provided to batch [`TickSystem`]s during simulation update.
@@ -332,6 +360,9 @@ pub trait TickSystem: Send + Sync {
     fn name(&self) -> &'static str;
     /// Executes the system logic over the entities for the elapsed delta time.
     fn update(&mut self, ctx: &mut TickContext);
+    /// Optional lifecycle callback executed at the end of the simulation tick
+    /// prior to ephemeral event queue clearing.
+    fn end_of_tick(&mut self, _ctx: &mut TickContext) {}
 }
 
 /// Handler for modular client packets addressed to a specific module.
@@ -580,5 +611,49 @@ mod tests {
         store.add_component(MockHealth { hp: 50, max_hp: 50 });
         let json = codecs.serialize_all(&store);
         assert!(json.get("health").is_some());
+    }
+
+    #[test]
+    fn test_event_queue_ephemeral_lifecycle() {
+        let mut queue = EventQueue::new();
+        let g1 = Guid::new(EntityType::Player, 1, 10);
+        let g2 = Guid::new(EntityType::Player, 1, 20);
+
+        queue.register_ephemeral::<MockDamageEvent>();
+        assert!(queue.is_ephemeral::<MockDamageEvent>());
+        assert!(!queue.is_ephemeral::<MockHealEvent>());
+
+        queue.push(MockDamageEvent {
+            target: g1,
+            amount: 15,
+        });
+        queue.push(MockDamageEvent {
+            target: g2,
+            amount: 30,
+        });
+        queue.push(MockHealEvent {
+            target: g1,
+            amount: 50,
+        });
+
+        assert_eq!(queue.len(), 3);
+
+        // Clearing ephemeral should remove MockDamageEvent instances while keeping MockHealEvent
+        queue.clear_ephemeral();
+        assert_eq!(queue.len(), 1);
+        assert!(queue.drain::<MockDamageEvent>().is_empty());
+
+        let heals = queue.drain::<MockHealEvent>();
+        assert_eq!(heals.len(), 1);
+        assert_eq!(heals[0].amount, 50);
+
+        // Test clear_type
+        queue.push(MockHealEvent {
+            target: g2,
+            amount: 25,
+        });
+        assert_eq!(queue.len(), 1);
+        queue.clear_type::<MockHealEvent>();
+        assert!(queue.is_empty());
     }
 }
