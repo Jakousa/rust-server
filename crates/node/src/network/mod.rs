@@ -762,6 +762,7 @@ mod tests {
                 assert!(!d.entity_store.contains_guid(g));
                 assert!(!d.is_migrating(g));
                 assert!(!d.kinematic_states.contains_key(&g));
+                assert!(d.tombstoned_entities.contains(&g));
             }
         }
 

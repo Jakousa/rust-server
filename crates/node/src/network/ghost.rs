@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use mmo_core::{BoundingBox3D, EntityStore, Guid, Octree};
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
@@ -19,31 +21,106 @@ pub struct GhostRecord {
     pub component_data: Vec<u8>,
     pub last_tick: u64,
     pub source_node_id: u32,
+    pub local_tick: u64,
+}
+
+impl GhostRecord {
+    /// Creates a new `GhostRecord` with `local_tick = 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        guid: Guid,
+        position: (f32, f32, f32),
+        velocity: (f32, f32, f32),
+        yaw: f32,
+        pitch: f32,
+        component_data: Vec<u8>,
+        last_tick: u64,
+        source_node_id: u32,
+    ) -> Self {
+        Self {
+            guid,
+            position,
+            velocity,
+            yaw,
+            pitch,
+            component_data,
+            last_tick,
+            source_node_id,
+            local_tick: 0,
+        }
+    }
+}
+
+impl Default for GhostRecord {
+    fn default() -> Self {
+        Self {
+            guid: Guid::from_raw(0),
+            position: (0.0, 0.0, 0.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: Vec::new(),
+            last_tick: 0,
+            source_node_id: 0,
+            local_tick: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GhostStoreInner {
+    ghosts: HashMap<Guid, GhostRecord>,
 }
 
 /// Dedicated storage container for ghost entities replicated from neighboring nodes.
+///
+/// Internally synchronized with `std::sync::RwLock` to avoid write-lock contention against the
+/// main simulation tick loop.
 #[derive(Debug, Clone, Default)]
 pub struct GhostStore {
-    ghosts: HashMap<Guid, GhostRecord>,
+    inner: Arc<RwLock<GhostStoreInner>>,
+    current_tick: Arc<AtomicU64>,
 }
 
 impl GhostStore {
     /// Creates a new empty `GhostStore`.
     pub fn new() -> Self {
         Self {
-            ghosts: HashMap::new(),
+            inner: Arc::new(RwLock::new(GhostStoreInner {
+                ghosts: HashMap::new(),
+            })),
+            current_tick: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Advances the current simulation tick tracked by this ghost store.
+    pub fn advance_tick(&self, tick: u64) {
+        self.current_tick.store(tick, Ordering::Relaxed);
+    }
+
+    /// Returns the current simulation tick tracked by this ghost store.
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick.load(Ordering::Relaxed)
+    }
+
     /// Inserts or updates a ghost entity. Returns `true` if inserted, `false` if updated.
-    pub fn insert_or_update(&mut self, record: GhostRecord) -> bool {
-        let is_new = !self.ghosts.contains_key(&record.guid);
-        self.ghosts.insert(record.guid, record);
+    pub fn insert_or_update(&self, mut record: GhostRecord) -> bool {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        if record.local_tick == 0 {
+            record.local_tick = self.current_tick();
+        }
+        let is_new = !inner.ghosts.contains_key(&record.guid);
+        inner.ghosts.insert(record.guid, record);
         is_new
     }
 
-    /// Upserts a ghost record from a protobuf [`GhostEntity`].
-    pub fn upsert_from_proto(&mut self, source_node_id: u32, proto: &GhostEntity) -> bool {
+    /// Internal helper upserting a single proto ghost into a mutable HashMap with finite validation.
+    fn upsert_proto_into_map(
+        ghosts: &mut HashMap<Guid, GhostRecord>,
+        source_node_id: u32,
+        proto: &GhostEntity,
+        current_tick: u64,
+    ) -> bool {
         let pos = proto
             .position
             .as_ref()
@@ -67,8 +144,9 @@ impl GhostStore {
             return false;
         }
 
+        let guid = Guid::from_raw(proto.guid);
         let record = GhostRecord {
-            guid: Guid::from_raw(proto.guid),
+            guid,
             position: pos,
             velocity: vel,
             yaw: proto.yaw,
@@ -76,65 +154,95 @@ impl GhostStore {
             component_data: proto.component_data.clone(),
             last_tick: proto.last_tick,
             source_node_id,
+            local_tick: current_tick,
         };
-        self.insert_or_update(record)
+        ghosts.insert(guid, record);
+        true
+    }
+
+    /// Upserts a ghost record from a protobuf [`GhostEntity`].
+    pub fn upsert_from_proto(&self, source_node_id: u32, proto: &GhostEntity) -> bool {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        Self::upsert_proto_into_map(
+            &mut inner.ghosts,
+            source_node_id,
+            proto,
+            self.current_tick(),
+        )
     }
 
     /// Updates or inserts all ghosts contained in a [`GhostSyncRequest`].
     /// Returns the number of synced ghost entities.
-    pub fn update_from_request(&mut self, req: &GhostSyncRequest) -> usize {
+    pub fn update_from_request(&self, req: &GhostSyncRequest) -> usize {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let tick = self.current_tick();
         let mut count = 0;
         for ghost in &req.ghosts {
-            self.upsert_from_proto(req.source_node_id, ghost);
-            count += 1;
+            if Self::upsert_proto_into_map(&mut inner.ghosts, req.source_node_id, ghost, tick) {
+                count += 1;
+            }
         }
         count
     }
 
-    /// Retrieves an immutable reference to a ghost entity by its GUID.
-    pub fn get(&self, guid: Guid) -> Option<&GhostRecord> {
-        self.ghosts.get(&guid)
+    /// Prunes all ghost records that have not been refreshed within `ttl_ticks`.
+    ///
+    /// Returns the count of pruned records.
+    pub fn prune_stale(&self, current_tick: u64, ttl_ticks: u64) -> usize {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let before = inner.ghosts.len();
+        inner
+            .ghosts
+            .retain(|_, record| current_tick.saturating_sub(record.local_tick) < ttl_ticks);
+        let pruned = before - inner.ghosts.len();
+        if pruned > 0 {
+            metrics::counter!("mmo_node_ghosts_pruned_total").increment(pruned as u64);
+        }
+        pruned
     }
 
-    /// Retrieves a mutable reference to a ghost entity by its GUID.
-    pub fn get_mut(&mut self, guid: Guid) -> Option<&mut GhostRecord> {
-        self.ghosts.get_mut(&guid)
+    /// Retrieves an immutable copy of a ghost entity by its GUID.
+    pub fn get(&self, guid: Guid) -> Option<GhostRecord> {
+        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        inner.ghosts.get(&guid).cloned()
     }
 
     /// Returns `true` if the ghost entity exists in this store.
     pub fn contains(&self, guid: Guid) -> bool {
-        self.ghosts.contains_key(&guid)
+        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        inner.ghosts.contains_key(&guid)
     }
 
     /// Removes a ghost entity by its GUID, returning the removed record if found.
-    pub fn remove(&mut self, guid: Guid) -> Option<GhostRecord> {
-        self.ghosts.remove(&guid)
+    pub fn remove(&self, guid: Guid) -> Option<GhostRecord> {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        inner.ghosts.remove(&guid)
     }
 
     /// Returns the total number of ghost entities in storage.
     pub fn len(&self) -> usize {
-        self.ghosts.len()
+        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        inner.ghosts.len()
     }
 
     /// Returns `true` if the store contains no ghost entities.
     pub fn is_empty(&self) -> bool {
-        self.ghosts.is_empty()
+        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        inner.ghosts.is_empty()
     }
 
     /// Clears all ghost entities from storage.
-    pub fn clear(&mut self) {
-        self.ghosts.clear();
-    }
-
-    /// Iterates over all ghost entities in storage.
-    pub fn iter(&self) -> impl Iterator<Item = (&Guid, &GhostRecord)> {
-        self.ghosts.iter()
+    pub fn clear(&self) {
+        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        inner.ghosts.clear();
     }
 
     /// Queries all ghost entities within radial distance from `center`.
-    pub fn query_radius(&self, center: (f32, f32, f32), radius: f32) -> Vec<&GhostRecord> {
+    pub fn query_radius(&self, center: (f32, f32, f32), radius: f32) -> Vec<GhostRecord> {
         let r_sq = radius * radius;
-        self.ghosts
+        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        inner
+            .ghosts
             .values()
             .filter(|g| {
                 let dx = g.position.0 - center.0;
@@ -142,6 +250,7 @@ impl GhostStore {
                 let dz = g.position.2 - center.2;
                 dx * dx + dy * dy + dz * dz <= r_sq
             })
+            .cloned()
             .collect()
     }
 }
@@ -377,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_ghost_store_lifecycle() {
-        let mut store = GhostStore::new();
+        let store = GhostStore::new();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
 
@@ -391,6 +500,7 @@ mod tests {
             component_data: vec![1, 2, 3],
             last_tick: 50,
             source_node_id: 2,
+            local_tick: 0,
         };
 
         // Insert and verify
@@ -398,8 +508,8 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(!store.is_empty());
         assert!(store.contains(g1));
-        assert_eq!(store.get(g1), Some(&record));
-        assert_eq!(store.get_mut(g1).unwrap().last_tick, 50);
+        assert_eq!(store.get(g1), Some(record.clone()));
+        assert_eq!(store.get(g1).unwrap().last_tick, 50);
 
         // Update returns false (not new)
         let mut updated = record.clone();
@@ -452,8 +562,88 @@ mod tests {
     }
 
     #[test]
+    fn test_ghost_store_tick_based_ttl_pruning() {
+        let store = GhostStore::new();
+        store.advance_tick(10);
+
+        let g_stale = Guid::from_raw(201);
+        let g_fresh = Guid::from_raw(202);
+
+        // Insert stale ghost at local_tick = 10
+        assert!(store.insert_or_update(GhostRecord {
+            guid: g_stale,
+            position: (1.0, 1.0, 1.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: vec![],
+            last_tick: 1,
+            source_node_id: 2,
+            local_tick: 0, // will be auto-stamped to store.current_tick() = 10
+        }));
+
+        // Advance tick to 25
+        store.advance_tick(25);
+
+        // Insert fresh ghost at local_tick = 25
+        assert!(store.insert_or_update(GhostRecord {
+            guid: g_fresh,
+            position: (2.0, 2.0, 2.0),
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            component_data: vec![],
+            last_tick: 2,
+            source_node_id: 2,
+            local_tick: 0, // will be stamped to 25
+        }));
+
+        assert_eq!(store.len(), 2);
+
+        // Prune with TTL = 10 at tick 25:
+        // g_stale delta is 25 - 10 = 15 >= 10 -> pruned
+        // g_fresh delta is 25 - 25 = 0 < 10 -> kept
+        let pruned = store.prune_stale(25, 10);
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len(), 1);
+        assert!(!store.contains(g_stale));
+        assert!(store.contains(g_fresh));
+    }
+
+    #[test]
+    fn test_ghost_store_concurrent_access() {
+        let store = GhostStore::new();
+        let store_clone = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            for i in 0..100 {
+                let guid = Guid::from_raw(1000 + i);
+                store_clone.insert_or_update(GhostRecord {
+                    guid,
+                    position: (i as f32, 0.0, 0.0),
+                    velocity: (0.0, 0.0, 0.0),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    component_data: vec![],
+                    last_tick: i,
+                    source_node_id: 2,
+                    local_tick: 0,
+                });
+            }
+        });
+
+        // Concurrent reader
+        for _ in 0..50 {
+            let _ = store.query_radius((0.0, 0.0, 0.0), 50.0);
+        }
+
+        handle.join().unwrap();
+        assert_eq!(store.len(), 100);
+    }
+
+    #[test]
     fn test_ghost_store_upsert_rejects_non_finite_floats() {
-        let mut store = GhostStore::new();
+        let store = GhostStore::new();
 
         // 1. Ghost with NaN in position
         let proto_nan_pos = GhostEntity {

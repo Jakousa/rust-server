@@ -64,26 +64,32 @@ pub fn make_remote_command(
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     pub sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+    pub ghost_store: crate::network::ghost::GhostStore,
     pub transaction_coord: Option<Arc<mmo_storage::TransactionCoordinator>>,
     /// Bounded ingress queue into the simulation; lets packet forwarding avoid the `sim` lock.
     input_tx: tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
 }
 
-/// Grabs the simulation's ingress sender once at service construction.
-fn ingress_sender(
+/// Grabs the simulation's ingress sender and cloned ghost store once at service construction.
+fn ingress_and_ghost_store(
     sim: &Arc<tokio::sync::RwLock<TickSimulation>>,
-) -> tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput> {
-    sim.try_read()
-        .expect("simulation must not be write-locked while constructing NodeServiceImpl")
-        .input_sender()
+) -> (
+    tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
+    crate::network::ghost::GhostStore,
+) {
+    let guard = sim
+        .try_read()
+        .expect("simulation must not be write-locked while constructing NodeServiceImpl");
+    (guard.input_sender(), guard.ghost_store.clone())
 }
 
 impl NodeServiceImpl {
     /// Creates a new `NodeServiceImpl` sharing the simulation state.
     pub fn new(sim: Arc<tokio::sync::RwLock<TickSimulation>>) -> Self {
-        let input_tx = ingress_sender(&sim);
+        let (input_tx, ghost_store) = ingress_and_ghost_store(&sim);
         Self {
             sim,
+            ghost_store,
             transaction_coord: None,
             input_tx,
         }
@@ -94,9 +100,10 @@ impl NodeServiceImpl {
         sim: Arc<tokio::sync::RwLock<TickSimulation>>,
         coord: Arc<mmo_storage::TransactionCoordinator>,
     ) -> Self {
-        let input_tx = ingress_sender(&sim);
+        let (input_tx, ghost_store) = ingress_and_ghost_store(&sim);
         Self {
             sim,
+            ghost_store,
             transaction_coord: Some(coord),
             input_tx,
         }
@@ -202,8 +209,7 @@ impl NodeService for NodeServiceImpl {
         request: tonic::Request<GhostSyncRequest>,
     ) -> Result<tonic::Response<GhostSyncResponse>, tonic::Status> {
         let req = request.into_inner();
-        let mut sim = self.sim.write().await;
-        let synced_count = sim.ghost_store.update_from_request(&req);
+        let synced_count = self.ghost_store.update_from_request(&req);
 
         Ok(tonic::Response::new(GhostSyncResponse {
             acknowledged: true,
