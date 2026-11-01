@@ -1201,41 +1201,60 @@ impl GatewayServer {
                                     }
                                 }
 
+                                const MAX_STREAM_BUFFER: usize =
+                                    mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE + mmo_schema::client::HEADER_SIZE;
+
                                 loop {
                                     match recv.read(&mut chunk).await {
                                         Ok(Some(n)) if n > 0 => {
+                                            if buf.len() + n > MAX_STREAM_BUFFER {
+                                                metrics::counter!("mmo_gateway_buffer_overflow_dropped_total")
+                                                    .increment(1);
+                                                buf.clear();
+                                                return;
+                                            }
                                             metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
                                             buf.extend_from_slice(&chunk[..n]);
-                                            while let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
-                                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
-                                                    .increment(1);
-                                                if let ClientPacket::Ping(ref ping) = pkt {
-                                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                                                        client_timestamp: ping.timestamp,
-                                                        server_timestamp: std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .unwrap()
-                                                            .as_millis() as u64,
-                                                    });
-                                                    let pong_bytes = pong.encode();
-                                                    metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
-                                                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
-                                                    let _ = stream_send_clone.lock().await.write_all(&pong_bytes).await;
-                                                    continue;
-                                                }
+                                            loop {
+                                                match ClientPacket::decode_frame(&mut buf) {
+                                                    Ok(Some(pkt)) => {
+                                                        metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                                                            .increment(1);
+                                                        if let ClientPacket::Ping(ref ping) = pkt {
+                                                            let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                                                                client_timestamp: ping.timestamp,
+                                                                server_timestamp: std::time::SystemTime::now()
+                                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                                    .unwrap()
+                                                                    .as_millis() as u64,
+                                                            });
+                                                            let pong_bytes = pong.encode();
+                                                            metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
+                                                            metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
+                                                            let _ = stream_send_clone.lock().await.write_all(&pong_bytes).await;
+                                                            continue;
+                                                        }
 
-                                                if intercept.handle_packet(session_id, &pkt).await {
-                                                    continue;
-                                                }
+                                                        if intercept.handle_packet(session_id, &pkt).await {
+                                                            continue;
+                                                        }
 
-                                                match dispatcher.dispatch_packet(session_id, pkt) {
-                                                    Ok(routed) => {
-                                                        if let Some(ref tx) = packet_tx {
-                                                            let _ = tx.send(routed).await;
+                                                        match dispatcher.dispatch_packet(session_id, pkt) {
+                                                            Ok(routed) => {
+                                                                if let Some(ref tx) = packet_tx {
+                                                                    let _ = tx.send(routed).await;
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                                                            }
                                                         }
                                                     }
-                                                    Err(_) => {
-                                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                                                    Ok(None) => break,
+                                                    Err(_codec_err) => {
+                                                        metrics::counter!("mmo_gateway_framing_errors_total").increment(1);
+                                                        buf.clear();
+                                                        return;
                                                     }
                                                 }
                                             }

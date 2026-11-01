@@ -350,154 +350,197 @@ impl WebTransportServer {
         let intercept_stream = intercept_handler.clone();
         let stream_ingress_task = tokio::spawn(async move {
             while let Ok((mut send_stream, mut recv_stream)) = conn_stream_in.accept_bi().await {
-                let mut buf = BytesMut::with_capacity(4096);
-                let mut temp = [0u8; 1024];
+                let disp_stream = disp_stream.clone();
+                let ptx_stream = ptx_stream.clone();
+                let is_auth_stream = is_auth_stream.clone();
+                let auth_opt = auth_opt.clone();
+                let default_node_opt = default_node_opt.clone();
+                let router_stream = router_stream.clone();
+                let intercept_stream = intercept_stream.clone();
 
-                // If not authenticated and authenticator is configured, enforce handshake
-                if !is_auth_stream.load(Ordering::Acquire) {
-                    if let Some(ref auth) = auth_opt {
-                        let timeout = auth.auth_timeout();
-                        let auth_fut = async {
-                            loop {
-                                match mmo_schema::client::ClientPacket::decode_frame(&mut buf) {
-                                    Ok(Some(pkt)) => {
-                                        return Ok::<mmo_schema::client::ClientPacket, ()>(pkt);
+                tokio::spawn(async move {
+                    const MAX_STREAM_BUFFER: usize = mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE
+                        + mmo_schema::client::HEADER_SIZE;
+                    let mut buf = BytesMut::with_capacity(4096);
+                    let mut temp = [0u8; 1024];
+
+                    // If not authenticated and authenticator is configured, enforce handshake
+                    if !is_auth_stream.load(Ordering::Acquire) {
+                        if let Some(ref auth) = auth_opt {
+                            let timeout = auth.auth_timeout();
+                            let auth_fut = async {
+                                loop {
+                                    match mmo_schema::client::ClientPacket::decode_frame(&mut buf) {
+                                        Ok(Some(pkt)) => {
+                                            return Ok::<mmo_schema::client::ClientPacket, ()>(pkt);
+                                        }
+                                        Ok(None) => {}
+                                        Err(_) => return Err(()),
                                     }
-                                    Ok(None) => {}
-                                    Err(_) => return Err(()),
+                                    if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                        return Err(());
+                                    }
+                                    match recv_stream.read(&mut temp).await {
+                                        Ok(Some(n)) if n > 0 => {
+                                            if buf.len() + n > MAX_STREAM_BUFFER {
+                                                return Err(());
+                                            }
+                                            buf.extend_from_slice(&temp[..n]);
+                                            if buf.len()
+                                                > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE
+                                            {
+                                                return Err(());
+                                            }
+                                        }
+                                        _ => return Err(()),
+                                    }
                                 }
-                                if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
-                                    return Err(());
+                            };
+
+                            let first_pkt = match tokio::time::timeout(timeout, auth_fut).await {
+                                Ok(Ok(pkt)) => pkt,
+                                _ => {
+                                    metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout").increment(1);
+                                    return;
                                 }
-                                match recv_stream.read(&mut temp).await {
-                                    Ok(Some(n)) if n > 0 => {
-                                        buf.extend_from_slice(&temp[..n]);
-                                        if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
-                                            return Err(());
+                            };
+
+                            match first_pkt {
+                                mmo_schema::client::ClientPacket::AuthRequest(auth_req) => {
+                                    match crate::server::auth_handshake::authenticate_and_register_session(
+                                        auth,
+                                        &auth_req.token,
+                                        session_id,
+                                        &router_stream,
+                                        default_node_opt.as_deref(),
+                                        None,
+                                        intercept_stream.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(auth_sess) => {
+                                            is_auth_stream.store(true, Ordering::Release);
+                                            let resp = mmo_schema::client::ClientPacket::AuthResponse(
+                                                auth_sess.auth_response,
+                                            );
+                                            let _ = send_stream.write_all(&resp.encode()).await;
+                                        }
+                                        Err((_err, err_resp)) => {
+                                            let resp =
+                                                mmo_schema::client::ClientPacket::AuthResponse(err_resp);
+                                            let _ = send_stream.write_all(&resp.encode()).await;
+                                            return;
                                         }
                                     }
-                                    _ => return Err(()),
                                 }
-                            }
-                        };
-
-                        let first_pkt = match tokio::time::timeout(timeout, auth_fut).await {
-                            Ok(Ok(pkt)) => pkt,
-                            _ => {
-                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout").increment(1);
-                                return;
-                            }
-                        };
-
-                        match first_pkt {
-                            mmo_schema::client::ClientPacket::AuthRequest(auth_req) => {
-                                match crate::server::auth_handshake::authenticate_and_register_session(
-                                    auth,
-                                    &auth_req.token,
-                                    session_id,
-                                    &router_stream,
-                                    default_node_opt.as_deref(),
-                                    None,
-                                    intercept_stream.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(auth_sess) => {
-                                        is_auth_stream.store(true, Ordering::Release);
-                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
-                                            auth_sess.auth_response,
-                                        );
-                                        let _ = send_stream.write_all(&resp.encode()).await;
-                                    }
-                                    Err((_err, err_resp)) => {
-                                        let resp =
-                                            mmo_schema::client::ClientPacket::AuthResponse(err_resp);
-                                        let _ = send_stream.write_all(&resp.encode()).await;
-                                        return;
-                                    }
-                                }
-                            }
-                            _ => {
-                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                loop {
-                    match recv_stream.read(&mut temp).await {
-                        Ok(Some(n)) if n > 0 => {
-                            buf.extend_from_slice(&temp[..n]);
-                            while let Ok(Some(pkt)) =
-                                mmo_schema::client::ClientPacket::decode_frame(&mut buf)
-                            {
-                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
-                                    .increment(1);
-
-                                // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid
-                                if let mmo_schema::client::ClientPacket::AuthRequest(_auth_req) =
-                                    &pkt
-                                {
-                                    if auth_opt.is_none() {
-                                        let default_guid = mmo_core::Guid::new(
-                                            mmo_core::EntityType::Player,
-                                            1,
-                                            (session_id & 0xFFFF_FFFF) as u32,
-                                        );
-                                        let assigned_node = default_node_opt
-                                            .clone()
-                                            .unwrap_or_else(|| "127.0.0.1:50052".to_string());
-                                        router_stream.register_session(
-                                            session_id,
-                                            default_guid,
-                                            assigned_node.clone(),
-                                        );
-                                        let resp = mmo_schema::client::ClientPacket::AuthResponse(
-                                            mmo_schema::client::AuthResponsePacket {
-                                                success: true,
-                                                error_code: 0,
-                                                session_id,
-                                                player_guid: default_guid.raw(),
-                                                assigned_node,
-                                                error_message: String::new(),
-                                            },
-                                        );
-                                        let _ = send_stream.write_all(&resp.encode()).await;
-                                        continue;
-                                    }
-                                }
-
-                                if let mmo_schema::client::ClientPacket::Ping(ref ping) = pkt {
-                                    let pong = mmo_schema::client::ClientPacket::Pong(
-                                        mmo_schema::client::PongPacket {
-                                            client_timestamp: ping.timestamp,
-                                            server_timestamp: std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis()
-                                                as u64,
-                                        },
-                                    );
-                                    let _ = send_stream.write_all(&pong.encode()).await;
-                                    continue;
-                                }
-
-                                if let Some(ref handler) = intercept_stream {
-                                    if handler.handle_packet(session_id, &pkt).await {
-                                        continue;
-                                    }
-                                }
-                                if let Ok(routed) = disp_stream.dispatch_packet(session_id, pkt) {
-                                    if let Some(ref tx) = ptx_stream {
-                                        let _ = tx.send(routed).await;
-                                    }
+                                _ => {
+                                    metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
+                                    return;
                                 }
                             }
                         }
-                        _ => break,
                     }
-                }
+
+                    loop {
+                        match recv_stream.read(&mut temp).await {
+                            Ok(Some(n)) if n > 0 => {
+                                if buf.len() + n > MAX_STREAM_BUFFER {
+                                    metrics::counter!("mmo_gateway_buffer_overflow_dropped_total")
+                                        .increment(1);
+                                    buf.clear();
+                                    return;
+                                }
+                                buf.extend_from_slice(&temp[..n]);
+                                loop {
+                                    match mmo_schema::client::ClientPacket::decode_frame(&mut buf) {
+                                        Ok(Some(pkt)) => {
+                                            metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                                                .increment(1);
+
+                                            // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid
+                                            if let mmo_schema::client::ClientPacket::AuthRequest(
+                                                _auth_req,
+                                            ) = &pkt
+                                            {
+                                                if auth_opt.is_none() {
+                                                    let default_guid = mmo_core::Guid::new(
+                                                        mmo_core::EntityType::Player,
+                                                        1,
+                                                        (session_id & 0xFFFF_FFFF) as u32,
+                                                    );
+                                                    let assigned_node =
+                                                        default_node_opt.clone().unwrap_or_else(
+                                                            || "127.0.0.1:50052".to_string(),
+                                                        );
+                                                    router_stream.register_session(
+                                                        session_id,
+                                                        default_guid,
+                                                        assigned_node.clone(),
+                                                    );
+                                                    let resp = mmo_schema::client::ClientPacket::AuthResponse(
+                                                        mmo_schema::client::AuthResponsePacket {
+                                                            success: true,
+                                                            error_code: 0,
+                                                            session_id,
+                                                            player_guid: default_guid.raw(),
+                                                            assigned_node,
+                                                            error_message: String::new(),
+                                                        },
+                                                    );
+                                                    let _ =
+                                                        send_stream.write_all(&resp.encode()).await;
+                                                    continue;
+                                                }
+                                            }
+
+                                            if let mmo_schema::client::ClientPacket::Ping(
+                                                ref ping,
+                                            ) = pkt
+                                            {
+                                                let pong = mmo_schema::client::ClientPacket::Pong(
+                                                    mmo_schema::client::PongPacket {
+                                                        client_timestamp: ping.timestamp,
+                                                        server_timestamp:
+                                                            std::time::SystemTime::now()
+                                                                .duration_since(
+                                                                    std::time::UNIX_EPOCH,
+                                                                )
+                                                                .unwrap()
+                                                                .as_millis()
+                                                                as u64,
+                                                    },
+                                                );
+                                                let _ = send_stream.write_all(&pong.encode()).await;
+                                                continue;
+                                            }
+
+                                            if let Some(ref handler) = intercept_stream {
+                                                if handler.handle_packet(session_id, &pkt).await {
+                                                    continue;
+                                                }
+                                            }
+                                            if let Ok(routed) =
+                                                disp_stream.dispatch_packet(session_id, pkt)
+                                            {
+                                                if let Some(ref tx) = ptx_stream {
+                                                    let _ = tx.send(routed).await;
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(_codec_err) => {
+                                            metrics::counter!("mmo_gateway_framing_errors_total")
+                                                .increment(1);
+                                            buf.clear();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                });
             }
         });
 

@@ -17,6 +17,7 @@ pub enum BackhaulState {
     Connected = 0,
     Degraded = 1,
     Broken = 2,
+    HalfOpen = 3,
 }
 
 impl From<u8> for BackhaulState {
@@ -24,6 +25,8 @@ impl From<u8> for BackhaulState {
         match val {
             0 => BackhaulState::Connected,
             1 => BackhaulState::Degraded,
+            2 => BackhaulState::Broken,
+            3 => BackhaulState::HalfOpen,
             _ => BackhaulState::Broken,
         }
     }
@@ -37,6 +40,17 @@ pub enum BackhaulError {
     NodeUnreachable(String),
 }
 
+/// Default probe interval in milliseconds before probing a broken channel in half-open state.
+pub const DEFAULT_PROBE_INTERVAL_MS: u64 = 5_000;
+
+#[inline]
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Managed backhaul multiplex channel to a single simulation node.
 #[derive(Debug)]
 pub struct BackhaulChannel {
@@ -45,42 +59,123 @@ pub struct BackhaulChannel {
     consecutive_failures: AtomicU32,
     rtt_ms: AtomicU64,
     state: AtomicU8,
+    last_state_change_ms: AtomicU64,
+    probe_interval_ms: AtomicU64,
 }
 
 impl BackhaulChannel {
     pub fn new(node_address: String, tx: mpsc::Sender<RoutedPacket>) -> Self {
+        Self::with_probe_interval(node_address, tx, DEFAULT_PROBE_INTERVAL_MS)
+    }
+
+    pub fn with_probe_interval(
+        node_address: String,
+        tx: mpsc::Sender<RoutedPacket>,
+        probe_interval_ms: u64,
+    ) -> Self {
+        let now = current_time_ms();
         Self {
             node_address,
             tx,
             consecutive_failures: AtomicU32::new(0),
             rtt_ms: AtomicU64::new(0),
             state: AtomicU8::new(BackhaulState::Connected as u8),
+            last_state_change_ms: AtomicU64::new(now),
+            probe_interval_ms: AtomicU64::new(probe_interval_ms),
         }
     }
 
-    pub fn state(&self) -> BackhaulState {
-        BackhaulState::from(self.state.load(Ordering::Relaxed))
+    pub fn probe_interval_ms(&self) -> u64 {
+        self.probe_interval_ms.load(Ordering::Relaxed)
     }
 
+    pub fn set_probe_interval_ms(&self, interval_ms: u64) {
+        self.probe_interval_ms.store(interval_ms, Ordering::Relaxed);
+    }
+
+    pub fn state(&self) -> BackhaulState {
+        let raw = self.state.load(Ordering::Acquire);
+        let s = BackhaulState::from(raw);
+        if s == BackhaulState::Broken {
+            let last = self.last_state_change_ms.load(Ordering::Relaxed);
+            let now = current_time_ms();
+            let interval = self.probe_interval_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= interval
+                && self
+                    .state
+                    .compare_exchange(
+                        BackhaulState::Broken as u8,
+                        BackhaulState::HalfOpen as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                self.last_state_change_ms.store(now, Ordering::Release);
+                metrics::counter!("mmo_gateway_backhaul_circuit_breaker_half_open_total")
+                    .increment(1);
+                return BackhaulState::HalfOpen;
+            }
+        }
+        BackhaulState::from(self.state.load(Ordering::Acquire))
+    }
+
+    /// Explicitly transitions the circuit breaker to HalfOpen state if it is currently Broken.
+    pub fn transition_to_half_open(&self) -> bool {
+        let now = current_time_ms();
+        if self
+            .state
+            .compare_exchange(
+                BackhaulState::Broken as u8,
+                BackhaulState::HalfOpen as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.last_state_change_ms.store(now, Ordering::Release);
+            metrics::counter!("mmo_gateway_backhaul_circuit_breaker_half_open_total").increment(1);
+            true
+        } else {
+            self.state.load(Ordering::Acquire) == BackhaulState::HalfOpen as u8
+        }
+    }
+
+    /// Whether this channel is considered healthy for routing (Connected or Degraded).
     pub fn is_healthy(&self) -> bool {
-        self.state() != BackhaulState::Broken
+        let s = self.state();
+        s == BackhaulState::Connected || s == BackhaulState::Degraded
+    }
+
+    /// Whether a packet or probe transmission is permitted through this channel.
+    pub fn can_send(&self) -> bool {
+        let s = self.state();
+        s != BackhaulState::Broken
     }
 
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.state
-            .store(BackhaulState::Connected as u8, Ordering::Relaxed);
+        let prev = self
+            .state
+            .swap(BackhaulState::Connected as u8, Ordering::Release);
+        if prev != BackhaulState::Connected as u8 {
+            self.last_state_change_ms
+                .store(current_time_ms(), Ordering::Release);
+            metrics::counter!("mmo_gateway_backhaul_circuit_breaker_recovered_total").increment(1);
+        }
     }
 
     pub fn record_failure(&self) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= 5 {
+        let now = current_time_ms();
+        if failures >= 5 || self.state.load(Ordering::Acquire) == BackhaulState::HalfOpen as u8 {
             self.state
-                .store(BackhaulState::Broken as u8, Ordering::Relaxed);
+                .store(BackhaulState::Broken as u8, Ordering::Release);
+            self.last_state_change_ms.store(now, Ordering::Release);
             metrics::counter!("mmo_gateway_backhaul_circuit_breaker_tripped_total").increment(1);
         } else {
             self.state
-                .store(BackhaulState::Degraded as u8, Ordering::Relaxed);
+                .store(BackhaulState::Degraded as u8, Ordering::Release);
         }
     }
 
@@ -99,13 +194,19 @@ impl BackhaulChannel {
 pub struct BackhaulPool {
     channels: DashMap<String, Arc<BackhaulChannel>>,
     channel_capacity: usize,
+    probe_interval_ms: u64,
 }
 
 impl BackhaulPool {
     pub fn new(channel_capacity: usize) -> Self {
+        Self::with_probe_interval(channel_capacity, DEFAULT_PROBE_INTERVAL_MS)
+    }
+
+    pub fn with_probe_interval(channel_capacity: usize, probe_interval_ms: u64) -> Self {
         Self {
             channels: DashMap::new(),
             channel_capacity,
+            probe_interval_ms,
         }
     }
 
@@ -119,7 +220,11 @@ impl BackhaulPool {
         }
 
         let (tx, rx) = mpsc::channel(self.channel_capacity);
-        let channel = Arc::new(BackhaulChannel::new(node_address.to_string(), tx));
+        let channel = Arc::new(BackhaulChannel::with_probe_interval(
+            node_address.to_string(),
+            tx,
+            self.probe_interval_ms,
+        ));
         self.channels
             .insert(node_address.to_string(), Arc::clone(&channel));
         (channel, Some(rx))
@@ -132,7 +237,7 @@ impl BackhaulPool {
             .get(&packet.node_address)
             .ok_or_else(|| BackhaulError::NodeUnreachable(packet.node_address.clone()))?;
 
-        if !channel.is_healthy() {
+        if !channel.can_send() {
             return Err(BackhaulError::CircuitBreakerOpen(
                 packet.node_address.clone(),
             ));
@@ -261,5 +366,99 @@ mod tests {
             err,
             BackhaulError::CircuitBreakerOpen("127.0.0.1:50052".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_half_open_probe_recovery() {
+        let pool = BackhaulPool::with_probe_interval(10, 20); // 20ms probe interval
+        let (ch, rx_opt) = pool.get_or_create("127.0.0.1:50052");
+        let mut rx = rx_opt.expect("receiver");
+
+        for _ in 0..5 {
+            ch.record_failure();
+        }
+        assert_eq!(ch.state(), BackhaulState::Broken);
+        assert!(!ch.can_send());
+
+        // Wait for probe interval to elapse
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Channel should transition to HalfOpen
+        assert_eq!(ch.state(), BackhaulState::HalfOpen);
+        assert!(ch.can_send());
+
+        // Probe packet send should succeed
+        let pkt = make_test_packet("127.0.0.1:50052");
+        assert!(pool.send_packet(pkt.clone()).is_ok());
+        let received = rx.recv().await.expect("received probe packet");
+        assert_eq!(received, pkt);
+
+        // Success records recovery back to Connected
+        ch.record_success();
+        assert_eq!(ch.state(), BackhaulState::Connected);
+        assert!(ch.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_half_open_probe_failure_trips_immediately() {
+        let pool = BackhaulPool::with_probe_interval(10, 20);
+        let (ch, _rx) = pool.get_or_create("127.0.0.1:50052");
+
+        for _ in 0..5 {
+            ch.record_failure();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(ch.state(), BackhaulState::HalfOpen);
+
+        // A failure during HalfOpen immediately trips back to Broken without requiring 5 failures
+        ch.record_failure();
+        assert_eq!(ch.state(), BackhaulState::Broken);
+        assert!(!ch.can_send());
+    }
+
+    #[tokio::test]
+    async fn test_backhaul_pool_healthy_channels_and_automatic_reassignment() {
+        let pool = BackhaulPool::with_probe_interval(10, 30);
+        let (ch1, _rx1) = pool.get_or_create("node1:50052");
+        let (_ch2, rx2_opt) = pool.get_or_create("node2:50052");
+        let mut rx2 = rx2_opt.expect("receiver");
+
+        let initial_healthy = pool.healthy_channels();
+        assert_eq!(initial_healthy.len(), 2);
+
+        // Trip node1 circuit breaker
+        for _ in 0..5 {
+            ch1.record_failure();
+        }
+
+        let healthy_after_trip = pool.healthy_channels();
+        assert_eq!(healthy_after_trip, vec!["node2:50052".to_string()]);
+
+        // Sending to node1 fails with CircuitBreakerOpen
+        let mut pkt = make_test_packet("node1:50052");
+        let err = pool.send_packet(pkt.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            BackhaulError::CircuitBreakerOpen("node1:50052".to_string())
+        );
+
+        // Automatic route reassignment fallback: pick healthy node
+        let fallback = pool
+            .healthy_channels()
+            .into_iter()
+            .find(|a| a != "node1:50052")
+            .unwrap();
+        pkt.node_address = fallback;
+        assert!(pool.send_packet(pkt.clone()).is_ok());
+
+        let received = rx2.recv().await.expect("received reassigned packet");
+        assert_eq!(received.node_address, "node2:50052");
+
+        // Wait for probe interval to recover node1
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(ch1.state(), BackhaulState::HalfOpen);
+        ch1.record_success();
+        assert_eq!(ch1.state(), BackhaulState::Connected);
+        assert_eq!(pool.healthy_channels().len(), 2);
     }
 }

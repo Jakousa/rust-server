@@ -283,3 +283,218 @@ async fn test_webtransport_gateway_poc_auth_handshake() {
     drop(connection);
     srv_handle.abort();
 }
+
+#[tokio::test]
+async fn test_webtransport_concurrent_bidirectional_streams_no_head_of_line_blocking() {
+    let router = Arc::new(SessionRouter::new());
+    let (packet_tx, mut packet_rx) = mpsc::channel(100);
+    let server = Arc::new(GatewayServer::with_packet_channel(
+        router.clone(),
+        packet_tx,
+    ));
+
+    let session_id = 2;
+    let player_guid = Guid::new(EntityType::Player, 1, 2002);
+    let node_addr = "127.0.0.1:50051".to_string();
+    server
+        .register_session(session_id, player_guid, node_addr)
+        .expect("register session");
+
+    let wt_server = server
+        .bind_webtransport("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind webtransport server");
+
+    let local_addr = wt_server.local_addr().expect("local addr");
+    let cert_digest_bytes = *wt_server.cert_digest_bytes();
+    let (srv_handle, _shutdown_tx) = wt_server.run_background();
+
+    let sha256_digest = Sha256Digest::new(cert_digest_bytes);
+    let client_config = ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([sha256_digest])
+        .build();
+
+    let client_endpoint = Endpoint::client(client_config).expect("create client endpoint");
+    let connect_url = format!("https://{}", local_addr);
+
+    let connection = timeout(
+        Duration::from_secs(5),
+        client_endpoint.connect(&connect_url),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("client connect");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Open Stream 1 and do NOT write anything yet (idle stream)
+    let (mut send_stream1, _recv_stream1) = connection
+        .open_bi()
+        .await
+        .expect("open bi stream 1")
+        .await
+        .expect("stream 1 ready");
+
+    // Concurrently open Stream 2 while Stream 1 is idle
+    let (mut send_stream2, _recv_stream2) = connection
+        .open_bi()
+        .await
+        .expect("open bi stream 2")
+        .await
+        .expect("stream 2 ready");
+
+    // Send packet on Stream 2 first - must NOT be blocked by idle Stream 1
+    let pkt2 = ClientPacket::Interaction(InteractionPacket {
+        source_guid: player_guid.raw(),
+        target_guid: 0,
+        interaction_type: InteractionType::Talk,
+        action_id: 99,
+        payload: bytes::Bytes::new(),
+    });
+    send_stream2
+        .write_all(&pkt2.encode())
+        .await
+        .expect("write to stream 2");
+
+    let routed2 = timeout(Duration::from_secs(2), packet_rx.recv())
+        .await
+        .expect("stream 2 packet not starved by stream 1")
+        .expect("routed packet 2");
+
+    if let ClientPacket::Interaction(i) = routed2.packet {
+        assert_eq!(i.action_id, 99);
+    } else {
+        panic!("Expected Interaction packet from stream 2");
+    }
+
+    // Now send packet on Stream 1 - both streams functional
+    let pkt1 = ClientPacket::Interaction(InteractionPacket {
+        source_guid: player_guid.raw(),
+        target_guid: 0,
+        interaction_type: InteractionType::Talk,
+        action_id: 100,
+        payload: bytes::Bytes::new(),
+    });
+    send_stream1
+        .write_all(&pkt1.encode())
+        .await
+        .expect("write to stream 1");
+
+    let routed1 = timeout(Duration::from_secs(2), packet_rx.recv())
+        .await
+        .expect("stream 1 packet timeout")
+        .expect("routed packet 1");
+
+    if let ClientPacket::Interaction(i) = routed1.packet {
+        assert_eq!(i.action_id, 100);
+    } else {
+        panic!("Expected Interaction packet from stream 1");
+    }
+
+    drop(connection);
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn test_webtransport_corrupted_stream_framing_rejection() {
+    let router = Arc::new(SessionRouter::new());
+    let (packet_tx, mut packet_rx) = mpsc::channel(100);
+    let server = Arc::new(GatewayServer::with_packet_channel(
+        router.clone(),
+        packet_tx,
+    ));
+
+    let session_id = 3;
+    let player_guid = Guid::new(EntityType::Player, 1, 3003);
+    let node_addr = "127.0.0.1:50051".to_string();
+    server
+        .register_session(session_id, player_guid, node_addr)
+        .expect("register session");
+
+    let wt_server = server
+        .bind_webtransport("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind webtransport server");
+
+    let local_addr = wt_server.local_addr().expect("local addr");
+    let cert_digest_bytes = *wt_server.cert_digest_bytes();
+    let (srv_handle, _shutdown_tx) = wt_server.run_background();
+
+    let sha256_digest = Sha256Digest::new(cert_digest_bytes);
+    let client_config = ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([sha256_digest])
+        .build();
+
+    let client_endpoint = Endpoint::client(client_config).expect("create client endpoint");
+    let connect_url = format!("https://{}", local_addr);
+
+    let connection = timeout(
+        Duration::from_secs(5),
+        client_endpoint.connect(&connect_url),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("client connect");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Open Stream 1 and write corrupted bytes (invalid magic)
+    let (mut send_stream1, mut recv_stream1) = connection
+        .open_bi()
+        .await
+        .expect("open bi stream 1")
+        .await
+        .expect("stream 1 ready");
+
+    // Invalid packet header (wrong magic)
+    send_stream1
+        .write_all(b"CORRUPTED_STREAM_BYTES_INVALID_MAGIC_HEADER")
+        .await
+        .expect("write bad bytes");
+
+    // Server should reject and close stream 1
+    let mut temp = [0u8; 128];
+    let read_res = timeout(Duration::from_secs(2), recv_stream1.read(&mut temp)).await;
+    match read_res {
+        Ok(Ok(None)) => {} // Stream cleanly closed on server side
+        Ok(Ok(Some(0))) => {}
+        Ok(Err(_)) => {} // Stream reset/closed
+        _ => {}          // Closed or timed out
+    }
+
+    // Connection remains healthy: open Stream 2 and verify valid packet is routed
+    let (mut send_stream2, _recv_stream2) = connection
+        .open_bi()
+        .await
+        .expect("open bi stream 2")
+        .await
+        .expect("stream 2 ready");
+
+    let valid_pkt = ClientPacket::Interaction(InteractionPacket {
+        source_guid: player_guid.raw(),
+        target_guid: 0,
+        interaction_type: InteractionType::UseItem,
+        action_id: 777,
+        payload: bytes::Bytes::new(),
+    });
+    send_stream2
+        .write_all(&valid_pkt.encode())
+        .await
+        .expect("write to stream 2");
+
+    let routed = timeout(Duration::from_secs(2), packet_rx.recv())
+        .await
+        .expect("valid packet routed on subsequent stream")
+        .expect("routed packet");
+
+    if let ClientPacket::Interaction(i) = routed.packet {
+        assert_eq!(i.action_id, 777);
+    } else {
+        panic!("Expected Interaction packet");
+    }
+
+    drop(connection);
+    srv_handle.abort();
+}

@@ -85,13 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Background worker to consume routed client packets and forward to node cluster via BackhaulPool
     let backhaul_pool = Arc::clone(server.backhaul_pool());
+    let router_clone = Arc::clone(server.router());
     tokio::spawn(async move {
-        while let Some(pkt) = packet_rx.recv().await {
+        while let Some(mut pkt) = packet_rx.recv().await {
             let (ch, rx_opt) = backhaul_pool.get_or_create(&pkt.node_address);
             if let Some(mut rx) = rx_opt {
                 let node_addr = pkt.node_address.clone();
                 let ch_clone = Arc::clone(&ch);
                 tokio::spawn(async move {
+                    use mmo_gateway::backhaul::BackhaulState;
                     use tracing::Instrument;
                     let endpoint = if node_addr.starts_with("http") {
                         node_addr
@@ -99,48 +101,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!("http://{}", node_addr)
                     };
                     let mut client_opt = None;
-                    while let Some(packet) = rx.recv().await {
-                        let opcode = packet.packet.opcode().as_str();
-                        let span = tracing::info_span!(
-                            "client_packet_forward",
-                            session_id = packet.session_id,
-                            opcode = opcode,
-                            target_node = %endpoint
-                        );
-                        async {
-                            if client_opt.is_none() {
-                                client_opt =
-                                    NodeServiceClient::connect(endpoint.clone()).await.ok();
-                            }
-                            if let Some(ref mut client) = client_opt {
-                                let req = ForwardClientPacketRequest {
-                                    session_id: packet.session_id,
-                                    guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
-                                    packet_data: packet.packet.encode(),
-                                    session_epoch: packet.session_epoch,
-                                };
-                                match client.forward_client_packet(req).await {
-                                    Ok(_) => ch_clone.record_success(),
-                                    Err(e) => {
-                                        ch_clone.record_failure();
-                                        tracing::error!(error = %e, "Failed forwarding client packet to node");
-                                        eprintln!(
-                                            "[Gateway Backhaul] Failed forwarding to node: {e}"
+                    let probe_duration =
+                        std::time::Duration::from_millis(ch_clone.probe_interval_ms());
+                    let mut probe_interval = tokio::time::interval(probe_duration);
+                    probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                    loop {
+                        tokio::select! {
+                            pkt_opt = rx.recv() => {
+                                match pkt_opt {
+                                    Some(packet) => {
+                                        let opcode = packet.packet.opcode().as_str();
+                                        let span = tracing::info_span!(
+                                            "client_packet_forward",
+                                            session_id = packet.session_id,
+                                            opcode = opcode,
+                                            target_node = %endpoint
                                         );
-                                        client_opt = None;
+                                        async {
+                                            if client_opt.is_none() {
+                                                client_opt =
+                                                    NodeServiceClient::connect(endpoint.clone()).await.ok();
+                                            }
+                                            if let Some(ref mut client) = client_opt {
+                                                let req = ForwardClientPacketRequest {
+                                                    session_id: packet.session_id,
+                                                    guid: packet.guid.map(|g| g.raw()).unwrap_or(0),
+                                                    packet_data: packet.packet.encode(),
+                                                    session_epoch: packet.session_epoch,
+                                                };
+                                                match client.forward_client_packet(req).await {
+                                                    Ok(_) => ch_clone.record_success(),
+                                                    Err(e) => {
+                                                        ch_clone.record_failure();
+                                                        tracing::error!(error = %e, "Failed forwarding client packet to node");
+                                                        eprintln!(
+                                                            "[Gateway Backhaul] Failed forwarding to node: {e}"
+                                                        );
+                                                        client_opt = None;
+                                                    }
+                                                }
+                                            } else {
+                                                ch_clone.record_failure();
+                                            }
+                                        }
+                                        .instrument(span)
+                                        .await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = probe_interval.tick() => {
+                                if ch_clone.state() == BackhaulState::HalfOpen {
+                                    if client_opt.is_none() {
+                                        client_opt =
+                                            NodeServiceClient::connect(endpoint.clone()).await.ok();
+                                    }
+                                    if let Some(ref mut client) = client_opt {
+                                        let probe_req = ForwardClientPacketRequest {
+                                            session_id: 0,
+                                            guid: 0,
+                                            packet_data: mmo_schema::client::ClientPacket::Ping(
+                                                mmo_schema::client::PingPacket {
+                                                    timestamp: std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_millis() as u64,
+                                                },
+                                            )
+                                            .encode(),
+                                            session_epoch: 0,
+                                        };
+                                        match client.forward_client_packet(probe_req).await {
+                                            Ok(_) => {
+                                                ch_clone.record_success();
+                                                tracing::info!(
+                                                    target_node = %endpoint,
+                                                    "Backhaul circuit breaker successfully recovered to Connected via probe"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                ch_clone.record_failure();
+                                                tracing::debug!(
+                                                    target_node = %endpoint,
+                                                    error = %e,
+                                                    "Backhaul probe failed"
+                                                );
+                                                client_opt = None;
+                                            }
+                                        }
+                                    } else {
+                                        ch_clone.record_failure();
                                     }
                                 }
-                            } else {
-                                ch_clone.record_failure();
                             }
                         }
-                        .instrument(span)
-                        .await;
                     }
                 });
             }
-            if let Err(e) = backhaul_pool.send_packet(pkt) {
-                eprintln!("[Gateway] Failed forwarding packet to BackhaulPool: {e:?}");
+            if let Err(e) = backhaul_pool.send_packet(pkt.clone()) {
+                match e {
+                    mmo_gateway::backhaul::BackhaulError::CircuitBreakerOpen(ref dead_node)
+                    | mmo_gateway::backhaul::BackhaulError::NodeUnreachable(ref dead_node) => {
+                        let healthy = backhaul_pool.healthy_channels();
+                        if let Some(fallback_node) =
+                            healthy.into_iter().find(|addr| addr != dead_node)
+                        {
+                            tracing::warn!(
+                                dead_node = %dead_node,
+                                fallback_node = %fallback_node,
+                                "Reassigning routes from broken node to healthy node"
+                            );
+                            router_clone.reassign_node_routes(dead_node, &fallback_node);
+                            pkt.node_address = fallback_node;
+                            if let Err(err) = backhaul_pool.send_packet(pkt) {
+                                eprintln!(
+                                    "[Gateway] Failed forwarding packet to reassigned node: {err:?}"
+                                );
+                            }
+                        } else {
+                            eprintln!("[Gateway] Failed forwarding packet to BackhaulPool: {e:?}");
+                        }
+                    }
+                    _ => {
+                        eprintln!("[Gateway] Failed forwarding packet to BackhaulPool: {e:?}");
+                    }
+                }
             }
         }
     });
