@@ -742,17 +742,35 @@ impl CharacterRepository {
             }
 
             // 4. Verify sender owns each item
-            for item_id in item_instance_ids {
-                let item_row = sqlx::query(&q!(
-                    "SELECT character_guid FROM items WHERE item_instance_id = ?"
-                ))
-                .bind(item_id)
-                .fetch_optional(&mut *conn)
-                .await?;
+            let mut q_str = String::from(
+                "SELECT item_instance_id, character_guid FROM items WHERE item_instance_id IN (",
+            );
+            for i in 0..item_instance_ids.len() {
+                if i > 0 {
+                    q_str.push_str(", ");
+                }
+                q_str.push('?');
+            }
+            q_str.push(')');
 
-                match item_row {
-                    Some(r) => {
-                        let owner: i64 = r.try_get("character_guid")?;
+            let q_cow = q!(&q_str);
+            let mut query = sqlx::query(&q_cow);
+            for item_id in item_instance_ids {
+                query = query.bind(item_id);
+            }
+
+            let rows = query.fetch_all(&mut *conn).await?;
+
+            let mut owner_map = std::collections::HashMap::with_capacity(rows.len());
+            for r in rows {
+                let id: String = r.try_get("item_instance_id")?;
+                let owner: i64 = r.try_get("character_guid")?;
+                owner_map.insert(id, owner);
+            }
+
+            for item_id in item_instance_ids {
+                match owner_map.get(item_id) {
+                    Some(&owner) => {
                         if owner as u64 != sender_guid {
                             return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                         }
