@@ -51,6 +51,10 @@ impl InterpolationBuffer {
     }
 
     /// Pushes a new kinematic snapshot for an entity.
+    ///
+    /// Snapshots are ordered by authoritative server tick rather than client arrival timestamp.
+    /// When multiple packets arrive in the same client frame (intra-frame), monotonic timeline
+    /// progression is preserved via 20 Hz tick intervals rather than dropping valid newer ticks.
     pub fn push_snapshot(
         &mut self,
         entity_id: u64,
@@ -62,16 +66,66 @@ impl InterpolationBuffer {
     ) {
         let queue = self.history.entry(entity_id).or_default();
 
-        // Discard out-of-order ticks if any
-        if let Some(back) = queue.back() {
-            if timestamp_sec <= back.timestamp_sec {
-                return;
+        let effective_ts = if let Some(back) = queue.back() {
+            if tick > 0 && back.tick > 0 {
+                if tick < back.tick {
+                    // Out-of-order tick arrival
+                    let front_tick = queue.front().map(|f| f.tick).unwrap_or(0);
+                    if tick <= front_tick || queue.iter().any(|s| s.tick == tick) {
+                        // Older than retained history or duplicate
+                        return;
+                    }
+
+                    // Insert at sorted index
+                    let insert_idx = queue
+                        .iter()
+                        .position(|s| s.tick > tick)
+                        .unwrap_or(queue.len());
+                    let prev_s = &queue[insert_idx - 1];
+                    let next_s = &queue[insert_idx];
+                    let frac = (tick - prev_s.tick) as f64 / (next_s.tick - prev_s.tick) as f64;
+                    let ts =
+                        prev_s.timestamp_sec + frac * (next_s.timestamp_sec - prev_s.timestamp_sec);
+
+                    queue.insert(
+                        insert_idx,
+                        EntitySnapshot {
+                            tick,
+                            timestamp_sec: ts,
+                            position,
+                            velocity,
+                            yaw,
+                        },
+                    );
+                    while queue.len() > self.max_history {
+                        queue.pop_front();
+                    }
+                    return;
+                } else if tick == back.tick {
+                    // Duplicate tick in same or subsequent packet: drop duplicate
+                    return;
+                } else {
+                    // tick > back.tick: newer tick
+                    // If client timestamp has not advanced yet (multiple packets in same frame),
+                    // enforce monotonic ordering spaced by 20 Hz tick duration (50ms).
+                    let tick_delta = (tick - back.tick) as f64;
+                    let min_ts = back.timestamp_sec + tick_delta * 0.05;
+                    timestamp_sec.max(min_ts)
+                }
+            } else {
+                // Unticked snapshot fallback
+                if timestamp_sec <= back.timestamp_sec {
+                    return;
+                }
+                timestamp_sec
             }
-        }
+        } else {
+            timestamp_sec
+        };
 
         queue.push_back(EntitySnapshot {
             tick,
-            timestamp_sec,
+            timestamp_sec: effective_ts,
             position,
             velocity,
             yaw,
@@ -238,5 +292,70 @@ mod tests {
         // Must clamp to stationary newest snapshot position (10.5)
         let (clamped_pos, _) = buffer.sample(entity_id, 1.50).expect("should clamp");
         assert_eq!(clamped_pos.0, 10.5);
+    }
+
+    #[test]
+    fn test_intra_frame_snapshots_preservation_and_interpolation() {
+        let mut buffer = InterpolationBuffer::new(0.10);
+        let entity_id = 303;
+
+        // Two packets arrive in the exact same client frame where client_time = 1.0s
+        // Tick 10: position (0, 0, 0)
+        // Tick 11: position (10, 0, 0)
+        buffer.push_snapshot(entity_id, 10, 1.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0);
+        buffer.push_snapshot(entity_id, 11, 1.0, (10.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0);
+
+        // Both snapshots must be retained in queue
+        let queue = buffer
+            .history
+            .get(&entity_id)
+            .expect("must have entity history");
+        assert_eq!(
+            queue.len(),
+            2,
+            "Second intra-frame snapshot must not be dropped"
+        );
+        assert_eq!(queue[0].tick, 10);
+        assert_eq!(queue[1].tick, 11);
+        assert!(
+            queue[1].timestamp_sec > queue[0].timestamp_sec,
+            "Timestamps must be monotonically spaced"
+        );
+
+        // Sampling at halfway render time should smoothly interpolate between the two
+        let halfway_time = queue[0].timestamp_sec + 0.025 + buffer.render_delay_sec;
+        let (pos, _) = buffer
+            .sample(entity_id, halfway_time)
+            .expect("sample halfway");
+        assert!(
+            (pos.0 - 5.0).abs() < 1e-3,
+            "Intra-frame snapshots must interpolate smoothly"
+        );
+    }
+
+    #[test]
+    fn test_out_of_order_snapshot_sorted_and_duplicates_dropped() {
+        let mut buffer = InterpolationBuffer::new(0.10);
+        let entity_id = 404;
+
+        // Arrival sequence: Tick 10, Tick 12, then late-arriving Tick 11, then duplicate Tick 11
+        buffer.push_snapshot(entity_id, 10, 1.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0);
+        buffer.push_snapshot(entity_id, 12, 1.1, (20.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0);
+        buffer.push_snapshot(entity_id, 11, 1.0, (10.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0); // late arrival
+        buffer.push_snapshot(entity_id, 11, 1.05, (10.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0); // duplicate
+
+        let queue = buffer
+            .history
+            .get(&entity_id)
+            .expect("must have entity history");
+        assert_eq!(
+            queue.len(),
+            3,
+            "Duplicate must be dropped and out-of-order preserved"
+        );
+        assert_eq!(queue[0].tick, 10);
+        assert_eq!(queue[1].tick, 11);
+        assert_eq!(queue[2].tick, 12);
+        assert_eq!(queue[1].position.0, 10.0);
     }
 }

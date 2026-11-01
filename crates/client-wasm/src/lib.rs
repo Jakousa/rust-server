@@ -202,15 +202,17 @@ impl WasmClientWorld {
                 let vel = replica.velocity;
                 let yaw = replica.yaw;
 
+                let tick = if self.latest_server_tick > 0 {
+                    self.latest_server_tick
+                } else if state.timestamp > 0 {
+                    state.timestamp / 50
+                } else {
+                    0
+                };
+
                 self.entities.insert(entity_id, replica);
-                self.interp_buffer.push_snapshot(
-                    entity_id,
-                    self.latest_server_tick,
-                    self.client_time,
-                    pos,
-                    vel,
-                    yaw,
-                );
+                self.interp_buffer
+                    .push_snapshot(entity_id, tick, self.client_time, pos, vel, yaw);
             }
             ClientPacket::EntityDespawn(despawn) => {
                 self.entities.remove(&despawn.entity_id);

@@ -30,6 +30,11 @@ export class ClientWorldBridge {
     this.clientTime = 0.0;
     this.onInteractionResultCallback = null;
     this.onAuthResponseCallback = null;
+    this.onMovementCorrectionCallback = null;
+  }
+
+  onMovementCorrection(callback) {
+    this.onMovementCorrectionCallback = callback;
   }
 
   onInteractionResult(callback) {
@@ -49,6 +54,36 @@ export class ClientWorldBridge {
     const opcode = view.getUint16(2, true);
 
     this.receivedPackets++;
+
+    // Opcode 0x0002: MovementCorrection
+    if (opcode === OPCODES.MOVEMENT_CORRECTION && view.byteLength >= 45) {
+      const rawEntityId = view.getBigUint64(8, true);
+      const entityId = rawEntityId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawEntityId) : rawEntityId;
+      const x = view.getFloat32(16, true);
+      const y = view.getFloat32(20, true);
+      const z = view.getFloat32(24, true);
+      const vx = view.getFloat32(28, true);
+      const vy = view.getFloat32(32, true);
+      const vz = view.getFloat32(36, true);
+      const sequence = view.getUint32(40, true);
+      const reason = view.getUint8(44);
+
+      if (this.onMovementCorrectionCallback) {
+        this.onMovementCorrectionCallback({
+          entityId,
+          rawEntityId,
+          x,
+          y,
+          z,
+          vx,
+          vy,
+          vz,
+          sequence,
+          reason,
+        });
+      }
+      return;
+    }
 
     // Opcode 0x0012: AuthResponse
     if (opcode === OPCODES.AUTH_RESPONSE && view.byteLength >= 33) {
@@ -414,6 +449,13 @@ if (typeof window !== "undefined") {
     world.processPacket(data);
   });
 
+  // Authoritative server movement correction listener
+  world.onMovementCorrection((corr) => {
+    if (BigInt(corr.entityId) === BigInt(world.localPlayerGuid)) {
+      controls.reconcile(corr.sequence, corr.x, corr.y, corr.z);
+    }
+  });
+
   transport.onStatus(({ status, error }) => {
     ui.setConnectionState(status);
     if (error) {
@@ -560,7 +602,7 @@ if (typeof window !== "undefined") {
     const playerPos = controls.position;
 
     for (const ent of world.entities.values()) {
-      if (ent.id === world.localPlayerGuid) continue;
+      if (BigInt(ent.id) === BigInt(world.localPlayerGuid)) continue;
       const dx = ent.x - playerPos.x;
       const dy = ent.y - playerPos.y;
       const dz = ent.z - playerPos.z;
@@ -578,9 +620,9 @@ if (typeof window !== "undefined") {
       if (nearestTarget.type === 2) {
         targetType = "Villager NPC";
         targetName =
-          nearestTarget.id % 3 === 1
+          BigInt(nearestTarget.id) % 3n === 1n
             ? "Blacksmith Ilmari"
-            : nearestTarget.id % 3 === 2
+            : BigInt(nearestTarget.id) % 3n === 2n
             ? "Herbalist Aino"
             : "Elder Väinö";
       } else if (nearestTarget.type === 1) {
