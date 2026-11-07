@@ -1119,6 +1119,56 @@ mod tests {
             invalid_owner_trade,
             Err(StorageError::ItemNotFound(_, 3001))
         ));
+
+        // 4. Multi-item batch fetch: verify batch validation failure and atomic success
+        let item3 = ItemRecord {
+            item_instance_id: "trade_potion".to_string(),
+            character_guid: 3001,
+            container_id: 3001,
+            item_def_id: 102,
+            slot: 2,
+            quantity: 5,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&item3).await.unwrap();
+
+        // 4a. Batch validation fails when one of the multiple items is not owned by sender
+        let multi_fail = repo
+            .execute_trade(
+                "trade_004_fail",
+                3001,
+                3002,
+                &[
+                    "trade_shield".to_string(),
+                    "unowned_item".to_string(),
+                    "trade_potion".to_string(),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            multi_fail,
+            Err(StorageError::ItemNotFound(ref id, 3001)) if id == "unowned_item"
+        ));
+
+        // 4b. Multi-item batch trade succeeds and transfers both items atomically
+        let multi_success = repo
+            .execute_trade(
+                "trade_004_ok",
+                3001,
+                3002,
+                &["trade_shield".to_string(), "trade_potion".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(multi_success.status, TradeStatus::Committed);
+
+        let bob_items_multi = repo.get_character_items(3002).await.unwrap();
+        assert_eq!(bob_items_multi.len(), 3);
+        let alice_items_multi = repo.get_character_items(3001).await.unwrap();
+        assert_eq!(alice_items_multi.len(), 0);
     }
 
     #[tokio::test]
