@@ -742,17 +742,35 @@ impl CharacterRepository {
             }
 
             // 4. Verify sender owns each item
-            for item_id in item_instance_ids {
-                let item_row = sqlx::query(&q!(
-                    "SELECT character_guid FROM items WHERE item_instance_id = ?"
-                ))
-                .bind(item_id)
-                .fetch_optional(&mut *conn)
-                .await?;
+            let mut q_str = String::from(
+                "SELECT item_instance_id, character_guid FROM items WHERE item_instance_id IN (",
+            );
+            for i in 0..item_instance_ids.len() {
+                if i > 0 {
+                    q_str.push_str(", ");
+                }
+                q_str.push('?');
+            }
+            q_str.push(')');
 
-                match item_row {
-                    Some(r) => {
-                        let owner: i64 = r.try_get("character_guid")?;
+            let q_cow = q!(&q_str);
+            let mut query = sqlx::query(&q_cow);
+            for item_id in item_instance_ids {
+                query = query.bind(item_id);
+            }
+
+            let rows = query.fetch_all(&mut *conn).await?;
+
+            let mut owner_map = std::collections::HashMap::with_capacity(rows.len());
+            for r in rows {
+                let id: String = r.try_get("item_instance_id")?;
+                let owner: i64 = r.try_get("character_guid")?;
+                owner_map.insert(id, owner);
+            }
+
+            for item_id in item_instance_ids {
+                match owner_map.get(item_id) {
+                    Some(&owner) => {
                         if owner as u64 != sender_guid {
                             return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                         }
@@ -1101,6 +1119,56 @@ mod tests {
             invalid_owner_trade,
             Err(StorageError::ItemNotFound(_, 3001))
         ));
+
+        // 4. Multi-item batch fetch: verify batch validation failure and atomic success
+        let item3 = ItemRecord {
+            item_instance_id: "trade_potion".to_string(),
+            character_guid: 3001,
+            container_id: 3001,
+            item_def_id: 102,
+            slot: 2,
+            quantity: 5,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&item3).await.unwrap();
+
+        // 4a. Batch validation fails when one of the multiple items is not owned by sender
+        let multi_fail = repo
+            .execute_trade(
+                "trade_004_fail",
+                3001,
+                3002,
+                &[
+                    "trade_shield".to_string(),
+                    "unowned_item".to_string(),
+                    "trade_potion".to_string(),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            multi_fail,
+            Err(StorageError::ItemNotFound(ref id, 3001)) if id == "unowned_item"
+        ));
+
+        // 4b. Multi-item batch trade succeeds and transfers both items atomically
+        let multi_success = repo
+            .execute_trade(
+                "trade_004_ok",
+                3001,
+                3002,
+                &["trade_shield".to_string(), "trade_potion".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(multi_success.status, TradeStatus::Committed);
+
+        let bob_items_multi = repo.get_character_items(3002).await.unwrap();
+        assert_eq!(bob_items_multi.len(), 3);
+        let alice_items_multi = repo.get_character_items(3001).await.unwrap();
+        assert_eq!(alice_items_multi.len(), 0);
     }
 
     #[tokio::test]
