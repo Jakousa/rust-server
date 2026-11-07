@@ -15,7 +15,7 @@ services:
   node-1:
     image: mmo-server:latest
     container_name: mmo-node-1
-    command: ["mmo-node"]
+    command: ["mmo-village-node"]
     environment:
       NODE_ID: "1"
       LISTEN_ADDR: "0.0.0.0:50052"
@@ -64,6 +64,20 @@ services:
     depends_on:
       - node-1
       - node-2
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: mmo-web:latest
+    container_name: mmo-web
+    ports:
+      - "3000:80"
+    networks:
+      - mmo-net
+    depends_on:
+      - gateway
     restart: unless-stopped
 
   loadtest:

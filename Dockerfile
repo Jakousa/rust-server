@@ -29,6 +29,7 @@ WORKDIR /app
 # Copy compiled binaries from builder stage
 COPY --from=builder /app/target/release/mmo-director /usr/local/bin/mmo-director
 COPY --from=builder /app/target/release/mmo-node /usr/local/bin/mmo-node
+COPY --from=builder /app/target/release/mmo-village-node /usr/local/bin/mmo-village-node
 COPY --from=builder /app/target/release/mmo-gateway /usr/local/bin/mmo-gateway
 COPY --from=builder /app/target/release/mmo-loadtest /usr/local/bin/mmo-loadtest
 
