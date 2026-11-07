@@ -6,21 +6,21 @@ Historical specifications, change proposals, and task manifests are permanently 
 
 ---
 
-## Active Focus: Playable Village & Barter Vertical Slice
+## Active Focus: Cloud VM Deployment & Public Playtest
 
-The current focus is connecting the foundational engine crates into the first end-to-end playable browser vertical slice:
+With the playable Village & Barter Vertical Slice completed and archived ([`2026-11-07-village-barter-vertical-slice-poc`](changes/archive/2026-11-07-village-barter-vertical-slice-poc/)), the active focus is live deployment and cluster playtesting:
 
-| Focus Area | OpenSpec Change | GitHub Issue(s) | Status | Target Crates | Summary |
-| :--- | :--- | :---: | :---: | :--- | :--- |
-| **Playable Vertical Slice** | [`village-barter-vertical-slice-poc`](changes/village-barter-vertical-slice-poc/) | [#143](https://github.com/Jakousa/rust-server/issues/143), [#144](https://github.com/Jakousa/rust-server/issues/144), [#153](https://github.com/Jakousa/rust-server/issues/153) | In Progress | `mmo-gameplay`, `mmo-node`, `mmo-gateway`, `mmo-core`, `mmo-client-wasm`, `web/` | First end-to-end playable slice: 3 NPC villagers (Blacksmith Ilmari, Herbalist Aino, Elder Väinö), village structures, starter inventories, atomic NPC barter & player-to-player trade, WebTransport listener with auto cert-hash discovery, and browser Village HUD. |
+| Focus Area | GitHub Issue(s) | Status | Target Crates / Artifacts | Summary |
+| :--- | :---: | :---: | :--- | :--- |
+| **Cloud VM Deployment & Live Testing** | [#143](https://github.com/Jakousa/rust-server/issues/143), [#153](https://github.com/Jakousa/rust-server/issues/153) | Active | `docker-compose.yml`, `web/`, `crates/gameplay`, `docs/CLOUD_POC_DEPLOYMENT.md` | Single-command deployment (`docker compose up -d`) on an inexpensive cloud VM (Hetzner/DO/AWS), serving the Three.js web client on port 3000 and gateway WebTransport over UDP 4433 with auto cert-hash discovery for multi-client playtesting. |
 
 ---
 
 ## Upcoming Initiatives
 
-1. **Cloud VM Deployment & Live Testing**: Deploy the vertical slice to a public cloud VM (using the guide in [`docs/CLOUD_POC_DEPLOYMENT.md`](../docs/CLOUD_POC_DEPLOYMENT.md)) for multi-client public browser verification.
-2. **Voxel FPS Arena Prototype**: Second distinct game genre testing high-frequency input prediction, voxel chunk destruction/building, and fast projectile combat on the same engine substrate.
-3. **Dedicated Godot Client (Separate Repository)**: Standalone native Godot client repository demonstrating multi-client connectivity to the authoritative cluster.
+1. **Voxel FPS Arena Prototype**: Second distinct game genre testing the engine substrate's genre-agnostic claim via high-frequency input prediction, destructible voxel terrain (`crates/plugins/voxel`), and fast projectile combat.
+2. **Dedicated Godot Client (Separate Repository)**: Standalone native Godot client repository demonstrating multi-client connectivity to the authoritative cluster.
+3. **Cluster Auto-Scaling & Dynamic Partitioning**: Director-driven live partition boundary migration and load rebalancing across multi-region simulation nodes.
 
 ---
 
