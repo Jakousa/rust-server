@@ -47,6 +47,10 @@ spec:
               value: "http://mmo-director:50051"
             - name: DEFAULT_NODE_ADDR
               value: "mmo-node-0.mmo-node:50052"
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
           ports:
             - name: webtransport
               containerPort: 4433
