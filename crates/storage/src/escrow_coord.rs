@@ -49,7 +49,7 @@ pub struct EscrowCoordinator {
     db: Database,
 }
 
-const MAX_ESCROW_TTL_SECS: u64 = 30 * 86400;
+const MAX_ESCROW_TTL_SECS: u64 = 2_592_000; // 30 days
 
 impl EscrowCoordinator {
     pub fn new(db: Database) -> Self {

@@ -733,4 +733,25 @@ mod tests {
         assert_eq!(path_val.as_i64(), Some(100));
         assert!(doc.get_path("combat.element.ice").is_none());
     }
+
+    #[test]
+    fn test_load_file_direct() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("items.json");
+        let content = r#"[
+            {"id": "item1", "name": "Potion"},
+            {"id": "item2", "name": "Elixir"},
+            {"id": "item3", "name": "Antidote"}
+        ]"#;
+        std::fs::write(&file_path, content).unwrap();
+
+        let store = DataStore::new();
+        let loaded = store.load_file(&file_path).unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(store.count(), 3);
+        assert!(store.contains(
+            temp_dir.path().file_name().unwrap().to_str().unwrap(),
+            "item1"
+        ));
+    }
 }

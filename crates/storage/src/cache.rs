@@ -61,7 +61,7 @@ impl MemoryCache {
     }
 }
 
-const MAX_TTL_SECS: u64 = 30 * 86400;
+const MAX_TTL_SECS: u64 = 2_592_000; // 30 days
 
 #[async_trait]
 impl SessionCacheBackend for MemoryCache {

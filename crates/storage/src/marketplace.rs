@@ -56,7 +56,7 @@ pub struct MarketplaceRepository {
     db: Database,
 }
 
-const MAX_LISTING_DURATION_SECS: u64 = 30 * 86400;
+const MAX_LISTING_DURATION_SECS: u64 = 2_592_000; // 30 days
 
 impl MarketplaceRepository {
     pub fn new(db: Database) -> Self {
