@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - prometheus.yaml
+  - grafana.yaml
+  - web.yaml
+
+images:
+  - name: mmo-server:local
+    newName: jakousa/mmo-server
+    newTag: latest
+
+patches:
+  - target:
+      kind: Deployment
+      name: mmo-director
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+  - target:
+      kind: Deployment
+      name: mmo-gateway
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+  - target:
+      kind: StatefulSet
+      name: mmo-node
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: grafana-dashboard-mmo-overview
+    namespace: mmo
+    files:
+      - dashboards/mmo-overview.json

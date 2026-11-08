@@ -66,6 +66,18 @@ The stack launches:
 - `mmo-gateway` (WebTransport UDP `:4433` + TCP `:8080` + `/cert-hash` `:9091` via `jakousa/mmo-server`)
 - `mmo-web` (Nginx serving the compiled `web/dist` browser client on `:80` / `:3000` via `jakousa/mmo-web`)
 
-### Option B: K3s / K3d Kubernetes (`k8s/overlays/local`)
-To run the full multi-pod Kubernetes topology used by the chaos and e2e test suites (multiple `mmo-node` pods, Prometheus + Grafana dashboards, PodDisruptionBudgets):
-- Run `./scripts/cluster.sh up` (or deploy to a single-node `k3s` installation on the VM).
+### Option B: Cloud Kubernetes Cluster (`k8s/overlays/cloud`)
+To run the full stack on a public k3s/Kubernetes VM using pre-built images from Docker Hub (`jakousa/mmo-server` and `jakousa/mmo-web`):
+```bash
+kubectl apply -k k8s/overlays/cloud
+```
+The overlay orchestrates:
+- `mmo-director`, `mmo-gateway`, and `mmo-node` (bootstrapping `mmo-village-node` on Node 1 for authoritative village NPCs and structures)
+- `postgres:16-alpine` with durable PVC persistence
+- `mmo-web` frontend served on HTTP port `:80` (via Traefik Ingress) and port `:3000` (LoadBalancer)
+- Prometheus (`:9090`) and Grafana (`:3001`, `admin`/`admin`) with the pre-provisioned `mmo-overview` dashboard
+
+### Option C: Local K3d Development Cluster (`k8s/overlays/local`)
+To run the multi-pod Kubernetes topology locally using `k3d` and locally built Docker images:
+- Run `./scripts/cluster.sh up` (or `./scripts/cluster.sh all`).
+
