@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mmo-server:latest
+    image: jakousa/mmo-server:latest
     container_name: mmo-director
     command: ["mmo-director"]
     networks:
@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
   node-1:
-    image: mmo-server:latest
+    image: jakousa/mmo-server:latest
     container_name: mmo-node-1
     command: ["mmo-village-node"]
     environment:
@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
 
   node-2:
-    image: mmo-server:latest
+    image: jakousa/mmo-server:latest
     container_name: mmo-node-2
     command: ["mmo-node"]
     environment:
@@ -47,7 +47,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: mmo-server:latest
+    image: jakousa/mmo-server:latest
     container_name: mmo-gateway
     command: ["mmo-gateway"]
     environment:
@@ -70,7 +70,7 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-    image: mmo-web:latest
+    image: jakousa/mmo-web:latest
     container_name: mmo-web
     ports:
       - "3000:80"
@@ -81,7 +81,7 @@ services:
     restart: unless-stopped
 
   loadtest:
-    image: mmo-server:latest
+    image: jakousa/mmo-server:latest
     container_name: mmo-loadtest
     command: ["mmo-loadtest", "--gateway-addr", "gateway:8080", "--bots", "100", "--duration-secs", "5"]
     environment:

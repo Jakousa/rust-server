@@ -1,0 +1,89 @@
+name: Publish Docker Images
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*.*.*', 'v*' ]
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - 'crates/**'
+      - 'web/**'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'jakousa' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --- 1. mmo-server (Authoritative Server Binaries) ---
+      - name: Docker metadata for mmo-server
+        id: meta-server
+        uses: docker/metadata-action@v5
+        with:
+          images: jakousa/mmo-server
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push mmo-server
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-server.outputs.tags }}
+          labels: ${{ steps.meta-server.outputs.labels }}
+          cache-from: type=gha,scope=mmo-server
+          cache-to: type=gha,mode=max,scope=mmo-server
+
+      # --- 2. mmo-web (Vite + Nginx Frontend Client) ---
+      - name: Docker metadata for mmo-web
+        id: meta-web
+        uses: docker/metadata-action@v5
+        with:
+          images: jakousa/mmo-web
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push mmo-web
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-web.outputs.tags }}
+          labels: ${{ steps.meta-web.outputs.labels }}
+          cache-from: type=gha,scope=mmo-web
+          cache-to: type=gha,mode=max,scope=mmo-web

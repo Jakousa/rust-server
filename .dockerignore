@@ -3,3 +3,8 @@ target
 .agents
 *.md
 openspec/changes/archive
+web/node_modules
+web/dist
+mutants.out*
+.worktrees
+
