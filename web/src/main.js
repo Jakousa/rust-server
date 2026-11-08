@@ -616,9 +616,27 @@ export async function autoFetchCertHash() {
   const certInput = document.getElementById("cert-hash");
   if (certInput && certInput.value.trim().length > 0) return;
   try {
-    const adminUrl = `http://${window.location.hostname || "127.0.0.1"}:9091/cert-hash`;
-    const res = await fetch(adminUrl);
-    if (res.ok) {
+    // 1. First try relative /cert-hash (works over both HTTP and HTTPS via ingress reverse proxy)
+    let res = null;
+    try {
+      res = await fetch("/cert-hash");
+    } catch {
+      // Fallback below
+    }
+
+    if (!res || !res.ok) {
+      // 2. Fall back to port 9091 matching active protocol or HTTP
+      const proto = window.location.protocol === "https:" ? "https:" : "http:";
+      const adminUrl = `${proto}//${window.location.hostname || "127.0.0.1"}:9091/cert-hash`;
+      try {
+        res = await fetch(adminUrl);
+      } catch {
+        // Fall back to plain http
+        res = await fetch(`http://${window.location.hostname || "127.0.0.1"}:9091/cert-hash`);
+      }
+    }
+
+    if (res && res.ok) {
       const data = await res.json();
       if (data && data.cert_hash) {
         if (certInput) certInput.value = data.cert_hash;

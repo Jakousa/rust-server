@@ -56,6 +56,13 @@ spec:
   rules:
     - http:
         paths:
+          - path: /cert-hash
+            pathType: Prefix
+            backend:
+              service:
+                name: mmo-gateway
+                port:
+                  number: 9091
           - path: /
             pathType: Prefix
             backend:
