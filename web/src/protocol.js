@@ -32,6 +32,75 @@ export const INTERACTION_TYPES = {
   CUSTOM: 5,
 };
 
+export const DELTA_FLAGS = {
+  MASK_KEYFRAME: 1,
+  MASK_DELTA_POS_X: 1 << 1,
+  MASK_DELTA_POS_Y: 1 << 2,
+  MASK_DELTA_POS_Z: 1 << 3,
+  MASK_VELOCITY: 1 << 4,
+  MASK_YAW: 1 << 5,
+  MASK_PITCH: 1 << 6,
+  MASK_HEALTH: 1 << 7,
+  MASK_MAX_HEALTH: 1 << 8,
+  MASK_STATE_FLAGS: 1 << 9,
+  MASK_ACTION_ID: 1 << 10,
+  MASK_ATTRIBUTES: 1 << 11,
+};
+
+export function dequantizeDeltaI16(val) {
+  return val / 128.0;
+}
+
+export function dequantizeVelocityI16(val) {
+  return val / 100.0;
+}
+
+export function dequantizeYawU8(val) {
+  return (val / 256.0) * (2.0 * Math.PI);
+}
+
+export function dequantizePitchI8(val) {
+  const clamped = Math.max(-127, Math.min(127, val));
+  return (clamped / 127.0) * (Math.PI * 0.5);
+}
+
+/**
+ * Appends an unsigned 64-bit integer into an array as LEB128 varint bytes.
+ */
+export function putVarintU64(val, out = []) {
+  let v = BigInt(val);
+  while (v >= 0x80n) {
+    out.push(Number((v & 0x7fn) | 0x80n));
+    v >>= 7n;
+  }
+  out.push(Number(v & 0x7fn));
+  return out;
+}
+
+/**
+ * Encodes ClientPacket::ClientAck (Opcode 0x000A).
+ */
+export function encodeClientAck(sessionId, observedTick, ackMask = 0) {
+  const payloadBytes = [];
+  putVarintU64(sessionId, payloadBytes);
+  putVarintU64(observedTick, payloadBytes);
+  const mask = ackMask >>> 0;
+  payloadBytes.push(mask & 0xff);
+  payloadBytes.push((mask >> 8) & 0xff);
+  payloadBytes.push((mask >> 16) & 0xff);
+  payloadBytes.push((mask >> 24) & 0xff);
+
+  const payloadLen = payloadBytes.length;
+  const frame = new Uint8Array(8 + payloadLen);
+  const view = new DataView(frame.buffer);
+  frame[0] = 0x4d;
+  frame[1] = 0x4d;
+  view.setUint16(2, OPCODES.CLIENT_ACK, true);
+  view.setUint32(4, payloadLen, true);
+  frame.set(payloadBytes, 8);
+  return frame;
+}
+
 /**
  * Encodes ClientPacket::AuthRequest (Opcode 0x0011).
  */

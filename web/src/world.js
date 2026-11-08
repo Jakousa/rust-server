@@ -154,28 +154,143 @@ export class WorldObjectRenderer {
 
   createObjectMesh(prefabId, sx, sy, sz) {
     const group = new THREE.Group();
-
-    // Base geometry: Unit cube scaled by transform (or cylinder for well)
     const mat = this.getMaterialForPrefab(prefabId);
-    let geo;
+
+    let mainGeo;
     if (prefabId === 10) {
-      // Well: cylinder
-      geo = new THREE.CylinderGeometry(0.5, 0.5, 1.0, 16);
+      // Well: stone circular base
+      mainGeo = new THREE.CylinderGeometry(0.5, 0.55, 0.6, 16);
+    } else if (prefabId === 11) {
+      // Forge: stone masonry hearth block
+      mainGeo = new THREE.BoxGeometry(1.0, 0.6, 1.0);
+    } else if (prefabId === 12) {
+      // Stall: market counter table
+      mainGeo = new THREE.BoxGeometry(1.0, 0.5, 0.7);
+    } else if (prefabId === 13) {
+      // House: log/stone cabin body
+      mainGeo = new THREE.BoxGeometry(1.0, 0.7, 0.9);
     } else {
-      geo = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+      mainGeo = new THREE.BoxGeometry(1.0, 1.0, 1.0);
     }
 
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = new THREE.Mesh(mainGeo, mat);
+    mesh.position.y = (prefabId === 10 || prefabId === 11 || prefabId === 12 || prefabId === 13) ? 0.35 : 0.5;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     group.add(mesh);
     group.userData.mesh = mesh;
 
+    // Prefab-specific structural composite additions
+    if (prefabId === 10) {
+      // Well: 2 wooden support posts + pitched roof canopy + rope/water
+      const timberMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.8 });
+      const postGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.8, 8);
+      const postL = new THREE.Mesh(postGeo, timberMat);
+      postL.position.set(-0.35, 0.7, 0);
+      group.add(postL);
+
+      const postR = new THREE.Mesh(postGeo, timberMat);
+      postR.position.set(0.35, 0.7, 0);
+      group.add(postR);
+
+      // Peaked roof canopy
+      const roofGeo = new THREE.ConeGeometry(0.55, 0.35, 4);
+      const roofMat = new THREE.MeshStandardMaterial({ color: 0x92400e, roughness: 0.7 });
+      const roof = new THREE.Mesh(roofGeo, roofMat);
+      roof.position.set(0, 1.2, 0);
+      roof.rotation.y = Math.PI / 4;
+      group.add(roof);
+
+      // Water surface inside
+      const waterGeo = new THREE.CircleGeometry(0.42, 16);
+      const waterMat = new THREE.MeshStandardMaterial({ color: 0x0ea5e9, roughness: 0.1, metalness: 0.8 });
+      const water = new THREE.Mesh(waterGeo, waterMat);
+      water.rotation.x = -Math.PI / 2;
+      water.position.set(0, 0.45, 0);
+      group.add(water);
+    } else if (prefabId === 11) {
+      // Forge: tall chimney + glowing hearth basin + anvil
+      const stoneMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.9 });
+      const chimneyGeo = new THREE.BoxGeometry(0.3, 0.8, 0.3);
+      const chimney = new THREE.Mesh(chimneyGeo, stoneMat);
+      chimney.position.set(0.3, 0.9, -0.3);
+      group.add(chimney);
+
+      // Glowing coal basin
+      const coalGeo = new THREE.BoxGeometry(0.45, 0.15, 0.45);
+      const coalMat = new THREE.MeshStandardMaterial({
+        color: 0xea580c,
+        emissive: 0xf97316,
+        emissiveIntensity: 0.8,
+        roughness: 0.5,
+      });
+      const coals = new THREE.Mesh(coalGeo, coalMat);
+      coals.position.set(-0.15, 0.68, 0.05);
+      group.add(coals);
+
+      // Anvil block
+      const ironMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.8, roughness: 0.3 });
+      const anvilGeo = new THREE.BoxGeometry(0.22, 0.22, 0.35);
+      const anvil = new THREE.Mesh(anvilGeo, ironMat);
+      anvil.position.set(-0.45, 0.2, 0.45);
+      group.add(anvil);
+    } else if (prefabId === 12) {
+      // Stall: wooden poles + striped awning canopy + produce crates
+      const timberMat = new THREE.MeshStandardMaterial({ color: 0x854d0e, roughness: 0.8 });
+      const poleGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.8, 8);
+      [[-0.42, 0.25], [0.42, 0.25], [-0.42, -0.25], [0.42, -0.25]].forEach(([px, pz]) => {
+        const pole = new THREE.Mesh(poleGeo, timberMat);
+        pole.position.set(px, 0.75, pz);
+        group.add(pole);
+      });
+
+      // Striped awning
+      const awningGeo = new THREE.BoxGeometry(1.1, 0.08, 0.8);
+      const awningMat = new THREE.MeshStandardMaterial({ color: 0x15803d, roughness: 0.5 });
+      const awning = new THREE.Mesh(awningGeo, awningMat);
+      awning.position.set(0, 1.15, 0);
+      awning.rotation.x = 0.15;
+      group.add(awning);
+
+      // Display crates on counter
+      const crateGeo = new THREE.BoxGeometry(0.25, 0.15, 0.2);
+      const crateMat = new THREE.MeshStandardMaterial({ color: 0xa16207, roughness: 0.7 });
+      const crate1 = new THREE.Mesh(crateGeo, crateMat);
+      crate1.position.set(-0.25, 0.65, 0);
+      group.add(crate1);
+
+      const crate2 = new THREE.Mesh(crateGeo, crateMat);
+      crate2.position.set(0.2, 0.65, 0);
+      group.add(crate2);
+    } else if (prefabId === 13) {
+      // House: pitched roof with eaves + stone chimney + timber door
+      const roofGeo = new THREE.ConeGeometry(0.85, 0.55, 4);
+      const roofMat = new THREE.MeshStandardMaterial({ color: 0x9a3412, roughness: 0.7 });
+      const roof = new THREE.Mesh(roofGeo, roofMat);
+      roof.position.set(0, 1.0, 0);
+      roof.rotation.y = Math.PI / 4;
+      group.add(roof);
+
+      // Chimney
+      const chimneyGeo = new THREE.BoxGeometry(0.18, 0.6, 0.18);
+      const stoneMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.9 });
+      const chimney = new THREE.Mesh(chimneyGeo, stoneMat);
+      chimney.position.set(0.32, 1.2, -0.25);
+      group.add(chimney);
+
+      // Door
+      const doorGeo = new THREE.BoxGeometry(0.24, 0.45, 0.06);
+      const doorMat = new THREE.MeshStandardMaterial({ color: 0x451a03, roughness: 0.9 });
+      const door = new THREE.Mesh(doorGeo, doorMat);
+      door.position.set(0, 0.35, 0.46);
+      group.add(door);
+    }
+
     // Overhead health bar for destructible objects
     const barGeo = new THREE.BoxGeometry(1.0, 0.08, 0.04);
     const barMat = new THREE.MeshBasicMaterial({ color: 0x10b981 });
     const hpBar = new THREE.Mesh(barGeo, barMat);
-    hpBar.position.y = 0.8;
+    hpBar.position.y = 1.4;
     hpBar.visible = false;
     group.add(hpBar);
     group.userData.hpBar = hpBar;

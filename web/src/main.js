@@ -5,9 +5,15 @@ import { UIController } from "./ui.js";
 import {
   OPCODES,
   INTERACTION_TYPES,
+  DELTA_FLAGS,
   encodeAuthRequest,
   encodeInteraction,
   encodeMovement,
+  encodeClientAck,
+  dequantizeDeltaI16,
+  dequantizeVelocityI16,
+  dequantizeYawU8,
+  dequantizePitchI8,
   readVarintU64,
   readVarintU32,
   readVarintString,
@@ -31,6 +37,19 @@ export class ClientWorldBridge {
     this.onInteractionResultCallback = null;
     this.onAuthResponseCallback = null;
     this.onMovementCorrectionCallback = null;
+    this.onServerTickCallback = null;
+  }
+
+  onServerTick(callback) {
+    this.onServerTickCallback = callback;
+  }
+
+  clear() {
+    this.entities.clear();
+    this.worldObjects.clear();
+    this.latestServerTick = 0;
+    this.latestBaselineTick = 0;
+    this.receivedPackets = 0;
   }
 
   onMovementCorrection(callback) {
@@ -167,10 +186,219 @@ export class ClientWorldBridge {
     }
 
     // Opcode 0x0009: EntityDeltaBatch
-    if (opcode === OPCODES.ENTITY_DELTA_BATCH && view.byteLength >= 24) {
-      this.latestServerTick = Number(view.getBigUint64(8, true));
-      this.latestBaselineTick = Number(view.getBigUint64(16, true));
-      // Entity deltas are applied to replicas
+    if (opcode === OPCODES.ENTITY_DELTA_BATCH) {
+      try {
+        let offset = 8;
+        if (offset >= view.byteLength) return;
+
+        // 1. server_tick & baseline_tick (LEB128 varint u64)
+        const tickRes = readVarintU64(view, offset);
+        offset += tickRes.bytesRead;
+        const baseRes = readVarintU64(view, offset);
+        offset += baseRes.bytesRead;
+
+        this.latestServerTick = Number(tickRes.value);
+        this.latestBaselineTick = Number(baseRes.value);
+
+        if (this.onServerTickCallback) {
+          this.onServerTickCallback({
+            sessionId: this.sessionId,
+            serverTick: this.latestServerTick,
+            baselineTick: this.latestBaselineTick,
+          });
+        }
+
+        // 2. despawns (LEB128 varint u32 length, then u64 entity_ids)
+        if (offset >= view.byteLength) return;
+        const despawnLenRes = readVarintU32(view, offset);
+        offset += despawnLenRes.bytesRead;
+        const despawnCount = despawnLenRes.value;
+
+        if (despawnCount > view.byteLength) return;
+
+        for (let i = 0; i < despawnCount; i++) {
+          if (offset >= view.byteLength) break;
+          const dRes = readVarintU64(view, offset);
+          offset += dRes.bytesRead;
+          const rawId = dRes.value;
+          const entId = rawId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawId) : rawId;
+          this.entities.delete(entId);
+        }
+
+        // 3. deltas (LEB128 varint u32 length, then EntityDeltaState)
+        if (offset >= view.byteLength) return;
+        const deltaLenRes = readVarintU32(view, offset);
+        offset += deltaLenRes.bytesRead;
+        const deltaCount = deltaLenRes.value;
+
+        if (deltaCount > view.byteLength) return;
+
+        for (let i = 0; i < deltaCount; i++) {
+          if (offset >= view.byteLength) break;
+          const idRes = readVarintU64(view, offset);
+          offset += idRes.bytesRead;
+          const rawEntityId = idRes.value;
+          const entityId = rawEntityId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawEntityId) : rawEntityId;
+
+          if (offset + 2 > view.byteLength) break;
+          const mask = view.getUint16(offset, true);
+          offset += 2;
+
+          let posX = 0.0, posY = 0.0, posZ = 0.0;
+          let hasKeyframe = false;
+          let hasDeltaX = false, hasDeltaY = false, hasDeltaZ = false;
+          let deltaX = 0.0, deltaY = 0.0, deltaZ = 0.0;
+
+          if ((mask & DELTA_FLAGS.MASK_KEYFRAME) !== 0) {
+            if (offset + 12 > view.byteLength) break;
+            posX = view.getFloat32(offset, true);
+            posY = view.getFloat32(offset + 4, true);
+            posZ = view.getFloat32(offset + 8, true);
+            offset += 12;
+            hasKeyframe = true;
+          } else {
+            if ((mask & DELTA_FLAGS.MASK_DELTA_POS_X) !== 0) {
+              if (offset + 2 > view.byteLength) break;
+              deltaX = dequantizeDeltaI16(view.getInt16(offset, true));
+              offset += 2;
+              hasDeltaX = true;
+            }
+            if ((mask & DELTA_FLAGS.MASK_DELTA_POS_Y) !== 0) {
+              if (offset + 2 > view.byteLength) break;
+              deltaY = dequantizeDeltaI16(view.getInt16(offset, true));
+              offset += 2;
+              hasDeltaY = true;
+            }
+            if ((mask & DELTA_FLAGS.MASK_DELTA_POS_Z) !== 0) {
+              if (offset + 2 > view.byteLength) break;
+              deltaZ = dequantizeDeltaI16(view.getInt16(offset, true));
+              offset += 2;
+              hasDeltaZ = true;
+            }
+          }
+
+          let vx = 0.0, vy = 0.0, vz = 0.0;
+          let hasVelocity = false;
+          if ((mask & DELTA_FLAGS.MASK_VELOCITY) !== 0) {
+            if (offset + 6 > view.byteLength) break;
+            vx = dequantizeVelocityI16(view.getInt16(offset, true));
+            vy = dequantizeVelocityI16(view.getInt16(offset + 2, true));
+            vz = dequantizeVelocityI16(view.getInt16(offset + 4, true));
+            offset += 6;
+            hasVelocity = true;
+          }
+
+          let yaw = null;
+          if ((mask & DELTA_FLAGS.MASK_YAW) !== 0) {
+            if (offset >= view.byteLength) break;
+            yaw = dequantizeYawU8(view.getUint8(offset));
+            offset += 1;
+          }
+
+          let pitch = null;
+          if ((mask & DELTA_FLAGS.MASK_PITCH) !== 0) {
+            if (offset >= view.byteLength) break;
+            pitch = dequantizePitchI8(view.getInt8(offset));
+            offset += 1;
+          }
+
+          let health = null;
+          if ((mask & DELTA_FLAGS.MASK_HEALTH) !== 0) {
+            if (offset >= view.byteLength) break;
+            const hRes = readVarintU32(view, offset);
+            health = hRes.value;
+            offset += hRes.bytesRead;
+          }
+
+          let maxHealth = null;
+          if ((mask & DELTA_FLAGS.MASK_MAX_HEALTH) !== 0) {
+            if (offset >= view.byteLength) break;
+            const mhRes = readVarintU32(view, offset);
+            maxHealth = mhRes.value;
+            offset += mhRes.bytesRead;
+          }
+
+          let stateFlags = null;
+          if ((mask & DELTA_FLAGS.MASK_STATE_FLAGS) !== 0) {
+            if (offset >= view.byteLength) break;
+            const sfRes = readVarintU32(view, offset);
+            stateFlags = sfRes.value;
+            offset += sfRes.bytesRead;
+          }
+
+          let actionId = null;
+          if ((mask & DELTA_FLAGS.MASK_ACTION_ID) !== 0) {
+            if (offset >= view.byteLength) break;
+            const actRes = readVarintU32(view, offset);
+            actionId = actRes.value;
+            offset += actRes.bytesRead;
+          }
+
+          if ((mask & DELTA_FLAGS.MASK_ATTRIBUTES) !== 0) {
+            if (offset >= view.byteLength) break;
+            const attrCountRes = readVarintU32(view, offset);
+            offset += attrCountRes.bytesRead;
+            const attrCount = attrCountRes.value;
+            for (let a = 0; a < attrCount && offset < view.byteLength; a++) {
+              const aIdRes = readVarintU32(view, offset);
+              offset += aIdRes.bytesRead;
+              const aValRes = readVarintU32(view, offset);
+              offset += aValRes.bytesRead;
+            }
+          }
+
+          // Entity replica update
+          const entityType = Number((rawEntityId >> 48n) & 0xffffn);
+          let ent = this.entities.get(entityId);
+          if (!ent) {
+            ent = {
+              id: entityId,
+              x: posX,
+              y: posY,
+              z: posZ,
+              vx,
+              vy,
+              vz,
+              yaw: yaw ?? 0.0,
+              pitch: pitch ?? 0.0,
+              health: health ?? 100,
+              maxHealth: maxHealth ?? 100,
+              hpPct: (maxHealth && maxHealth > 0) ? (health ?? 100) / maxHealth : 1.0,
+              castPct: 0.0,
+              type: entityType,
+            };
+            this.entities.set(entityId, ent);
+          } else {
+            // Apply updates
+            if (hasKeyframe) {
+              ent.x = posX;
+              ent.y = posY;
+              ent.z = posZ;
+            } else {
+              if (hasDeltaX) ent.x += deltaX;
+              if (hasDeltaY) ent.y += deltaY;
+              if (hasDeltaZ) ent.z += deltaZ;
+            }
+            if (hasVelocity) {
+              ent.vx = vx;
+              ent.vy = vy;
+              ent.vz = vz;
+            }
+            if (yaw !== null) ent.yaw = yaw;
+            if (pitch !== null) ent.pitch = pitch;
+            if (health !== null) ent.health = health;
+            if (maxHealth !== null) ent.maxHealth = maxHealth;
+            if (ent.maxHealth > 0) {
+              ent.hpPct = ent.health / ent.maxHealth;
+            }
+            if (stateFlags !== null) ent.stateFlags = stateFlags;
+            if (actionId !== null) ent.actionId = actionId;
+          }
+        }
+      } catch (err) {
+        console.warn("Failed to parse EntityDeltaBatch:", err);
+      }
+      return;
     }
 
     // Opcode 0x000B: WorldObjectSpawn (LEB128 varints for object_id, prefab_id)
@@ -343,7 +571,8 @@ export class ClientWorldBridge {
    */
   getTelemetry() {
     const t = (this._telemetry ??= {});
-    t.entity_count = this.entities.size + 1;
+    const hasLocal = this.entities.has(this.localPlayerGuid);
+    t.entity_count = this.entities.size + (hasLocal ? 0 : 1);
     t.latest_server_tick = this.latestServerTick;
     t.latest_baseline_tick = this.latestBaselineTick;
     t.received_packets = this.receivedPackets;
@@ -353,6 +582,30 @@ export class ClientWorldBridge {
   getTelemetryJson() {
     return JSON.stringify(this.getTelemetry());
   }
+}
+
+/**
+ * Returns or generates a unique session token stored in sessionStorage
+ * so concurrent browser tabs authenticate as distinct characters.
+ */
+export function getOrCreateSessionToken() {
+  if (typeof window === "undefined" || !window.sessionStorage) {
+    return "guest-poc";
+  }
+  const params = new URLSearchParams(window.location.search);
+  const tokenParam = params.get("token");
+  if (tokenParam) {
+    window.sessionStorage.setItem("mmo_token", tokenParam);
+    return tokenParam;
+  }
+  let token = window.sessionStorage.getItem("mmo_token");
+  if (!token) {
+    const rand = Math.random().toString(36).substring(2, 8);
+    const ts = Date.now().toString(36);
+    token = `guest-${ts}-${rand}`;
+    window.sessionStorage.setItem("mmo_token", token);
+  }
+  return token;
 }
 
 /**
@@ -387,6 +640,14 @@ if (typeof window !== "undefined") {
   const ui = new UIController();
   const world = new ClientWorldBridge();
 
+  // Dynamic gateway host resolution
+  const host = window.location.hostname || "127.0.0.1";
+  const defaultGatewayUrl = `https://${host}:4433`;
+  const urlInput = document.getElementById("gateway-url");
+  if (urlInput && (!urlInput.value || urlInput.value.includes("127.0.0.1"))) {
+    urlInput.value = defaultGatewayUrl;
+  }
+
   // Try to load cert hash from URL parameters if provided (e.g. ?cert=aa:bb:cc...)
   const params = new URLSearchParams(window.location.search);
   const certFromUrl = params.get("cert");
@@ -395,6 +656,15 @@ if (typeof window !== "undefined") {
     if (certInput) certInput.value = certFromUrl;
   } else {
     await autoFetchCertHash();
+  }
+
+  // Auto-connect if WebTransport is supported
+  if (typeof WebTransport !== "undefined") {
+    setTimeout(() => {
+      ui.btnConnect?.click();
+    }, 150);
+  } else {
+    console.warn("WebTransport is not supported in this browser environment.");
   }
 
   let nearestTarget = null;
@@ -456,8 +726,20 @@ if (typeof window !== "undefined") {
     }
   });
 
+  // Baseline Ack Hook: Send ClientAck upon observing new server tick
+  world.onServerTick(({ sessionId, serverTick }) => {
+    if (transport.connected && sessionId) {
+      const ackPkt = encodeClientAck(sessionId, serverTick, 0);
+      transport.sendDatagram(ackPkt);
+    }
+  });
+
   transport.onStatus(({ status, error }) => {
     ui.setConnectionState(status);
+    if (status === "disconnected") {
+      world.clear();
+      renderer.clear();
+    }
     if (error) {
       console.warn("Transport status notice:", error);
     }
@@ -483,8 +765,9 @@ if (typeof window !== "undefined") {
     onConnect: async (url, certHash) => {
       try {
         await transport.connect(url, certHash);
-        // Send AuthRequest handshake upon connection
-        const authPkt = encodeAuthRequest("guest-poc", 1);
+        // Send AuthRequest handshake upon connection with isolated session token
+        const sessionToken = getOrCreateSessionToken();
+        const authPkt = encodeAuthRequest(sessionToken, 1);
         await transport.sendStream(authPkt);
 
         // Initial inventory inspection query
@@ -492,11 +775,13 @@ if (typeof window !== "undefined") {
           performInspect({ id: 0 });
         }, 200);
       } catch (err) {
-        alert("Failed to connect via WebTransport: " + err.message);
+        console.warn("Failed to connect via WebTransport:", err?.message || err);
       }
     },
     onDisconnect: async () => {
       await transport.disconnect();
+      world.clear();
+      renderer.clear();
     },
     onTogglePartitions: (visible) => renderer.setPartitionsVisible(visible),
     onToggleAoi: (visible) => renderer.setAoiVisible(visible),
