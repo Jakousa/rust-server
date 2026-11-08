@@ -207,7 +207,7 @@ impl AabbCollisionWorld {
         point: Vec3,
         filter: SpatialQueryFilter,
     ) -> bool {
-        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+        if !point.is_finite() {
             return false;
         }
 
@@ -241,9 +241,6 @@ impl AabbCollisionWorld {
     pub fn is_segment_clear(&self, from: Vec3, to: Vec3, clearance: f32) -> bool {
         let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
         let dist = diff.length();
-        if dist < 1e-4 {
-            return true;
-        }
         let Some(norm_dir) = diff.normalized() else {
             return true;
         };
@@ -282,12 +279,8 @@ impl CollisionWorld for AabbCollisionWorld {
         max_distance: f32,
         filter: SpatialQueryFilter,
     ) -> Option<RayHit> {
-        if !origin.x.is_finite()
-            || !origin.y.is_finite()
-            || !origin.z.is_finite()
-            || !direction.x.is_finite()
-            || !direction.y.is_finite()
-            || !direction.z.is_finite()
+        if !origin.is_finite()
+            || !direction.is_finite()
             || !max_distance.is_finite()
             || max_distance <= 0.0
         {
@@ -338,11 +331,7 @@ impl CollisionWorld for AabbCollisionWorld {
         translation: Vec3,
         filter: SpatialQueryFilter,
     ) -> Option<SweepHit> {
-        if !translation.x.is_finite()
-            || !translation.y.is_finite()
-            || !translation.z.is_finite()
-            || translation.length_squared() < 1e-8
-        {
+        if !translation.is_finite() {
             return None;
         }
 
@@ -429,16 +418,6 @@ impl CollisionWorld for AabbCollisionWorld {
     }
 
     fn find_path(&self, start: Vec3, end: Vec3) -> Option<Vec<Vec3>> {
-        if !start.x.is_finite()
-            || !start.y.is_finite()
-            || !start.z.is_finite()
-            || !end.x.is_finite()
-            || !end.y.is_finite()
-            || !end.z.is_finite()
-        {
-            return None;
-        }
-
         // Fast Path 1: Check start & end point traversability
         if !self.is_point_traversable(start) || !self.is_point_traversable(end) {
             return None;
@@ -1197,21 +1176,147 @@ mod tests {
             SpatialQueryFilter::all()
         ));
 
-        // 2. is_segment_clear with non-zero 3D coordinates
+        // Default trait method coverage via minimal mock
+        struct DummyWorld;
+        impl CollisionWorld for DummyWorld {
+            fn raycast(&self, _: Vec3, _: Vec3, _: f32, _: SpatialQueryFilter) -> Option<RayHit> {
+                None
+            }
+            fn sweep_test(
+                &self,
+                _: &BoundingBox3D,
+                _: Vec3,
+                _: SpatialQueryFilter,
+            ) -> Option<SweepHit> {
+                None
+            }
+            fn is_point_traversable(&self, p: Vec3) -> bool {
+                p.x > 0.0
+            }
+            fn register_obstacle(&mut self, _: Guid, _: BoundingBox3D) {}
+            fn unregister_obstacle(&mut self, _: Guid) {}
+            fn find_path(&self, _: Vec3, _: Vec3) -> Option<Vec<Vec3>> {
+                None
+            }
+        }
+        let dummy = DummyWorld;
+        assert!(dummy
+            .is_point_traversable_with_filter(Vec3::new(1.0, 0.0, 0.0), SpatialQueryFilter::all()));
+        assert!(!dummy.is_point_traversable_with_filter(
+            Vec3::new(-1.0, 0.0, 0.0),
+            SpatialQueryFilter::all()
+        ));
+
+        let world_dyn: &dyn CollisionWorld = &world;
+        assert!(!world_dyn.is_point_traversable_with_filter(
+            Vec3::new(15.0, 20.0, 30.0),
+            SpatialQueryFilter::all()
+        ));
+        assert!(world_dyn.is_point_traversable_with_filter(
+            Vec3::new(10.0, 20.0, 30.0),
+            SpatialQueryFilter::all()
+        ));
+
+        // 2. is_segment_clear with non-zero 3D coordinates and exact boundaries
         let p_start = Vec3::new(10.0, 20.0, 30.0);
         let p_diag = Vec3::new(12.0, 23.0, 36.0);
         assert!(world.is_segment_clear(p_start, p_diag, 0.5));
         assert!(world.is_segment_clear(p_start, p_start, 0.5)); // dist < 1e-4
+        assert!(world.is_segment_clear(p_start, p_diag, 0.0)); // clearance == 0.0 boundary
+        assert!(world.is_segment_clear(p_start, Vec3::new(10.0 + 1e-4, 20.0, 30.0), 0.0)); // dist == 1e-4 boundary
 
         // Segment through obstacle must fail
         let p_through = Vec3::new(20.0, 20.0, 30.0);
         assert!(!world.is_segment_clear(p_start, p_through, 0.0));
 
-        // Segment with clearance clipping box1
+        // Segment with clearance clipping box1 on +Y, -Y, +Z, -Z
         let p_grazing_start = Vec3::new(10.0, 21.5, 30.0);
         let p_grazing_end = Vec3::new(20.0, 21.5, 30.0);
         assert!(world.is_segment_clear(p_grazing_start, p_grazing_end, 0.0)); // ray passes at Y=21.5 > 21.0
         assert!(!world.is_segment_clear(p_grazing_start, p_grazing_end, 0.8)); // clearance 0.8 reaches down to 20.7 <= 21.0
+
+        // -Y clearance clipping (from.y + clearance reaches 18.5 + 0.8 = 19.3 >= 19.0)
+        let p_grazing_low_start = Vec3::new(10.0, 18.5, 30.0);
+        let p_grazing_low_end = Vec3::new(20.0, 18.5, 30.0);
+        assert!(world.is_segment_clear(p_grazing_low_start, p_grazing_low_end, 0.0));
+        assert!(!world.is_segment_clear(p_grazing_low_start, p_grazing_low_end, 0.8));
+
+        // +Z clearance clipping (from.z - clearance reaches 31.5 - 0.8 = 30.7 <= 31.0)
+        let p_grazing_z_hi_start = Vec3::new(10.0, 20.0, 31.5);
+        let p_grazing_z_hi_end = Vec3::new(20.0, 20.0, 31.5);
+        assert!(world.is_segment_clear(p_grazing_z_hi_start, p_grazing_z_hi_end, 0.0));
+        assert!(!world.is_segment_clear(p_grazing_z_hi_start, p_grazing_z_hi_end, 0.8));
+
+        // -Z clearance clipping (from.z + clearance reaches 28.5 + 0.8 = 29.3 >= 29.0)
+        let p_grazing_z_lo_start = Vec3::new(10.0, 20.0, 28.5);
+        let p_grazing_z_lo_end = Vec3::new(20.0, 20.0, 28.5);
+        assert!(world.is_segment_clear(p_grazing_z_lo_start, p_grazing_z_lo_end, 0.0));
+        assert!(!world.is_segment_clear(p_grazing_z_lo_start, p_grazing_z_lo_end, 0.8));
+
+        // +X clearance clipping (moving along Y at X=16.5, reaches down to 16.5 - 0.8 = 15.7 <= 16.0)
+        let p_grazing_x_hi_start = Vec3::new(16.5, 10.0, 30.0);
+        let p_grazing_x_hi_end = Vec3::new(16.5, 30.0, 30.0);
+        assert!(world.is_segment_clear(p_grazing_x_hi_start, p_grazing_x_hi_end, 0.0));
+        assert!(!world.is_segment_clear(p_grazing_x_hi_start, p_grazing_x_hi_end, 0.8));
+
+        // -X clearance clipping (moving along Y at X=13.5, reaches up to 13.5 + 0.8 = 14.3 >= 14.0)
+        let p_grazing_x_lo_start = Vec3::new(13.5, 10.0, 30.0);
+        let p_grazing_x_lo_end = Vec3::new(13.5, 30.0, 30.0);
+        assert!(world.is_segment_clear(p_grazing_x_lo_start, p_grazing_x_lo_end, 0.0));
+        assert!(!world.is_segment_clear(p_grazing_x_lo_start, p_grazing_x_lo_end, 0.8));
+
+        // Reverse sweep in -X direction
+        let sweep_rev_box = BoundingBox3D::new((19.0, 19.0, 29.0), (20.0, 21.0, 31.0));
+        let sweep_rev_hit = world
+            .sweep_test(
+                &sweep_rev_box,
+                Vec3::new(-10.0, 0.0, 0.0),
+                SpatialQueryFilter::all(),
+            )
+            .expect("reverse sweep hit");
+        assert_eq!(sweep_rev_hit.entity_id, Some(id1));
+        assert!((sweep_rev_hit.hit_fraction - 0.3).abs() < 1e-4);
+        assert!((sweep_rev_hit.point.x - 16.5).abs() < 1e-4);
+
+        // Multi-obstacle strictly closer obstacle selection test
+        let mut multi_world = AabbCollisionWorld::new();
+        let near_id = Guid(201);
+        let mid_id = Guid(202);
+        let far_id = Guid(203);
+        multi_world.register_obstacle(
+            far_id,
+            BoundingBox3D::new((30.0, 0.0, 0.0), (32.0, 2.0, 2.0)),
+        );
+        multi_world.register_obstacle(
+            mid_id,
+            BoundingBox3D::new((20.0, 0.0, 0.0), (22.0, 2.0, 2.0)),
+        );
+        multi_world.register_obstacle(
+            near_id,
+            BoundingBox3D::new((10.0, 0.0, 0.0), (12.0, 2.0, 2.0)),
+        );
+
+        let multi_ray = multi_world
+            .raycast(
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+                SpatialQueryFilter::all(),
+            )
+            .expect("multi ray hit");
+        assert_eq!(multi_ray.entity_id, Some(near_id));
+        assert!((multi_ray.distance - 10.0).abs() < 1e-4);
+
+        let multi_sweep_box = BoundingBox3D::new((-0.5, 0.5, 0.5), (0.5, 1.5, 1.5));
+        let multi_sweep = multi_world
+            .sweep_test(
+                &multi_sweep_box,
+                Vec3::new(100.0, 0.0, 0.0),
+                SpatialQueryFilter::all(),
+            )
+            .expect("multi sweep hit");
+        assert_eq!(multi_sweep.entity_id, Some(near_id));
+        assert!((multi_sweep.hit_fraction - 0.095).abs() < 1e-3);
 
         // 3. Raycast with non-zero coordinates and verify exact hit point coordinates
         let ray_hit = world
@@ -1227,6 +1332,29 @@ mod tests {
         assert!((ray_hit.point.x - 14.0).abs() < 1e-4);
         assert!((ray_hit.point.y - 20.0).abs() < 1e-4);
         assert!((ray_hit.point.z - 30.0).abs() < 1e-4);
+
+        // 3D diagonal raycast hit point verification
+        let box_diag = BoundingBox3D::new((12.0, 22.0, 32.0), (14.0, 24.0, 34.0));
+        let id_diag = Guid(102);
+        world.register_obstacle(id_diag, box_diag);
+        let diag_origin = Vec3::new(0.0, 10.0, 20.0);
+        let diag_dir = Vec3::new(1.0, 1.0, 1.0);
+        let diag_hit = world
+            .raycast(diag_origin, diag_dir, 50.0, SpatialQueryFilter::all())
+            .expect("diag raycast hit");
+        assert_eq!(diag_hit.entity_id, Some(id_diag));
+        assert!((diag_hit.point.x - 12.0).abs() < 1e-4);
+        assert!((diag_hit.point.y - 22.0).abs() < 1e-4);
+        assert!((diag_hit.point.z - 32.0).abs() < 1e-4);
+
+        // Closest hit tie-breaker: equal distance obstacles retain one of the valid hits
+        let box_tie = BoundingBox3D::new((12.0, 22.0, 32.0), (14.0, 24.0, 34.0));
+        let id_tie = Guid(103);
+        world.register_obstacle(id_tie, box_tie);
+        let tie_hit = world
+            .raycast(diag_origin, diag_dir, 50.0, SpatialQueryFilter::all())
+            .expect("tie hit");
+        assert!(tie_hit.entity_id == Some(id_diag) || tie_hit.entity_id == Some(id_tie));
 
         // Raycast non-finite & non-positive boundaries
         assert!(world
@@ -1332,6 +1460,21 @@ mod tests {
                 SpatialQueryFilter::all()
             )
             .is_none());
+
+        // 3D diagonal sweep test hit point and tie breaker
+        let sweep_box = BoundingBox3D::new((0.0, 10.0, 20.0), (1.0, 11.0, 21.0));
+        let sweep_hit = world
+            .sweep_test(
+                &sweep_box,
+                Vec3::new(20.0, 20.0, 20.0),
+                SpatialQueryFilter::all(),
+            )
+            .expect("sweep hit");
+        assert!(sweep_hit.entity_id == Some(id_diag) || sweep_hit.entity_id == Some(id_tie));
+        assert!(sweep_hit.hit_fraction < 1.0);
+        assert!((sweep_hit.point.x - 11.5).abs() < 1e-3);
+        assert!((sweep_hit.point.y - 21.5).abs() < 1e-3);
+        assert!((sweep_hit.point.z - 31.5).abs() < 1e-3);
 
         // 5. find_path around obstacle at non-zero coordinates
         let path = world

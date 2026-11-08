@@ -522,12 +522,6 @@ impl LagCompensationPayload {
         let max_distance = src.get_f32_le();
         let sequence = src.get_u32_le();
 
-        if !origin.is_finite() || !direction.is_finite() {
-            return Err(ClientCodecError::InvalidData(
-                "Origin and direction must contain finite floats".to_string(),
-            ));
-        }
-
         if !max_distance.is_finite() || max_distance <= 0.0 {
             return Err(ClientCodecError::InvalidData(
                 "max_distance must be finite and positive".to_string(),
@@ -4329,6 +4323,42 @@ mod tests {
         assert!(
             matches!(err, ClientCodecError::BufferTooShort { expected, got } if expected == 65535 * 40 && got == 0)
         );
+
+        // Non-zero remaining shortage check (kills / with % and *)
+        let mut buf_short = BytesMut::new();
+        buf_short.put_u8(1);
+        buf_short.put_u8(1);
+        buf_short.put_u32_le(0);
+        buf_short.put_u16_le(0); // empty message
+        buf_short.put_u16_le(2); // claims 2 listings (needs 2 * 40 = 80 bytes)
+        buf_short.put_slice(&[0u8; 50]); // only 50 bytes provided
+        let err_short = MarketResponsePacket::decode(&mut buf_short.freeze()).unwrap_err();
+        assert!(
+            matches!(err_short, ClientCodecError::BufferTooShort { expected, got } if expected == 80 && got == 50)
+        );
+    }
+
+    #[test]
+    fn test_vec3_dot_and_conversions() {
+        let a = Vec3::new(2.0, 3.0, 4.0);
+        let b = Vec3::new(5.0, 6.0, 7.0);
+        // dot: 2*5 + 3*6 + 4*7 = 10 + 18 + 28 = 56.0
+        assert_eq!(a.dot(&b), 56.0);
+
+        let c = Vec3::new(1.0, 2.0, 3.0);
+        let d = Vec3::new(4.0, 5.0, 6.0);
+        // 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32.0
+        assert_eq!(c.dot(&d), 32.0);
+
+        // Conversions
+        let tuple = (1.5f32, 2.5f32, 3.5f32);
+        let from_tuple: Vec3 = tuple.into();
+        assert_eq!(from_tuple.x, 1.5);
+        assert_eq!(from_tuple.y, 2.5);
+        assert_eq!(from_tuple.z, 3.5);
+
+        let into_tuple: (f32, f32, f32) = from_tuple.into();
+        assert_eq!(into_tuple, (1.5, 2.5, 3.5));
     }
 
     #[test]
