@@ -54,12 +54,17 @@ WebTransport mandates TLS 1.3, but **a custom domain or Let's Encrypt certificat
 ## 4. Running the Stack on the Cloud VM
 
 ### Option A: Single-Command Docker Compose (Fastest PoC Setup)
-Ideal for a single VM (`docker compose up -d --build`):
+Ideal for a single VM using pre-built images from Docker Hub (`jakousa/mmo-server` and `jakousa/mmo-web`):
+```bash
+docker compose pull
+docker compose up -d
+```
+The stack launches:
 - `postgres:16-alpine` (durable storage for characters and inventories)
-- `mmo-director` (cluster topology coordinator)
-- `mmo-village-node` (authoritative village simulation, 3 NPC villagers, village structures, and barter/trade logic)
-- `mmo-gateway` (WebTransport UDP `:4433` + TCP `:8080` + `/cert-hash` `:9091`)
-- `mmo-web` (Nginx/Vite serving the compiled `web/dist` browser client on `:80` / `:3000`)
+- `mmo-director` (cluster topology coordinator via `jakousa/mmo-server`)
+- `mmo-village-node` (authoritative village simulation, 3 NPC villagers, village structures, and barter/trade logic via `jakousa/mmo-server`)
+- `mmo-gateway` (WebTransport UDP `:4433` + TCP `:8080` + `/cert-hash` `:9091` via `jakousa/mmo-server`)
+- `mmo-web` (Nginx serving the compiled `web/dist` browser client on `:80` / `:3000` via `jakousa/mmo-web`)
 
 ### Option B: K3s / K3d Kubernetes (`k8s/overlays/local`)
 To run the full multi-pod Kubernetes topology used by the chaos and e2e test suites (multiple `mmo-node` pods, Prometheus + Grafana dashboards, PodDisruptionBudgets):
