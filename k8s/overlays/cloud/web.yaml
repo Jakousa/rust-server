@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-web
+  namespace: mmo
+  labels:
+    app: mmo-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mmo-web
+  template:
+    metadata:
+      labels:
+        app: mmo-web
+    spec:
+      containers:
+        - name: web
+          image: jakousa/mmo-web:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-web
+  namespace: mmo
+  labels:
+    app: mmo-web
+spec:
+  type: LoadBalancer
+  selector:
+    app: mmo-web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mmo-web
+  namespace: mmo
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mmo-web
+                port:
+                  number: 3000

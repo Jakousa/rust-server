@@ -40,19 +40,19 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.50, sum(rate(mmo_node_tick_duration_seconds_bucket[1m])) by (le))",
+          "expr": "max(mmo_node_tick_duration_seconds{quantile=\"0.5\"})",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.95, sum(rate(mmo_node_tick_duration_seconds_bucket[1m])) by (le))",
+          "expr": "max(mmo_node_tick_duration_seconds{quantile=\"0.95\"})",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.99, sum(rate(mmo_node_tick_duration_seconds_bucket[1m])) by (le))",
+          "expr": "max(mmo_node_tick_duration_seconds{quantile=\"0.99\"})",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -77,7 +77,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(mmo_node_tick_overruns_total[1m])) by (node_id)",
+          "expr": "sum(rate(mmo_node_tick_overruns_total[1m])) by (node_id) or on() vector(0)",
           "legendFormat": "Node {{node_id}} Overruns",
           "refId": "A"
         }
@@ -191,7 +191,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(mmo_gateway_packets_dropped_total[1m]))",
+          "expr": "sum(rate(mmo_gateway_packets_dropped_total[1m])) or on() vector(0)",
           "legendFormat": "Dropped Packets /s",
           "refId": "A"
         }
@@ -248,19 +248,19 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(mmo_migration_inbound_total[1m]))",
+          "expr": "sum(rate(mmo_migration_inbound_total[1m])) or on() vector(0)",
           "legendFormat": "Inbound /s",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(mmo_migration_outbound_total[1m]))",
+          "expr": "sum(rate(mmo_migration_outbound_total[1m])) or on() vector(0)",
           "legendFormat": "Outbound /s",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(mmo_migration_rollbacks_total[1m]))",
+          "expr": "sum(rate(mmo_migration_rollbacks_total[1m])) or on() vector(0)",
           "legendFormat": "Rollbacks /s",
           "refId": "C"
         }
