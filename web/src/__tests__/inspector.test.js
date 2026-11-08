@@ -3,15 +3,22 @@ import * as THREE from "three";
 import { PlayerControls } from "../controls.js";
 import { WorldObjectRenderer } from "../world.js";
 import { WorldRenderer, disposeHierarchy } from "../renderer.js";
-import { ClientWorldBridge } from "../main.js";
+import { ClientWorldBridge, getOrCreateSessionToken } from "../main.js";
 import { UIController } from "../ui.js";
 import { WebTransportClient } from "../transport.js";
 import {
   OPCODES,
   INTERACTION_TYPES,
+  DELTA_FLAGS,
   encodeAuthRequest,
   encodeInteraction,
   encodeMovement,
+  encodeClientAck,
+  putVarintU64,
+  dequantizeDeltaI16,
+  dequantizeVelocityI16,
+  dequantizeYawU8,
+  dequantizePitchI8,
   readVarintU64,
   readVarintU32,
 } from "../protocol.js";
@@ -947,5 +954,206 @@ describe("UIController Village HUD", () => {
 
     ui.hidePlayerTrade();
     expect(modal.style.display).toBe("none");
+  });
+});
+
+describe("EntityDeltaBatch and Protocol Extensions", () => {
+  it("encodes ClientPacket::ClientAck with 0x4D4D magic, opcode 0x000A, and correct varint payload", () => {
+    const frame = encodeClientAck(12345n, 888n, 0b101);
+    expect(frame[0]).toBe(0x4d);
+    expect(frame[1]).toBe(0x4d);
+    const view = new DataView(frame.buffer);
+    expect(view.getUint16(2, true)).toBe(OPCODES.CLIENT_ACK);
+
+    const payloadLen = view.getUint32(4, true);
+    expect(frame.length).toBe(8 + payloadLen);
+
+    // Read payload
+    const { value: sessId, bytesRead: b1 } = readVarintU64(view, 8);
+    expect(sessId).toBe(12345n);
+    const { value: obsTick, bytesRead: b2 } = readVarintU64(view, 8 + b1);
+    expect(obsTick).toBe(888n);
+    const ackMask = view.getUint32(8 + b1 + b2, true);
+    expect(ackMask).toBe(5);
+  });
+
+  it("dequantizes displacement deltas, velocities, yaw, and pitch accurately", () => {
+    // 128 units per meter
+    expect(dequantizeDeltaI16(128)).toBeCloseTo(1.0, 5);
+    expect(dequantizeDeltaI16(-256)).toBeCloseTo(-2.0, 5);
+
+    // 100 units per m/s
+    expect(dequantizeVelocityI16(550)).toBeCloseTo(5.5, 5);
+    expect(dequantizeVelocityI16(-100)).toBeCloseTo(-1.0, 5);
+
+    // 256 units per 2*PI radians
+    expect(dequantizeYawU8(0)).toBeCloseTo(0.0, 5);
+    expect(dequantizeYawU8(128)).toBeCloseTo(Math.PI, 2);
+
+    // 127 units per PI/2 radians
+    expect(dequantizePitchI8(0)).toBeCloseTo(0.0, 5);
+    expect(dequantizePitchI8(127)).toBeCloseTo(Math.PI * 0.5, 3);
+  });
+
+  it("decodes EntityDeltaBatch packet, tracks ticks, despawns entities, and reconciles keyframes and deltas", () => {
+    const bridge = new ClientWorldBridge();
+    bridge.sessionId = 999;
+    let notifiedTick = null;
+    bridge.onServerTick((info) => {
+      notifiedTick = info;
+    });
+
+    // Construct mock EntityDeltaBatch payload:
+    // header: [0x4d, 0x4d, opcode: 0x0009 (2B), payloadLen (4B)]
+    // payload:
+    //   server_tick: 50 (varint)
+    //   baseline_tick: 48 (varint)
+    //   despawns: 1 item -> entity 101n (varint)
+    //   deltas: 2 items
+    //     delta 1: entity 200n (remote player type 1), MASK_KEYFRAME (x=10, y=0, z=-15), yaw=128
+    //     delta 2: entity 300n (NPC type 2), MASK_KEYFRAME (x=0, y=0, z=0)
+    const payload = [];
+    putVarintU64(50, payload); // server_tick
+    putVarintU64(48, payload); // baseline_tick
+
+    // Despawns: 1 despawn
+    payload.push(1); // despawn_count = 1
+    putVarintU64(101, payload); // despawn entity 101
+
+    // Pre-populate entity 101 in bridge to test despawn
+    bridge.entities.set(101, { id: 101, x: 0, y: 0, z: 0 });
+
+    // Deltas: 2 deltas
+    payload.push(2); // delta_count = 2
+
+    // Delta 1: remote player GUID with type=1 in upper bits: (1n << 48n) | 200n
+    const playerGuid = (1n << 48n) | 200n;
+    putVarintU64(playerGuid, payload);
+    const mask1 = DELTA_FLAGS.MASK_KEYFRAME | DELTA_FLAGS.MASK_YAW | DELTA_FLAGS.MASK_HEALTH | DELTA_FLAGS.MASK_MAX_HEALTH;
+    payload.push(mask1 & 0xff);
+    payload.push((mask1 >> 8) & 0xff);
+    // Keyframe 3x f32
+    const f32Buf = new ArrayBuffer(12);
+    const f32View = new DataView(f32Buf);
+    f32View.setFloat32(0, 10.5, true);
+    f32View.setFloat32(4, 1.0, true);
+    f32View.setFloat32(8, -15.2, true);
+    new Uint8Array(f32Buf).forEach((b) => payload.push(b));
+    // Yaw u8 (128 -> ~PI)
+    payload.push(128);
+    // Health (varint u32)
+    payload.push(75);
+    // MaxHealth (varint u32)
+    payload.push(100);
+
+    // Delta 2: Villager NPC with type=2 in upper bits: (2n << 48n) | 300n
+    const npcGuid = (2n << 48n) | 300n;
+    putVarintU64(npcGuid, payload);
+    const mask2 = DELTA_FLAGS.MASK_KEYFRAME;
+    payload.push(mask2 & 0xff);
+    payload.push((mask2 >> 8) & 0xff);
+    f32View.setFloat32(0, -9.0, true);
+    f32View.setFloat32(4, 0.0, true);
+    f32View.setFloat32(8, -6.0, true);
+    new Uint8Array(f32Buf).forEach((b) => payload.push(b));
+
+    // Build complete frame
+    const frame = new Uint8Array(8 + payload.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.ENTITY_DELTA_BATCH, true);
+    view.setUint32(4, payload.length, true);
+    frame.set(payload, 8);
+
+    bridge.processPacket(frame);
+
+    // Assert tick update and callback
+    expect(bridge.latestServerTick).toBe(50);
+    expect(bridge.latestBaselineTick).toBe(48);
+    expect(notifiedTick).toEqual({ sessionId: 999, serverTick: 50, baselineTick: 48 });
+
+    // Assert despawn occurred
+    expect(bridge.entities.has(101)).toBe(false);
+
+    // Assert remote player replica
+    const p1 = bridge.entities.get(Number(playerGuid));
+    expect(p1).toBeDefined();
+    expect(p1.type).toBe(1); // Player
+    expect(p1.x).toBeCloseTo(10.5, 4);
+    expect(p1.y).toBeCloseTo(1.0, 4);
+    expect(p1.z).toBeCloseTo(-15.2, 4);
+    expect(p1.yaw).toBeCloseTo(Math.PI, 2);
+    expect(p1.hpPct).toBeCloseTo(0.75, 4);
+
+    // Assert NPC replica
+    const npc = bridge.entities.get(Number(npcGuid));
+    expect(npc).toBeDefined();
+    expect(npc.type).toBe(2); // Villager NPC
+    expect(npc.x).toBeCloseTo(-9.0, 4);
+    expect(npc.z).toBeCloseTo(-6.0, 4);
+
+    // Assert telemetry entity count
+    const tele = bridge.getTelemetry();
+    expect(tele.latest_server_tick).toBe(50);
+    expect(tele.latest_baseline_tick).toBe(48);
+    expect(tele.entity_count).toBeGreaterThanOrEqual(2);
+  });
+
+  it("safely handles truncated or corrupted EntityDeltaBatch packets without throwing", () => {
+    const bridge = new ClientWorldBridge();
+    const badFrame = new Uint8Array([0x4d, 0x4d, 0x09, 0x00, 0x05, 0x00, 0x00, 0x00, 0x80, 0x80]);
+    expect(() => bridge.processPacket(badFrame)).not.toThrow();
+  });
+});
+
+describe("Session Token & Multi-Session Isolation", () => {
+  beforeEach(() => {
+    const store = new Map();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (k) => store.get(k) || null,
+      setItem: (k, v) => store.set(k, String(v)),
+      clear: () => store.clear(),
+    });
+    vi.stubGlobal("window", {
+      sessionStorage: globalThis.sessionStorage,
+      location: { search: "" },
+    });
+  });
+
+  it("generates unique guest tokens per session when sessionStorage is empty", () => {
+    const token1 = getOrCreateSessionToken();
+    expect(token1).toMatch(/^guest-[a-z0-9]+-[a-z0-9]+$/);
+
+    // Same session retrieves existing token
+    const token2 = getOrCreateSessionToken();
+    expect(token2).toBe(token1);
+  });
+
+  it("prioritizes ?token= URL parameter when supplied", () => {
+    window.location.search = "?token=custom-test-agent";
+    const token = getOrCreateSessionToken();
+    expect(token).toBe("custom-test-agent");
+  });
+});
+
+describe("Spherical Orbit Camera Calculations", () => {
+  it("calculates spherical orbit camera coordinates around player position", () => {
+    const renderer = new WorldRenderer(null);
+    renderer.camera = new THREE.PerspectiveCamera();
+    renderer.orbitYaw = 0.0;
+    renderer.orbitPitch = 0.0; // horizontal
+    renderer.orbitDistance = 20.0;
+
+    const targetPos = { x: 10.0, y: 0.0, z: -5.0 };
+    renderer.updateCamera(targetPos);
+
+    // With yaw=0, pitch=0: sin(0)=0, cos(0)=1
+    // cx = target.x + 20 * 0 = 10.0
+    // cy = target.y + 1.5 + 20 * 0 = 1.5
+    // cz = target.z + 20 * 1 = 15.0
+    expect(renderer.camera.position.x).toBeCloseTo(10.0, 4);
+    expect(renderer.camera.position.y).toBeCloseTo(1.5, 4);
+    expect(renderer.camera.position.z).toBeCloseTo(15.0, 4);
   });
 });

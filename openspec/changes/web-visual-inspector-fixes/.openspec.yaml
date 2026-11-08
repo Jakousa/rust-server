@@ -1,0 +1,9 @@
+schema: spec-driven
+name: web-visual-inspector-fixes
+title: Web Visual Inspector Telemetry, Camera, Multi-Session, and Village Scene Fixes
+version: 1.0.0
+description: Fix broken telemetry metrics, camera mouse orbit/zoom controls, EntityDeltaBatch decoding, multi-session character visibility, and village visual environment.
+authors:
+  - MMO Engineering Team
+related_issues:
+  - 185

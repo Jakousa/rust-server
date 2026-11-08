@@ -21,6 +21,7 @@ export class WebTransportClient {
     this.lastPingSentTime = 0;
     this.onPacketCallback = null;
     this.onStatusCallback = null;
+    this._isConnecting = false;
   }
 
   /**
@@ -43,6 +44,11 @@ export class WebTransportClient {
    * @param {string} certHashHex - SHA-256 fingerprint in dotted or raw hex format.
    */
   async connect(url, certHashHex = "") {
+    if (this._isConnecting) {
+      return;
+    }
+    this._isConnecting = true;
+
     if (this.transport) {
       await this.disconnect();
     }
@@ -110,6 +116,8 @@ export class WebTransportClient {
       this.connected = false;
       this.notifyStatus("disconnected", err.message);
       throw err;
+    } finally {
+      this._isConnecting = false;
     }
   }
 
@@ -145,7 +153,11 @@ export class WebTransportClient {
         if (done) break;
         if (value) {
           this.trackIngress(value.byteLength);
-          this.handleIncomingPacket(value);
+          try {
+            this.handleIncomingPacket(value);
+          } catch (packetErr) {
+            console.warn("Error processing datagram packet:", packetErr);
+          }
         }
       }
     } catch (err) {
