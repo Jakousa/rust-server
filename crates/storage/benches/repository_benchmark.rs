@@ -1,24 +1,26 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use mmo_storage::db::{Database};
-use mmo_storage::repository::CharacterRepository;
+use mmo_storage::db::Database;
 use mmo_storage::models::ItemRecord;
+use mmo_storage::repository::CharacterRepository;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::runtime::Runtime;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TRADE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn benchmark(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let db = rt.block_on(async {
-        Database::connect_memory().await.unwrap()
-    });
+    let db = rt.block_on(async { Database::connect_memory().await.unwrap() });
     let repo = CharacterRepository::new(db);
 
     rt.block_on(async {
         repo.create_account("acc_1", "user").await.unwrap();
-        repo.create_character("acc_1", 1, "Char1", (0.0, 0.0, 0.0)).await.unwrap();
-        repo.create_character("acc_1", 2, "Char2", (0.0, 0.0, 0.0)).await.unwrap();
+        repo.create_character("acc_1", 1, "Char1", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        repo.create_character("acc_1", 2, "Char2", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
     });
 
     c.bench_function("execute_trade_bulk", |b| {
@@ -50,7 +52,10 @@ fn benchmark(c: &mut Criterion) {
                     }
 
                     let trade_id = format!("trade_{}", iter_idx);
-                    repo_clone.execute_trade(&trade_id, 1, 2, &items).await.unwrap();
+                    repo_clone
+                        .execute_trade(&trade_id, 1, 2, &items)
+                        .await
+                        .unwrap();
 
                     // Cleanup for next iteration
                     for item in items {

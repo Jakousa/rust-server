@@ -764,39 +764,17 @@ impl CharacterRepository {
             }
 
             // 5. Transfer items to recipient free slots
-            if !item_instance_ids.is_empty() {
-                let mut query_str = String::from("UPDATE items SET character_guid = ?, container_id = ?, updated_at = ?, slot = CASE item_instance_id ");
-
-                for _ in 0..item_instance_ids.len() {
-                    query_str.push_str("WHEN ? THEN ? ");
-                }
-
-                query_str.push_str("END WHERE item_instance_id IN (");
-
-                for i in 0..item_instance_ids.len() {
-                    if i > 0 {
-                        query_str.push_str(", ");
-                    }
-                    query_str.push('?');
-                }
-                query_str.push(')');
-
-                // Using sql_for_dialect directly because using the macro in a long-lived scope causes lifetime issues
-                let q_str = crate::db::sql_for_dialect(&query_str, false);
-                let mut query = sqlx::query(&q_str)
-                    .bind(recipient_guid as i64)
-                    .bind(recipient_guid as i64)
-                    .bind(now);
-
-                for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                    query = query.bind(item_id).bind(*target_slot as i32);
-                }
-
-                for item_id in item_instance_ids.iter() {
-                    query = query.bind(item_id);
-                }
-
-                query.execute(&mut *conn).await?;
+            for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                sqlx::query(&q!(
+                    "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                ))
+                .bind(recipient_guid as i64)
+                .bind(recipient_guid as i64)
+                .bind(*target_slot as i32)
+                .bind(now)
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
             }
 
             // 6. Record audit trail
