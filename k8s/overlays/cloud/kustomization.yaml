@@ -13,6 +13,9 @@ images:
   - name: mmo-server:local
     newName: jakousa/mmo-server
     newTag: latest
+  - name: jakousa/mmo-web
+    newName: jakousa/mmo-web
+    newTag: latest
 
 patches:
   - target:
