@@ -252,12 +252,23 @@ impl EscrowCoordinator {
             }
 
             // Constant-time comparison preventing timing attacks
-            if candidate_hash
-                .as_bytes()
-                .ct_eq(stored_hash.as_bytes())
-                .unwrap_u8()
-                != 1
-            {
+            // We manually compare in constant time, looping exactly 64 times (max hash string size)
+            // to avoid short-circuiting on differing string lengths (which acts as a timing side channel)
+            let cand_bytes = candidate_hash.as_bytes();
+            let stored_bytes = stored_hash.as_bytes();
+
+            let mut is_equal = cand_bytes.len().ct_eq(&stored_bytes.len());
+            let mut cand_padded = [0u8; 64];
+            let mut stored_padded = [0u8; 64];
+
+            for i in 0..64 {
+                cand_padded[i] = if i < cand_bytes.len() { cand_bytes[i] } else { 0 };
+                stored_padded[i] = if i < stored_bytes.len() { stored_bytes[i] } else { 0 };
+            }
+
+            is_equal &= cand_padded.ct_eq(&stored_padded);
+
+            if is_equal.unwrap_u8() != 1 {
                 return Err(StorageError::EscrowSecretMismatch(escrow_id.to_string()));
             }
 
