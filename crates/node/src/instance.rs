@@ -269,4 +269,30 @@ mod tests {
         assert!(reaped[0].1.contains(&npc1));
         assert!(mgr.is_empty());
     }
+
+    #[test]
+    fn test_is_idle_expired_boundary() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
+        let timeout = Duration::from_secs(10);
+        let mut domain = LocalInstanceDomain::new(1, 1, bounds, timeout);
+
+        let base_time = Instant::now();
+        domain.last_occupied_at = base_time;
+
+        // Ensure player_entities is empty initially
+        assert!(domain.player_entities.is_empty());
+
+        // Test strictly before timeout
+        assert!(!domain.is_idle_expired(base_time + timeout - Duration::from_nanos(1)));
+
+        // Test exactly at timeout boundary
+        assert!(domain.is_idle_expired(base_time + timeout));
+
+        // Test strictly after timeout
+        assert!(domain.is_idle_expired(base_time + timeout + Duration::from_nanos(1)));
+
+        // Test with players present (should never expire, regardless of time)
+        domain.player_entities.insert(Guid::from_raw(1));
+        assert!(!domain.is_idle_expired(base_time + timeout + Duration::from_secs(100)));
+    }
 }
