@@ -6,6 +6,8 @@ resources:
   - prometheus.yaml
   - grafana.yaml
   - web.yaml
+  - cluster-issuer.yaml
+  - middleware-redirect.yaml
 
 images:
   - name: mmo-server:local

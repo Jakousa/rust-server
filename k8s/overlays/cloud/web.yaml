@@ -52,8 +52,32 @@ kind: Ingress
 metadata:
   name: mmo-web
   namespace: mmo
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: mmo-redirect-to-https@kubernetescrd
 spec:
+  tls:
+    - hosts:
+        - rust-server.kousa.dev
+      secretName: rust-server-tls
   rules:
+    - host: rust-server.kousa.dev
+      http:
+        paths:
+          - path: /cert-hash
+            pathType: Prefix
+            backend:
+              service:
+                name: mmo-gateway
+                port:
+                  number: 9091
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mmo-web
+                port:
+                  number: 3000
     - http:
         paths:
           - path: /cert-hash
