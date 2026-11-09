@@ -1,0 +1,7 @@
+schema: 1.0.0
+change:
+  name: gitops-flux-rollout
+  title: "GitOps Automated Cluster Rollout with Flux v2"
+  issue: 188
+  author: MMO Engineering Team
+  status: draft

@@ -27,6 +27,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       schema: ${{ steps.filter.outputs.schema }}
+      k8s: ${{ steps.filter.outputs.k8s }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,9 +41,12 @@ jobs:
               - '!**.md'
               - '!openspec/**'
               - '!docs/**'
+              - '!k8s/**'
               - '!.github/dependabot.yml'
             schema:
               - 'crates/schema/**'
+            k8s:
+              - 'k8s/**'
 
   lint:
     name: Lint & Audit
@@ -211,9 +215,28 @@ jobs:
           name: mutants-report
           path: mutants.out/
 
+  k8s:
+    name: Validate Kubernetes Manifests
+    needs: [filter]
+    if: needs.filter.outputs.k8s == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Kustomize overlays
+        run: |
+          kubectl kustomize k8s/base > /dev/null
+          kubectl kustomize k8s/overlays/cloud > /dev/null
+          kubectl kustomize k8s/overlays/local > /dev/null
+          if [ -d "k8s/flux-system" ]; then
+            kubectl kustomize k8s/flux-system > /dev/null
+          fi
+          echo "All Kustomize overlays validated successfully."
+
   verify:
     name: Lint, Test & Verify
-    needs: [filter, lint, test, mutants]
+    needs: [filter, lint, test, mutants, k8s]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -226,7 +249,7 @@ jobs:
           fi
 
           # 2. Reject any failure or cancellation across all downstream jobs
-          for res in "${{ needs.lint.result }}" "${{ needs.test.result }}" "${{ needs.mutants.result }}"; do
+          for res in "${{ needs.lint.result }}" "${{ needs.test.result }}" "${{ needs.mutants.result }}" "${{ needs.k8s.result }}"; do
             if [ "$res" == "failure" ] || [ "$res" == "cancelled" ]; then
               echo "A downstream CI job failed or was cancelled (status: $res)"
               exit 1
@@ -249,6 +272,14 @@ jobs:
           if [ "${{ needs.filter.outputs.code }}" == "true" ] && [ "${{ needs.filter.outputs.schema }}" == "true" ]; then
             if [ "${{ needs.mutants.result }}" != "success" ]; then
               echo "Schema modified, but Mutation testing job did not succeed (status: ${{ needs.mutants.result }})"
+              exit 1
+            fi
+          fi
+
+          # 5. If k8s changed, k8s validation job MUST have executed and succeeded
+          if [ "${{ needs.filter.outputs.k8s }}" == "true" ]; then
+            if [ "${{ needs.k8s.result }}" != "success" ]; then
+              echo "K8s modified, but K8s validation job did not succeed (status: ${{ needs.k8s.result }})"
               exit 1
             fi
           fi

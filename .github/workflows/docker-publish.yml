@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: docker-publish-${{ github.ref }}
@@ -87,3 +87,21 @@ jobs:
           labels: ${{ steps.meta-web.outputs.labels }}
           cache-from: type=gha,scope=mmo-web
           cache-to: type=gha,mode=max,scope=mmo-web
+
+      # --- 3. GitOps Tag Pinning ---
+      - name: Update Cloud Kustomization Image Tags
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          python3 -c "
+          import re
+          path = 'k8s/overlays/cloud/kustomization.yaml'
+          with open(path) as f: content = f.read()
+          content = re.sub(r'(newName:\s*jakousa/mmo-server\s*\n\s*newTag:\s*)\S+', r'\g<1>sha-${SHORT_SHA}', content)
+          content = re.sub(r'(newName:\s*jakousa/mmo-web\s*\n\s*newTag:\s*)\S+', r'\g<1>sha-${SHORT_SHA}', content)
+          with open(path, 'w') as f: f.write(content)
+          "
+          git diff --quiet || git commit -am "chore(k8s): deploy sha-${SHORT_SHA}"
+          git push --force origin HEAD:refs/heads/deploy/cloud

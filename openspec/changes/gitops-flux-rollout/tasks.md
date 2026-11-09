@@ -1,0 +1,24 @@
+# Tasks: GitOps Continuous Delivery with Flux v2 (Issue #188)
+
+- [x] 1. Flux v2 Minimal Distribution Manifests
+  - [x] 1.1 Vendor minimal Flux v2 CRDs and controller manifests (`source-controller`, `kustomize-controller`) under `k8s/flux-system/gotk-components.yaml`
+  - [x] 1.2 Configure resource requests and limits (`requests.memory: 64Mi`, `limits.memory: 256Mi`) to protect host memory
+  - [x] 1.3 Create `GitRepository` manifest targeting `https://github.com/Jakousa/rust-server.git` on branch `deploy/cloud` with `.k8s` path filter
+  - [x] 1.4 Create `Kustomization` manifest targeting `./k8s/overlays/cloud` with `prune: true` and 2-minute interval
+- [x] 2. Deployment Hardening & Healthcheck Probes
+  - [x] 2.1 Add readiness and liveness probes to `k8s/overlays/cloud/web.yaml`
+  - [x] 2.2 Add explicit deployment rollout strategies (`RollingUpdate` on `web.yaml`/`gateway.yaml`, `Recreate` on single-instance `director.yaml`)
+  - [x] 2.3 Update `k8s/overlays/cloud/kustomization.yaml` to include image overrides for both `jakousa/mmo-server` and `jakousa/mmo-web`
+- [x] 3. CI / Rollout Automation Alignment
+  - [x] 3.1 Update `.github/workflows/docker-publish.yml` with `permissions: contents: write`
+  - [x] 3.2 Add automated GitOps tag commit step in `docker-publish.yml` setting `sha-<short_sha>` and pushing to `deploy/cloud`
+- [x] 4. Cluster Verification & End-to-End Validation
+  - [x] 4.1 Apply Flux v2 components to the remote cluster (`49.13.149.126`)
+  - [x] 4.2 Verify `source-controller` and `kustomize-controller` pods reach `Running` state within memory bounds (<100 MiB)
+  - [x] 4.3 Verify `GitRepository` successfully clones and reconciles `deploy/cloud` branch
+  - [x] 4.4 Verify `Kustomization` reports `ReconciliationSucceeded` on `mmo-cloud`
+  - [x] 4.5 Test drift detection: edit a label or annotation in `mmo` and observe Flux self-healing
+- [x] 5. Quality Gates & PR Lifecycle
+  - [x] 5.1 Run workspace checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+  - [x] 5.2 Commit and push to `feat/gitops-flux-rollout`
+  - [x] 5.3 Open PR linking to Issue #188 with auto-merge enabled
