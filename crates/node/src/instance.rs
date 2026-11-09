@@ -237,7 +237,7 @@ mod tests {
         let mut mgr = InstanceDomainManager::new();
         let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
 
-        mgr.create_instance(500, 1, bounds.clone(), Duration::from_millis(50))
+        mgr.create_instance(500, 1, bounds, Duration::from_millis(50))
             .expect("create instance");
 
         let err = mgr
