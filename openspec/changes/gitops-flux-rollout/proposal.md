@@ -8,7 +8,7 @@ Furthermore, manual cluster interventions suffer from configuration drift: chang
 ## Proposed Solution
 Deploy a minimal, lightweight **Flux v2** GitOps architecture on the cluster:
 1. **Lightweight Controller Footprint**: Install only `source-controller` and `kustomize-controller` in the `flux-system` namespace, maintaining memory usage below 120 MiB (<4% of node capacity).
-2. **Declarative Synchronization**: Establish a `GitRepository` source watching `https://github.com/Jakousa/rust-server.git` (`main` branch) and a `Kustomization` reconciliation object targeting `k8s/overlays/cloud`.
+2. **Declarative Synchronization**: Establish a `GitRepository` source watching `https://github.com/Jakousa/rust-server.git` (`deploy/cloud` delivery branch) and a `Kustomization` reconciliation object targeting `k8s/overlays/cloud`.
 3. **Automated Rollout Pipeline**:
    - Update `.github/workflows/docker-publish.yml` to tag published images with the git commit SHA (`sha-<hash>`).
    - Enable automated synchronization either via short-interval polling (1m) or webhook receiver, ensuring zero manual `kubectl` intervention for cluster updates.

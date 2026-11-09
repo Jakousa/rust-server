@@ -75,26 +75,6 @@ spec:
   policyTypes:
   - Ingress
 ---
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  labels:
-    app.kubernetes.io/instance: flux-system
-    app.kubernetes.io/part-of: flux
-    app.kubernetes.io/version: v2.10.0
-  name: critical-pods-flux-system
-  namespace: flux-system
-spec:
-  hard:
-    pods: "1000"
-  scopeSelector:
-    matchExpressions:
-    - operator: In
-      scopeName: PriorityClass
-      values:
-      - system-node-critical
-      - system-cluster-critical
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -2685,7 +2665,6 @@ spec:
           name: tmp
       nodeSelector:
         kubernetes.io/os: linux
-      priorityClassName: system-cluster-critical
       securityContext:
         fsGroup: 1337
       serviceAccountName: source-controller
@@ -3602,7 +3581,6 @@ spec:
           name: temp
       nodeSelector:
         kubernetes.io/os: linux
-      priorityClassName: system-cluster-critical
       securityContext:
         fsGroup: 1337
       serviceAccountName: kustomize-controller

@@ -7,7 +7,7 @@ spec:
   interval: 2m0s
   url: https://github.com/Jakousa/rust-server.git
   ref:
-    branch: main
+    branch: deploy/cloud
   ignore: |
     # Exclude non-k8s directories to minimize artifact tarball generation
     /*
@@ -26,5 +26,20 @@ spec:
     kind: GitRepository
     name: rust-server
   targetNamespace: mmo
+  timeout: 3m0s
+  wait: true
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 10m0s
+  path: "./k8s/flux-system"
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: rust-server
   timeout: 3m0s
   wait: true
