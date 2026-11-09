@@ -146,7 +146,8 @@ impl EscrowCoordinator {
             }
 
             // 3. Move items into escrow container
-            for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+            // Verify all items belong to the depositor container
+            for item_id in item_instance_ids.iter() {
                 let item_sql = format!(
                     "SELECT container_id FROM items WHERE item_instance_id = ?{}",
                     lock_suffix!()
@@ -173,16 +174,54 @@ impl EscrowCoordinator {
                         ));
                     }
                 }
+            }
 
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
-                ))
-                .bind(escrow_container_id as i64)
-                .bind(*target_slot as i32)
-                .bind(now_secs)
-                .bind(item_id)
-                .execute(&mut *conn)
-                .await?;
+            if !item_instance_ids.is_empty() {
+                if is_pg {
+                    let mut sql = format!("UPDATE items AS i SET container_id = {}, updated_at = {}, slot = v.slot FROM (VALUES ", escrow_container_id, now_secs);
+                    let mut param_idx = 1;
+                    for (i, _) in item_instance_ids.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&format!(
+                            "(${param_idx}::text, ${}::integer)",
+                            param_idx + 1
+                        ));
+                        param_idx += 2;
+                    }
+                    sql.push_str(") AS v(id, slot) WHERE i.item_instance_id = v.id");
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                        query = query.bind(item_id);
+                        query = query.bind(*target_slot as i32);
+                    }
+                    query.execute(&mut *conn).await?;
+                } else {
+                    let mut sql = format!("UPDATE items SET container_id = {}, updated_at = {}, slot = CASE item_instance_id ", escrow_container_id, now_secs);
+                    for _ in item_instance_ids {
+                        sql.push_str("WHEN ? THEN ? ");
+                    }
+                    sql.push_str("END WHERE item_instance_id IN (");
+                    for (i, _) in item_instance_ids.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push('?');
+                    }
+                    sql.push(')');
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
+                        query = query.bind(item_id);
+                        query = query.bind(*target_slot as i32);
+                    }
+                    for item_id in item_instance_ids {
+                        query = query.bind(item_id);
+                    }
+                    query.execute(&mut *conn).await?;
+                }
             }
 
             // 4. Insert escrow record
@@ -296,17 +335,55 @@ impl EscrowCoordinator {
                 return Err(StorageError::ContainerFull(ben_cid as u64, ben_cap as u32));
             }
 
-            for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-                let item_id: String = item_row.try_get("item_instance_id")?;
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
-                ))
-                .bind(ben_cid)
-                .bind(*target_slot as i32)
-                .bind(now_secs)
-                .bind(&item_id)
-                .execute(&mut *conn)
-                .await?;
+            if !escrow_items.is_empty() {
+                if is_pg {
+                    let mut sql = format!("UPDATE items AS i SET container_id = {}, updated_at = {}, slot = v.slot FROM (VALUES ", ben_cid, now_secs);
+                    let mut param_idx = 1;
+                    for (i, _) in escrow_items.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&format!(
+                            "(${param_idx}::text, ${}::integer)",
+                            param_idx + 1
+                        ));
+                        param_idx += 2;
+                    }
+                    sql.push_str(") AS v(id, slot) WHERE i.item_instance_id = v.id");
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id);
+                        query = query.bind(*target_slot as i32);
+                    }
+                    query.execute(&mut *conn).await?;
+                } else {
+                    let mut sql = format!("UPDATE items SET container_id = {}, updated_at = {}, slot = CASE item_instance_id ", ben_cid, now_secs);
+                    for _ in escrow_items.iter() {
+                        sql.push_str("WHEN ? THEN ? ");
+                    }
+                    sql.push_str("END WHERE item_instance_id IN (");
+                    for (i, _) in escrow_items.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push('?');
+                    }
+                    sql.push(')');
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id.clone());
+                        query = query.bind(*target_slot as i32);
+                    }
+                    for item_row in escrow_items.iter() {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id);
+                    }
+                    query.execute(&mut *conn).await?;
+                }
             }
 
             sqlx::query(&q!(
@@ -380,17 +457,55 @@ impl EscrowCoordinator {
                 return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
             }
 
-            for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
-                let item_id: String = item_row.try_get("item_instance_id")?;
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
-                ))
-                .bind(dep_cid)
-                .bind(*target_slot as i32)
-                .bind(now_secs)
-                .bind(&item_id)
-                .execute(&mut *conn)
-                .await?;
+            if !escrow_items.is_empty() {
+                if is_pg {
+                    let mut sql = format!("UPDATE items AS i SET container_id = {}, updated_at = {}, slot = v.slot FROM (VALUES ", dep_cid, now_secs);
+                    let mut param_idx = 1;
+                    for (i, _) in escrow_items.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&format!(
+                            "(${param_idx}::text, ${}::integer)",
+                            param_idx + 1
+                        ));
+                        param_idx += 2;
+                    }
+                    sql.push_str(") AS v(id, slot) WHERE i.item_instance_id = v.id");
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id);
+                        query = query.bind(*target_slot as i32);
+                    }
+                    query.execute(&mut *conn).await?;
+                } else {
+                    let mut sql = format!("UPDATE items SET container_id = {}, updated_at = {}, slot = CASE item_instance_id ", dep_cid, now_secs);
+                    for _ in escrow_items.iter() {
+                        sql.push_str("WHEN ? THEN ? ");
+                    }
+                    sql.push_str("END WHERE item_instance_id IN (");
+                    for (i, _) in escrow_items.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push('?');
+                    }
+                    sql.push(')');
+
+                    let mut query = sqlx::query(&sql);
+                    for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id.clone());
+                        query = query.bind(*target_slot as i32);
+                    }
+                    for item_row in escrow_items.iter() {
+                        let item_id: String = item_row.try_get("item_instance_id")?;
+                        query = query.bind(item_id);
+                    }
+                    query.execute(&mut *conn).await?;
+                }
             }
 
             sqlx::query(&q!(
