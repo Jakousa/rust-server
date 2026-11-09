@@ -123,7 +123,7 @@ jobs:
         if: steps.pkg_filter.outputs.skip != 'true'
         uses: arduino/setup-protoc@v3
         with:
-          version: '25.x'
+          version: '25.1'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust toolchain
