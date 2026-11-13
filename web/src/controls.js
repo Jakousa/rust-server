@@ -13,9 +13,9 @@ export class PlayerControls {
       space: false,
     };
 
-    this.position = { x: 0.0, y: 0.0, z: 0.0 };
+    this.position = { x: 0.0, y: 0.0, z: 5.0 };
     this.yaw = 0.0;
-    this.speed = 10.0; // units/sec
+    this.speed = 7.5; // units/sec (comfortable headroom below server 10.0 m/s cap)
     this.turnSpeed = 2.5; // rad/sec
     this.sequence = 1;
     this.onCastCallback = null;

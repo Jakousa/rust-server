@@ -183,6 +183,14 @@ describe("PlayerControls", () => {
     expect(s2.sequence).toBe(2);
     expect(s3.sequence).toBe(3);
   });
+
+  it("initializes at unobstructed plaza spawn (0, 0, 5) with speed headroom below 10.0 m/s", () => {
+    const controls = new PlayerControls();
+    expect(controls.position).toEqual({ x: 0.0, y: 0.0, z: 5.0 });
+    expect(controls.speed).toBeGreaterThan(0.0);
+    expect(controls.speed).toBeLessThan(10.0);
+    expect(controls.speed).toBe(7.5);
+  });
 });
 
 describe("WorldObjectRenderer", () => {
@@ -1209,6 +1217,55 @@ describe("EntityDeltaBatch and Protocol Extensions", () => {
     const bridge = new ClientWorldBridge();
     const badFrame = new Uint8Array([0x4d, 0x4d, 0x09, 0x00, 0x05, 0x00, 0x00, 0x00, 0x80, 0x80]);
     expect(() => bridge.processPacket(badFrame)).not.toThrow();
+  });
+
+  it("invokes onLocalPlayerKeyframe when EntityDeltaBatch contains localPlayerGuid", () => {
+    const bridge = new ClientWorldBridge();
+    const localGuid = (1n << 48n) | 77n;
+    bridge.localPlayerGuid = Number(localGuid);
+
+    let keyframe = null;
+    bridge.onLocalPlayerKeyframe((state) => {
+      keyframe = state;
+    });
+
+    const payload = [];
+    const pushVarint = (val) => {
+      let v = BigInt(val);
+      while (v >= 0x80n) {
+        payload.push(Number((v & 0x7fn) | 0x80n));
+        v >>= 7n;
+      }
+      payload.push(Number(v));
+    };
+
+    pushVarint(1); // server_tick
+    pushVarint(0); // baseline_tick
+    pushVarint(0); // despawn_count
+    pushVarint(1); // delta_count
+    pushVarint(localGuid);
+    payload.push(DELTA_FLAGS.MASK_KEYFRAME & 0xff, (DELTA_FLAGS.MASK_KEYFRAME >> 8) & 0xff);
+    const f32Buf = new ArrayBuffer(12);
+    const f32View = new DataView(f32Buf);
+    f32View.setFloat32(0, 0.0, true);
+    f32View.setFloat32(4, 0.0, true);
+    f32View.setFloat32(8, 5.0, true);
+    new Uint8Array(f32Buf).forEach((b) => payload.push(b));
+
+    const frame = new Uint8Array(8 + payload.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.ENTITY_DELTA_BATCH, true);
+    view.setUint32(4, payload.length, true);
+    frame.set(payload, 8);
+
+    bridge.processPacket(frame);
+
+    expect(keyframe).not.toBeNull();
+    expect(keyframe.x).toBeCloseTo(0.0, 4);
+    expect(keyframe.y).toBeCloseTo(0.0, 4);
+    expect(keyframe.z).toBeCloseTo(5.0, 4);
   });
 });
 

@@ -233,6 +233,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_instance_already_exists() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        mgr.create_instance(500, 1, bounds, Duration::from_millis(50))
+            .expect("create instance");
+
+        let err = mgr
+            .create_instance(500, 2, bounds, Duration::from_millis(100))
+            .expect_err("should fail to create duplicate instance");
+
+        assert_eq!(err, NodeInstanceError::AlreadyExists(500));
+    }
+
+    #[test]
     fn test_node_instance_lifecycle_and_entity_membership() {
         let mut mgr = InstanceDomainManager::new();
         let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
@@ -268,5 +283,81 @@ mod tests {
         assert_eq!(reaped[0].0, 500);
         assert!(reaped[0].1.contains(&npc1));
         assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn test_assign_entity_errors() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let instance_id_1 = 100;
+        let instance_id_2 = 200;
+        mgr.create_instance(instance_id_1, 1, bounds, Duration::from_millis(50))
+            .expect("create instance 1");
+        mgr.create_instance(instance_id_2, 1, bounds, Duration::from_millis(50))
+            .expect("create instance 2");
+
+        let entity_guid = Guid::from_raw(1);
+
+        // 1. Assign to non-existent instance
+        let non_existent_instance = 999;
+        let res = mgr.assign_entity(entity_guid, non_existent_instance, false);
+        assert_eq!(res, Err(NodeInstanceError::NotFound(non_existent_instance)));
+
+        // 2. Successful assignment
+        assert!(mgr.assign_entity(entity_guid, instance_id_1, false).is_ok());
+
+        // 3. Assign to a different instance should fail with EntityAlreadyInInstance
+        let res = mgr.assign_entity(entity_guid, instance_id_2, false);
+        assert_eq!(
+            res,
+            Err(NodeInstanceError::EntityAlreadyInInstance(
+                entity_guid,
+                instance_id_1
+            ))
+        );
+
+        // 4. Assigning to the same instance again should succeed (idempotent)
+        assert!(mgr.assign_entity(entity_guid, instance_id_1, false).is_ok());
+    }
+
+    #[test]
+    fn test_teardown_instance() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        // Create an instance
+        mgr.create_instance(999, 1, bounds, Duration::from_secs(60))
+            .expect("create instance");
+
+        // Add some entities
+        let p1 = Guid::from_raw(111);
+        let npc1 = Guid::from_raw(222);
+
+        mgr.assign_entity(p1, 999, true).unwrap();
+        mgr.assign_entity(npc1, 999, false).unwrap();
+
+        // Verify state before teardown
+        assert_eq!(mgr.len(), 1);
+        assert_eq!(mgr.get_entity_instance(p1), Some(999));
+        assert_eq!(mgr.get_entity_instance(npc1), Some(999));
+
+        // Test Success Path
+        let evicted = mgr.teardown_instance(999).unwrap();
+
+        // Verify return value
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&p1));
+        assert!(evicted.contains(&npc1));
+
+        // Verify state after teardown
+        assert!(mgr.is_empty());
+        assert!(mgr.get_instance(999).is_none());
+        assert_eq!(mgr.get_entity_instance(p1), None);
+        assert_eq!(mgr.get_entity_instance(npc1), None);
+
+        // Test Error Path
+        let result = mgr.teardown_instance(1000);
+        assert_eq!(result, Err(NodeInstanceError::NotFound(1000)));
     }
 }
