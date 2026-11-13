@@ -639,6 +639,11 @@ impl EntityStatePacket {
         let velocity = Vec3::decode(src)?;
         let yaw = src.get_f32_le();
         let pitch = src.get_f32_le();
+        if !yaw.is_finite() || !pitch.is_finite() {
+            return Err(ClientCodecError::InvalidData(
+                "Non-finite rotation float in EntityStatePacket".to_string(),
+            ));
+        }
         let health = src.get_u32_le();
         let max_health = src.get_u32_le();
         let state_flags = src.get_u32_le();
@@ -874,13 +879,8 @@ impl EntityDeltaState {
 
         let mut position = (0.0, 0.0, 0.0);
         if field_mask & delta_flags::MASK_KEYFRAME != 0 {
-            if src.remaining() < 12 {
-                return Err(ClientCodecError::BufferTooShort {
-                    expected: 12,
-                    got: src.remaining(),
-                });
-            }
-            position = (src.get_f32_le(), src.get_f32_le(), src.get_f32_le());
+            let v = Vec3::decode(src)?;
+            position = (v.x, v.y, v.z);
         } else {
             if field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
                 if src.remaining() < 2 {
@@ -1110,6 +1110,12 @@ impl ClientAckPacket {
     }
 }
 
+/// Maximum allowed byte length for a variable-length UTF-8 string decoded from the wire.
+pub const MAX_WIRE_STRING_LEN: usize = 4096;
+
+/// Maximum allowed number of entries in a decoded property map to prevent hash-flooding DoS.
+pub const MAX_PROPERTIES_PER_MAP: usize = 128;
+
 fn put_string(dst: &mut BytesMut, s: &str) {
     put_varint_u32(dst, s.len() as u32);
     dst.extend_from_slice(s.as_bytes());
@@ -1117,6 +1123,11 @@ fn put_string(dst: &mut BytesMut, s: &str) {
 
 fn get_string(src: &mut impl Buf) -> Result<String, ClientCodecError> {
     let len = get_varint_u32(src)? as usize;
+    if len > MAX_WIRE_STRING_LEN {
+        return Err(ClientCodecError::InvalidData(format!(
+            "String length {len} exceeds maximum allowed {MAX_WIRE_STRING_LEN}"
+        )));
+    }
     if src.remaining() < len {
         return Err(ClientCodecError::BufferTooShort {
             expected: len,
@@ -1138,13 +1149,18 @@ fn put_property_map(dst: &mut BytesMut, map: &HashMap<String, String>) {
 
 fn get_property_map(src: &mut impl Buf) -> Result<HashMap<String, String>, ClientCodecError> {
     let count = get_varint_u32(src)? as usize;
+    if count > MAX_PROPERTIES_PER_MAP {
+        return Err(ClientCodecError::InvalidData(format!(
+            "Property map entry count {count} exceeds maximum allowed {MAX_PROPERTIES_PER_MAP}"
+        )));
+    }
     if count > src.remaining() / 2 {
         return Err(ClientCodecError::BufferTooShort {
             expected: count * 2,
             got: src.remaining(),
         });
     }
-    let mut map = HashMap::with_capacity(count.min(1024));
+    let mut map = HashMap::with_capacity(count);
     for _ in 0..count {
         let k = get_string(src)?;
         let v = get_string(src)?;
@@ -1214,32 +1230,21 @@ impl WorldObjectSpawnPacket {
                 got: src.remaining(),
             });
         }
-        let pos = Vec3 {
-            x: src.get_f32_le(),
-            y: src.get_f32_le(),
-            z: src.get_f32_le(),
-        };
+        let pos = Vec3::decode(src)?;
         let rot = (
             src.get_f32_le(),
             src.get_f32_le(),
             src.get_f32_le(),
             src.get_f32_le(),
         );
-        let scale = Vec3 {
-            x: src.get_f32_le(),
-            y: src.get_f32_le(),
-            z: src.get_f32_le(),
-        };
-        let bounds_min = Vec3 {
-            x: src.get_f32_le(),
-            y: src.get_f32_le(),
-            z: src.get_f32_le(),
-        };
-        let bounds_max = Vec3 {
-            x: src.get_f32_le(),
-            y: src.get_f32_le(),
-            z: src.get_f32_le(),
-        };
+        if !rot.0.is_finite() || !rot.1.is_finite() || !rot.2.is_finite() || !rot.3.is_finite() {
+            return Err(ClientCodecError::InvalidData(
+                "Non-finite quaternion float in WorldObjectSpawnPacket".to_string(),
+            ));
+        }
+        let scale = Vec3::decode(src)?;
+        let bounds_min = Vec3::decode(src)?;
+        let bounds_max = Vec3::decode(src)?;
         let state_flags = get_varint_u32(src)?;
         if src.remaining() < 1 {
             return Err(ClientCodecError::BufferTooShort {
@@ -5427,5 +5432,121 @@ mod tests {
                 .expect_err(&format!("field {field_idx} as NaN must be rejected"));
             assert!(matches!(err, ClientCodecError::InvalidData(_)));
         }
+    }
+
+    #[test]
+    fn test_entity_state_packet_rejects_non_finite_yaw_pitch() {
+        for (yaw, pitch) in [
+            (f32::NAN, 0.0),
+            (0.0, f32::NAN),
+            (f32::INFINITY, 0.0),
+            (0.0, f32::NEG_INFINITY),
+        ] {
+            let pkt = EntityStatePacket {
+                entity_id: 1,
+                position: Vec3::ZERO,
+                velocity: Vec3::ZERO,
+                yaw,
+                pitch,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                timestamp: 1,
+            };
+            let mut buf = BytesMut::new();
+            pkt.encode(&mut buf);
+            let err = EntityStatePacket::decode(&mut buf.freeze())
+                .expect_err("non-finite yaw/pitch must be rejected");
+            assert!(matches!(err, ClientCodecError::InvalidData(_)));
+        }
+    }
+
+    #[test]
+    fn test_entity_delta_state_rejects_non_finite_keyframe_position() {
+        for bad_pos in [
+            (f32::NAN, 0.0, 0.0),
+            (0.0, f32::INFINITY, 0.0),
+            (0.0, 0.0, f32::NEG_INFINITY),
+        ] {
+            let delta = EntityDeltaState {
+                entity_id: 42,
+                field_mask: delta_flags::MASK_KEYFRAME,
+                position: bad_pos,
+                ..Default::default()
+            };
+
+            let mut buf = BytesMut::new();
+            delta.encode(&mut buf);
+            let err = EntityDeltaState::decode(&mut buf.freeze())
+                .expect_err("non-finite keyframe position must be rejected");
+            assert!(matches!(err, ClientCodecError::InvalidData(_)));
+        }
+    }
+
+    #[test]
+    fn test_world_object_spawn_packet_rejects_non_finite_fields() {
+        for field_idx in 0..16 {
+            let mut floats = [1.0f32; 16];
+            floats[field_idx] = if field_idx % 2 == 0 {
+                f32::NAN
+            } else {
+                f32::INFINITY
+            };
+
+            let mut buf = BytesMut::new();
+            put_varint_u64(&mut buf, 100); // object_id
+            put_varint_u32(&mut buf, 7); // prefab_id
+            for f in floats {
+                buf.put_f32_le(f);
+            }
+            put_varint_u32(&mut buf, 0); // state_flags
+            buf.put_u8(0); // owner_type
+            put_string(&mut buf, "sys"); // owner_id
+            buf.put_u8(0); // has_health
+            put_property_map(&mut buf, &HashMap::new());
+            put_varint_u64(&mut buf, 1); // revision
+
+            let err = WorldObjectSpawnPacket::decode(&mut buf.freeze())
+                .expect_err(&format!("field {field_idx} non-finite must be rejected"));
+            assert!(matches!(err, ClientCodecError::InvalidData(_)));
+        }
+    }
+
+    #[test]
+    fn test_get_string_and_get_property_map_enforce_caps() {
+        // String exceeding MAX_WIRE_STRING_LEN is rejected
+        let mut too_long = BytesMut::new();
+        put_varint_u32(&mut too_long, (MAX_WIRE_STRING_LEN + 1) as u32);
+        too_long.put_bytes(b'a', MAX_WIRE_STRING_LEN + 1);
+        let err = get_string(&mut too_long.freeze())
+            .expect_err("string longer than MAX_WIRE_STRING_LEN must be rejected");
+        assert!(matches!(err, ClientCodecError::InvalidData(_)));
+
+        // String at exact MAX_WIRE_STRING_LEN succeeds
+        let mut exact_len = BytesMut::new();
+        put_varint_u32(&mut exact_len, MAX_WIRE_STRING_LEN as u32);
+        exact_len.put_bytes(b'a', MAX_WIRE_STRING_LEN);
+        let decoded = get_string(&mut exact_len.freeze()).expect("exact limit should succeed");
+        assert_eq!(decoded.len(), MAX_WIRE_STRING_LEN);
+
+        // Property map exceeding MAX_PROPERTIES_PER_MAP is rejected even with valid payload bytes
+        let mut too_many = BytesMut::new();
+        put_varint_u32(&mut too_many, (MAX_PROPERTIES_PER_MAP + 1) as u32);
+        for _ in 0..=(MAX_PROPERTIES_PER_MAP * 2 + 1) {
+            too_many.put_u8(0);
+        }
+        let err = get_property_map(&mut too_many.freeze())
+            .expect_err("property map exceeding MAX_PROPERTIES_PER_MAP must be rejected");
+        assert!(matches!(err, ClientCodecError::InvalidData(_)));
+
+        // Property map at exact MAX_PROPERTIES_PER_MAP succeeds
+        let mut exact_map = HashMap::new();
+        for i in 0..MAX_PROPERTIES_PER_MAP {
+            exact_map.insert(format!("k{i}"), "v".to_string());
+        }
+        let mut buf = BytesMut::new();
+        put_property_map(&mut buf, &exact_map);
+        let decoded_map = get_property_map(&mut buf.freeze()).expect("exact map limit should pass");
+        assert_eq!(decoded_map.len(), MAX_PROPERTIES_PER_MAP);
     }
 }

@@ -104,9 +104,12 @@ impl TimedAction {
         self.progress()
     }
 
-    /// Returns `true` if the action has completed its elapsed duration.
+    /// Returns `true` if the action has completed its elapsed duration
+    /// (or if `duration_sec` is zero, negative, or non-finite).
     pub fn is_finished(&self) -> bool {
-        self.elapsed_sec >= self.duration_sec
+        self.duration_sec <= 0.0
+            || !self.duration_sec.is_finite()
+            || self.elapsed_sec >= self.duration_sec
     }
 }
 
@@ -419,6 +422,9 @@ impl CooldownTracker {
 
     /// Advances cooldown timers by `dt_sec`, removing expired entries.
     pub fn tick(&mut self, dt_sec: f32) {
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return;
+        }
         if self.gcd_remaining_sec > 0.0 {
             self.gcd_remaining_sec = (self.gcd_remaining_sec - dt_sec).max(0.0);
         }
@@ -780,5 +786,34 @@ mod tests {
         let mut nan_elapsed = TimedAction::new(1, 2.0, ActionInterruptFlags::default(), None);
         nan_elapsed.elapsed_sec = f32::NAN;
         assert_eq!(nan_elapsed.progress(), 0.0);
+    }
+
+    #[test]
+    fn test_timed_action_is_finished_and_cooldown_tick_non_finite() {
+        let mut inf_dur = TimedAction::new(1, f32::INFINITY, ActionInterruptFlags::default(), None);
+        assert!(inf_dur.is_finished());
+
+        inf_dur.duration_sec = f32::NAN;
+        assert!(inf_dur.is_finished());
+
+        inf_dur.duration_sec = 0.0;
+        assert!(inf_dur.is_finished());
+
+        inf_dur.duration_sec = -1.0;
+        assert!(inf_dur.is_finished());
+
+        let mut normal = TimedAction::new(1, 2.0, ActionInterruptFlags::default(), None);
+        assert!(!normal.is_finished());
+        normal.elapsed_sec = 2.0;
+        assert!(normal.is_finished());
+
+        let mut tracker = CooldownTracker::new();
+        tracker.start_cooldown(10, 5.0, 1.5);
+        for bad_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            tracker.tick(bad_dt);
+            assert!(tracker.is_on_cooldown(10));
+            assert_eq!(tracker.ability_cooldowns.get(&10).copied(), Some(5.0));
+            assert_eq!(tracker.gcd_remaining_sec, 1.5);
+        }
     }
 }

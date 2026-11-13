@@ -327,11 +327,17 @@ impl Octree {
     }
 
     /// Creates a new empty `Octree` with custom leaf capacity and merge thresholds.
+    ///
+    /// Clamps `max_entities_per_leaf` to at least `1` and `min_entities_to_merge` strictly
+    /// below `max_entities_per_leaf` to prevent immediate subdivision or subdivide/merge thrashing.
     pub fn with_config(
         bounds: BoundingBox3D,
         max_entities_per_leaf: usize,
         min_entities_to_merge: usize,
     ) -> Self {
+        let max_entities_per_leaf = max_entities_per_leaf.max(1);
+        let min_entities_to_merge =
+            min_entities_to_merge.min(max_entities_per_leaf.saturating_sub(1));
         Self {
             bounds,
             node: OctreeNode::Leaf {
@@ -1232,5 +1238,32 @@ mod tests {
         // Outside point in corner
         assert_eq!(bbox.clamp_point((13.0, 14.0, 10.0)), (10.0, 10.0, 10.0));
         assert_eq!(bbox.distance_to_point((13.0, 14.0, 10.0)), 5.0); // 3-4-5 triangle
+    }
+
+    #[test]
+    fn test_octree_with_config_clamps_degenerate_thresholds() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut tree = Octree::with_config(bounds, 0, 10);
+        assert_eq!(tree.max_entities_per_leaf, 1);
+        assert_eq!(tree.min_entities_to_merge, 0);
+
+        // First entity fits in root leaf without immediate recursive subdivision
+        assert!(tree.insert(make_guid(1), (10.0, 10.0, 10.0)));
+        assert!(matches!(tree.node, OctreeNode::Leaf { .. }));
+        assert_eq!(tree.len(), 1);
+
+        // Second entity subdivides cleanly
+        assert!(tree.insert(make_guid(2), (80.0, 80.0, 80.0)));
+        assert!(matches!(tree.node, OctreeNode::Branch { .. }));
+        assert_eq!(tree.len(), 2);
+
+        // Removing one leaves 1 entity (> min_entities_to_merge=0), no thrashing
+        assert!(tree.remove(make_guid(1), (10.0, 10.0, 10.0)));
+        assert!(matches!(tree.node, OctreeNode::Branch { .. }));
+
+        // Removing final entity merges back to leaf
+        assert!(tree.remove(make_guid(2), (80.0, 80.0, 80.0)));
+        assert!(matches!(tree.node, OctreeNode::Leaf { .. }));
+        assert_eq!(tree.len(), 0);
     }
 }
