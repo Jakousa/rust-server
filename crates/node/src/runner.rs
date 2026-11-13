@@ -84,11 +84,13 @@ pub async fn run_node_daemon_with_sim(
         (None, None)
     };
 
+    let input_tx = tick_sim.input_sender();
+    let ghost_store = tick_sim.ghost_store.clone();
     let sim = Arc::new(RwLock::new(tick_sim));
 
     // 1. Start gRPC NodeService server with graceful shutdown support
     let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let node_service = NodeServiceImpl::new(Arc::clone(&sim));
+    let node_service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
     let grpc_handle = tokio::spawn(async move {
         println!(
             "[Node {}] gRPC service listening on {}",

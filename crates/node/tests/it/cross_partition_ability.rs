@@ -87,10 +87,11 @@ async fn create_node(
     Arc<tokio::sync::RwLock<TickSimulation>>,
     std::net::SocketAddr,
 ) {
-    let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
-        node_id, bounds,
-    )));
-    let service = NodeServiceImpl::new(Arc::clone(&sim));
+    let tick_sim = TickSimulation::new(node_id, bounds);
+    let input_tx = tick_sim.input_sender();
+    let ghost_store = tick_sim.ghost_store.clone();
+    let sim = Arc::new(tokio::sync::RwLock::new(tick_sim));
+    let service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

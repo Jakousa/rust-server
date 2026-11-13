@@ -137,7 +137,7 @@ impl WorldObjectWriteBehindSnapshotter {
     /// and immediately notifies the background flusher.
     pub fn mark_dirty(&self, record: WorldObjectRecord) -> bool {
         let guid = Guid(record.object_id);
-        let mut map = self.dirty_map.lock().unwrap();
+        let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= self.max_dirty_capacity && !map.contains_key(&guid) {
             eprintln!(
                 "[WorldSnapshotter] Dirty queue capacity exceeded ({}/{}), dropping world object {}",
@@ -170,7 +170,10 @@ impl WorldObjectWriteBehindSnapshotter {
 
     /// Returns the number of currently queued dirty world objects.
     pub fn dirty_count(&self) -> usize {
-        self.dirty_map.lock().unwrap().len()
+        self.dirty_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Signals the background worker to stop.
@@ -206,7 +209,7 @@ impl WorldObjectWriteBehindSnapshotter {
     pub async fn flush_batch(&self) -> usize {
         // Fast buffer swap: holding lock for nanoseconds
         let batch: Vec<WorldObjectRecord> = {
-            let mut map = self.dirty_map.lock().unwrap();
+            let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
             let swapped = std::mem::take(&mut *map);
             metrics::gauge!("mmo_node_world_snapshot_dirty_queue").set(0.0);
             swapped.into_values().collect()
@@ -230,7 +233,7 @@ impl WorldObjectWriteBehindSnapshotter {
                         e
                     );
                     // Pro Review mitigation: Merge failed records back into dirty_map so they are retried on the next flush cycle
-                    let mut map = self.dirty_map.lock().unwrap();
+                    let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
                     for record in chunk {
                         let guid = Guid(record.object_id);
                         if let Some(existing) = map.get_mut(&guid) {

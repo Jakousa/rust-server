@@ -35,6 +35,8 @@ pub enum MigrationError {
     MissingPosition(Guid),
 }
 
+const MIGRATION_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Consolidated outcome report for a completed or aborted batch entity migration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchMigrationReport {
@@ -78,6 +80,9 @@ pub fn ingest_migrated_entity(
 
     // 2. Insert entity into EntityStore and Octree
     sim.entity_store.spawn(guid, target_pos);
+    if let Some(entity) = sim.entity_store.get_mut_by_guid(guid) {
+        entity.rotation = req.yaw;
+    }
     sim.octree.insert(guid, target_pos);
 
     // 3. Restore serialized components
@@ -92,8 +97,9 @@ pub fn ingest_migrated_entity(
         }
     }
 
-    // 4. Restore kinematic tracking state with preserved sequence
-    let mut kin_state = crate::kinematics::EntityKinematicState::new(sim.current_time);
+    // 4. Restore kinematic tracking state with preserved position and sequence
+    let mut kin_state =
+        crate::kinematics::EntityKinematicState::new(sim.current_time).with_position(target_pos);
     kin_state.initialized = true;
     kin_state.last_sequence = req.last_sequence;
     sim.kinematic_states.insert(guid, kin_state);
@@ -112,6 +118,9 @@ pub fn ingest_migrated_entity(
 }
 
 /// Executes an authoritative two-phase entity migration for a single player or NPC using a pooled client connection.
+///
+/// Delegates directly to [`execute_batch_entity_migration_pooled`] with a single-element slice
+/// so single and batch migrations share identical state preservation, donor despawn, and timeout guarantees.
 pub async fn execute_entity_migration_pooled(
     pool: &GrpcClientPool,
     sim: Arc<tokio::sync::RwLock<TickSimulation>>,
@@ -120,136 +129,16 @@ pub async fn execute_entity_migration_pooled(
     target_node_addr: &str,
     gateway_addr: Option<&str>,
 ) -> Result<bool, MigrationError> {
-    let (req, session_id) = {
-        let mut sim_guard = sim.write().await;
-        if !sim_guard.acquire_migration_lease(guid) {
-            return Err(MigrationError::LeaseConflict(guid));
-        }
-        let entity = match sim_guard.entity_store.get_by_guid(guid) {
-            Some(e) => e,
-            None => {
-                sim_guard.release_migration_lease(guid);
-                return Err(MigrationError::EntityNotFound(guid));
-            }
-        };
-        let pos = entity.position;
-        let last_seq = sim_guard
-            .kinematic_states
-            .get(&guid)
-            .map(|s| s.last_sequence)
-            .unwrap_or(0);
-        let last_mig_tick = sim_guard.tick_counter;
-
-        let comp_json = sim_guard.codecs.serialize_all(&entity.components);
-        let comp_bytes = serde_json::to_vec(&comp_json).unwrap_or_default();
-        let components = vec![SerializedComponent {
-            component_id: 0,
-            data: comp_bytes,
-        }];
-
-        let session_id = sim_guard.aoi.get_session_by_guid(guid).unwrap_or(0);
-
-        let req = MigrateEntityRequest {
-            guid: guid.raw(),
-            source_node_id: sim_guard.node_id as u32,
-            target_node_id,
-            position: Some(Vector3 {
-                x: pos.0,
-                y: pos.1,
-                z: pos.2,
-            }),
-            velocity: Some(Vector3 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            }),
-            yaw: 0.0,
-            pitch: 0.0,
-            last_sequence: last_seq,
-            session_id,
-            components,
-            topology_epoch: 1,
-            last_migration_tick: last_mig_tick,
-        };
-        (req, session_id)
-    };
-
-    let channel = match pool.get_connected_channel(target_node_addr).await {
-        Ok(c) => c,
-        Err(e) => {
-            let mut sim_guard = sim.write().await;
-            sim_guard.release_migration_lease(guid);
-            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-            return Err(MigrationError::ConnectionFailed(e.to_string()));
-        }
-    };
-
-    let mut client = NodeServiceClient::new(channel);
-
-    let resp = match tokio::time::timeout(Duration::from_secs(5), client.migrate_entity(req)).await
-    {
-        Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => {
-            pool.invalidate(target_node_addr);
-            let mut sim_guard = sim.write().await;
-            sim_guard.release_migration_lease(guid);
-            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-            return Err(MigrationError::RpcFailed(e.to_string()));
-        }
-        Err(_) => {
-            pool.invalidate(target_node_addr);
-            let mut sim_guard = sim.write().await;
-            sim_guard.release_migration_lease(guid);
-            metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-            return Err(MigrationError::RpcFailed(
-                "Migration RPC timed out".to_string(),
-            ));
-        }
-    };
-
-    if !resp.success {
-        let mut sim_guard = sim.write().await;
-        sim_guard.release_migration_lease(guid);
-        metrics::counter!("mmo_migration_rollbacks_total").increment(1);
-        return Err(MigrationError::RecipientRejected(resp.error_message));
-    }
-
-    // Step 3: Gateway commit
-    if let Some(gw_addr) = gateway_addr {
-        if let Ok(gw_channel) = pool.get_connected_channel(gw_addr).await {
-            let mut gw_client = GatewayServiceClient::new(gw_channel);
-            let _ = gw_client
-                .update_route(RouteUpdateRequest {
-                    guid: guid.raw(),
-                    session_id,
-                    node_address: target_node_addr.to_string(),
-                })
-                .await;
-        }
-    }
-
-    // Step 4: Despawn local entity cleanly
-    {
-        let mut sim_guard = sim.write().await;
-        sim_guard.release_migration_lease(guid);
-        sim_guard.kinematic_states.remove(&guid);
-        sim_guard.last_migration_ticks.remove(&guid);
-        sim_guard.tombstoned_entities.insert(guid);
-        sim_guard.aoi.unregister_by_guid(guid);
-        sim_guard.sectors.clear_rate_limit(guid);
-        sim_guard.instances.remove_entity(guid);
-        if session_id != 0 {
-            sim_guard.unregister_aoi_observer(session_id);
-        }
-        if let Some(entity) = sim_guard.entity_store.despawn_by_guid(guid) {
-            if !sim_guard.octree.remove(guid, entity.position) {
-                sim_guard.octree.remove_by_guid(guid);
-            }
-        }
-    }
-
-    metrics::counter!("mmo_migration_outbound_total", "status" => "success").increment(1);
-    Ok(true)
+    let report = execute_batch_entity_migration_pooled(
+        pool,
+        sim,
+        std::slice::from_ref(&guid),
+        target_node_id,
+        target_node_addr,
+        gateway_addr,
+    )
+    .await?;
+    Ok(report.success && report.migrated_count == 1)
 }
 
 /// Executes an authoritative two-phase entity migration for a single player or NPC.
@@ -353,7 +242,7 @@ pub async fn execute_batch_entity_migration_pooled(
                     y: 0.0,
                     z: 0.0,
                 }),
-                yaw: 0.0,
+                yaw: entity.rotation,
                 pitch: 0.0,
                 last_sequence: last_seq,
                 session_id,
@@ -373,9 +262,14 @@ pub async fn execute_batch_entity_migration_pooled(
         (batch_req, session_routes)
     };
 
-    let channel = match pool.get_connected_channel(target_node_addr).await {
-        Ok(c) => c,
-        Err(e) => {
+    let channel = match tokio::time::timeout(
+        MIGRATION_RPC_TIMEOUT,
+        pool.get_connected_channel(target_node_addr),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             let mut sim_guard = sim.write().await;
             for &g in guids {
                 sim_guard.release_migration_lease(g);
@@ -383,12 +277,23 @@ pub async fn execute_batch_entity_migration_pooled(
             metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
             return Err(MigrationError::ConnectionFailed(e.to_string()));
         }
+        Err(_) => {
+            pool.invalidate(target_node_addr);
+            let mut sim_guard = sim.write().await;
+            for &g in guids {
+                sim_guard.release_migration_lease(g);
+            }
+            metrics::counter!("mmo_batch_migration_rollbacks_total").increment(1);
+            return Err(MigrationError::ConnectionFailed(
+                "Connection to recipient node timed out".to_string(),
+            ));
+        }
     };
 
     let mut client = NodeServiceClient::new(channel);
 
     let resp = match tokio::time::timeout(
-        Duration::from_secs(5),
+        MIGRATION_RPC_TIMEOUT,
         client.migrate_batch_entities(batch_req),
     )
     .await
@@ -426,17 +331,19 @@ pub async fn execute_batch_entity_migration_pooled(
     }
 
     // POINT OF NO RETURN: Recipient successfully ingested entities.
+    // Despawn on the donor node immediately before awaiting Gateway route updates.
     {
         let mut sim_guard = sim.write().await;
+        let now = sim_guard.current_time;
         for &guid in guids {
             sim_guard.release_migration_lease(guid);
             sim_guard.kinematic_states.remove(&guid);
             sim_guard.last_migration_ticks.remove(&guid);
-            sim_guard.tombstoned_entities.insert(guid);
+            sim_guard.tombstoned_entities.insert(guid, now);
             sim_guard.session_epochs.remove(&guid);
             sim_guard.aoi.unregister_by_guid(guid);
             sim_guard.sectors.clear_rate_limit(guid);
-            sim_guard.instances.remove_entity(guid);
+            sim_guard.instances.remove_entity_at(guid, now);
             if let Some((_, sid)) = session_updates.iter().find(|(g, _)| *g == guid) {
                 if *sid != 0 {
                     sim_guard.unregister_aoi_observer(*sid);
@@ -453,11 +360,10 @@ pub async fn execute_batch_entity_migration_pooled(
             .increment(1);
     }
 
-    // Step 4: Dispatch gateway batch route updates post-ingestion
+    // Step 4: Dispatch bounded gateway batch route updates post-ingestion
     if let Some(gw_addr) = gateway_addr {
-        if let Ok(gw_channel) = pool.get_connected_channel(gw_addr).await {
-            let mut gw_client = GatewayServiceClient::new(gw_channel);
-            let updates = session_updates
+        if !session_updates.is_empty() {
+            let updates: Vec<RouteUpdateRequest> = session_updates
                 .into_iter()
                 .map(|(guid, session_id)| RouteUpdateRequest {
                     guid: guid.raw(),
@@ -465,9 +371,15 @@ pub async fn execute_batch_entity_migration_pooled(
                     node_address: target_node_addr.to_string(),
                 })
                 .collect();
-            let _ = gw_client
-                .update_batch_routes(BatchRouteUpdateRequest { updates })
-                .await;
+            let _ = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
+                if let Ok(gw_channel) = pool.get_connected_channel(gw_addr).await {
+                    let mut gw_client = GatewayServiceClient::new(gw_channel);
+                    let _ = gw_client
+                        .update_batch_routes(BatchRouteUpdateRequest { updates })
+                        .await;
+                }
+            })
+            .await;
         }
     }
 
@@ -606,19 +518,24 @@ mod tests {
         // Ghost must be removed
         assert!(!sim.ghost_store.contains(guid));
 
-        // Entity exists in entity store and octree
-        assert!(sim.entity_store.get_by_guid(guid).is_some());
+        // Entity exists in entity store and octree with preserved rotation
+        let ent = sim
+            .entity_store
+            .get_by_guid(guid)
+            .expect("migrated entity present");
+        assert!((ent.rotation - 1.57).abs() < f32::EPSILON);
         assert!(sim
             .octree
             .query_radius((50.0, 50.0, 50.0), 1.0)
             .contains(&guid));
 
-        // Kinematic tracking state restored
+        // Kinematic tracking state restored with target_pos and sequence
         let kin = sim
             .kinematic_states
             .get(&guid)
             .expect("kinematic state present");
         assert_eq!(kin.last_sequence, 77);
+        assert_eq!(kin.last_position, (50.0, 50.0, 50.0));
 
         // Cooldown tick preserved
         assert_eq!(sim.get_last_migration_tick(guid), Some(15));

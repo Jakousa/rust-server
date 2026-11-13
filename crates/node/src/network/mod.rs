@@ -67,6 +67,25 @@ mod tests {
         BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0))
     }
 
+    async fn make_service(sim: Arc<RwLock<TickSimulation>>) -> NodeServiceImpl {
+        let (input_tx, ghost_store) = {
+            let guard = sim.read().await;
+            (guard.input_sender(), guard.ghost_store.clone())
+        };
+        NodeServiceImpl::new(sim, input_tx, ghost_store)
+    }
+
+    async fn make_service_with_coordinator(
+        sim: Arc<RwLock<TickSimulation>>,
+        coord: Arc<mmo_storage::TransactionCoordinator>,
+    ) -> NodeServiceImpl {
+        let (input_tx, ghost_store) = {
+            let guard = sim.read().await;
+            (guard.input_sender(), guard.ghost_store.clone())
+        };
+        NodeServiceImpl::with_coordinator(sim, input_tx, ghost_store, coord)
+    }
+
     #[tokio::test]
     async fn test_remote_command_success_when_entity_exists() {
         let sim = TickSimulation::new(1, test_bounds()).into_shared();
@@ -112,7 +131,7 @@ mod tests {
             });
         }
 
-        let service = NodeServiceImpl::new(sim);
+        let service = make_service(sim).await;
         let req = make_remote_command(initiator_guid, target_guid, 1001, &[], 2, 1);
 
         let resp = service.remote_command(tonic::Request::new(req)).await;
@@ -133,7 +152,7 @@ mod tests {
         let target_guid = Guid::new(EntityType::Npc, 1, 999);
         let initiator_guid = Guid::new(EntityType::Player, 2, 102);
 
-        let service = NodeServiceImpl::new(sim);
+        let service = make_service(sim).await;
         let req = make_remote_command(initiator_guid, target_guid, 2002, &[], 2, 1);
 
         let resp = service.remote_command(tonic::Request::new(req)).await;
@@ -177,7 +196,7 @@ mod tests {
             });
         }
 
-        let service = NodeServiceImpl::new(sim);
+        let service = make_service(sim).await;
         let req = make_remote_command(initiator_guid, target_guid, 9999, &[], 2, 1);
 
         let resp = service.remote_command(tonic::Request::new(req)).await;
@@ -202,7 +221,7 @@ mod tests {
             assert!(s.spawn_entity(target_guid, (0.0, 0.0, 0.0)));
         }
 
-        let service = NodeServiceImpl::new(sim);
+        let service = make_service(sim).await;
 
         // Case 1: Undersized payload (< 8 bytes)
         let req_short = RemoteCommandRequest {
@@ -252,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_ghost_entity_sync_insert_update_and_query() {
         let sim = TickSimulation::new(1, test_bounds()).into_shared();
-        let service = NodeServiceImpl::new(sim.clone());
+        let service = make_service(sim.clone()).await;
 
         let ghost_guid = Guid::new(EntityType::Player, 2, 777);
 
@@ -449,7 +468,7 @@ mod tests {
             });
         }
 
-        let service = NodeServiceImpl::new(sim.clone());
+        let service = make_service(sim.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -537,7 +556,7 @@ mod tests {
             1,
             test_bounds(),
         )));
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         let initiator = Guid::new(EntityType::Player, 1, 10);
         let target = Guid::new(EntityType::Player, 1, 20);
@@ -568,7 +587,7 @@ mod tests {
             2,
             recipient_bounds,
         )));
-        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+        let recipient_service = make_service(Arc::clone(&recipient_sim)).await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
@@ -595,8 +614,11 @@ mod tests {
         {
             let mut d = donor_sim.write().await;
             d.spawn_entity(guid, (49.0, 10.0, 10.0));
-            // Update entity to target_pos in preparation for migration
-            d.entity_store.get_mut_by_guid(guid).unwrap().position = target_pos;
+            // Update entity to target_pos and rotation in preparation for migration
+            let ent = d.entity_store.get_mut_by_guid(guid).unwrap();
+            ent.position = target_pos;
+            ent.rotation = 2.25;
+            d.update_session_epoch(guid, 7);
             let mut kin = crate::kinematics::EntityKinematicState::new(d.current_time);
             kin.initialized = true;
             kin.last_sequence = 123;
@@ -615,23 +637,114 @@ mod tests {
 
         assert_eq!(res, Ok(true));
 
-        // Verify donor has cleanly despawned the entity and cleared lease
+        // Verify donor has cleanly despawned the entity, cleared lease, tombstone, and session_epochs
         {
             let d = donor_sim.read().await;
             assert!(!d.entity_store.contains_guid(guid));
             assert!(!d.is_migrating(guid));
             assert!(!d.kinematic_states.contains_key(&guid));
+            assert!(!d.session_epochs.contains_key(&guid));
+            assert!(d.tombstoned_entities.contains_key(&guid));
         }
 
-        // Verify recipient has adopted entity with sequence restored
+        // Verify recipient has adopted entity with position, rotation (yaw), and kinematic state restored
         {
             let r = recipient_sim.read().await;
             assert!(r.entity_store.contains_guid(guid));
             let ent = r.entity_store.get_by_guid(guid).unwrap();
             assert_eq!(ent.position, target_pos);
+            assert!((ent.rotation - 2.25).abs() < f32::EPSILON);
             let kin = r.kinematic_states.get(&guid).unwrap();
             assert_eq!(kin.last_sequence, 123);
+            assert_eq!(kin.last_position, target_pos);
         }
+    }
+
+    #[tokio::test]
+    async fn test_single_migration_despawns_before_gateway_timeout() {
+        use tonic::transport::Server;
+
+        let recipient_bounds = BoundingBox3D::new((50.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let recipient_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            2,
+            recipient_bounds,
+        )));
+        let recipient_service = make_service(Arc::clone(&recipient_sim)).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recipient_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(recipient_service.into_server())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        // Hanging mock Gateway socket: accepts TCP connection and holds it open without HTTP/2 response
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = gw_listener.local_addr().unwrap();
+        let gw_accepted = Arc::new(tokio::sync::Notify::new());
+        let gw_accepted_clone = Arc::clone(&gw_accepted);
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = gw_listener.accept().await {
+                gw_accepted_clone.notify_one();
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let donor_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (50.0, 100.0, 100.0));
+        let donor_sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
+            1,
+            donor_bounds,
+        )));
+        let guid = Guid::new(EntityType::Player, 1, 556);
+        let target_pos = (60.0, 10.0, 10.0);
+
+        {
+            let mut d = donor_sim.write().await;
+            d.spawn_entity(guid, (49.0, 10.0, 10.0));
+            let ent = d.entity_store.get_mut_by_guid(guid).unwrap();
+            ent.position = target_pos;
+            ent.rotation = 1.25;
+            d.register_aoi_observer(888, guid, Default::default());
+        }
+
+        let donor_clone = Arc::clone(&donor_sim);
+        let mig_task = tokio::spawn(async move {
+            execute_entity_migration(
+                donor_clone,
+                guid,
+                2,
+                &recipient_addr.to_string(),
+                Some(&gw_addr.to_string()),
+            )
+            .await
+        });
+
+        // As soon as the hanging Gateway receives the connection, donor MUST already be despawned!
+        gw_accepted.notified().await;
+        {
+            let d = donor_sim.read().await;
+            assert!(!d.entity_store.contains_guid(guid));
+            assert!(!d.is_migrating(guid));
+        }
+
+        // Migration must return Ok(true) within the bounded 3s Gateway RPC timeout (not hang)
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), mig_task)
+            .await
+            .expect("migration must not hang on unresponsive gateway")
+            .unwrap();
+        assert_eq!(res, Ok(true));
+
+        let r = recipient_sim.read().await;
+        let ent = r.entity_store.get_by_guid(guid).unwrap();
+        assert!((ent.rotation - 1.25).abs() < f32::EPSILON);
+        assert_eq!(
+            r.kinematic_states.get(&guid).unwrap().last_position,
+            target_pos
+        );
     }
 
     #[tokio::test]
@@ -671,7 +784,7 @@ mod tests {
             2,
             recipient_bounds,
         )));
-        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+        let recipient_service = make_service(Arc::clone(&recipient_sim)).await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
@@ -762,7 +875,7 @@ mod tests {
                 assert!(!d.entity_store.contains_guid(g));
                 assert!(!d.is_migrating(g));
                 assert!(!d.kinematic_states.contains_key(&g));
-                assert!(d.tombstoned_entities.contains(&g));
+                assert!(d.tombstoned_entities.contains_key(&g));
             }
         }
 
@@ -827,7 +940,7 @@ mod tests {
             2,
             recipient_bounds,
         )));
-        let recipient_service = NodeServiceImpl::new(Arc::clone(&recipient_sim));
+        let recipient_service = make_service(Arc::clone(&recipient_sim)).await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recipient_addr = listener.local_addr().unwrap();
@@ -924,7 +1037,7 @@ mod tests {
             ent.add_component(q);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
         let req = RemoteAbilityRequest {
             ability_id: 1,
             caster_guid: caster_guid.raw(),
@@ -978,7 +1091,7 @@ mod tests {
             ent.add_component(attrs);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
         let req = RemoteAbilityRequest {
             ability_id: 1,
             caster_guid: caster_guid.raw(),
@@ -1025,7 +1138,7 @@ mod tests {
             ent.add_component(attrs);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
         let req = RemoteAbilityRequest {
             ability_id: 1,
             caster_guid: caster_guid.raw(),
@@ -1082,7 +1195,7 @@ mod tests {
             assert!(s.acquire_migration_lease(migrating_guid));
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         // Test dead target
         let req_dead = RemoteAbilityRequest {
@@ -1170,7 +1283,7 @@ mod tests {
                 .add_component(a2);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
         let req = BatchRemoteAbilityRequest {
             ability_id: 10,
             caster_guid: caster.raw(),
@@ -1247,7 +1360,7 @@ mod tests {
         char_repo.add_item(&item).await.unwrap();
 
         let coord = Arc::new(mmo_storage::TransactionCoordinator::new(db));
-        let service = NodeServiceImpl::with_coordinator(Arc::clone(&sim), coord);
+        let service = make_service_with_coordinator(Arc::clone(&sim), coord).await;
 
         // 1. Reserve source slot
         let res_out = service
@@ -1330,7 +1443,7 @@ mod tests {
         container_repo.create_container(&c1).await.unwrap();
 
         let coord = Arc::new(mmo_storage::TransactionCoordinator::new(db));
-        let service = NodeServiceImpl::with_coordinator(Arc::clone(&sim), coord);
+        let service = make_service_with_coordinator(Arc::clone(&sim), coord).await;
 
         // Reserve slot
         let res_in = service
@@ -1377,7 +1490,7 @@ mod tests {
             s.session_epochs.insert(guid, 2);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         let move_pkt =
             mmo_schema::client::ClientPacket::Movement(mmo_schema::client::MovementPacket {
@@ -1433,7 +1546,7 @@ mod tests {
             s.spawn_entity(guid, (0.0, 0.0, 0.0));
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         // Invalid placement with NaN coordinate
         let place_pkt =
@@ -1484,7 +1597,7 @@ mod tests {
             s.insert_world_object(obj);
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         let resync_pkt = mmo_schema::client::ClientPacket::WorldObjectResync(
             mmo_schema::client::WorldObjectResyncPacket {
@@ -1545,7 +1658,7 @@ mod tests {
             s.packets.register(0x00A0, Box::new(TestModuleHandler));
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         // 1. Spoofed source_guid rejected
         let spoofed_pkt =
@@ -1627,7 +1740,7 @@ mod tests {
             });
         }
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         // 1. Unknown non-player entity is rejected
         let move_pkt =
@@ -1695,7 +1808,7 @@ mod tests {
         let sim = Arc::new(RwLock::new(TickSimulation::new(1, bounds)));
         let player = Guid::new(EntityType::Player, 1, 777);
 
-        let service = NodeServiceImpl::new(Arc::clone(&sim));
+        let service = make_service(Arc::clone(&sim)).await;
 
         // 1. Initial hydration succeeds
         let move_pkt =
@@ -1726,7 +1839,7 @@ mod tests {
         {
             let mut s = sim.write().await;
             assert!(s.despawn_entity(player));
-            assert!(s.tombstoned_entities.contains(&player));
+            assert!(s.tombstoned_entities.contains_key(&player));
             assert!(!s.entity_store.contains_guid(player));
         }
 

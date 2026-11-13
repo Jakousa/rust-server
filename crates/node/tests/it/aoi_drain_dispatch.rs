@@ -118,8 +118,10 @@ async fn test_e2e_forward_client_packet_and_movement_correction_snapback() {
     assert!(sim.spawn_entity(player_guid, (0.0, 0.0, 0.0)));
     sim.register_aoi_observer(session_id, player_guid, Default::default());
 
+    let input_tx = sim.input_sender();
+    let ghost_store = sim.ghost_store.clone();
     let sim_arc = Arc::new(RwLock::new(sim));
-    let node_service = NodeServiceImpl::new(Arc::clone(&sim_arc));
+    let node_service = NodeServiceImpl::new(Arc::clone(&sim_arc), input_tx, ghost_store);
     let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node_addr = node_listener.local_addr().unwrap();
 

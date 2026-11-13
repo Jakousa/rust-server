@@ -20,8 +20,10 @@ async fn test_village_bootstrap_and_modular_barter_integration() {
     // 1. Authoritatively bootstrap village world (structures, plugins, NPCs)
     bootstrap_village_world(&mut tick_sim);
 
+    let input_tx = tick_sim.input_sender();
+    let ghost_store = tick_sim.ghost_store.clone();
     let sim = Arc::new(RwLock::new(tick_sim));
-    let service = NodeServiceImpl::new(Arc::clone(&sim));
+    let service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
 
     let p1_guid = Guid::new(EntityType::Player, 1, 555);
     let ilmari_guid = Guid::new(EntityType::Npc, 1, 1);

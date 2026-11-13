@@ -45,6 +45,9 @@ pub enum PlacementError {
 
     #[error("Invalid transform or dimension parameters: {0}")]
     InvalidTransform(String),
+
+    #[error("Invalid object properties: {0}")]
+    InvalidProperties(String),
 }
 
 /// Token bucket entry for tracking client action rates.
@@ -55,17 +58,20 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(capacity: f32) -> Self {
+    fn new(capacity: f32, now: Instant) -> Self {
         Self {
             tokens: capacity,
-            last_update: Instant::now(),
+            last_update: now,
         }
     }
 
-    fn try_consume(&mut self, capacity: f32, refill_per_sec: f32) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f32();
-        self.last_update = now;
+    fn try_consume(&mut self, capacity: f32, refill_per_sec: f32, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f32();
+        if now > self.last_update {
+            self.last_update = now;
+        }
 
         self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity);
 
@@ -175,15 +181,20 @@ impl SectorManager {
         Some(unloaded)
     }
 
-    /// Checks and consumes a token from the player's placement rate limiter bucket.
-    pub fn check_rate_limit(&mut self, player_guid: Guid) -> bool {
+    /// Checks and consumes a token from the player's placement rate limiter bucket using an explicit timestamp.
+    pub fn check_rate_limit_at(&mut self, player_guid: Guid, now: Instant) -> bool {
         let cap = self.rate_limit_capacity;
         let refill = self.rate_limit_refill_per_sec;
         let bucket = self
             .rate_limits
             .entry(player_guid)
-            .or_insert_with(|| TokenBucket::new(cap));
-        bucket.try_consume(cap, refill)
+            .or_insert_with(|| TokenBucket::new(cap, now));
+        bucket.try_consume(cap, refill, now)
+    }
+
+    /// Checks and consumes a token from the player's placement rate limiter bucket.
+    pub fn check_rate_limit(&mut self, player_guid: Guid) -> bool {
+        self.check_rate_limit_at(player_guid, Instant::now())
     }
 
     /// Clears any rate limit tracking bucket for a player (e.g. upon entity despawn or migration).
@@ -191,16 +202,18 @@ impl SectorManager {
         self.rate_limits.remove(&player_guid).is_some()
     }
 
-    /// Authoritatively validates a placement request against distance, rate limits, line of sight, and collision.
-    pub fn validate_placement(
+    /// Authoritatively validates a placement request against distance, rate limits, line of sight, and collision
+    /// using an explicit simulation timestamp `now`.
+    pub fn validate_placement_at(
         &mut self,
         player_guid: Guid,
         player_pos: (f32, f32, f32),
         target_pos: (f32, f32, f32),
         candidate_bounds: &BoundingBox3D,
+        now: Instant,
     ) -> Result<(), PlacementError> {
         // 1. Rate limiter check
-        if !self.check_rate_limit(player_guid) {
+        if !self.check_rate_limit_at(player_guid, now) {
             return Err(PlacementError::RateLimitExceeded);
         }
 
@@ -266,6 +279,23 @@ impl SectorManager {
         }
 
         Ok(())
+    }
+
+    /// Authoritatively validates a placement request against distance, rate limits, line of sight, and collision.
+    pub fn validate_placement(
+        &mut self,
+        player_guid: Guid,
+        player_pos: (f32, f32, f32),
+        target_pos: (f32, f32, f32),
+        candidate_bounds: &BoundingBox3D,
+    ) -> Result<(), PlacementError> {
+        self.validate_placement_at(
+            player_guid,
+            player_pos,
+            target_pos,
+            candidate_bounds,
+            Instant::now(),
+        )
     }
 
     /// Inserts or updates an object in the spatial index.
@@ -398,5 +428,38 @@ mod tests {
         // 11th placement without time elapsed should be rejected by rate limiter
         let rate_limited = mgr.validate_placement(player, player_pos, target_pos, &bounds);
         assert_eq!(rate_limited, Err(PlacementError::RateLimitExceeded));
+    }
+
+    #[test]
+    fn test_deterministic_rate_limiter_at() {
+        let mut mgr = SectorManager::new();
+        let sector = SectorCoord3D::from_world_pos((1.0, 0.0, 0.0));
+        mgr.mark_sector_loaded(sector);
+
+        let player = Guid(77);
+        let player_pos = (0.0, 0.0, 0.0);
+        let target_pos = (1.0, 0.0, 0.0);
+        let bounds = BoundingBox3D::new((0.9, 0.0, -0.1), (1.1, 1.0, 0.1));
+        let t0 = Instant::now();
+
+        // Exhaust all 10 tokens at fixed t0
+        for _ in 0..10 {
+            assert!(mgr
+                .validate_placement_at(player, player_pos, target_pos, &bounds, t0)
+                .is_ok());
+        }
+        assert_eq!(
+            mgr.validate_placement_at(player, player_pos, target_pos, &bounds, t0),
+            Err(PlacementError::RateLimitExceeded)
+        );
+
+        // Advance simulation clock by 100ms (0.1s * 5.0 tokens/sec = 0.5 tokens) -> still exhausted
+        let t_100ms = t0 + std::time::Duration::from_millis(100);
+        assert!(!mgr.check_rate_limit_at(player, t_100ms));
+
+        // Advance another 100ms (total 200ms -> 1.0 token refilled) -> succeeds deterministically
+        let t_200ms = t0 + std::time::Duration::from_millis(200);
+        assert!(mgr.check_rate_limit_at(player, t_200ms));
+        assert!(!mgr.check_rate_limit_at(player, t_200ms));
     }
 }

@@ -43,7 +43,7 @@ pub struct TickSimulation {
     pub migrating_leases: HashMap<Guid, Instant>,
     pub last_migration_ticks: HashMap<Guid, u64>,
     pub session_epochs: HashMap<Guid, u64>,
-    pub tombstoned_entities: std::collections::HashSet<Guid>,
+    pub tombstoned_entities: HashMap<Guid, Instant>,
     pub current_time: Instant,
     pub last_tick_duration: Duration,
     pub ack_sender: tokio::sync::mpsc::Sender<mmo_schema::client::ClientAckPacket>,
@@ -119,6 +119,16 @@ impl TickSimulation {
     pub const COMPENSATION_CHANNEL_CAPACITY: usize = 4096;
     /// Bounded capacity of the container transfer notification queue.
     pub const TRANSFER_CHANNEL_CAPACITY: usize = 4096;
+    /// Time-to-live for active outbound migration leases on donor nodes (strictly exceeds RPC timeout).
+    pub const MIGRATION_LEASE_TTL: Duration = Duration::from_secs(10);
+    /// Time-to-live for entity tombstones preventing stale-packet rehydration after despawn/migration.
+    pub const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+    /// Maximum number of custom properties allowed on a `PlaceObjectPacket`.
+    pub const MAX_PLACE_OBJECT_PROPERTIES: usize = 64;
+    /// Maximum byte length allowed for a `PlaceObjectPacket` property key.
+    pub const MAX_PLACE_OBJECT_KEY_LEN: usize = 256;
+    /// Maximum byte length allowed for a `PlaceObjectPacket` property value.
+    pub const MAX_PLACE_OBJECT_VALUE_LEN: usize = 1024;
 
     /// Creates a new `TickSimulation` instance with default kinematic validation.
     pub fn new(node_id: u16, bounds: BoundingBox3D) -> Self {
@@ -178,7 +188,7 @@ impl TickSimulation {
             migrating_leases: HashMap::new(),
             last_migration_ticks: HashMap::new(),
             session_epochs: HashMap::new(),
-            tombstoned_entities: std::collections::HashSet::new(),
+            tombstoned_entities: HashMap::new(),
             current_time: Instant::now(),
             last_tick_duration: Duration::from_millis(0),
             ack_sender,
@@ -233,7 +243,7 @@ impl TickSimulation {
         }
 
         if !self.entity_store.contains_guid(guid) {
-            if self.tombstoned_entities.contains(&guid) {
+            if self.tombstoned_entities.contains_key(&guid) {
                 metrics::counter!("mmo_node_stale_epoch_packets_dropped_total").increment(1);
                 return;
             }
@@ -664,8 +674,12 @@ impl TickSimulation {
     }
 
     /// Creates a [`NodeServiceImpl`] backed by a shared simulation instance.
-    pub fn create_service(shared_sim: Arc<RwLock<Self>>) -> NodeServiceImpl {
-        NodeServiceImpl::new(shared_sim)
+    pub async fn create_service(shared_sim: Arc<RwLock<Self>>) -> NodeServiceImpl {
+        let (input_tx, ghost_store) = {
+            let guard = shared_sim.read().await;
+            (guard.input_sender(), guard.ghost_store.clone())
+        };
+        NodeServiceImpl::new(shared_sim, input_tx, ghost_store)
     }
 
     /// Creates a [`GhostBroadcaster`] configured for this simulation node.
@@ -816,6 +830,31 @@ impl TickSimulation {
             scale_raw.2.abs().clamp(0.01, 100.0),
         );
 
+        // Validate custom properties count and string lengths before spatial/rate checks
+        if packet.properties.len() > Self::MAX_PLACE_OBJECT_PROPERTIES {
+            return Err(crate::sector::PlacementError::InvalidProperties(format!(
+                "Property count {} exceeds maximum of {}",
+                packet.properties.len(),
+                Self::MAX_PLACE_OBJECT_PROPERTIES
+            )));
+        }
+        for (k, v) in &packet.properties {
+            if k.len() > Self::MAX_PLACE_OBJECT_KEY_LEN {
+                return Err(crate::sector::PlacementError::InvalidProperties(format!(
+                    "Property key length {} exceeds maximum of {}",
+                    k.len(),
+                    Self::MAX_PLACE_OBJECT_KEY_LEN
+                )));
+            }
+            if v.len() > Self::MAX_PLACE_OBJECT_VALUE_LEN {
+                return Err(crate::sector::PlacementError::InvalidProperties(format!(
+                    "Property value length {} exceeds maximum of {}",
+                    v.len(),
+                    Self::MAX_PLACE_OBJECT_VALUE_LEN
+                )));
+            }
+        }
+
         // Prefab footprint is plugin-defined; core uses the scaled unit cube centered on pos.
         let half = (0.5 * scale.0, 0.5 * scale.1, 0.5 * scale.2);
         let bounds = BoundingBox3D::new(
@@ -823,7 +862,7 @@ impl TickSimulation {
             (pos.0 + half.0, pos.1 + half.1, pos.2 + half.2),
         );
         self.sectors
-            .validate_placement(player, player_pos, pos, &bounds)?;
+            .validate_placement_at(player, player_pos, pos, &bounds, self.current_time)?;
 
         let seq = self.next_world_object_seq;
         self.next_world_object_seq = self.next_world_object_seq.wrapping_add(1);
@@ -898,7 +937,7 @@ impl TickSimulation {
         player: Guid,
         packet: &mmo_schema::client::WorldObjectResyncPacket,
     ) -> Option<mmo_schema::client::WorldObjectSpawnPacket> {
-        if !self.sectors.check_rate_limit(player) {
+        if !self.sectors.check_rate_limit_at(player, self.current_time) {
             return None;
         }
         let obj = self.sectors.get_object(Guid::from_raw(packet.object_id))?;
@@ -913,10 +952,10 @@ impl TickSimulation {
         self.migrating_leases.remove(&guid);
         self.last_migration_ticks.remove(&guid);
         self.session_epochs.remove(&guid);
-        self.tombstoned_entities.insert(guid);
+        self.tombstoned_entities.insert(guid, self.current_time);
         self.aoi.unregister_by_guid(guid);
         self.sectors.clear_rate_limit(guid);
-        self.instances.remove_entity(guid);
+        self.instances.remove_entity_at(guid, self.current_time);
         if let Some(entity) = self.entity_store.despawn_by_guid(guid) {
             if !self.octree.remove(guid, entity.position) {
                 self.octree.remove_by_guid(guid);
@@ -1172,17 +1211,22 @@ impl TickSimulation {
             self.event_queue.push(notif);
         }
 
-        // 0.25 Sweep expired migrating leases older than 5 seconds
+        // 0.25 Sweep expired migrating leases older than 10 seconds
         let now = self.current_time;
-        self.migrating_leases
-            .retain(|_guid, start| now.saturating_duration_since(*start) <= Duration::from_secs(5));
+        self.migrating_leases.retain(|_guid, start| {
+            now.saturating_duration_since(*start) <= Self::MIGRATION_LEASE_TTL
+        });
+
+        // 0.255 Sweep expired entity tombstones older than 60 seconds
+        self.tombstoned_entities
+            .retain(|_guid, ts| now.saturating_duration_since(*ts) <= Self::TOMBSTONE_TTL);
 
         // 0.26 Advance ghost store tick and prune stale ghosts older than 20 ticks (1 sec at 20 Hz)
         self.ghost_store.advance_tick(self.tick_counter);
         self.ghost_store.prune_stale(self.tick_counter, 20);
 
         // 0.3 Reap idle instance domains and evict remaining non-player entities
-        let reaped_instances = self.instances.reap_idle_instances();
+        let reaped_instances = self.instances.reap_idle_instances_at(now);
         for (reaped_inst_id, evicted_guids) in reaped_instances {
             metrics::counter!("mmo_node_idle_instances_reaped_total").increment(1);
             for g in evicted_guids {
@@ -3016,12 +3060,12 @@ mod tests {
         };
         sim.queue_container_transfer(notif.clone());
 
-        // Insert an expired lease (>5s old) and a recent lease (<5s old)
+        // Insert an expired lease (>10s old) and a recent lease (<10s old)
         let expired_guid = Guid::new(EntityType::Player, 1, 901);
         let active_guid = Guid::new(EntityType::Player, 1, 902);
         sim.migrating_leases
-            .insert(expired_guid, Instant::now() - Duration::from_secs(10));
-        sim.migrating_leases.insert(active_guid, Instant::now());
+            .insert(expired_guid, sim.current_time - Duration::from_secs(11));
+        sim.migrating_leases.insert(active_guid, sim.current_time);
 
         // Step simulation
         sim.step(0.05);
@@ -3050,7 +3094,7 @@ mod tests {
         sim.hydrate_player_session(player_guid, session_id, session_epoch, None, 50.0);
         assert!(sim.entity_store.get_by_guid(player_guid).is_some());
         assert!(sim.aoi.get_observer(session_id).is_some());
-        assert!(!sim.tombstoned_entities.contains(&player_guid));
+        assert!(!sim.tombstoned_entities.contains_key(&player_guid));
 
         // Disconnect by session ID
         let snap = sim
@@ -3062,7 +3106,7 @@ mod tests {
         assert!(sim.entity_store.get_by_guid(player_guid).is_none());
         assert!(sim.aoi.get_observer(session_id).is_none());
         assert!(!sim.kinematic_states.contains_key(&player_guid));
-        assert!(sim.tombstoned_entities.contains(&player_guid));
+        assert!(sim.tombstoned_entities.contains_key(&player_guid));
 
         let payload = rx.try_recv().expect("snapshot payload must be sent");
         assert_eq!(payload.guid, player_guid);
@@ -3197,5 +3241,133 @@ mod tests {
             has_correction,
             "expected MovementCorrection to (0.0, 0.0, 5.0)"
         );
+    }
+
+    #[test]
+    fn test_tombstoned_entities_ttl_sweep() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let expired_guid = Guid::new(EntityType::Npc, 1, 501);
+        let active_guid = Guid::new(EntityType::Npc, 1, 502);
+
+        assert!(sim.spawn_entity(expired_guid, (0.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(active_guid, (5.0, 0.0, 0.0)));
+
+        assert!(sim.despawn_entity(expired_guid));
+        // Backdate expired_guid tombstone by 61 seconds
+        sim.tombstoned_entities
+            .insert(expired_guid, sim.current_time - Duration::from_secs(61));
+        assert!(sim.despawn_entity(active_guid));
+
+        sim.step(0.05);
+
+        assert!(!sim.tombstoned_entities.contains_key(&expired_guid));
+        assert!(sim.tombstoned_entities.contains_key(&active_guid));
+    }
+
+    #[test]
+    fn test_migrating_lease_10s_ttl_exceeds_rpc_timeout() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let g_recent = Guid::new(EntityType::Player, 1, 601);
+        let g_expired = Guid::new(EntityType::Player, 1, 602);
+        sim.spawn_entity(g_recent, (0.0, 0.0, 0.0));
+        sim.spawn_entity(g_expired, (5.0, 0.0, 0.0));
+
+        // Lease acquired 6 seconds ago must STILL be retained under 10s TTL
+        sim.migrating_leases
+            .insert(g_recent, sim.current_time - Duration::from_secs(6));
+        // Lease acquired 11 seconds ago must be swept
+        sim.migrating_leases
+            .insert(g_expired, sim.current_time - Duration::from_secs(11));
+
+        sim.step(0.05);
+
+        assert!(sim.is_migrating(g_recent));
+        assert!(!sim.is_migrating(g_expired));
+    }
+
+    #[test]
+    fn test_place_object_property_bounds() {
+        use mmo_schema::client::{PlaceObjectPacket, Vec3};
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let player = Guid::new(EntityType::Player, 1, 888);
+        sim.spawn_entity(player, (10.0, 10.0, 10.0));
+        let sector = mmo_core::world::SectorCoord3D::from_world_pos((10.0, 10.0, 10.0));
+        sim.sectors.mark_sector_loaded(sector);
+
+        // 1. Too many properties (> 64) rejected
+        let mut too_many = std::collections::HashMap::new();
+        for i in 0..=TickSimulation::MAX_PLACE_OBJECT_PROPERTIES {
+            too_many.insert(format!("k{i}"), "v".to_string());
+        }
+        let pkt_too_many = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: too_many,
+        };
+        assert!(matches!(
+            sim.handle_place_object(player, &pkt_too_many),
+            Err(crate::sector::PlacementError::InvalidProperties(_))
+        ));
+
+        // 2. Oversized key (> 256 bytes) rejected
+        let mut long_key = std::collections::HashMap::new();
+        long_key.insert(
+            "k".repeat(TickSimulation::MAX_PLACE_OBJECT_KEY_LEN + 1),
+            "v".to_string(),
+        );
+        let pkt_long_key = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: long_key,
+        };
+        assert!(matches!(
+            sim.handle_place_object(player, &pkt_long_key),
+            Err(crate::sector::PlacementError::InvalidProperties(_))
+        ));
+
+        // 3. Oversized value (> 1024 bytes) rejected
+        let mut long_val = std::collections::HashMap::new();
+        long_val.insert(
+            "k".to_string(),
+            "v".repeat(TickSimulation::MAX_PLACE_OBJECT_VALUE_LEN + 1),
+        );
+        let pkt_long_val = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: long_val,
+        };
+        assert!(matches!(
+            sim.handle_place_object(player, &pkt_long_val),
+            Err(crate::sector::PlacementError::InvalidProperties(_))
+        ));
+
+        // 4. Exact boundary (64 keys, 256-byte key, 1024-byte value) succeeds
+        let mut boundary = std::collections::HashMap::new();
+        boundary.insert(
+            "a".repeat(TickSimulation::MAX_PLACE_OBJECT_KEY_LEN),
+            "b".repeat(TickSimulation::MAX_PLACE_OBJECT_VALUE_LEN),
+        );
+        for i in 1..TickSimulation::MAX_PLACE_OBJECT_PROPERTIES {
+            boundary.insert(format!("k{i}"), "ok".to_string());
+        }
+        let pkt_boundary = PlaceObjectPacket {
+            prefab_id: 1,
+            pos: Vec3::new(12.0, 10.0, 10.0),
+            rot: (0.0, 0.0, 0.0, 1.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            properties: boundary,
+        };
+        assert!(sim.handle_place_object(player, &pkt_boundary).is_ok());
     }
 }
