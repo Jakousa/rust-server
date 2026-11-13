@@ -383,12 +383,19 @@ impl DirectorService for DirectorServiceImpl {
                 should_split,
                 topology_epoch,
             }))
-        } else {
+        } else if reg.is_evicted(req.node_id) {
             metrics::counter!("mmo_director_node_fenced_total").increment(1);
             Err(Status::failed_precondition(format!(
-                "Node {} is evicted or not registered in director topology (node fenced to prevent split-brain simulation)",
+                "Node {} is evicted from director topology (node fenced to prevent split-brain simulation)",
                 req.node_id
             )))
+        } else {
+            metrics::counter!("mmo_director_node_reregister_required_total").increment(1);
+            Ok(Response::new(HeartbeatResponse {
+                acknowledged: false,
+                should_split: false,
+                topology_epoch,
+            }))
         }
     }
 
@@ -855,7 +862,7 @@ mod tests {
         assert!(resp2.acknowledged);
         assert!(resp2.should_split);
 
-        // Heartbeat for unknown node -> acknowledged = false
+        // Heartbeat for unknown (non-evicted) node -> acknowledged = false (prompts re-registration)
         let hb_unknown = Request::new(HeartbeatRequest {
             node_id: 999,
             tick_rate: 20.0,
@@ -866,9 +873,9 @@ mod tests {
             tick_duration_ms: 5.0,
             entity_centroid: None,
         });
-        let err_unknown = service.heartbeat(hb_unknown).await.unwrap_err();
-        assert_eq!(err_unknown.code(), tonic::Code::FailedPrecondition);
-        assert!(err_unknown.message().contains("fenced"));
+        let resp_unknown = service.heartbeat(hb_unknown).await.unwrap().into_inner();
+        assert!(!resp_unknown.acknowledged);
+        assert!(!resp_unknown.should_split);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! Stores registered simulation nodes, tracks their health heartbeats,
 //! and detects expired nodes after timeouts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use mmo_core::BoundingBox3D;
@@ -40,6 +40,7 @@ impl RegisteredNode {
 #[derive(Debug, Default)]
 pub struct NodeRegistry {
     nodes: HashMap<u32, RegisteredNode>,
+    evicted_nodes: HashSet<u32>,
     next_node_id: u32,
 }
 
@@ -48,6 +49,7 @@ impl NodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            evicted_nodes: HashSet::new(),
             next_node_id: 1,
         }
     }
@@ -69,6 +71,7 @@ impl NodeRegistry {
             assigned_bounds: bounds,
         };
 
+        self.evicted_nodes.remove(&node_id);
         self.nodes.insert(node_id, node);
         node_id
     }
@@ -102,6 +105,7 @@ impl NodeRegistry {
             assigned_bounds: bounds,
         };
 
+        self.evicted_nodes.remove(&node_id);
         self.nodes.insert(node_id, node);
         node_id
     }
@@ -163,8 +167,17 @@ impl NodeRegistry {
             }
         });
 
+        for &id in &dead_nodes {
+            self.evicted_nodes.insert(id);
+        }
+
         dead_nodes.sort_unstable();
         dead_nodes
+    }
+
+    /// Returns `true` if `node_id` was previously evicted due to heartbeat timeout and has not re-registered.
+    pub fn is_evicted(&self, node_id: u32) -> bool {
+        self.evicted_nodes.contains(&node_id)
     }
 
     /// Explicitly deregisters a node by ID, returning its record if present.
@@ -493,6 +506,26 @@ mod tests {
         let node = registry.get_node(id).unwrap();
         assert_eq!(node.assigned_bounds.len(), 1);
         assert_eq!(node.assigned_bounds[0], bbox2);
+    }
+
+    #[test]
+    fn test_evicted_node_tracking_and_reregistration_clears_evicted() {
+        let mut registry = NodeRegistry::new();
+        let id = registry.register_node_with_id(42, "127.0.0.1:50042".to_string(), vec![]);
+        assert!(!registry.is_evicted(id));
+        assert!(!registry.is_evicted(999));
+
+        // Simulate timeout and eviction
+        let past = Instant::now() - Duration::from_secs(10);
+        registry.set_last_heartbeat(id, past);
+        let dead = registry.check_dead_nodes(Duration::from_secs(5));
+        assert_eq!(dead, vec![42]);
+        assert!(registry.is_evicted(42));
+        assert!(!registry.is_evicted(999));
+
+        // Re-registering clears the evicted state
+        registry.register_node_with_id(42, "127.0.0.1:50042".to_string(), vec![]);
+        assert!(!registry.is_evicted(42));
     }
 }
 
