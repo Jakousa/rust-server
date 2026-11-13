@@ -233,6 +233,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_instance_already_exists() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        mgr.create_instance(500, 1, bounds, Duration::from_millis(50))
+            .expect("create instance");
+
+        let err = mgr
+            .create_instance(500, 2, bounds, Duration::from_millis(100))
+            .expect_err("should fail to create duplicate instance");
+
+        assert_eq!(err, NodeInstanceError::AlreadyExists(500));
+    }
+
+    #[test]
     fn test_node_instance_lifecycle_and_entity_membership() {
         let mut mgr = InstanceDomainManager::new();
         let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
@@ -268,5 +283,41 @@ mod tests {
         assert_eq!(reaped[0].0, 500);
         assert!(reaped[0].1.contains(&npc1));
         assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn test_assign_entity_errors() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let instance_id_1 = 100;
+        let instance_id_2 = 200;
+        mgr.create_instance(instance_id_1, 1, bounds, Duration::from_millis(50))
+            .expect("create instance 1");
+        mgr.create_instance(instance_id_2, 1, bounds, Duration::from_millis(50))
+            .expect("create instance 2");
+
+        let entity_guid = Guid::from_raw(1);
+
+        // 1. Assign to non-existent instance
+        let non_existent_instance = 999;
+        let res = mgr.assign_entity(entity_guid, non_existent_instance, false);
+        assert_eq!(res, Err(NodeInstanceError::NotFound(non_existent_instance)));
+
+        // 2. Successful assignment
+        assert!(mgr.assign_entity(entity_guid, instance_id_1, false).is_ok());
+
+        // 3. Assign to a different instance should fail with EntityAlreadyInInstance
+        let res = mgr.assign_entity(entity_guid, instance_id_2, false);
+        assert_eq!(
+            res,
+            Err(NodeInstanceError::EntityAlreadyInInstance(
+                entity_guid,
+                instance_id_1
+            ))
+        );
+
+        // 4. Assigning to the same instance again should succeed (idempotent)
+        assert!(mgr.assign_entity(entity_guid, instance_id_1, false).is_ok());
     }
 }
