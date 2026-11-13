@@ -233,6 +233,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_instance_already_exists() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        mgr.create_instance(500, 1, bounds, Duration::from_millis(50))
+            .expect("create instance");
+
+        let err = mgr
+            .create_instance(500, 2, bounds, Duration::from_millis(100))
+            .expect_err("should fail to create duplicate instance");
+
+        assert_eq!(err, NodeInstanceError::AlreadyExists(500));
+    }
+
+    #[test]
     fn test_node_instance_lifecycle_and_entity_membership() {
         let mut mgr = InstanceDomainManager::new();
         let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
