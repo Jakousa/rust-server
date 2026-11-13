@@ -119,9 +119,11 @@ pub fn canonical_id_for_name(name: &str) -> Option<AttributeId> {
 /// Representation of a single numerical attribute with bounds and regeneration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttributeValue {
+    /// Initial value used to seed `current` upon construction.
     pub base: f32,
     pub current: f32,
     pub min: f32,
+    /// Unmodified ceiling used by [`AttributeSet::get_effective_max`].
     pub max: f32,
     pub regen_per_sec: f32,
 }
@@ -227,7 +229,7 @@ impl AttributeSet {
     }
 
     /// Calculates the effective maximum value applying all attached flat and percentage modifiers:
-    /// `Effective = (Base + Sum(Flat)) * (1.0 + Sum(Percent))`
+    /// `Effective = (attr.max + Sum(Flat)) * (1.0 + Sum(Percent))`
     pub fn get_effective_max(&self, name: &str) -> Option<f32> {
         let attr = self.attributes.get(name)?;
         Some(compute_effective_max_for(name, attr, &self.modifiers))
@@ -314,8 +316,14 @@ impl AttributeSet {
         })
     }
 
-    /// Attaches a timed modifier.
+    /// Attaches a timed modifier, ignoring modifiers with non-finite values or durations.
     pub fn add_modifier(&mut self, modifier: TimedModifier) {
+        let value = match modifier.modifier {
+            ModifierType::Flat(v) | ModifierType::Percent(v) => v,
+        };
+        if !value.is_finite() || !modifier.remaining_duration_sec.is_finite() {
+            return;
+        }
         self.modifiers.push(modifier);
     }
 
@@ -328,6 +336,9 @@ impl AttributeSet {
 
     /// Ticks attribute regeneration and advances modifier expiration.
     pub fn tick(&mut self, entity: Guid, dt_sec: f32, events: &mut EventQueue) {
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return;
+        }
         // 1. Advance passive regeneration/decay
         for (name, attr) in &mut self.attributes {
             if attr.regen_per_sec != 0.0 {
@@ -620,5 +631,35 @@ mod tests {
             nan_max_set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn test_add_modifier_rejects_non_finite_values() {
+        let mut set = AttributeSet::new();
+        set.add_attribute("health", 100.0, 0.0, 100.0, 0.0);
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            set.add_modifier(TimedModifier::new(
+                "bad_flat",
+                "health",
+                ModifierType::Flat(bad),
+                5.0,
+            ));
+            set.add_modifier(TimedModifier::new(
+                "bad_pct",
+                "health",
+                ModifierType::Percent(bad),
+                5.0,
+            ));
+        }
+        set.add_modifier(TimedModifier::new(
+            "bad_dur",
+            "health",
+            ModifierType::Flat(10.0),
+            f32::INFINITY,
+        ));
+
+        assert!(set.modifiers.is_empty());
+        assert_eq!(set.get_effective_max("health"), Some(100.0));
     }
 }

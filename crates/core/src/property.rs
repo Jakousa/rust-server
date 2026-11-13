@@ -36,12 +36,13 @@ impl PropertyValue {
         }
     }
 
-    /// Returns the integer value if this is a `PropertyValue::Int`, or if it is a whole float.
+    /// Returns the integer value if this is a `PropertyValue::Int`, or if it is a whole float
+    /// within the representable `i64` range.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             PropertyValue::Int(i) => Some(*i),
             PropertyValue::Float(f)
-                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < (i64::MAX as f64) =>
             {
                 Some(*f as i64)
             }
@@ -191,7 +192,9 @@ impl From<serde_json::Value> for PropertyValue {
                 if let Some(i) = n.as_i64() {
                     PropertyValue::Int(i)
                 } else if let Some(u) = n.as_u64() {
-                    PropertyValue::Int(u as i64)
+                    i64::try_from(u)
+                        .map(PropertyValue::Int)
+                        .unwrap_or_else(|_| PropertyValue::Float(u as f64))
                 } else if let Some(f) = n.as_f64() {
                     PropertyValue::Float(f)
                 } else {
@@ -523,5 +526,37 @@ mod tests {
         assert_eq!(target.get_f64("speed"), Some(6.5)); // Overwritten
         assert_eq!(target.get_str("existing"), Some("keep_me")); // Retained
         assert_eq!(target.get_i64("armor"), Some(25)); // Added
+    }
+
+    #[test]
+    fn test_large_u64_json_conversion_and_as_i64_bounds() {
+        // u64::MAX and (i64::MAX as u64 + 1) must not sign-wrap into negative i64
+        let above_i64_max = (i64::MAX as u64) + 1;
+        let prop_above = PropertyValue::from(serde_json::json!(above_i64_max));
+        match prop_above {
+            PropertyValue::Float(f) => assert!(f > 0.0 && f == above_i64_max as f64),
+            other => panic!("expected Float for u64 > i64::MAX, got {other:?}"),
+        }
+
+        let prop_max_u64 = PropertyValue::from(serde_json::json!(u64::MAX));
+        match prop_max_u64 {
+            PropertyValue::Float(f) => assert!(f > 0.0 && f == u64::MAX as f64),
+            other => panic!("expected Float for u64::MAX, got {other:?}"),
+        }
+
+        // Values <= i64::MAX remain exact Int
+        let prop_i64_max = PropertyValue::from(serde_json::json!(i64::MAX));
+        assert_eq!(prop_i64_max, PropertyValue::Int(i64::MAX));
+
+        // 2^63 (i64::MAX as f64) is outside i64 range, so as_i64 must return None
+        assert_eq!(PropertyValue::Float(i64::MAX as f64).as_i64(), None);
+        assert_eq!(PropertyValue::Float(f64::INFINITY).as_i64(), None);
+        assert_eq!(PropertyValue::Float(f64::NAN).as_i64(), None);
+
+        // i64::MIN is exactly representable as f64 and within bounds
+        assert_eq!(
+            PropertyValue::Float(i64::MIN as f64).as_i64(),
+            Some(i64::MIN)
+        );
     }
 }

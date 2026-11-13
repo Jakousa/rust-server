@@ -266,13 +266,15 @@ impl EntityStore {
 
     /// Inserts an already initialized `Entity`, returning its `EntityKey`.
     ///
-    /// If an entity with the same GUID already existed in the store, the previous entity is removed.
+    /// If an entity with the same GUID already existed in the store, the previous entity
+    /// is cleanly despawned first so any existing parent/child links are detached.
     pub fn insert_entity(&mut self, entity: Entity) -> EntityKey {
         let guid = entity.guid;
-        let key = self.entities.insert(entity);
-        if let Some(old_key) = self.guid_to_key.insert(guid, key) {
-            self.entities.remove(old_key);
+        if let Some(old_key) = self.guid_to_key.get(&guid).copied() {
+            self.despawn(old_key);
         }
+        let key = self.entities.insert(entity);
+        self.guid_to_key.insert(guid, key);
         key
     }
 
@@ -295,19 +297,8 @@ impl EntityStore {
 
     /// Despawns an entity by its `Guid`, removing it from storage and indexing.
     pub fn despawn_by_guid(&mut self, guid: Guid) -> Option<Entity> {
-        let key = self.guid_to_key.remove(&guid)?;
-        let entity = self.entities.remove(key)?;
-        if let Some(parent_guid) = entity.parent_guid {
-            if let Some(parent) = self.get_mut_by_guid(parent_guid) {
-                parent.children.retain(|&g| g != guid);
-            }
-        }
-        for child_guid in &entity.children {
-            if let Some(child) = self.get_mut_by_guid(*child_guid) {
-                child.parent_guid = None;
-            }
-        }
-        Some(entity)
+        let key = self.get_key_by_guid(guid)?;
+        self.despawn(key)
     }
 
     /// Returns an immutable reference to the entity associated with the given key.
@@ -1110,5 +1101,54 @@ mod tests {
         let updates = store.propagate_hierarchy_transforms(a);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].0, b);
+    }
+
+    #[test]
+    fn test_insert_entity_guid_overwrite_detaches_hierarchy() {
+        let mut store = EntityStore::new();
+        let parent = Guid::new(EntityType::Player, 1, 1);
+        let mid = Guid::new(EntityType::Player, 1, 2);
+        let child = Guid::new(EntityType::Player, 1, 3);
+
+        store.spawn(parent, (0.0, 0.0, 0.0));
+        store.spawn(mid, (1.0, 0.0, 0.0));
+        store.spawn(child, (2.0, 0.0, 0.0));
+
+        assert!(store.attach_child(mid, parent, (1.0, 0.0, 0.0), 0.0));
+        assert!(store.attach_child(child, mid, (1.0, 0.0, 0.0), 0.0));
+
+        // Overwrite `mid` via insert_entity with a fresh entity sharing the same GUID
+        let replacement = Entity::new(mid, (10.0, 0.0, 0.0));
+        let new_key = store.insert_entity(replacement);
+
+        assert_eq!(store.get_key_by_guid(mid), Some(new_key));
+        assert!(!store.get_by_guid(parent).unwrap().children.contains(&mid));
+        assert_eq!(store.get_by_guid(child).unwrap().parent_guid, None);
+        let new_mid = store.get_by_guid(mid).unwrap();
+        assert_eq!(new_mid.parent_guid, None);
+        assert!(new_mid.children.is_empty());
+        assert_eq!(new_mid.position, (10.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_despawn_by_guid_detaches_parent_and_children() {
+        let mut store = EntityStore::new();
+        let parent = Guid::new(EntityType::Player, 1, 10);
+        let mid = Guid::new(EntityType::Player, 1, 20);
+        let child = Guid::new(EntityType::Player, 1, 30);
+
+        store.spawn(parent, (0.0, 0.0, 0.0));
+        store.spawn(mid, (1.0, 0.0, 0.0));
+        store.spawn(child, (2.0, 0.0, 0.0));
+
+        assert!(store.attach_child(mid, parent, (1.0, 0.0, 0.0), 0.0));
+        assert!(store.attach_child(child, mid, (1.0, 0.0, 0.0), 0.0));
+
+        let removed = store.despawn_by_guid(mid).expect("mid should despawn");
+        assert_eq!(removed.guid, mid);
+        assert!(!store.contains_guid(mid));
+        assert!(!store.get_by_guid(parent).unwrap().children.contains(&mid));
+        assert_eq!(store.get_by_guid(child).unwrap().parent_guid, None);
+        assert!(store.despawn_by_guid(mid).is_none());
     }
 }
