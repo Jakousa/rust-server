@@ -316,18 +316,28 @@ impl EdgeAuthenticator {
                 .or_else(|_| data_encoding::BASE64.decode(token_str.as_bytes()))
             {
                 if let Ok(ticket) = HandoverTicket::from_bytes(&ticket_bytes) {
-                    if ticket.verify(secret).is_ok() {
-                        if !self.handover_rate_limiter.check_and_consume(ticket.guid) {
+                    match self
+                        .handover_rate_limiter
+                        .verify_and_consume(&ticket, secret)
+                    {
+                        Ok(()) => {
+                            metrics::counter!("mmo_gateway_auth_success_total").increment(1);
+                            return Ok(AuthResult {
+                                guid: ticket.guid,
+                                roles: vec![],
+                                is_handover: true,
+                                session_epoch: ticket.session_epoch,
+                            });
+                        }
+                        Err(HandoverError::RateLimited) => {
                             metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "rate_limited").increment(1);
                             return Err(AuthError::Handover(HandoverError::RateLimited));
                         }
-                        metrics::counter!("mmo_gateway_auth_success_total").increment(1);
-                        return Ok(AuthResult {
-                            guid: ticket.guid,
-                            roles: vec![],
-                            is_handover: true,
-                            session_epoch: ticket.session_epoch,
-                        });
+                        Err(HandoverError::AlreadyConsumed) => {
+                            metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "ticket_replayed").increment(1);
+                            return Err(AuthError::Handover(HandoverError::AlreadyConsumed));
+                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -521,6 +531,26 @@ mod tests {
             ),
             "Expected algorithm rejection, got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn test_handover_ticket_replay_rejected() {
+        let guid = Guid::new(EntityType::Player, 1, 999);
+        let handover_secret = b"handover_cluster_shared_secret_key_987";
+        let auth = EdgeAuthenticator::new_hs256(TEST_SECRET, None, None)
+            .with_handover_secret(handover_secret.to_vec());
+
+        let ticket = HandoverTicket::create(guid, 556, 3, "gw-us-east", handover_secret, 10_000);
+        let token = data_encoding::BASE64URL_NOPAD.encode(&ticket.to_bytes());
+
+        // First presentation succeeds
+        assert!(auth.authenticate(&token).is_ok());
+
+        // Replay of the same ticket must be rejected
+        assert!(
+            auth.authenticate(&token).is_err(),
+            "Replaying a consumed HandoverTicket must fail authentication"
         );
     }
 }

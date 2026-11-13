@@ -5,7 +5,8 @@
 
 use dashmap::DashMap;
 use ring::hmac::{self, Key, HMAC_SHA256};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use mmo_core::guid::Guid;
@@ -18,6 +19,9 @@ pub enum HandoverError {
 
     #[error("Handover ticket has expired")]
     Expired,
+
+    #[error("Handover ticket has already been consumed")]
+    AlreadyConsumed,
 
     #[error("Handover rate limit exceeded (BGP flapping protection)")]
     RateLimited,
@@ -205,21 +209,80 @@ impl HandoverTicket {
     }
 }
 
-/// Token-bucket rate limiter per entity GUID protecting against BGP Anycast flapping.
+/// Token-bucket rate limiter per entity GUID protecting against BGP Anycast flapping,
+/// combined with single-use consumed ticket replay protection.
 ///
-/// Refills at 0.2 tokens/second (1 op per 5.0 seconds) with a burst capacity of 2.0.
+/// Refills at 0.2 tokens/second (1 op per 5.0 seconds) with a strict burst capacity of 1.0.
 #[derive(Debug, Default)]
 pub struct HandoverRateLimiter {
     states: DashMap<Guid, (f32, Instant)>,
+    consumed_tickets: DashMap<Vec<u8>, u64>,
+    op_counter: AtomicU64,
 }
 
 impl HandoverRateLimiter {
     pub const REFILL_RATE_PER_SEC: f32 = 0.2; // 1 token every 5.0s
-    pub const MAX_BURST: f32 = 2.0;
+    pub const MAX_BURST: f32 = 1.0;
 
     pub fn new() -> Self {
         Self {
             states: DashMap::new(),
+            consumed_tickets: DashMap::new(),
+            op_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Prunes expired rate-limiter state and expired consumed ticket records.
+    pub fn prune_expired(&self) {
+        self.prune_expired_at(Instant::now());
+    }
+
+    /// Prunes rate-limiter entries that have fully refilled by `now` and expired consumed tickets.
+    pub fn prune_expired_at(&self, now: Instant) {
+        let ttl = Duration::from_secs_f32(Self::MAX_BURST / Self::REFILL_RATE_PER_SEC);
+        self.states.retain(|_, (tokens, last_refill)| {
+            let elapsed = now.saturating_duration_since(*last_refill);
+            let refilled = *tokens + elapsed.as_secs_f32() * Self::REFILL_RATE_PER_SEC;
+            refilled < Self::MAX_BURST && elapsed < ttl
+        });
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.consumed_tickets
+            .retain(|_, expires_at_ms| *expires_at_ms >= now_ms);
+    }
+
+    /// Returns the number of tracked GUID rate-limiter entries.
+    pub fn tracked_state_count(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Returns the number of tracked single-use consumed ticket signatures.
+    pub fn consumed_ticket_count(&self) -> usize {
+        self.consumed_tickets.len()
+    }
+
+    /// Verifies a `HandoverTicket`, enforces rate limiting, and consumes the ticket for single-use.
+    pub fn verify_and_consume(
+        &self,
+        ticket: &HandoverTicket,
+        secret_key: &[u8],
+    ) -> Result<(), HandoverError> {
+        ticket.verify(secret_key)?;
+        if self.consumed_tickets.contains_key(&ticket.signature) {
+            return Err(HandoverError::AlreadyConsumed);
+        }
+        if !self.check_and_consume(ticket.guid) {
+            return Err(HandoverError::RateLimited);
+        }
+        match self.consumed_tickets.entry(ticket.signature.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(HandoverError::AlreadyConsumed),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(ticket.expires_at_epoch_ms);
+                Ok(())
+            }
         }
     }
 
@@ -229,10 +292,15 @@ impl HandoverRateLimiter {
     }
 
     pub fn check_and_consume_at(&self, guid: Guid, now: Instant) -> bool {
+        let count = self.op_counter.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(64) || self.states.len() >= 1024 {
+            self.prune_expired_at(now);
+        }
+
         let mut entry = self.states.entry(guid).or_insert((Self::MAX_BURST, now));
         let (tokens, last_refill) = entry.value_mut();
 
-        let elapsed = now.duration_since(*last_refill).as_secs_f32();
+        let elapsed = now.saturating_duration_since(*last_refill).as_secs_f32();
         let refilled = (*tokens + elapsed * Self::REFILL_RATE_PER_SEC).min(Self::MAX_BURST);
 
         *last_refill = now;
@@ -306,11 +374,10 @@ mod tests {
         let guid = Guid::new(mmo_core::guid::EntityType::Player, 1, 99);
         let t0 = Instant::now();
 
-        // Initial burst capacity allows 2 operations immediately
-        assert!(limiter.check_and_consume_at(guid, t0)); // 2.0 -> 1.0
+        // Strict single-use burst capacity allows 1 operation immediately
         assert!(limiter.check_and_consume_at(guid, t0)); // 1.0 -> 0.0
 
-        // 3rd immediate attempt is rejected
+        // 2nd immediate attempt is rejected
         assert!(!limiter.check_and_consume_at(guid, t0));
 
         // After 2.5 seconds, refilled 0.5 tokens (total 0.5) -> still rejected (< 1.0)
@@ -320,5 +387,47 @@ mod tests {
         // After 5.0 seconds total, refilled 1.0 tokens -> accepted
         let t2 = t0 + Duration::from_secs(5);
         assert!(limiter.check_and_consume_at(guid, t2));
+    }
+
+    #[test]
+    fn test_handover_ticket_single_use_and_rate_limiter_pruning() {
+        let secret = b"cluster_shared_secret_key_12345";
+        let limiter = HandoverRateLimiter::new();
+        let guid1 = Guid::new(mmo_core::guid::EntityType::Player, 1, 101);
+        let guid2 = Guid::new(mmo_core::guid::EntityType::Player, 1, 102);
+
+        let ticket1 = HandoverTicket::create(guid1, 1001, 1, "gw-us-1", secret, 5_000);
+        assert!(limiter.verify_and_consume(&ticket1, secret).is_ok());
+        assert_eq!(limiter.consumed_ticket_count(), 1);
+        assert_eq!(limiter.tracked_state_count(), 1);
+
+        // Immediate or delayed replay of the exact same ticket must fail with AlreadyConsumed,
+        // even after the rate limit bucket refills or for the same GUID.
+        let t_later = Instant::now() + Duration::from_secs(10);
+        assert!(limiter.check_and_consume_at(guid1, t_later));
+        assert_eq!(
+            limiter.verify_and_consume(&ticket1, secret).unwrap_err(),
+            HandoverError::AlreadyConsumed
+        );
+
+        // Fresh ticket for another GUID works once, then rejects replay.
+        let ticket2 = HandoverTicket::create(guid2, 1002, 1, "gw-us-1", secret, 1);
+        assert!(limiter.verify_and_consume(&ticket2, secret).is_ok());
+        assert_eq!(limiter.consumed_ticket_count(), 2);
+        assert_eq!(limiter.tracked_state_count(), 2);
+
+        // Wait briefly for ticket2 (1ms TTL) to expire, and prune well past `t_later`
+        // so both rate limiter buckets (>= 5s for 0.2/s -> 1.0) and expired consumed tickets are pruned.
+        std::thread::sleep(Duration::from_millis(5));
+        let now = t_later + Duration::from_secs(10);
+        limiter.prune_expired_at(now);
+
+        assert_eq!(
+            limiter.tracked_state_count(),
+            0,
+            "Fully refilled rate limiter buckets must be pruned"
+        );
+        // ticket2 had 1ms TTL so it must be pruned, while ticket1 (5s TTL) stays tracked until it expires.
+        assert_eq!(limiter.consumed_ticket_count(), 1);
     }
 }

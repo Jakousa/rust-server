@@ -84,12 +84,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Arc::new(MemoryCache::new()),
     };
 
+    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(capacity as usize));
     let router = Arc::new(SessionRouter::new());
     let (packet_tx, mut packet_rx) = mpsc::channel(10000);
     let server = Arc::new(
         GatewayServer::with_packet_channel(router, packet_tx)
             .with_cache(cache)
-            .with_default_node_address(default_node_addr.clone()),
+            .with_default_node_address(default_node_addr.clone())
+            .with_connection_semaphore(Arc::clone(&connection_semaphore)),
     );
 
     // Background worker to consume routed client packets and forward to node cluster via BackhaulPool
@@ -359,7 +361,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.mark_ready();
     println!("Edge Gateway actively listening for client connections on {listen_addr}");
 
-    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(capacity as usize));
     let shutdown_fut = mmo_core::shutdown_signal();
     tokio::pin!(shutdown_fut);
 
@@ -407,6 +408,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(tx) = wt_shutdown_tx {
+        let _ = tx.send(());
+    }
+    if let Some(tx) = ws_shutdown_tx {
+        let _ = tx.send(());
+    }
     let drained = server
         .drain_and_shutdown(
             &telemetry,
@@ -416,12 +423,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::time::Duration::from_secs(3),
         )
         .await;
-    if let Some(tx) = wt_shutdown_tx {
-        let _ = tx.send(());
-    }
-    if let Some(tx) = ws_shutdown_tx {
-        let _ = tx.send(());
-    }
     let _ = grpc_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), grpc_handle).await;
     println!("[Gateway] Clean shutdown complete (closed {drained} active session(s)).");

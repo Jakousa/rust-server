@@ -65,9 +65,11 @@ impl Drop for SessionDropGuard {
         if let Some(ref cache) = self.cache {
             let cache = cache.clone();
             let session_id = self.session_id;
-            tokio::spawn(async move {
-                let _ = cache.remove_session(session_id).await;
-            });
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = cache.remove_session(session_id).await;
+                });
+            }
         }
     }
 }

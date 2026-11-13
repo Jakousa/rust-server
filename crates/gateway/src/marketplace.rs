@@ -250,9 +250,10 @@ impl GatewayMarketplaceService {
             None
         };
 
+        let safe_limit = req.limit.clamp(1, 100);
         match self
             .repo
-            .query_listings(item_def_id, min_price, max_price, req.offset, req.limit)
+            .query_listings(item_def_id, min_price, max_price, req.offset, safe_limit)
             .await
         {
             Ok(listings) => MarketResponsePacket {

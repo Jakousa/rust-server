@@ -8,6 +8,48 @@ use crate::interceptor::{EdgeInterceptOutcome, EdgePacketInterceptor};
 use crate::router::SessionRouter;
 use crate::social::GatewaySubscriptionManager;
 
+/// Maximum number of social pub/sub topics a single session may subscribe to concurrently.
+pub const MAX_TOPICS_PER_SESSION: usize = 16;
+
+/// Maximum byte length allowed for a client-supplied social topic name.
+pub const MAX_TOPIC_NAME_LEN: usize = 64;
+
+fn is_valid_topic_chars(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_TOPIC_NAME_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
+fn validate_and_authorize_topic(topic: &str, bound_guid: mmo_core::guid::Guid) -> bool {
+    if !is_valid_topic_chars(topic) {
+        return false;
+    }
+
+    if topic == "chat:global" || topic == "chat:area" {
+        return true;
+    }
+    if topic.starts_with("whisper:") {
+        return topic == format!("whisper:{}", bound_guid.raw());
+    }
+    if topic.starts_with("chat:whisper:") {
+        return topic == format!("chat:whisper:{}", bound_guid.raw());
+    }
+    if let Some(rest) = topic.strip_prefix("chat:region:") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = topic.strip_prefix("chat:party:") {
+        return !rest.is_empty() && rest.parse::<u64>().is_ok();
+    }
+    if let Some(rest) = topic.strip_prefix("chat:guild:") {
+        return !rest.is_empty() && rest.parse::<u64>().is_ok();
+    }
+    if let Some(rest) = topic.strip_prefix("trade:") {
+        return !rest.is_empty();
+    }
+    false
+}
+
 #[derive(Clone)]
 pub struct GatewayInterceptHandler {
     pub router: Arc<SessionRouter>,
@@ -40,6 +82,11 @@ impl GatewayInterceptHandler {
 
     /// Subscribes a session to a named topic and ensures a background bus listener is active if needed.
     pub async fn subscribe_session_topic(&self, session_id: u64, topic: String) {
+        let current_topics = self.subscription_manager.get_session_topics(session_id);
+        if !current_topics.contains(&topic) && current_topics.len() >= MAX_TOPICS_PER_SESSION {
+            metrics::counter!("mmo_gateway_social_topic_limit_exceeded_total").increment(1);
+            return;
+        }
         let is_new = self
             .subscription_manager
             .subscribe(session_id, topic.clone());
@@ -219,14 +266,10 @@ impl GatewayInterceptHandler {
                 };
 
                 let topic = if !sub.channel_name.is_empty() {
-                    // Prevent whisper impersonation or eavesdropping via custom channel names
-                    if sub.channel_name.starts_with("whisper:") {
-                        let expected = format!("whisper:{}", bound_guid.raw());
-                        if sub.channel_name != expected {
-                            metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
-                                .increment(1);
-                            return true;
-                        }
+                    if !validate_and_authorize_topic(&sub.channel_name, bound_guid) {
+                        metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                            .increment(1);
+                        return true;
                     }
                     sub.channel_name.clone()
                 } else {
@@ -246,7 +289,11 @@ impl GatewayInterceptHandler {
                         2 => format!("chat:party:{}", sub.target_id),
                         3 => format!("chat:guild:{}", sub.target_id),
                         4 => "chat:area".to_string(),
-                        _ => format!("custom:{}", sub.target_id),
+                        _ => {
+                            metrics::counter!("mmo_gateway_spoofed_social_packets_dropped_total")
+                                .increment(1);
+                            return true;
+                        }
                     }
                 };
                 self.subscribe_session_topic(session_id, topic).await;
@@ -265,7 +312,16 @@ impl GatewayInterceptHandler {
                         _ => format!("custom:{}", unsub.target_id),
                     }
                 };
-                self.subscription_manager.unsubscribe(session_id, &topic);
+                if self.subscription_manager.unsubscribe(session_id, &topic)
+                    && self.subscription_manager.get_subscribers(&topic).is_empty()
+                {
+                    if let Some((_, handle)) = self.active_bus_subscriptions.remove(&topic) {
+                        handle.abort();
+                    }
+                    if let Some(ref bus) = self.social_bus {
+                        let _ = bus.unsubscribe(&topic).await;
+                    }
+                }
                 true
             }
             _ => {
@@ -638,5 +694,141 @@ mod tests {
         });
         assert!(handler.handle_packet(s1, &unsolicited).await);
         assert!(srx.try_recv().is_err());
+    }
+
+    #[derive(Default)]
+    struct TrackingSocialBus {
+        subscribes: std::sync::Mutex<Vec<String>>,
+        unsubscribes: std::sync::Mutex<Vec<String>>,
+        inner: mmo_storage::MemorySocialBus,
+    }
+
+    #[tonic::async_trait]
+    impl mmo_storage::SocialBus for TrackingSocialBus {
+        async fn publish(
+            &self,
+            topic: &str,
+            envelope: &mmo_storage::SocialEnvelope,
+        ) -> Result<(), mmo_storage::SocialBusError> {
+            self.inner.publish(topic, envelope).await
+        }
+
+        async fn subscribe(
+            &self,
+            topic: &str,
+        ) -> Result<
+            tokio::sync::broadcast::Receiver<mmo_storage::SocialEnvelope>,
+            mmo_storage::SocialBusError,
+        > {
+            self.subscribes.lock().unwrap().push(topic.to_string());
+            self.inner.subscribe(topic).await
+        }
+
+        async fn unsubscribe(&self, topic: &str) -> Result<(), mmo_storage::SocialBusError> {
+            self.unsubscribes.lock().unwrap().push(topic.to_string());
+            self.inner.unsubscribe(topic).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_social_subscribe_limits_validation_and_unsubscribe_cleanup() {
+        let (mut handler, router, sub_mgr, sinks) = create_test_handler();
+        let bus = Arc::new(TrackingSocialBus::default());
+        handler.social_bus = Some(bus.clone());
+
+        let s1 = 101;
+        let s2 = 102;
+        router.register_session(s1, Guid::from_raw(101), "127.0.0.1:50051".to_string());
+        router.register_session(s2, Guid::from_raw(102), "127.0.0.1:50051".to_string());
+        let (tx1, _rx1) = mpsc::channel(16);
+        let (tx2, _rx2) = mpsc::channel(16);
+        let (stx1, _srx1) = mpsc::channel(16);
+        let (stx2, _srx2) = mpsc::channel(16);
+        sinks.insert(s1, SessionSink::new(tx1, stx1));
+        sinks.insert(s2, SessionSink::new(tx2, stx2));
+
+        // 1. Unauthorized / malformed topics must be rejected before touching SocialBus.
+        for bad_topic in [
+            "",
+            "admin:secret",
+            "chat:global*",
+            "chat:guild:has space",
+            &format!("chat:region:{}", "a".repeat(80)),
+        ] {
+            let pkt = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                channel_type: 99,
+                target_id: 0,
+                channel_name: bad_topic.to_string(),
+            });
+            assert!(handler.handle_packet(s1, &pkt).await);
+        }
+        assert!(
+            bus.subscribes.lock().unwrap().is_empty(),
+            "Rejected topics must not subscribe on SocialBus"
+        );
+        assert!(handler.active_bus_subscriptions.is_empty());
+
+        // 2. Enforce MAX_TOPICS_PER_SESSION (16).
+        for i in 0..16u64 {
+            let pkt = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+                channel_type: 3,
+                target_id: i,
+                channel_name: String::new(),
+            });
+            assert!(handler.handle_packet(s1, &pkt).await);
+        }
+        assert_eq!(sub_mgr.get_session_topics(s1).len(), 16);
+        assert_eq!(handler.active_bus_subscriptions.len(), 16);
+
+        // 17th distinct topic for s1 must be rejected.
+        let pkt_17 = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+            channel_type: 0,
+            target_id: 0,
+            channel_name: String::new(),
+        });
+        assert!(handler.handle_packet(s1, &pkt_17).await);
+        assert_eq!(sub_mgr.get_session_topics(s1).len(), 16);
+        assert!(
+            !handler.active_bus_subscriptions.contains_key("chat:global"),
+            "17th topic beyond MAX_TOPICS_PER_SESSION must not create bus subscription"
+        );
+
+        // 3. Another session subscribing to chat:guild:0 shares the bus task;
+        // unsubscribing s1 leaves it active, then unsubscribing s2 aborts & removes it.
+        let shared_sub = ClientPacket::SocialSubscribe(SocialSubscribePacket {
+            channel_type: 3,
+            target_id: 0,
+            channel_name: String::new(),
+        });
+        assert!(handler.handle_packet(s2, &shared_sub).await);
+        assert!(handler
+            .active_bus_subscriptions
+            .contains_key("chat:guild:0"));
+
+        let unsub = ClientPacket::SocialUnsubscribe(SocialUnsubscribePacket {
+            channel_type: 3,
+            target_id: 0,
+            channel_name: String::new(),
+        });
+        assert!(handler.handle_packet(s1, &unsub).await);
+        assert!(
+            handler
+                .active_bus_subscriptions
+                .contains_key("chat:guild:0"),
+            "Bus subscription must stay active while s2 is still subscribed"
+        );
+        assert!(bus.unsubscribes.lock().unwrap().is_empty());
+
+        assert!(handler.handle_packet(s2, &unsub).await);
+        assert!(
+            !handler
+                .active_bus_subscriptions
+                .contains_key("chat:guild:0"),
+            "Bus subscription must be aborted and removed once subscriber count reaches 0"
+        );
+        assert_eq!(
+            bus.unsubscribes.lock().unwrap().as_slice(),
+            &["chat:guild:0".to_string()]
+        );
     }
 }
