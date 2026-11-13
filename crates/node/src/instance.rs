@@ -114,6 +114,21 @@ impl InstanceDomainManager {
         self.instances.is_empty()
     }
 
+    /// Returns `(instance_id, player_count, total_entity_count, is_idle)` for all active instances.
+    pub fn active_instance_heartbeats(&self) -> Vec<(u64, u32, u32, bool)> {
+        self.instances
+            .values()
+            .map(|domain| {
+                (
+                    domain.instance_id,
+                    domain.player_entities.len() as u32,
+                    domain.entities.len() as u32,
+                    domain.player_entities.is_empty(),
+                )
+            })
+            .collect()
+    }
+
     /// Creates and registers an isolated instance domain.
     pub fn create_instance(
         &mut self,

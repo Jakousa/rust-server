@@ -76,26 +76,42 @@ pub struct DirectorServiceImpl {
 
 impl DirectorServiceImpl {
     /// Initializes `fallback_gateway_addr` from `GATEWAY_GRPC_ADDR` environment variable,
-    /// falling back to `"127.0.0.1:50051"` when absent or empty.
+    /// falling back to `"http://127.0.0.1:50050"` when absent or empty.
     pub fn fallback_gateway_addr_from_env() -> String {
         std::env::var("GATEWAY_GRPC_ADDR")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1:50051".to_string())
+            .unwrap_or_else(|| "http://127.0.0.1:50050".to_string())
     }
 
     /// Initializes `RealmFederationAuthority` from `REALM_ID` and `FEDERATION_HMAC_SECRET`
-    /// environment variables, falling back to safe defaults when absent or empty.
+    /// environment variables. Generates an ephemeral cryptographically random 32-byte key
+    /// with a prominent warning when `FEDERATION_HMAC_SECRET` is unset or shorter than 16 bytes.
     pub fn federation_authority_from_env() -> RealmFederationAuthority {
+        use ring::rand::SecureRandom;
+
         let realm_id = std::env::var("REALM_ID")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "realm-default".to_string());
-        let secret = std::env::var("FEDERATION_HMAC_SECRET")
-            .ok()
-            .filter(|s| s.len() >= 16)
-            .map(|s| s.into_bytes())
-            .unwrap_or_else(|| b"cluster-realm-federation-default-secret-key".to_vec());
+        let secret = match std::env::var("FEDERATION_HMAC_SECRET") {
+            Ok(s) if s.len() >= 16 => s.into_bytes(),
+            other => {
+                let reason = match other {
+                    Ok(_) => "shorter than 16 bytes",
+                    Err(_) => "unset",
+                };
+                tracing::warn!(
+                    realm_id = %realm_id,
+                    "FEDERATION_HMAC_SECRET is {reason}; generating an ephemeral 32-byte random HMAC key. Cross-cluster realm transfer tokens will not verify across restarts or independent director instances."
+                );
+                let mut key = vec![0u8; 32];
+                ring::rand::SystemRandom::new()
+                    .fill(&mut key)
+                    .expect("CSPRNG failure generating federation HMAC secret");
+                key
+            }
+        };
         RealmFederationAuthority::new(realm_id, secret).expect("valid federation authority")
     }
 
@@ -335,9 +351,11 @@ impl DirectorService for DirectorServiceImpl {
         let req = request.into_inner();
 
         let mut assigned_bounds = Vec::new();
+        let mut parsed_bounds = None;
         if let Some(ref bounds_proto) = req.bounds {
             if let Some(bbox) = proto_bbox_to_bounding_box_3d(bounds_proto) {
                 assigned_bounds.push(bbox);
+                parsed_bounds = Some(bbox);
             }
         }
 
@@ -346,7 +364,11 @@ impl DirectorService for DirectorServiceImpl {
             reg.register_node_with_id(req.node_id, req.listen_addr, assigned_bounds);
 
         let mut coord = self.coordinator.write().await;
-        coord.assign_initial_node(assigned_node_id);
+        if let Some(bbox) = parsed_bounds {
+            coord.assign_or_map_node_bounds_with_registry(assigned_node_id, bbox, Some(&mut reg));
+        } else {
+            coord.assign_initial_node(assigned_node_id);
+        }
         let topology_epoch = coord.topology_epoch();
 
         metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
@@ -1696,8 +1718,81 @@ mod tests {
 
         std::env::remove_var("REALM_ID");
         std::env::remove_var("FEDERATION_HMAC_SECRET");
+        std::env::remove_var("GATEWAY_GRPC_ADDR");
 
-        let default_auth = DirectorServiceImpl::federation_authority_from_env();
-        assert_eq!(default_auth.realm_id(), "realm-default");
+        let mut default_auth_1 = DirectorServiceImpl::federation_authority_from_env();
+        let mut default_auth_2 = DirectorServiceImpl::federation_authority_from_env();
+        assert_eq!(default_auth_1.realm_id(), "realm-default");
+
+        // Ephemeral keys must be independently randomized when FEDERATION_HMAC_SECRET is unset
+        let claim =
+            default_auth_1.issue_claim(77, "realm-default", 1, std::time::Duration::from_secs(30));
+        assert_eq!(
+            default_auth_2.verify_and_redeem_claim(&claim),
+            Err(crate::federation::FederationError::InvalidSignature)
+        );
+
+        // Short (< 16 bytes) secret must also trigger ephemeral random generation
+        std::env::set_var("FEDERATION_HMAC_SECRET", "too-short");
+        let mut short_auth_1 = DirectorServiceImpl::federation_authority_from_env();
+        let mut short_auth_2 = DirectorServiceImpl::federation_authority_from_env();
+        std::env::remove_var("FEDERATION_HMAC_SECRET");
+        let short_claim =
+            short_auth_1.issue_claim(78, "realm-default", 1, std::time::Duration::from_secs(30));
+        assert_eq!(
+            short_auth_2.verify_and_redeem_claim(&short_claim),
+            Err(crate::federation::FederationError::InvalidSignature)
+        );
+
+        // Default GATEWAY_GRPC_ADDR must point to gateway port 50050 with http:// scheme
+        assert_eq!(
+            DirectorServiceImpl::fallback_gateway_addr_from_env(),
+            "http://127.0.0.1:50050"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_multi_node_registration_maps_sub_octant_bounds() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let octants = crate::coordinator::subdivide_bounds(&root_bounds);
+        let service = DirectorServiceImpl::new(
+            Arc::new(RwLock::new(NodeRegistry::new())),
+            Arc::new(RwLock::new(GlobalOctreeCoordinator::new(root_bounds))),
+        );
+
+        // Register 3 nodes with distinct sub-octant bounds (simulating multi-node startup or re-registration)
+        for (idx, octant_idx) in [(1u32, 0usize), (2u32, 1usize), (3u32, 7usize)] {
+            let resp = service
+                .register_node(Request::new(RegisterNodeRequest {
+                    node_id: idx,
+                    listen_addr: format!("127.0.0.1:5005{idx}"),
+                    bounds: Some(bounding_box_3d_to_proto(&octants[octant_idx])),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(resp.success);
+            assert_eq!(resp.assigned_node_id, idx);
+        }
+
+        let coord = service.coordinator.read().await;
+        assert_eq!(coord.find_node_for_point((25.0, 25.0, 25.0)), Some(1));
+        assert_eq!(coord.find_node_for_point((75.0, 25.0, 25.0)), Some(2));
+        assert_eq!(coord.find_node_for_point((75.0, 75.0, 75.0)), Some(3));
+        drop(coord);
+
+        // Non-first node (node 2) can split its mapped sub-octant
+        let split_resp = service
+            .report_split(Request::new(SplitReportRequest {
+                node_id: 2,
+                original_bounds: Some(bounding_box_3d_to_proto(&octants[1])),
+                child_bounds: vec![],
+                total_entities: 80,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(split_resp.acknowledged);
+        assert_eq!(split_resp.assigned_node_ids.len(), 8);
     }
 }
