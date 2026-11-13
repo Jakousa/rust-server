@@ -3173,7 +3173,7 @@ mod tests {
                 },
             ),
         };
-        sim.process_client_input(input);
+        sim.handle_client_input(input);
 
         // Player entity must be placed at the unobstructed default spawn, not inside the obstacle
         let ent = sim
