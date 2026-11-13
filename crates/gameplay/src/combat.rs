@@ -98,10 +98,19 @@ impl StatsComponent {
         }
     }
 
-    /// Computes mitigated damage applying an armor curve: raw * 100 / (100 + armor).
+    /// Computes mitigated damage applying a capped 90% armor curve:
+    /// `raw * (1 - clamp(armor / (armor + 100), 0.0, 0.9))`.
     pub fn mitigate_damage(&self, raw_damage: f32) -> f32 {
-        let reduction_factor = 100.0 / (100.0 + self.armor as f32);
-        raw_damage * reduction_factor
+        if !raw_damage.is_finite() || raw_damage <= 0.0 {
+            return 0.0;
+        }
+        let armor = self.armor as f32;
+        let mitigation_factor = if armor > 0.0 {
+            (armor / (armor + 100.0)).clamp(0.0, 0.9)
+        } else {
+            0.0
+        };
+        raw_damage * (1.0 - mitigation_factor)
     }
 }
 
@@ -145,9 +154,12 @@ impl TickSystem for HealthRegenSystem {
     }
 }
 
-/// Batch tick system that drains queued DamageEvents, applies damage, and emits EntityDiedEvents.
+/// Batch tick system that processes queued `DamageEvent`s, applies damage, and cleans up
+/// processed events at the end of the tick so other systems in the same tick can inspect them.
 #[derive(Default)]
-pub struct DamageProcessingSystem;
+pub struct DamageProcessingSystem {
+    re_pushed_damage_events: Vec<DamageEvent>,
+}
 
 impl TickSystem for DamageProcessingSystem {
     fn name(&self) -> &'static str {
@@ -155,7 +167,17 @@ impl TickSystem for DamageProcessingSystem {
     }
 
     fn update(&mut self, ctx: &mut TickContext) {
-        let _ = process_damage_events(ctx.events, ctx.entities);
+        if !self.re_pushed_damage_events.is_empty() {
+            strip_re_pushed_damage_events(ctx.events, &mut self.re_pushed_damage_events);
+        }
+        let (_, processed_damage) = process_damage_events_inner(ctx.events, ctx.entities, true);
+        self.re_pushed_damage_events = processed_damage;
+    }
+
+    fn end_of_tick(&mut self, ctx: &mut TickContext) {
+        if !self.re_pushed_damage_events.is_empty() {
+            strip_re_pushed_damage_events(ctx.events, &mut self.re_pushed_damage_events);
+        }
     }
 }
 
@@ -173,7 +195,11 @@ impl CombatResolver for RpgCombatResolver {
         healing: u32,
         event_queue: &mut EventQueue,
     ) -> Result<CombatEffectOutcome, &'static str> {
-        if target_ent.is_incapacitated() {
+        if target_ent.is_incapacitated()
+            || target_ent
+                .get_component::<HealthComponent>()
+                .is_some_and(|h| h.is_dead)
+        {
             return Err("Target entity is dead");
         }
 
@@ -254,10 +280,18 @@ impl CombatResolver for RpgCombatResolver {
             }
 
             if died {
+                if let Some(health_comp) = target_ent.get_component_mut::<HealthComponent>() {
+                    health_comp.is_dead = true;
+                    health_comp.current_hp = 0.0;
+                }
                 target_ent.state_flags |= state_flags::INCAPACITATED;
                 event_queue.push(EntityIncapacitatedEvent {
                     entity: target_guid,
                     instigator: caster_guid,
+                });
+                event_queue.push(EntityDiedEvent {
+                    entity: target_guid,
+                    killer: caster_guid,
                 });
             }
 
@@ -342,7 +376,8 @@ impl GameplayPlugin for CombatPlugin {
         ctx.codecs.register::<StatsComponent>("stats");
 
         // 2. Register batch tick systems
-        ctx.tick_systems.push(Box::new(DamageProcessingSystem));
+        ctx.tick_systems
+            .push(Box::new(DamageProcessingSystem::default()));
         ctx.tick_systems.push(Box::new(HealthRegenSystem));
 
         // 3. Register RPG combat resolver
@@ -350,15 +385,37 @@ impl GameplayPlugin for CombatPlugin {
     }
 }
 
-/// Processes all queued `DamageEvent`s against entities, updating health and emitting `EntityDiedEvent`.
+fn strip_re_pushed_damage_events(event_queue: &mut EventQueue, re_pushed: &mut Vec<DamageEvent>) {
+    let mut queued = event_queue.drain::<DamageEvent>();
+    for prev in re_pushed.drain(..) {
+        if let Some(pos) = queued.iter().position(|e| e == &prev) {
+            queued.remove(pos);
+        }
+    }
+    for remaining in queued {
+        event_queue.push(remaining);
+    }
+}
+
+/// Processes all queued `DamageEvent`s against entities, updating health and emitting
+/// `EntityDiedEvent` and `EntityIncapacitatedEvent`.
 pub fn process_damage_events(
     event_queue: &mut EventQueue,
     entities: &mut EntityStore,
 ) -> Vec<EntityDiedEvent> {
+    process_damage_events_inner(event_queue, entities, false).0
+}
+
+fn process_damage_events_inner(
+    event_queue: &mut EventQueue,
+    entities: &mut EntityStore,
+    repush_damage_events: bool,
+) -> (Vec<EntityDiedEvent>, Vec<DamageEvent>) {
     let damage_events = event_queue.drain::<DamageEvent>();
     let mut died_events = Vec::new();
+    let mut incapacitated_events = Vec::new();
 
-    for dmg in damage_events {
+    for dmg in &damage_events {
         let bonus_damage = entities
             .get_by_guid(dmg.source)
             .and_then(|attacker| attacker.get_property_f64("bonus_damage"))
@@ -372,6 +429,14 @@ pub fn process_damage_events(
             Some(e) => e,
             None => continue,
         };
+
+        if target_entity.is_incapacitated()
+            || target_entity
+                .get_component::<HealthComponent>()
+                .is_some_and(|h| h.is_dead)
+        {
+            continue;
+        }
 
         let mut effective_damage =
             if let Some(stats) = target_entity.get_component::<StatsComponent>() {
@@ -390,15 +455,10 @@ pub fn process_damage_events(
             continue;
         }
 
+        let has_health_comp = target_entity.get_component::<HealthComponent>().is_some();
+        let mut died = false;
         if let Some(health) = target_entity.get_component_mut::<HealthComponent>() {
-            let died = health.take_damage(effective_damage);
-            if died {
-                let death_event = EntityDiedEvent {
-                    entity: dmg.target,
-                    killer: Some(dmg.source),
-                };
-                died_events.push(death_event);
-            }
+            died = health.take_damage(effective_damage);
         }
 
         // 1. Interrupt active action if configured with cancel_on_damage
@@ -414,15 +474,40 @@ pub fn process_damage_events(
 
         // 2. Synchronize with dynamic AttributeSet if attached
         if let Some(attrs) = target_entity.get_component_mut::<mmo_core::AttributeSet>() {
-            let _ = attrs.modify_current("health", -effective_damage);
+            if let Ok(new_hp) = attrs.modify_current("health", -effective_damage) {
+                if !has_health_comp && new_hp <= 0.0 {
+                    died = true;
+                }
+            }
+        }
+
+        if died {
+            target_entity.state_flags |= state_flags::INCAPACITATED;
+            died_events.push(EntityDiedEvent {
+                entity: dmg.target,
+                killer: Some(dmg.source),
+            });
+            incapacitated_events.push(EntityIncapacitatedEvent {
+                entity: dmg.target,
+                instigator: Some(dmg.source),
+            });
         }
     }
 
     for death in &died_events {
         event_queue.push(death.clone());
     }
+    for incap in incapacitated_events {
+        event_queue.push(incap);
+    }
 
-    died_events
+    if repush_damage_events {
+        for dmg in &damage_events {
+            event_queue.push(dmg.clone());
+        }
+    }
+
+    (died_events, damage_events)
 }
 
 #[cfg(test)]
@@ -655,7 +740,7 @@ mod tests {
             raw_damage: 35.0,
         });
 
-        let mut sys = DamageProcessingSystem;
+        let mut sys = DamageProcessingSystem::default();
         let mut ctx = TickContext {
             tick: 1,
             dt_sec: 0.1,
@@ -744,5 +829,184 @@ mod tests {
             .unwrap();
         assert_eq!(def_comp.current_hp, 100.0);
         assert!(!def_comp.is_dead);
+    }
+
+    #[test]
+    fn test_armor_mitigation_90_percent_cap_and_non_finite_guard() {
+        let high_armor = StatsComponent::new(10, 100_000);
+        // 100_000 / 100_100 = 0.999... clamped to 0.90 -> 10% damage passes through
+        let mitigated = high_armor.mitigate_damage(100.0);
+        assert!((mitigated - 10.0).abs() < 1e-4);
+
+        // Non-finite and non-positive damage must return 0.0
+        assert_eq!(high_armor.mitigate_damage(f32::NAN), 0.0);
+        assert_eq!(high_armor.mitigate_damage(f32::INFINITY), 0.0);
+        assert_eq!(high_armor.mitigate_damage(f32::NEG_INFINITY), 0.0);
+        assert_eq!(high_armor.mitigate_damage(-10.0), 0.0);
+        assert_eq!(high_armor.mitigate_damage(0.0), 0.0);
+
+        // RpgCombatResolver must apply the exact same 90% armor cap
+        let target_guid = Guid::new(EntityType::Npc, 1, 1);
+        let mut target = Entity::new(target_guid, (0.0, 0.0, 0.0));
+        target.add_component(HealthComponent::new(100.0, 0.0));
+        target.add_component(StatsComponent::new(0, 100_000));
+        let mut events = EventQueue::new();
+        let outcome = RpgCombatResolver
+            .resolve_combat_effect(&mut target, target_guid, None, 100, 0, &mut events)
+            .unwrap();
+        assert!((outcome.effective_damage - 10.0).abs() < 1e-4);
+        assert_eq!(outcome.current_health, 90);
+    }
+
+    #[test]
+    fn test_combat_resolver_and_damage_events_sync_death_and_incapacitated_state() {
+        let attacker = Guid::new(EntityType::Player, 1, 10);
+
+        // 1. Kill via RpgCombatResolver -> sets both is_dead & INCAPACITATED and emits both events
+        let target_a_guid = Guid::new(EntityType::Npc, 1, 11);
+        let mut target_a = Entity::new(target_a_guid, (0.0, 0.0, 0.0));
+        target_a.add_component(HealthComponent::new(50.0, 0.0));
+        let mut events_a = EventQueue::new();
+
+        let outcome = RpgCombatResolver
+            .resolve_combat_effect(
+                &mut target_a,
+                target_a_guid,
+                Some(attacker),
+                60,
+                0,
+                &mut events_a,
+            )
+            .unwrap();
+        assert!(outcome.died);
+        assert!(target_a.get_component::<HealthComponent>().unwrap().is_dead);
+        assert!(target_a.is_incapacitated());
+
+        let died_a = events_a.drain::<EntityDiedEvent>();
+        let incap_a = events_a.drain::<EntityIncapacitatedEvent>();
+        assert_eq!(died_a.len(), 1);
+        assert_eq!(died_a[0].entity, target_a_guid);
+        assert_eq!(died_a[0].killer, Some(attacker));
+        assert_eq!(incap_a.len(), 1);
+        assert_eq!(incap_a[0].entity, target_a_guid);
+        assert_eq!(incap_a[0].instigator, Some(attacker));
+
+        // Already dead target rejected
+        assert_eq!(
+            RpgCombatResolver.resolve_combat_effect(
+                &mut target_a,
+                target_a_guid,
+                Some(attacker),
+                10,
+                0,
+                &mut events_a,
+            ),
+            Err("Target entity is dead")
+        );
+
+        // 2. Kill via process_damage_events -> sets both is_dead & INCAPACITATED and emits both events
+        let mut store = EntityStore::new();
+        let target_b_guid = Guid::new(EntityType::Npc, 1, 12);
+        let b_key = store.spawn(target_b_guid, (0.0, 0.0, 0.0));
+        store
+            .get_mut(b_key)
+            .unwrap()
+            .add_component(HealthComponent::new(50.0, 0.0));
+
+        let mut events_b = EventQueue::new();
+        events_b.push(DamageEvent {
+            source: attacker,
+            target: target_b_guid,
+            raw_damage: 60.0,
+        });
+        let deaths = process_damage_events(&mut events_b, &mut store);
+        assert_eq!(deaths.len(), 1);
+
+        let ent_b = store.get(b_key).unwrap();
+        assert!(ent_b.get_component::<HealthComponent>().unwrap().is_dead);
+        assert!(ent_b.is_incapacitated());
+
+        let died_b = events_b.drain::<EntityDiedEvent>();
+        let incap_b = events_b.drain::<EntityIncapacitatedEvent>();
+        assert_eq!(died_b.len(), 1);
+        assert_eq!(died_b[0].entity, target_b_guid);
+        assert_eq!(died_b[0].killer, Some(attacker));
+        assert_eq!(incap_b.len(), 1);
+        assert_eq!(incap_b[0].entity, target_b_guid);
+        assert_eq!(incap_b[0].instigator, Some(attacker));
+    }
+
+    #[test]
+    fn test_damage_processing_system_preserves_damage_event_in_tick_and_cleans_at_end_of_tick() {
+        let mut store = EntityStore::new();
+        let mut queue = EventQueue::new();
+        let mut octree = mmo_core::Octree::new(mmo_core::BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+
+        let attacker = Guid::new(EntityType::Player, 1, 701);
+        let victim = Guid::new(EntityType::Npc, 1, 702);
+        store.spawn(attacker, (0.0, 0.0, 0.0));
+        let v_key = store.spawn(victim, (1.0, 0.0, 0.0));
+        store
+            .get_mut(v_key)
+            .unwrap()
+            .add_component(HealthComponent::new(100.0, 0.0));
+
+        let tick1_dmg = DamageEvent {
+            source: attacker,
+            target: victim,
+            raw_damage: 25.0,
+        };
+        queue.push(tick1_dmg.clone());
+
+        let mut sys = DamageProcessingSystem::default();
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut queue,
+                dt_sec: 0.05,
+                tick: 1,
+                collision_world: None,
+            };
+            sys.update(&mut ctx);
+        }
+
+        // Damage was applied, AND DamageEvent remains queued during the tick for ThreatSystem
+        assert_eq!(
+            store
+                .get(v_key)
+                .unwrap()
+                .get_component::<HealthComponent>()
+                .unwrap()
+                .current_hp,
+            75.0
+        );
+
+        // Simulate a downstream AI system emitting a NEW DamageEvent later in the same tick
+        let next_tick_dmg = DamageEvent {
+            source: victim,
+            target: attacker,
+            raw_damage: 10.0,
+        };
+        queue.push(next_tick_dmg.clone());
+
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut queue,
+                dt_sec: 0.05,
+                tick: 1,
+                collision_world: None,
+            };
+            sys.end_of_tick(&mut ctx);
+        }
+
+        // Processed tick1_dmg was cleaned up; next_tick_dmg emitted later in the tick remains
+        let remaining = queue.drain::<DamageEvent>();
+        assert_eq!(remaining, vec![next_tick_dmg]);
     }
 }

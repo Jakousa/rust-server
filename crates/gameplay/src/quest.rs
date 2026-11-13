@@ -179,20 +179,18 @@ impl QuestLogComponent {
             return Err("Quest is not ready for turn-in");
         }
 
-        // Verify inventory capacity for reward items
-        let free_slots = inventory.slots.iter().filter(|s| s.is_none()).count();
-        if free_slots < quest.reward_items.len() {
-            return Err("Not enough inventory space for quest rewards");
+        // Stage reward distribution to atomically verify slot capacity, item validity, and weight limit
+        let mut staged_inventory = inventory.clone();
+        for reward in &quest.reward_items {
+            staged_inventory.add_item(reward.clone())?;
+        }
+        if !quest.reward_items.is_empty() && staged_inventory.is_encumbered() {
+            return Err("Quest rewards would exceed inventory weight capacity");
         }
 
         let mut completed_quest = self.active_quests.remove(&quest_id).unwrap();
         completed_quest.status = QuestStatus::Completed;
-
-        // Distribute items
-        for reward in completed_quest.reward_items {
-            let _ = inventory.add_item(reward);
-        }
-
+        *inventory = staged_inventory;
         self.completed_quests.push(quest_id);
         Ok(completed_quest.reward_xp)
     }
@@ -255,5 +253,50 @@ mod tests {
         assert_eq!(xp, 250);
         assert_eq!(inv.slots[0].as_ref().unwrap().item_id, 50);
         assert!(log.completed_quests.contains(&1));
+    }
+
+    #[test]
+    fn test_turn_in_quest_failure_preserves_active_quest_and_inventory() {
+        let mut log = QuestLogComponent::new();
+        let mut quest = QuestRecord::new(
+            7,
+            "Heavy Bounty",
+            vec![QuestObjective::KillMonster {
+                monster_type_id: 3,
+                required: 1,
+                current: 1,
+            }],
+            vec![
+                ItemStack::new(60, "Light Coin", 1, 1.0),
+                ItemStack::new(61, "Heavy Anvil", 1, 50.0),
+            ],
+            400,
+        );
+        quest.update_status();
+        assert_eq!(quest.status, QuestStatus::ReadyForTurnIn);
+        log.accept_quest(quest).unwrap();
+
+        // 1. Insufficient slots -> turn-in fails atomically
+        let mut small_inv = InventoryComponent::new(1, 100.0);
+        assert_eq!(
+            log.turn_in_quest(7, &mut small_inv),
+            Err("Inventory is full")
+        );
+        assert!(log.active_quests.contains_key(&7));
+        assert!(!log.completed_quests.contains(&7));
+        assert!(small_inv.slots[0].is_none());
+
+        // 2. Exceeds weight capacity -> turn-in fails atomically without partial rewards or quest removal
+        let mut light_inv = InventoryComponent::new(4, 20.0);
+        assert_eq!(
+            log.turn_in_quest(7, &mut light_inv),
+            Err("Quest rewards would exceed inventory weight capacity")
+        );
+        assert_eq!(
+            log.active_quests.get(&7).unwrap().status,
+            QuestStatus::ReadyForTurnIn
+        );
+        assert!(!log.completed_quests.contains(&7));
+        assert!(light_inv.slots.iter().all(|s| s.is_none()));
     }
 }

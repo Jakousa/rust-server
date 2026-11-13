@@ -3,11 +3,31 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use mmo_core::{EntityStore, FuelMeteredExecutor, Guid, ScriptError, ScriptValue};
+use mmo_core::{DomainEvent, EntityStore, FuelMeteredExecutor, Guid, ScriptError, ScriptValue};
 use wasmtime::{InstancePre, Linker, Module, Store};
 
 use super::engine::WasmScriptEngine;
 use super::host_api::{register_host_api, HostContext};
+
+/// Domain event forwarded from a WASM guest script's `dispatch_event` host call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmDispatchedEvent {
+    pub module_id: String,
+    pub event_type: i32,
+    pub target_guid: Guid,
+    pub payload: Vec<u8>,
+}
+
+impl DomainEvent for WasmDispatchedEvent {}
+
+/// Drained host-side outputs captured from a single WASM invocation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WasmInvocationOutputs {
+    pub results: Vec<ScriptValue>,
+    pub fuel_consumed: u64,
+    pub logs: Vec<(i32, String)>,
+    pub dispatched_events: Vec<WasmDispatchedEvent>,
+}
 
 /// Module paired with the pre-linked instance template built from it.
 type CachedPre = (Arc<Module>, InstancePre<HostContext>);
@@ -51,6 +71,21 @@ impl WasmRuntime {
         self.execute_function_internal(module_id, func_name, args, host_ctx, fuel_limit)
     }
 
+    /// Executes an exported function and returns both its return values and drained host logs/events.
+    pub fn execute_function_capturing(
+        &self,
+        module_id: &str,
+        func_name: &str,
+        args: &[ScriptValue],
+        entities: Option<&mut EntityStore>,
+        fuel_limit: u64,
+    ) -> Result<WasmInvocationOutputs, ScriptError> {
+        let host_ctx = HostContext::new(entities);
+        self.execute_function_internal_with_outputs(
+            module_id, func_name, args, host_ctx, fuel_limit,
+        )
+    }
+
     /// Executes an exported function with full tick context (entities, octree, and events).
     #[allow(clippy::too_many_arguments)]
     pub fn execute_function_with_tick_context(
@@ -91,6 +126,54 @@ impl WasmRuntime {
         Ok(pre)
     }
 
+    fn drain_host_outputs(
+        store: &mut Store<HostContext>,
+        module_id: &str,
+    ) -> (Vec<(i32, String)>, Vec<WasmDispatchedEvent>) {
+        let logs = std::mem::take(&mut store.data_mut().logs);
+        for (level, msg) in &logs {
+            tracing::debug!(
+                target: "wasm_script",
+                module_id = %module_id,
+                level = *level,
+                "{}",
+                msg
+            );
+        }
+
+        let raw_events = std::mem::take(&mut store.data_mut().dispatched_events);
+        let dispatched_events: Vec<WasmDispatchedEvent> = raw_events
+            .into_iter()
+            .map(|(event_type, target_raw, payload)| WasmDispatchedEvent {
+                module_id: module_id.to_string(),
+                event_type,
+                target_guid: Guid::from_raw(target_raw),
+                payload,
+            })
+            .collect();
+
+        let events_ptr = store.data().events_ptr;
+        if !events_ptr.is_null() {
+            let events = unsafe { &mut *events_ptr };
+            for evt in &dispatched_events {
+                events.push(evt.clone());
+            }
+        } else {
+            for evt in &dispatched_events {
+                tracing::debug!(
+                    target: "wasm_script",
+                    module_id = %evt.module_id,
+                    event_type = evt.event_type,
+                    target_guid = ?evt.target_guid,
+                    payload_len = evt.payload.len(),
+                    "WASM dispatched event without EventQueue context"
+                );
+            }
+        }
+
+        (logs, dispatched_events)
+    }
+
     fn execute_function_internal(
         &self,
         module_id: &str,
@@ -99,6 +182,20 @@ impl WasmRuntime {
         host_ctx: HostContext,
         fuel_limit: u64,
     ) -> Result<(Vec<ScriptValue>, u64), ScriptError> {
+        let outputs = self.execute_function_internal_with_outputs(
+            module_id, func_name, args, host_ctx, fuel_limit,
+        )?;
+        Ok((outputs.results, outputs.fuel_consumed))
+    }
+
+    fn execute_function_internal_with_outputs(
+        &self,
+        module_id: &str,
+        func_name: &str,
+        args: &[ScriptValue],
+        host_ctx: HostContext,
+        fuel_limit: u64,
+    ) -> Result<WasmInvocationOutputs, ScriptError> {
         let module = self
             .engine
             .get_module(module_id)
@@ -133,12 +230,15 @@ impl WasmRuntime {
         let num_results = func.ty(&store).results().len();
         let mut wasm_results = vec![wasmtime::Val::I32(0); num_results];
 
-        match func.call(&mut store, &wasm_args, &mut wasm_results) {
+        let call_res = func.call(&mut store, &wasm_args, &mut wasm_results);
+        let (logs, dispatched_events) = Self::drain_host_outputs(&mut store, module_id);
+
+        match call_res {
             Ok(()) => {
                 let remaining_fuel = store.get_fuel().unwrap_or(0);
                 let fuel_consumed = fuel_limit.saturating_sub(remaining_fuel);
 
-                let script_results = wasm_results
+                let results = wasm_results
                     .into_iter()
                     .map(|val| match val {
                         wasmtime::Val::I32(v) => ScriptValue::I32(v),
@@ -149,7 +249,12 @@ impl WasmRuntime {
                     })
                     .collect();
 
-                Ok((script_results, fuel_consumed))
+                Ok(WasmInvocationOutputs {
+                    results,
+                    fuel_consumed,
+                    logs,
+                    dispatched_events,
+                })
             }
             Err(trap) => {
                 if let Some(t) = trap.downcast_ref::<wasmtime::Trap>() {
@@ -317,5 +422,72 @@ mod tests {
         let result = runtime.execute_function("test_mod", "non_existent", &[], None, 10_000);
 
         assert!(matches!(result, Err(ScriptError::ExportNotFound(_))));
+    }
+
+    #[test]
+    fn test_runtime_drains_and_forwards_logs_and_dispatched_events() {
+        use mmo_core::{BoundingBox3D, EntityType, EventQueue, Octree};
+
+        let engine = Arc::new(WasmScriptEngine::new().unwrap());
+        let wat = r#"
+        (module
+            (import "env" "script_log" (func $log (param i32 i32 i32) (result i32)))
+            (import "env" "dispatch_event" (func $dispatch (param i32 i64 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "tick-log")
+            (data (i32.const 16) "evt-payload")
+            (func (export "emit") (result i32)
+                (call $log (i32.const 2) (i32.const 0) (i32.const 8))
+                drop
+                (call $dispatch (i32.const 99) (i64.const 12345) (i32.const 16) (i32.const 11))
+                drop
+                i32.const 1
+            )
+        )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        engine.load_module("emitter", &wasm_bytes).unwrap();
+
+        let runtime = WasmRuntime::new(engine).unwrap();
+
+        // 1. Capturing mode returns drained logs and dispatched events
+        let outputs = runtime
+            .execute_function_capturing("emitter", "emit", &[], None, 50_000)
+            .unwrap();
+        assert_eq!(outputs.results, vec![ScriptValue::I32(1)]);
+        assert_eq!(outputs.logs, vec![(2, "tick-log".to_string())]);
+        assert_eq!(outputs.dispatched_events.len(), 1);
+        assert_eq!(outputs.dispatched_events[0].module_id, "emitter");
+        assert_eq!(outputs.dispatched_events[0].event_type, 99);
+        assert_eq!(
+            outputs.dispatched_events[0].target_guid,
+            Guid::from_raw(12345)
+        );
+        assert_eq!(outputs.dispatched_events[0].payload, b"evt-payload");
+
+        // 2. Tick context mode forwards dispatched events to EventQueue
+        let mut entities = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-10.0, -10.0, -10.0),
+            (10.0, 10.0, 10.0),
+        ));
+        let mut events = EventQueue::new();
+        let _ = Guid::new(EntityType::Npc, 1, 1);
+
+        let (res, _) = runtime
+            .execute_function_with_tick_context(
+                "emitter",
+                "emit",
+                &[],
+                &mut entities,
+                &mut octree,
+                &mut events,
+                50_000,
+            )
+            .unwrap();
+        assert_eq!(res, vec![ScriptValue::I32(1)]);
+
+        let forwarded = events.drain::<WasmDispatchedEvent>();
+        assert_eq!(forwarded, outputs.dispatched_events);
     }
 }

@@ -14,7 +14,10 @@ pub mod plugin;
 pub mod runtime;
 
 pub use engine::WasmScriptEngine;
-pub use host_api::{register_host_api, validate_memory_bounds, HostContext};
+pub use host_api::{
+    register_host_api, validate_memory_bounds, HostContext, MAX_WASM_HOST_ITEMS_PER_CALL,
+    MAX_WASM_HOST_PAYLOAD_BYTES,
+};
 pub use hot_reload::ScriptHotReloader;
 pub use plugin::{ScriptHookHandler, ScriptTickSystem, WasmScriptPlugin};
-pub use runtime::WasmRuntime;
+pub use runtime::{WasmDispatchedEvent, WasmInvocationOutputs, WasmRuntime};
