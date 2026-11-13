@@ -950,6 +950,8 @@ impl MarketplaceRepository {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<MarketListingRecord>, StorageError> {
+        let safe_limit = limit.clamp(1, 100);
+        let safe_offset = offset.min(i32::MAX as u32);
         let now_ms = current_time_ms();
         let mut query = String::from(
             r#"
@@ -986,7 +988,7 @@ impl MarketplaceRepository {
                 if let Some(max_p) = max_price {
                     q = q.bind(max_p as i64);
                 }
-                q = q.bind(limit as i32).bind(offset as i32);
+                q = q.bind(safe_limit as i32).bind(safe_offset as i32);
                 let rows = q.fetch_all(pool).await?;
                 let mut results = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -1005,7 +1007,7 @@ impl MarketplaceRepository {
                 if let Some(max_p) = max_price {
                     q = q.bind(max_p as i64);
                 }
-                q = q.bind(limit as i32).bind(offset as i32);
+                q = q.bind(safe_limit as i32).bind(safe_offset as i32);
                 let rows = q.fetch_all(pool).await?;
                 let mut results = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -2058,5 +2060,44 @@ mod tests {
         assert!(ms > 1_700_000_000_000);
         assert!(ms > secs * 900);
         assert!(ms >= secs * 1000);
+    }
+
+    #[tokio::test]
+    async fn test_query_listings_clamps_limit() {
+        let (db, repo) = setup_test_db().await;
+        let seller_guid = 2001;
+        let seller_container = 20;
+        let escrow_container = 98;
+        create_container(&db, seller_container, "2001", 200).await;
+        create_container(&db, escrow_container, "system", 200).await;
+
+        for i in 0..105u32 {
+            let item_id = format!("item-clamp-{i}");
+            create_item(&db, &item_id, seller_container, i, 777).await;
+            repo.create_listing(
+                seller_guid,
+                seller_container,
+                i,
+                100 + i as u64,
+                3600,
+                escrow_container,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Requesting > 100 (or u32::MAX) must clamp to 100 rows.
+        let capped = repo
+            .query_listings(Some(777), None, None, 0, u32::MAX)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 100);
+
+        // Requesting 0 must clamp up to 1 row.
+        let min_clamped = repo
+            .query_listings(Some(777), None, None, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(min_clamped.len(), 1);
     }
 }

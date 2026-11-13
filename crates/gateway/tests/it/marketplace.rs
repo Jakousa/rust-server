@@ -414,6 +414,142 @@ async fn test_marketplace_e2e_lifecycle_and_simulation_bypass() {
     );
 }
 
+#[tokio::test]
+async fn test_marketplace_query_limit_clamped() {
+    let db = Database::connect_memory().await.unwrap();
+    let mkt_repo = Arc::new(MarketplaceRepository::new(db.clone()));
+    let escrow_container_id = 999_998;
+    let mkt_service = Arc::new(
+        GatewayMarketplaceService::new(mkt_repo.clone())
+            .with_escrow_container_id(escrow_container_id),
+    );
+
+    let seller_guid = Guid::new(EntityType::Player, 1, 3001);
+    let seller_container = 300;
+    create_container(&db, seller_container, &seller_guid.raw().to_string(), 200).await;
+    create_container(&db, escrow_container_id, "system", 200).await;
+
+    for i in 0..105u32 {
+        let item_id = format!("item-limit-{i}");
+        create_item(&db, &item_id, seller_container, i, 888).await;
+        mkt_repo
+            .create_listing(
+                seller_guid.raw(),
+                seller_container,
+                i,
+                100 + i as u64,
+                3600,
+                escrow_container_id,
+            )
+            .await
+            .unwrap();
+    }
+
+    let router = Arc::new(SessionRouter::new());
+    let (packet_tx, _packet_rx) = mpsc::channel(16);
+    let auth = Arc::new(
+        EdgeAuthenticator::new_hs256(
+            TEST_SECRET,
+            Some("mmo-auth".to_string()),
+            Some("mmo-gateway".to_string()),
+        )
+        .with_auth_timeout(Duration::from_secs(5)),
+    );
+
+    let server = Arc::new(
+        GatewayServer::with_packet_channel(router, packet_tx)
+            .with_authenticator(auth)
+            .with_marketplace(mkt_service)
+            .with_default_node_address("127.0.0.1:50051"),
+    );
+
+    let listener = server.bind("127.0.0.1:0").await.expect("bind tcp listener");
+    let local_addr = listener.local_addr().expect("local addr");
+
+    let srv = server.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let s = srv.clone();
+            let sid = s.next_session_id();
+            tokio::spawn(async move {
+                let _ = s.handle_connection(socket, sid).await;
+            });
+        }
+    });
+
+    let token = EdgeAuthenticator::create_test_jwt(
+        seller_guid,
+        TEST_SECRET,
+        3600,
+        Some("mmo-auth"),
+        Some("mmo-gateway"),
+    );
+    let mut stream = TcpStream::connect(local_addr).await.expect("connect");
+    let mut buf = BytesMut::with_capacity(8192);
+    stream
+        .write_all(
+            &ClientPacket::AuthRequest(AuthRequestPacket {
+                token,
+                client_version: 1,
+            })
+            .encode(),
+        )
+        .await
+        .expect("write auth");
+    match read_next_packet(&mut stream, &mut buf).await {
+        ClientPacket::AuthResponse(r) => assert!(r.success),
+        other => panic!("Expected AuthResponse, got {other:?}"),
+    }
+
+    // Limit > 100 must be clamped to 100
+    stream
+        .write_all(
+            &ClientPacket::MarketQueryRequest(MarketQueryRequestPacket {
+                item_def_id: 888,
+                min_price: 0,
+                max_price: 0,
+                offset: 0,
+                limit: 500,
+            })
+            .encode(),
+        )
+        .await
+        .expect("write oversized query");
+    let max_res = timeout(
+        Duration::from_secs(2),
+        read_next_packet(&mut stream, &mut buf),
+    )
+    .await
+    .expect("query timeout")
+    .expect_market_response();
+    assert!(max_res.success);
+    assert_eq!(max_res.listings.len(), 100);
+
+    // Limit == 0 must be clamped to 1
+    stream
+        .write_all(
+            &ClientPacket::MarketQueryRequest(MarketQueryRequestPacket {
+                item_def_id: 888,
+                min_price: 0,
+                max_price: 0,
+                offset: 0,
+                limit: 0,
+            })
+            .encode(),
+        )
+        .await
+        .expect("write zero query");
+    let min_res = timeout(
+        Duration::from_secs(2),
+        read_next_packet(&mut stream, &mut buf),
+    )
+    .await
+    .expect("zero query timeout")
+    .expect_market_response();
+    assert!(min_res.success);
+    assert_eq!(min_res.listings.len(), 1);
+}
+
 trait MarketPacketExt {
     fn expect_market_response(self) -> MarketResponsePacket;
 }

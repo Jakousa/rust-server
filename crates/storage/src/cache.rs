@@ -127,29 +127,83 @@ impl SessionCacheBackend for MemoryCache {
 #[derive(Clone)]
 pub struct RedisCache {
     client: redis::Client,
+    conn: Arc<RwLock<(u64, Option<redis::aio::MultiplexedConnection>)>>,
 }
 
 impl RedisCache {
     pub fn new(redis_url: &str) -> Result<Self, StorageError> {
         let client = redis::Client::open(redis_url)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            conn: Arc::new(RwLock::new((0, None))),
+        })
     }
+
+    async fn get_connection(
+        &self,
+    ) -> Result<(u64, redis::aio::MultiplexedConnection), StorageError> {
+        {
+            let guard = self.conn.read().await;
+            if let Some(ref conn) = guard.1 {
+                return Ok((guard.0, conn.clone()));
+            }
+        }
+        let mut guard = self.conn.write().await;
+        if let Some(ref conn) = guard.1 {
+            return Ok((guard.0, conn.clone()));
+        }
+        let new_conn = self.client.get_multiplexed_tokio_connection().await?;
+        guard.0 = guard.0.wrapping_add(1);
+        guard.1 = Some(new_conn.clone());
+        Ok((guard.0, new_conn))
+    }
+
+    async fn invalidate_connection(&self, failed_gen: u64) {
+        let mut guard = self.conn.write().await;
+        if guard.0 == failed_gen {
+            guard.1 = None;
+        }
+    }
+}
+
+fn is_transient_connection_error(err: &redis::RedisError) -> bool {
+    err.is_io_error()
+        || err.is_connection_dropped()
+        || err.is_unrecoverable_error()
+        || err.is_timeout()
+        || err.is_connection_refusal()
+}
+
+macro_rules! with_redis_conn {
+    ($self:expr, $conn:ident => $body:expr) => {{
+        let (gen_id, mut $conn) = $self.get_connection().await?;
+        match $body {
+            Ok(val) => Ok(val),
+            Err(err) if is_transient_connection_error(&err) => {
+                $self.invalidate_connection(gen_id).await;
+                let (_new_gen, mut $conn) = $self.get_connection().await?;
+                $body.map_err(StorageError::from)
+            }
+            Err(err) => Err(StorageError::from(err)),
+        }
+    }};
 }
 
 #[async_trait]
 impl SessionCacheBackend for RedisCache {
     async fn set_session(&self, data: &SessionData, ttl_secs: u64) -> Result<(), StorageError> {
-        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:session:{}", data.session_id);
         let val = serde_json::to_string(data)?;
-        conn.set_ex::<_, _, ()>(key, val, ttl_secs).await?;
-        Ok(())
+        with_redis_conn!(self, conn => {
+            conn.set_ex::<_, _, ()>(&key, &val, ttl_secs).await
+        })
     }
 
     async fn get_session(&self, session_id: u64) -> Result<Option<SessionData>, StorageError> {
-        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:session:{}", session_id);
-        let val: Option<String> = conn.get(key).await?;
+        let val: Option<String> = with_redis_conn!(self, conn => {
+            conn.get(&key).await
+        })?;
         match val {
             Some(s) => Ok(Some(serde_json::from_str(&s)?)),
             None => Ok(None),
@@ -157,22 +211,22 @@ impl SessionCacheBackend for RedisCache {
     }
 
     async fn remove_session(&self, session_id: u64) -> Result<bool, StorageError> {
-        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:session:{}", session_id);
-        let deleted: i64 = conn.del(key).await?;
+        let deleted: i64 = with_redis_conn!(self, conn => {
+            conn.del(&key).await
+        })?;
         Ok(deleted > 0)
     }
 
     async fn stage_handover(&self, data: &HandoverData, ttl_secs: u64) -> Result<(), StorageError> {
-        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:handover:{}", data.guid);
         let val = serde_json::to_string(data)?;
-        conn.set_ex::<_, _, ()>(key, val, ttl_secs).await?;
-        Ok(())
+        with_redis_conn!(self, conn => {
+            conn.set_ex::<_, _, ()>(&key, &val, ttl_secs).await
+        })
     }
 
     async fn claim_handover(&self, guid: u64) -> Result<Option<HandoverData>, StorageError> {
-        let mut conn = self.client.get_multiplexed_tokio_connection().await?;
         let key = format!("mmo:handover:{}", guid);
         let script = redis::Script::new(
             r#"
@@ -183,7 +237,9 @@ impl SessionCacheBackend for RedisCache {
             return val
             "#,
         );
-        let val: Option<String> = script.key(&key).invoke_async(&mut conn).await?;
+        let val: Option<String> = with_redis_conn!(self, conn => {
+            script.key(&key).invoke_async(&mut conn).await
+        })?;
         match val {
             Some(s) => Ok(Some(serde_json::from_str(&s)?)),
             None => Ok(None),
@@ -405,5 +461,202 @@ mod tests {
         assert!(cache.stage_handover(&handover, u64::MAX).await.is_ok());
         let claimed = cache.claim_handover(333).await.unwrap();
         assert!(claimed.is_some());
+    }
+
+    async fn read_resp_command(
+        buf: &mut Vec<u8>,
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<Vec<Vec<u8>>> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some((args, consumed)) = parse_resp_array(buf) {
+                buf.drain(..consumed);
+                return Some(args);
+            }
+            let mut tmp = [0u8; 2048];
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    fn parse_resp_array(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        let crlf = buf.windows(2).position(|w| w == b"\r\n")?;
+        if *buf.first()? != b'*' {
+            return None;
+        }
+        let count: usize = std::str::from_utf8(&buf[1..crlf]).ok()?.parse().ok()?;
+        let mut pos = crlf + 2;
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            if *buf.get(pos)? != b'$' {
+                return None;
+            }
+            let len_end = buf[pos..].windows(2).position(|w| w == b"\r\n")? + pos;
+            let len: usize = std::str::from_utf8(&buf[pos + 1..len_end])
+                .ok()?
+                .parse()
+                .ok()?;
+            pos = len_end + 2;
+            if buf.len() < pos + len + 2 {
+                return None;
+            }
+            args.push(buf[pos..pos + len].to_vec());
+            pos += len + 2;
+        }
+        Some((args, pos))
+    }
+
+    #[tokio::test]
+    async fn test_redis_cache_reuses_persistent_connection_and_reconnects_on_drop() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let drop_next_set = Arc::new(AtomicBool::new(false));
+        let store: Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let accept_count_srv = accept_count.clone();
+        let drop_flag_srv = drop_next_set.clone();
+        let store_srv = store.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accept_count_srv.fetch_add(1, Ordering::SeqCst);
+                let drop_flag = drop_flag_srv.clone();
+                let store = store_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    while let Some(args) = read_resp_command(&mut buf, &mut stream).await {
+                        let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+                        let reply: Vec<u8> = match cmd.as_str() {
+                            "PING" => b"+PONG\r\n".to_vec(),
+                            "SET" if args.len() >= 3 => {
+                                if drop_flag.swap(false, Ordering::SeqCst) {
+                                    // Simulate sudden TCP drop to force client reconnect
+                                    return;
+                                }
+                                store
+                                    .lock()
+                                    .unwrap()
+                                    .insert(args[1].clone(), args[2].clone());
+                                b"+OK\r\n".to_vec()
+                            }
+                            "SETEX" if args.len() >= 4 => {
+                                if drop_flag.swap(false, Ordering::SeqCst) {
+                                    return;
+                                }
+                                store
+                                    .lock()
+                                    .unwrap()
+                                    .insert(args[1].clone(), args[3].clone());
+                                b"+OK\r\n".to_vec()
+                            }
+                            "GET" if args.len() >= 2 => {
+                                let val = store.lock().unwrap().get(&args[1]).cloned();
+                                match val {
+                                    Some(v) => {
+                                        let mut r = format!("${}\r\n", v.len()).into_bytes();
+                                        r.extend_from_slice(&v);
+                                        r.extend_from_slice(b"\r\n");
+                                        r
+                                    }
+                                    None => b"$-1\r\n".to_vec(),
+                                }
+                            }
+                            "DEL" if args.len() >= 2 => {
+                                let removed = store.lock().unwrap().remove(&args[1]).is_some();
+                                format!(":{}\r\n", usize::from(removed)).into_bytes()
+                            }
+                            "EVALSHA" | "EVAL" if args.len() >= 4 => {
+                                let val = store.lock().unwrap().remove(&args[3]);
+                                match val {
+                                    Some(v) => {
+                                        let mut r = format!("${}\r\n", v.len()).into_bytes();
+                                        r.extend_from_slice(&v);
+                                        r.extend_from_slice(b"\r\n");
+                                        r
+                                    }
+                                    None => b"$-1\r\n".to_vec(),
+                                }
+                            }
+                            _ => b"+OK\r\n".to_vec(),
+                        };
+                        if stream.write_all(&reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cache = RedisCache::new(&format!("redis://{addr}")).unwrap();
+        let session = SessionData {
+            session_id: 42,
+            guid: 777,
+            node_address: "127.0.0.1:50051".to_string(),
+            expires_at: 9999,
+        };
+
+        // Multiple sequential operations must reuse the exact same single TCP connection.
+        cache.set_session(&session, 60).await.unwrap();
+        let fetched = cache
+            .get_session(42)
+            .await
+            .unwrap()
+            .expect("session cached");
+        assert_eq!(fetched.guid, 777);
+        assert!(cache.remove_session(42).await.unwrap());
+        assert!(cache.get_session(42).await.unwrap().is_none());
+
+        let handover = HandoverData {
+            guid: 777,
+            source_node: 1,
+            target_node: 2,
+            snapshot: EntitySnapshot {
+                guid: 777,
+                position: (1.0, 2.0, 3.0),
+                rotation: 0.5,
+                attributes: serde_json::json!({}),
+                state_blob: None,
+                version: 1,
+                timestamp: 1000,
+            },
+            staged_at: 1000,
+        };
+        cache.stage_handover(&handover, 30).await.unwrap();
+        let claimed = cache.claim_handover(777).await.unwrap().expect("handover");
+        assert_eq!(claimed.target_node, 2);
+
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            1,
+            "RedisCache must reuse a single multiplexed TCP connection across operations"
+        );
+
+        // Trigger a TCP connection drop on the next SET, verifying automatic reconnect.
+        drop_next_set.store(true, Ordering::SeqCst);
+        cache.set_session(&session, 60).await.unwrap();
+        let fetched_after = cache
+            .get_session(42)
+            .await
+            .unwrap()
+            .expect("session after reconnect");
+        assert_eq!(fetched_after.guid, 777);
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "RedisCache should reconnect once after connection failure and reuse the new connection"
+        );
+
+        server_task.abort();
     }
 }

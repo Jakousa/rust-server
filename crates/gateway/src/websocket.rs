@@ -24,9 +24,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use mmo_schema::client::{ClientCodecError, ClientPacket, MAX_PACKET_PAYLOAD_SIZE};
+use mmo_storage::cache::SessionCacheBackend;
 
 use crate::router::SessionRouter;
-use crate::server::{PacketDispatcher, RoutedPacket, SessionSink};
+use crate::server::{PacketDispatcher, RoutedPacket, SessionDropGuard, SessionSink};
 
 /// Maximum WebSocket message/frame and accumulation buffer size (256 KiB) to allow
 /// coalesced multi-frame binary messages while preventing memory exhaustion DoS.
@@ -64,6 +65,8 @@ pub struct WebSocketServer {
     authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
     default_node_address: Option<String>,
     intercept_handler: Option<crate::server::GatewayInterceptHandler>,
+    cache: Option<Arc<dyn SessionCacheBackend>>,
+    connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl WebSocketServer {
@@ -89,6 +92,8 @@ impl WebSocketServer {
             authenticator: None,
             default_node_address: None,
             intercept_handler: None,
+            cache: None,
+            connection_semaphore: None,
         })
     }
 
@@ -122,6 +127,21 @@ impl WebSocketServer {
         self
     }
 
+    /// Configures an optional distributed session cache backend.
+    pub fn with_cache(mut self, cache: Arc<dyn SessionCacheBackend>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Configures a shared connection capacity semaphore.
+    pub fn with_connection_semaphore(
+        mut self,
+        connection_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.connection_semaphore = Some(connection_semaphore);
+        self
+    }
+
     /// Returns the local bound socket address.
     pub fn local_addr(&self) -> Result<SocketAddr, WebSocketError> {
         self.listener.local_addr().map_err(WebSocketError::Io)
@@ -141,6 +161,20 @@ impl WebSocketServer {
                         Ok(pair) => pair,
                         Err(_) => continue,
                     };
+
+                    let permit = if let Some(ref sem) = self.connection_semaphore {
+                        match sem.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                metrics::counter!("mmo_gateway_connections_rejected_max_capacity")
+                                    .increment(1);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let _ = tcp_stream.set_nodelay(true);
 
                     let session_id = self.session_counter.fetch_add(1, Ordering::Relaxed);
@@ -152,8 +186,10 @@ impl WebSocketServer {
                     let authenticator = self.authenticator.clone();
                     let default_node = self.default_node_address.clone();
                     let intercept_handler = self.intercept_handler.clone();
+                    let cache = self.cache.clone();
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         Self::accept_and_serve(
                             tcp_stream,
                             tls_acceptor,
@@ -165,6 +201,7 @@ impl WebSocketServer {
                             authenticator,
                             default_node,
                             intercept_handler,
+                            cache,
                         )
                         .await;
                     });
@@ -209,6 +246,7 @@ impl WebSocketServer {
         authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
         default_node_address: Option<String>,
         intercept_handler: Option<crate::server::GatewayInterceptHandler>,
+        cache: Option<Arc<dyn SessionCacheBackend>>,
     ) {
         let ws_config = Some(Self::ws_config());
 
@@ -238,6 +276,7 @@ impl WebSocketServer {
                 authenticator,
                 default_node_address,
                 intercept_handler,
+                cache,
             )
             .await;
         } else {
@@ -260,6 +299,7 @@ impl WebSocketServer {
                 authenticator,
                 default_node_address,
                 intercept_handler,
+                cache,
             )
             .await;
         }
@@ -276,6 +316,7 @@ impl WebSocketServer {
         authenticator: Option<Arc<crate::auth::EdgeAuthenticator>>,
         default_node_address: Option<String>,
         intercept_handler: Option<crate::server::GatewayInterceptHandler>,
+        cache: Option<Arc<dyn SessionCacheBackend>>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -284,12 +325,8 @@ impl WebSocketServer {
         let (stream_tx, mut stream_rx) =
             mpsc::channel::<Bytes>(crate::server::DEFAULT_STREAM_CHANNEL_CAPACITY);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Bytes>(64);
-
-        session_sinks.insert(
-            session_id,
-            SessionSink::new(datagram_tx.clone(), stream_tx.clone()),
-        );
-        metrics::gauge!("mmo_gateway_active_sessions").set(session_sinks.len() as f64);
+        let writer_done = Arc::new(tokio::sync::Notify::new());
+        let writer_done_signal = writer_done.clone();
 
         // Writer task: biased select prioritizes control pongs & reliable stream packets
         // over ephemeral datagram broadcasts.
@@ -315,35 +352,18 @@ impl WebSocketServer {
                     else => break,
                 }
             }
+            let _ = ws_write.close().await;
+            writer_done_signal.notify_waiters();
         });
 
-        struct WsSessionGuard {
-            session_id: u64,
-            router: Arc<SessionRouter>,
-            session_sinks: Arc<DashMap<u64, SessionSink>>,
-            intercept_handler: Option<crate::server::GatewayInterceptHandler>,
-            writer_handle: Option<tokio::task::JoinHandle<()>>,
-        }
-        impl Drop for WsSessionGuard {
-            fn drop(&mut self) {
-                let _ = self.router.remove_session(self.session_id);
-                self.session_sinks.remove(&self.session_id);
-                if let Some(ref handler) = self.intercept_handler {
-                    handler.remove_session(self.session_id);
-                }
-                if let Some(ref handle) = self.writer_handle {
-                    handle.abort();
-                }
-                metrics::gauge!("mmo_gateway_active_sessions").set(self.session_sinks.len() as f64);
-            }
-        }
-
-        let _guard = WsSessionGuard {
+        let _guard = SessionDropGuard {
             session_id,
             router: router.clone(),
             session_sinks: session_sinks.clone(),
-            intercept_handler: intercept_handler.clone(),
+            cache: cache.clone(),
+            subscription_manager: None,
             writer_handle: Some(writer_handle),
+            intercept_handler: intercept_handler.clone().map(Arc::new),
         };
 
         let mut buf = BytesMut::with_capacity(4096);
@@ -403,12 +423,19 @@ impl WebSocketServer {
                         session_id,
                         &router,
                         default_node_address.as_deref(),
-                        None,
+                        cache.as_ref(),
                         intercept_handler.as_ref(),
                     )
                     .await
                     {
                         Ok(auth_sess) => {
+                            // Register SessionSink ONLY after authentication succeeds.
+                            session_sinks.insert(
+                                session_id,
+                                SessionSink::new(datagram_tx.clone(), stream_tx.clone()),
+                            );
+                            metrics::gauge!("mmo_gateway_active_sessions")
+                                .set(session_sinks.len() as f64);
                             let resp = ClientPacket::AuthResponse(auth_sess.auth_response);
                             let _ = stream_tx.send(resp.encode().into()).await;
                         }
@@ -429,14 +456,21 @@ impl WebSocketServer {
                     return;
                 }
             }
-        } else if let Some(ref target_node) = default_node_address {
-            // Auto-register default player route in PoC / unauthenticated mode.
-            let default_guid = mmo_core::Guid::new(
-                mmo_core::EntityType::Player,
-                1,
-                (session_id & 0xFFFF_FFFF) as u32,
+        } else {
+            if let Some(ref target_node) = default_node_address {
+                // Auto-register default player route in PoC / unauthenticated mode.
+                let default_guid = mmo_core::Guid::new(
+                    mmo_core::EntityType::Player,
+                    1,
+                    (session_id & 0xFFFF_FFFF) as u32,
+                );
+                router.register_session(session_id, default_guid, target_node.clone());
+            }
+            session_sinks.insert(
+                session_id,
+                SessionSink::new(datagram_tx.clone(), stream_tx.clone()),
             );
-            router.register_session(session_id, default_guid, target_node.clone());
+            metrics::gauge!("mmo_gateway_active_sessions").set(session_sinks.len() as f64);
         }
 
         // Process any packets already buffered after the AuthRequest frame.
@@ -446,8 +480,7 @@ impl WebSocketServer {
             &router,
             &dispatcher,
             &packet_tx,
-            &stream_tx,
-            &datagram_tx,
+            &session_sinks,
             authenticator.is_some(),
             default_node_address.as_deref(),
             intercept_handler.as_ref(),
@@ -457,44 +490,54 @@ impl WebSocketServer {
             return;
         }
 
+        // Drop stack sender clones so `session_sinks.remove(&session_id)` (e.g. session revocation)
+        // immediately closes the writer channels and terminates the WebSocket writer task.
+        drop(datagram_tx);
+        drop(stream_tx);
+
         // Main ingress loop.
-        while let Some(msg_res) = ws_read.next().await {
-            match msg_res {
-                Ok(Message::Binary(data)) => {
-                    if buf.len() + data.len() > MAX_WS_BUFFER_SIZE {
-                        metrics::counter!("mmo_gateway_buffer_overflow_dropped_total").increment(1);
-                        buf.clear();
-                        return;
+        loop {
+            tokio::select! {
+                _ = writer_done.notified() => break,
+                msg_opt = ws_read.next() => {
+                    match msg_opt {
+                        Some(Ok(Message::Binary(data))) => {
+                            if buf.len() + data.len() > MAX_WS_BUFFER_SIZE {
+                                metrics::counter!("mmo_gateway_buffer_overflow_dropped_total")
+                                    .increment(1);
+                                buf.clear();
+                                return;
+                            }
+                            buf.extend_from_slice(&data);
+                            if !Self::process_buffered_frames(
+                                &mut buf,
+                                session_id,
+                                &router,
+                                &dispatcher,
+                                &packet_tx,
+                                &session_sinks,
+                                authenticator.is_some(),
+                                default_node_address.as_deref(),
+                                intercept_handler.as_ref(),
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = ctrl_tx.try_send(payload);
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Text(_))) => {
+                            metrics::counter!("mmo_gateway_framing_errors_total").increment(1);
+                            return;
+                        }
+                        Some(Ok(Message::Frame(_))) => {}
+                        Some(Err(_)) => break,
                     }
-                    buf.extend_from_slice(&data);
-                    if !Self::process_buffered_frames(
-                        &mut buf,
-                        session_id,
-                        &router,
-                        &dispatcher,
-                        &packet_tx,
-                        &stream_tx,
-                        &datagram_tx,
-                        authenticator.is_some(),
-                        default_node_address.as_deref(),
-                        intercept_handler.as_ref(),
-                    )
-                    .await
-                    {
-                        return;
-                    }
                 }
-                Ok(Message::Ping(payload)) => {
-                    let _ = ctrl_tx.try_send(payload);
-                }
-                Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) => break,
-                Ok(Message::Text(_)) => {
-                    metrics::counter!("mmo_gateway_framing_errors_total").increment(1);
-                    return;
-                }
-                Ok(Message::Frame(_)) => {}
-                Err(_) => break,
             }
         }
     }
@@ -506,8 +549,7 @@ impl WebSocketServer {
         router: &SessionRouter,
         dispatcher: &PacketDispatcher,
         packet_tx: &Option<mpsc::Sender<RoutedPacket>>,
-        stream_tx: &mpsc::Sender<Bytes>,
-        datagram_tx: &mpsc::Sender<Bytes>,
+        session_sinks: &DashMap<u64, SessionSink>,
         has_authenticator: bool,
         default_node_address: Option<&str>,
         intercept_handler: Option<&crate::server::GatewayInterceptHandler>,
@@ -520,6 +562,10 @@ impl WebSocketServer {
                         "opcode" => pkt.opcode().as_str()
                     )
                     .increment(1);
+
+                    let Some(sink_entry) = session_sinks.get(&session_id) else {
+                        return false;
+                    };
 
                     // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid.
                     if let ClientPacket::AuthRequest(_) = &pkt {
@@ -547,7 +593,7 @@ impl WebSocketServer {
                                     error_message: String::new(),
                                 },
                             );
-                            let _ = stream_tx.send(resp.encode().into()).await;
+                            let _ = sink_entry.stream_tx.try_send(resp.encode().into());
                             continue;
                         }
                     }
@@ -560,9 +606,10 @@ impl WebSocketServer {
                                 .unwrap_or_default()
                                 .as_millis() as u64,
                         });
-                        let _ = datagram_tx.try_send(pong.encode().into());
+                        let _ = sink_entry.datagram_tx.try_send(pong.encode().into());
                         continue;
                     }
+                    drop(sink_entry);
 
                     if let Some(handler) = intercept_handler {
                         if handler.handle_packet(session_id, &pkt).await {

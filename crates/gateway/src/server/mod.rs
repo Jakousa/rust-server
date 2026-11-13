@@ -123,6 +123,7 @@ pub struct GatewayServer {
     marketplace_service: Option<Arc<GatewayMarketplaceService>>,
     active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     handshake_timeout: Option<Duration>,
+    connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl GatewayServer {
@@ -146,6 +147,7 @@ impl GatewayServer {
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
+            connection_semaphore: None,
         }
     }
 
@@ -172,6 +174,7 @@ impl GatewayServer {
             marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
+            connection_semaphore: None,
         }
     }
 
@@ -230,6 +233,15 @@ impl GatewayServer {
     /// Sets an optional distributed session cache backend.
     pub fn with_cache(mut self, cache: Arc<dyn SessionCacheBackend>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Sets a shared connection semaphore applied across TCP, WebTransport, and WebSocket accepts.
+    pub fn with_connection_semaphore(
+        mut self,
+        connection_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.connection_semaphore = Some(connection_semaphore);
         self
     }
 
@@ -728,8 +740,6 @@ impl GatewayServer {
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
         let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
-        self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
-
         let writer_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -819,12 +829,16 @@ impl GatewayServer {
                     .await
                     {
                         Ok(auth_sess) => {
+                            self.register_session_sink(
+                                session_id,
+                                SessionSink::new(datagram_tx, stream_tx),
+                            )?;
                             let resp = ClientPacket::AuthResponse(auth_sess.auth_response);
                             let _ = self.send_packet_to_session(session_id, &resp).await;
                         }
                         Err((err, err_resp)) => {
                             let resp = ClientPacket::AuthResponse(err_resp);
-                            let _ = self.send_packet_to_session(session_id, &resp).await;
+                            let _ = stream_tx.send(Bytes::from(resp.encode())).await;
                             tokio::time::sleep(Duration::from_millis(15)).await;
                             return Err(err);
                         }
@@ -838,6 +852,7 @@ impl GatewayServer {
                 }
             }
         } else {
+            self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
             // Unauthenticated connection: enforce handshake timeout (Slowloris mitigation)
             let timeout_duration = self.handshake_timeout();
             let handshake_fut = async {
@@ -969,6 +984,12 @@ impl GatewayServer {
         if let Some(ref node) = self.default_node_address {
             server = server.with_default_node_address(node.clone());
         }
+        if let Some(ref cache) = self.cache {
+            server = server.with_cache(cache.clone());
+        }
+        if let Some(ref sem) = self.connection_semaphore {
+            server = server.with_connection_semaphore(sem.clone());
+        }
 
         Ok(server)
     }
@@ -994,6 +1015,12 @@ impl GatewayServer {
         if let Some(ref node) = self.default_node_address {
             server = server.with_default_node_address(node.clone());
         }
+        if let Some(ref cache) = self.cache {
+            server = server.with_cache(cache.clone());
+        }
+        if let Some(ref sem) = self.connection_semaphore {
+            server = server.with_connection_semaphore(sem.clone());
+        }
 
         Ok(server)
     }
@@ -1015,15 +1042,250 @@ impl GatewayServer {
         connection: quinn::Connection,
         session_id: u64,
     ) -> Result<(), GatewayError> {
-        let is_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(
-            self.authenticator.is_none(),
-        ));
+        const MAX_CONCURRENT_BI_STREAMS: usize = 16;
+        const MAX_STREAM_BUFFER: usize =
+            mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE + mmo_schema::client::HEADER_SIZE;
+
+        struct StreamTasksGuard(Vec<tokio::task::AbortHandle>);
+        impl Drop for StreamTasksGuard {
+            fn drop(&mut self) {
+                for handle in &self.0 {
+                    handle.abort();
+                }
+            }
+        }
+
         let active_send_stream: Arc<
             tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<quinn::SendStream>>>>,
         > = Arc::new(tokio::sync::Mutex::new(None));
         let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(1024);
         let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
+        let intercept_handler = self.intercept_handler();
+        let mut _drop_guard = SessionDropGuard {
+            session_id,
+            router: self.router.clone(),
+            session_sinks: self.session_sinks.clone(),
+            cache: self.cache.clone(),
+            subscription_manager: Some(self.subscription_manager.clone()),
+            writer_handle: None,
+            intercept_handler: Some(Arc::new(intercept_handler.clone())),
+        };
+        let mut _stream_tasks = StreamTasksGuard(Vec::new());
+        let bi_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BI_STREAMS));
+
+        let spawn_stream_reader =
+            |stream_send: Arc<tokio::sync::Mutex<quinn::SendStream>>,
+             mut recv: quinn::RecvStream,
+             mut buf: BytesMut,
+             permit: tokio::sync::OwnedSemaphorePermit| {
+                let dispatcher = self.dispatcher.clone();
+                let packet_tx = self.packet_tx.clone();
+                let intercept = intercept_handler.clone();
+                tokio::spawn(async move {
+                let _permit = permit;
+                let mut chunk = [0u8; 4096];
+
+                loop {
+                    // Drain any already-buffered frames (e.g. frames coalesced after AuthRequest).
+                    loop {
+                        match ClientPacket::decode_frame(&mut buf) {
+                            Ok(Some(pkt)) => {
+                                metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
+                                    .increment(1);
+                                if let ClientPacket::Ping(ref ping) = pkt {
+                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                                        client_timestamp: ping.timestamp,
+                                        server_timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64,
+                                    });
+                                    let pong_bytes = pong.encode();
+                                    metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
+                                    metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
+                                    let _ = stream_send.lock().await.write_all(&pong_bytes).await;
+                                    continue;
+                                }
+
+                                if intercept.handle_packet(session_id, &pkt).await {
+                                    continue;
+                                }
+
+                                match dispatcher.dispatch_packet(session_id, pkt) {
+                                    Ok(routed) => {
+                                        if let Some(ref tx) = packet_tx {
+                                            let _ = tx.send(routed).await;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
+                                    }
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_codec_err) => {
+                                metrics::counter!("mmo_gateway_framing_errors_total").increment(1);
+                                buf.clear();
+                                return;
+                            }
+                        }
+                    }
+
+                    match recv.read(&mut chunk).await {
+                        Ok(Some(n)) if n > 0 => {
+                            if buf.len() + n > MAX_STREAM_BUFFER {
+                                metrics::counter!("mmo_gateway_buffer_overflow_dropped_total")
+                                    .increment(1);
+                                buf.clear();
+                                return;
+                            }
+                            metrics::counter!("mmo_gateway_bytes_received_total")
+                                .increment(n as u64);
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        _ => break,
+                    }
+                }
+            })
+            .abort_handle()
+            };
+
+        // Pre-authentication phase: authenticate on the single initial stream BEFORE
+        // registering SessionSink or accepting secondary bidirectional streams.
+        let mut initial_stream: Option<(
+            Arc<tokio::sync::Mutex<quinn::SendStream>>,
+            quinn::RecvStream,
+            BytesMut,
+        )> = None;
+        if let Some(ref auth) = self.authenticator {
+            let timeout_duration = auth.auth_timeout();
+            let auth_fut = async {
+                let (send, mut recv) = loop {
+                    tokio::select! {
+                        dgram_res = connection.read_datagram() => {
+                            match dgram_res {
+                                Ok(_) => {
+                                    metrics::counter!("mmo_gateway_unauthenticated_packets_dropped_total")
+                                        .increment(1);
+                                }
+                                Err(_) => {
+                                    return Err(GatewayError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "QUIC connection closed before authentication",
+                                    )));
+                                }
+                            }
+                        }
+                        bi_res = connection.accept_bi() => {
+                            match bi_res {
+                                Ok(pair) => break pair,
+                                Err(_) => {
+                                    return Err(GatewayError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "QUIC connection closed before auth stream",
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let mut buf = BytesMut::with_capacity(8192);
+                let mut chunk = [0u8; 4096];
+                let first_pkt = loop {
+                    match ClientPacket::decode_frame(&mut buf) {
+                        Ok(Some(pkt)) => break pkt,
+                        Ok(None) => {}
+                        Err(e) => {
+                            metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "malformed_frame")
+                                .increment(1);
+                            return Err(GatewayError::Codec(e));
+                        }
+                    }
+                    if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                        return Err(GatewayError::Codec(
+                            mmo_schema::client::ClientCodecError::PacketTooLarge {
+                                size: buf.len(),
+                                max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
+                            },
+                        ));
+                    }
+                    match recv.read(&mut chunk).await {
+                        Ok(Some(n)) if n > 0 => {
+                            metrics::counter!("mmo_gateway_bytes_received_total")
+                                .increment(n as u64);
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
+                                return Err(GatewayError::Codec(
+                                    mmo_schema::client::ClientCodecError::PacketTooLarge {
+                                        size: buf.len(),
+                                        max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(GatewayError::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Connection closed before auth",
+                            )));
+                        }
+                    }
+                };
+
+                Ok((send, recv, buf, first_pkt))
+            };
+
+            let (mut send, recv, buf, first_pkt) =
+                match tokio::time::timeout(timeout_duration, auth_fut).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout")
+                            .increment(1);
+                        return Err(GatewayError::Auth(crate::auth::AuthError::Timeout));
+                    }
+                };
+
+            match first_pkt {
+                ClientPacket::AuthRequest(auth_req) => {
+                    match auth_handshake::authenticate_and_register_session(
+                        auth,
+                        &auth_req.token,
+                        session_id,
+                        &self.router,
+                        self.default_node_address.as_deref(),
+                        self.cache.as_ref(),
+                        Some(&intercept_handler),
+                    )
+                    .await
+                    {
+                        Ok(auth_sess) => {
+                            let resp = ClientPacket::AuthResponse(auth_sess.auth_response);
+                            let _ = send.write_all(&resp.encode()).await;
+                            let send_arc = Arc::new(tokio::sync::Mutex::new(send));
+                            *active_send_stream.lock().await = Some(send_arc.clone());
+                            initial_stream = Some((send_arc, recv, buf));
+                        }
+                        Err((err, err_resp)) => {
+                            let resp = ClientPacket::AuthResponse(err_resp);
+                            let _ = send.write_all(&resp.encode()).await;
+                            let _ = send.finish();
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            return Err(err);
+                        }
+                    }
+                }
+                _ => {
+                    metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
+                    return Err(GatewayError::Auth(crate::auth::AuthError::InvalidToken(
+                        "Expected AuthRequest packet".to_string(),
+                    )));
+                }
+            }
+        }
+
+        // Register SessionSink ONLY after authentication has succeeded (or in unauthenticated PoC mode).
         self.register_session_sink(session_id, SessionSink::new(datagram_tx, stream_tx))?;
 
         let active_stream_writer = active_send_stream.clone();
@@ -1039,44 +1301,35 @@ impl GatewayServer {
                         if let Some(ref send_arc) = *lock {
                             if send_arc.lock().await.write_all(&bytes).await.is_err() {
                                 *lock = None;
-                                break;
                             }
                         } else if let Ok((send, _recv)) = conn_writer.open_bi().await {
                             let send_arc = Arc::new(tokio::sync::Mutex::new(send));
                             if send_arc.lock().await.write_all(&bytes).await.is_err() {
                                 *lock = None;
-                                break;
+                            } else {
+                                *lock = Some(send_arc);
                             }
-                            *lock = Some(send_arc);
                         }
                     }
                     else => break,
                 }
             }
         });
+        _drop_guard.writer_handle = Some(downstream_handle);
 
-        let intercept_handler = self.intercept_handler();
-        let _drop_guard = SessionDropGuard {
-            session_id,
-            router: self.router.clone(),
-            session_sinks: self.session_sinks.clone(),
-            cache: self.cache.clone(),
-            subscription_manager: Some(self.subscription_manager.clone()),
-            writer_handle: Some(downstream_handle),
-            intercept_handler: Some(Arc::new(intercept_handler.clone())),
-        };
+        if let Some((send_arc, recv, buf)) = initial_stream {
+            if let Ok(permit) = bi_stream_semaphore.clone().try_acquire_owned() {
+                _stream_tasks
+                    .0
+                    .push(spawn_stream_reader(send_arc, recv, buf, permit));
+            }
+        }
 
         loop {
             tokio::select! {
                 dgram_res = connection.read_datagram() => {
                     match dgram_res {
                         Ok(dg) => {
-                            // Zero-cost atomic packet filter: drop unauthenticated datagrams instantly
-                            if !is_authenticated.load(Ordering::Acquire) {
-                                metrics::counter!("mmo_gateway_unauthenticated_packets_dropped_total").increment(1);
-                                continue;
-                            }
-
                             metrics::counter!("mmo_gateway_bytes_received_total").increment(dg.len() as u64);
                             let mut dgram_buf = BytesMut::from(dg.as_ref());
                             while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut dgram_buf) {
@@ -1118,185 +1371,27 @@ impl GatewayServer {
                 }
                 bi_res = connection.accept_bi() => {
                     match bi_res {
-                        Ok((send, mut recv)) => {
+                        Ok((send, recv)) => {
+                            let Ok(permit) = bi_stream_semaphore.clone().try_acquire_owned() else {
+                                metrics::counter!("mmo_gateway_quic_stream_limit_exceeded_total")
+                                    .increment(1);
+                                drop(send);
+                                drop(recv);
+                                continue;
+                            };
                             let stream_send = Arc::new(tokio::sync::Mutex::new(send));
-                            if is_authenticated.load(Ordering::Acquire) {
+                            {
                                 let mut lock = active_send_stream.lock().await;
                                 if lock.is_none() {
                                     *lock = Some(stream_send.clone());
                                 }
                             }
-                            let active_stream = active_send_stream.clone();
-                            let dispatcher = self.dispatcher.clone();
-                            let packet_tx = self.packet_tx.clone();
-                            let authenticator = self.authenticator.clone();
-                            let is_auth = is_authenticated.clone();
-                            let router = self.router.clone();
-                            let cache = self.cache.clone();
-                            let default_node = self.default_node_address.clone();
-                            let intercept = intercept_handler.clone();
-                            let stream_send_clone = stream_send.clone();
-                            tokio::spawn(async move {
-                                let mut buf = BytesMut::with_capacity(8192);
-                                let mut chunk = [0u8; 4096];
-
-                                // Enforce authentication handshake on stream if authenticator is configured
-                                if !is_auth.load(Ordering::Acquire) {
-                                    if let Some(ref auth) = authenticator {
-                                        let timeout = auth.auth_timeout();
-                                        let auth_fut = async {
-                                            loop {
-                                                match ClientPacket::decode_frame(&mut buf) {
-                                                    Ok(Some(pkt)) => {
-                                                        return Ok::<ClientPacket, GatewayError>(pkt);
-                                                    }
-                                                    Ok(None) => {}
-                                                    Err(e) => {
-                                                        metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "malformed_frame").increment(1);
-                                                        return Err(GatewayError::Codec(e));
-                                                    }
-                                                }
-                                                if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
-                                                    return Err(GatewayError::Codec(
-                                                        mmo_schema::client::ClientCodecError::PacketTooLarge {
-                                                            size: buf.len(),
-                                                            max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
-                                                        },
-                                                    ));
-                                                }
-                                                match recv.read(&mut chunk).await {
-                                                    Ok(Some(n)) if n > 0 => {
-                                                        metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
-                                                        buf.extend_from_slice(&chunk[..n]);
-                                                        if buf.len() > mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE {
-                                                            return Err(GatewayError::Codec(
-                                                                mmo_schema::client::ClientCodecError::PacketTooLarge {
-                                                                    size: buf.len(),
-                                                                    max: mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE,
-                                                                },
-                                                            ));
-                                                        }
-                                                    }
-                                                    _ => return Err(GatewayError::Io(std::io::Error::new(
-                                                        std::io::ErrorKind::UnexpectedEof,
-                                                        "Connection closed before auth",
-                                                    ))),
-                                                }
-                                            }
-                                        };
-
-                                        let first_pkt = match tokio::time::timeout(timeout, auth_fut).await {
-                                            Ok(res) => match res {
-                                                Ok(p) => p,
-                                                Err(_) => return,
-                                            },
-                                            Err(_) => {
-                                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "timeout").increment(1);
-                                                return;
-                                            }
-                                        };
-
-                                        match first_pkt {
-                                            ClientPacket::AuthRequest(auth_req) => {
-                                                match auth_handshake::authenticate_and_register_session(
-                                                    auth,
-                                                    &auth_req.token,
-                                                    session_id,
-                                                    &router,
-                                                    default_node.as_deref(),
-                                                    cache.as_ref(),
-                                                    Some(&intercept),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(auth_sess) => {
-                                                        is_auth.store(true, Ordering::Release);
-                                                        {
-                                                            let mut lock = active_stream.lock().await;
-                                                            if lock.is_none() {
-                                                                *lock = Some(stream_send_clone.clone());
-                                                            }
-                                                        }
-                                                        let resp = ClientPacket::AuthResponse(auth_sess.auth_response);
-                                                        let _ = stream_send_clone.lock().await.write_all(&resp.encode()).await;
-                                                    }
-                                                    Err((_err, err_resp)) => {
-                                                        let resp = ClientPacket::AuthResponse(err_resp);
-                                                        let _ = stream_send_clone.lock().await.write_all(&resp.encode()).await;
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                metrics::counter!("mmo_gateway_auth_failures_total", "reason" => "unauthenticated_action").increment(1);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                const MAX_STREAM_BUFFER: usize =
-                                    mmo_schema::client::MAX_PACKET_PAYLOAD_SIZE + mmo_schema::client::HEADER_SIZE;
-
-                                loop {
-                                    match recv.read(&mut chunk).await {
-                                        Ok(Some(n)) if n > 0 => {
-                                            if buf.len() + n > MAX_STREAM_BUFFER {
-                                                metrics::counter!("mmo_gateway_buffer_overflow_dropped_total")
-                                                    .increment(1);
-                                                buf.clear();
-                                                return;
-                                            }
-                                            metrics::counter!("mmo_gateway_bytes_received_total").increment(n as u64);
-                                            buf.extend_from_slice(&chunk[..n]);
-                                            loop {
-                                                match ClientPacket::decode_frame(&mut buf) {
-                                                    Ok(Some(pkt)) => {
-                                                        metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
-                                                            .increment(1);
-                                                        if let ClientPacket::Ping(ref ping) = pkt {
-                                                            let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                                                                client_timestamp: ping.timestamp,
-                                                                server_timestamp: std::time::SystemTime::now()
-                                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                                    .unwrap()
-                                                                    .as_millis() as u64,
-                                                            });
-                                                            let pong_bytes = pong.encode();
-                                                            metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
-                                                            metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
-                                                            let _ = stream_send_clone.lock().await.write_all(&pong_bytes).await;
-                                                            continue;
-                                                        }
-
-                                                        if intercept.handle_packet(session_id, &pkt).await {
-                                                            continue;
-                                                        }
-
-                                                        match dispatcher.dispatch_packet(session_id, pkt) {
-                                                            Ok(routed) => {
-                                                                if let Some(ref tx) = packet_tx {
-                                                                    let _ = tx.send(routed).await;
-                                                                }
-                                                            }
-                                                            Err(_) => {
-                                                                metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(None) => break,
-                                                    Err(_codec_err) => {
-                                                        metrics::counter!("mmo_gateway_framing_errors_total").increment(1);
-                                                        buf.clear();
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                            });
+                            _stream_tasks.0.push(spawn_stream_reader(
+                                stream_send,
+                                recv,
+                                BytesMut::with_capacity(8192),
+                                permit,
+                            ));
                         }
                         Err(_) => break,
                     }

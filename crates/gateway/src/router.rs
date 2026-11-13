@@ -90,6 +90,7 @@ impl SessionRouter {
         if let Some((_, old_sid)) = self.guid_to_session.remove(&guid) {
             if old_sid != session_id {
                 self.session_to_node.remove(&old_sid);
+                self.session_to_epoch.remove(&old_sid);
                 self.session_to_guid.remove(&old_sid);
             }
         }
@@ -133,6 +134,19 @@ impl SessionRouter {
     ) -> bool {
         let existed = self.guid_to_node.contains_key(&guid);
         if session_id != 0 {
+            if let Some((_, old_guid)) = self.session_to_guid.remove(&session_id) {
+                if old_guid != guid {
+                    self.guid_to_node.remove(&old_guid);
+                    self.guid_to_session.remove(&old_guid);
+                }
+            }
+            if let Some((_, old_sid)) = self.guid_to_session.remove(&guid) {
+                if old_sid != session_id {
+                    self.session_to_node.remove(&old_sid);
+                    self.session_to_epoch.remove(&old_sid);
+                    self.session_to_guid.remove(&old_sid);
+                }
+            }
             self.session_to_guid.insert(session_id, guid);
             self.guid_to_session.insert(guid, session_id);
             self.session_to_node
@@ -225,6 +239,7 @@ impl SessionRouter {
         // 2. Remove identity maps last
         if let Some((_, session_id)) = self.guid_to_session.remove(&guid) {
             self.session_to_node.remove(&session_id);
+            self.session_to_epoch.remove(&session_id);
             self.session_to_guid.remove(&session_id);
             Some(session_id)
         } else {
@@ -258,6 +273,7 @@ impl SessionRouter {
         self.guid_to_node.clear();
         self.session_to_guid.clear();
         self.guid_to_session.clear();
+        self.session_to_epoch.clear();
     }
 }
 
@@ -451,5 +467,56 @@ mod tests {
             router.get_route_by_guid(guid3).as_deref(),
             Some("mmo-node-1.mmo-node:50052")
         );
+    }
+
+    #[test]
+    fn test_session_to_epoch_cleanup_and_stale_reverse_mapping_eviction() {
+        let router = SessionRouter::new();
+        let guid1 = Guid::new(EntityType::Player, 1, 100);
+        let guid2 = Guid::new(EntityType::Player, 1, 200);
+
+        // 1. remove_route_by_guid removes session_to_epoch
+        router.register_session(10, guid1, "node-a:50051".to_string());
+        router.set_session_epoch(10, 3);
+        assert_eq!(router.get_epoch_by_session(10), Some(3));
+        assert!(router.remove_route_by_guid(guid1).is_some());
+        assert_eq!(router.get_epoch_by_session(10), None);
+        assert_eq!(router.get_route_by_session(10), None);
+        assert_eq!(router.get_guid_by_session(10), None);
+        assert_eq!(router.get_session_by_guid(guid1), None);
+
+        // 2. clear removes session_to_epoch along with all routes
+        router.register_session(20, guid1, "node-a:50051".to_string());
+        router.set_session_epoch(20, 7);
+        router.clear();
+        assert_eq!(router.get_epoch_by_session(20), None);
+        assert_eq!(router.get_route_by_guid(guid1), None);
+
+        // 3. update_route_with_session evicts stale reverse mappings when rebinding guid or session_id
+        router.register_session(30, guid1, "node-a:50051".to_string());
+        router.set_session_epoch(30, 5);
+        router.register_session(40, guid2, "node-b:50051".to_string());
+        router.set_session_epoch(40, 9);
+
+        // Rebind session 40 from guid2 -> guid1 (replaces old session 30 for guid1 and old guid2 for session 40)
+        router.update_route_with_session(guid1, 40, "node-c:50051".to_string());
+
+        assert_eq!(router.get_session_by_guid(guid1), Some(40));
+        assert_eq!(router.get_guid_by_session(40), Some(guid1));
+        assert_eq!(
+            router.get_route_by_guid(guid1).as_deref(),
+            Some("node-c:50051")
+        );
+        assert_eq!(
+            router.get_route_by_session(40).as_deref(),
+            Some("node-c:50051")
+        );
+        // Old session 30 was evicted completely (route, guid, and epoch)
+        assert_eq!(router.get_route_by_session(30), None);
+        assert_eq!(router.get_guid_by_session(30), None);
+        assert_eq!(router.get_epoch_by_session(30), None);
+        // Old guid2 no longer points to session 40
+        assert_eq!(router.get_session_by_guid(guid2), None);
+        assert_eq!(router.get_route_by_guid(guid2), None);
     }
 }
