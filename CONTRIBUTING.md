@@ -6,41 +6,45 @@ Thank you for contributing to the Distributed Rust MMO Server Platform! This doc
 
 ## 1. Core Architectural Invariants
 
-Every pull request must strictly uphold the following core system invariants:
+Every pull request must strictly uphold the following core system invariants (see also [`AGENTS.md`](AGENTS.md)):
 
-1. **Server Authority & Anti-Cheat**:
+1. **Genre-Agnostic Core**:
+   - Core engine crates (`mmo-core`, `mmo-node`, `mmo-schema`, `mmo-storage`, `mmo-gateway`, `mmo-director`) must remain strictly genre-agnostic and mathematically generalized.
+   - All game- or genre-specific mechanics belong in [`crates/gameplay`](crates/gameplay) or modular plugin crates under `crates/plugins/*` (such as [`crates/plugins/voxel`](crates/plugins/voxel)).
+
+2. **Server Authority & Anti-Cheat**:
    - *Never trust client $\Delta t$ or coordinates*. Elapsed time ($\Delta t$) must always be calculated on the server using monotonic clocks.
    - Kinematic displacement must be validated against speed limits with a small tolerance for network jitter before state changes are accepted.
    - Actions (spell casts, interactions, channeling) must abort immediately upon non-zero displacement when configured with `cancel_on_movement`.
 
-2. **Zero Server Pollution**:
-   - Client-specific crates like `crates/client-wasm` and frontend assets in `web/` are strict leaf packages.
-   - Core server crates (`mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-gameplay`) must **never** depend on `mmo-client-wasm` or browser WebAssembly runtime packages (`wasm-bindgen`, `web-sys`, `js-sys`).
+3. **Zero Server Pollution**:
+   - Client-specific crates like [`crates/client-wasm`](crates/client-wasm) and frontend assets in [`web/`](web/) are strict leaf packages.
+   - Core server crates (`mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-gameplay`, `mmo-plugin-voxel`) must **never** depend on `mmo-client-wasm` or browser WebAssembly runtime packages (`wasm-bindgen`, `web-sys`, `js-sys`).
 
-3. **Zero Duplication**:
-   - Packet framing, bit-packing, varints, and quantization codecs live exclusively in `crates/schema`.
+4. **Zero Duplication**:
+   - Packet framing, bit-packing, varints, and quantization codecs live exclusively in [`crates/schema`](crates/schema).
    - The WebAssembly client imports `mmo-schema` directly to guarantee single-source-of-truth parsing across native servers and web clients.
 
-4. **Non-Blocking Hot Paths**:
+5. **Non-Blocking Hot Paths**:
    - The 20 Hz simulation tick loop and edge gateway routing paths must never perform blocking disk I/O, synchronous network calls, or hold mutexes across `.await` points.
    - Database operations use asynchronous write-behind queues; cross-node RPCs execute asynchronously with speculative cooldowns and compensation pipelines.
 
 ---
 
-## 2. Engineering Workflow (OpenSpec Pro Workflow)
+## 2. Engineering Workflow (OpenSpec 2.0 Pro Workflow)
 
-All non-trivial architectural enhancements and new tracks follow the 5-stage OpenSpec Pro Workflow:
+All non-trivial architectural enhancements and new features follow the 5-stage OpenSpec 2.0 Pro Workflow (see [`.agents/skills/openspec-pro-workflow/SKILL.md`](.agents/skills/openspec-pro-workflow/SKILL.md)):
 
 1. **Stage 1 (OpenSpec Proposal & Specs)**:
-   - Draft a complete OpenSpec proposal in `openspec/changes/<change-name>/` with `proposal.md`, capability specs in `specs/`, `design.md`, and granular `tasks.md`.
+   - Scaffold a change with `openspec new change "<change-name>"` and author `proposal.md`, capability delta specs in `specs/`, `design.md`, and granular `tasks.md`.
 2. **Stage 2 (Pro Architectural Review)**:
    - Run an architectural review evaluating concurrency, anti-cheat, edge cases, zero-pollution invariants, and testability.
 3. **Stage 3 (Review Refinement)**:
-   - Refine design and tasks based on review feedback.
+   - Refine design and tasks based on review feedback and validate with `openspec validate "<change-name>"`.
 4. **Stage 4 (Verified Implementation)**:
-   - Implement tasks sequentially on a dedicated feature branch (`feat/<change-name>`), verifying unit and integration tests.
-5. **Stage 5 (Quality Gates & PR)**:
-   - Pass all quality gates (`cargo fmt`, `cargo clippy`, `cargo test --workspace`), submit PR with auto-merge, and archive the change via `openspec archive`.
+   - Implement tasks sequentially on a dedicated feature branch (`feat/<change-name>`), verifying unit, property, and integration tests.
+5. **Stage 5 (Quality Gates, Archive & PR)**:
+   - Pass all quality gates, sync delta specs to `openspec/specs/` and archive the change to `openspec/changes/archive/`, verify `openspec validate --all`, and submit a PR with squash auto-merge enabled.
 
 ---
 
@@ -55,11 +59,15 @@ cargo fmt --all -- --check
 # 2. Strict Clippy linter
 cargo clippy --workspace --all-targets -- -D warnings
 
-# 3. Full test suite (all unit and integration tests)
+# 3. Full Rust test suite (all unit, property, and integration tests)
 cargo test --workspace
 
-# 4. Web inspector build check (if web assets or wasm modified)
+# 4. Web inspector unit tests & production bundle build (if web/ or client-wasm modified)
+npm --prefix web test -- --run
 npm --prefix web run build
+
+# 5. OpenSpec 2.0 specification validation
+openspec validate --all
 ```
 
 ---
@@ -71,7 +79,6 @@ To verify cluster-wide distributed behaviors:
 ```bash
 # Provision local Kubernetes cluster (k3d) via declarative config (k8s/k3d.yaml)
 ./scripts/cluster.sh up
-# Or directly: k3d cluster create --config k8s/k3d.yaml
 
 # Build and deploy all cluster components
 ./scripts/cluster.sh all
@@ -87,6 +94,6 @@ To verify cluster-wide distributed behaviors:
 
 ## 5. Commit & Pull Request Guidelines
 
-- Use conventional commits format: `feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, `test(...)`.
+- Use conventional commits format: `feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, `test(...)`, `chore(...)`.
 - Include a summary of changes, architectural decisions made, and test output in pull request descriptions.
-- Reference applicable OpenSpec change directories or roadmap tracks.
+- Reference applicable OpenSpec change directories or roadmap issues.

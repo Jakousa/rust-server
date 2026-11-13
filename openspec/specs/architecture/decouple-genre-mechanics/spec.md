@@ -1,8 +1,11 @@
-# Specification: Decoupled Genre-Agnostic Core Architecture
+# Decoupled Genre-Agnostic Core Architecture Specification
 
-## Domain: Architecture & Modularity
+## Purpose
+Defines the architectural boundary decoupling genre-agnostic core simulation, attribute indexing, spatial math, snapshot persistence, and edge packet interception from pluggable gameplay mechanics.
 
-### Capability: Pluggable Combat Resolution
+## Requirements
+
+### Requirement: Pluggable Combat Resolution
 The simulation core in `mmo-node` SHALL delegate combat calculations (including damage mitigation, armor curves, and vitality reductions) to a pluggable `CombatResolver` trait defined in `mmo-core`, defaulting to a genre-agnostic baseline and allowing `crates/gameplay` plugins to install specialized rules via `PluginContext`.
 
 #### Scenario: Default Combat Resolution
@@ -19,7 +22,7 @@ The simulation core in `mmo-node` SHALL delegate combat calculations (including 
 
 ---
 
-### Capability: Extensible Attribute Registry
+### Requirement: Extensible Attribute Registry
 `crates/core` SHALL provide an extensible `AttributeRegistry` mapping domain string aliases (e.g. "health", "armor", "hull") to canonical `AttributeId`s, preserving backward compatibility while keeping the mathematical substrate genre-agnostic.
 
 #### Scenario: Domain Attribute Alias Resolution
@@ -29,7 +32,7 @@ The simulation core in `mmo-node` SHALL delegate combat calculations (including 
 
 ---
 
-### Capability: Generalized Snapshot Persistence
+### Requirement: Generalized Snapshot Persistence
 The storage substrate in `mmo-storage` SHALL persist `entity_snapshots` purely as a generalized key-value/spatial entity snapshot without requiring or issuing queries against the RPG `characters` table.
 
 #### Scenario: Batch Persistence of Non-Character Entities
@@ -40,7 +43,7 @@ The storage substrate in `mmo-storage` SHALL persist `entity_snapshots` purely a
 
 ---
 
-### Capability: Unified 3D Spatial Vector Substrate
+### Requirement: Unified 3D Spatial Vector Substrate
 The codebase SHALL maintain a single canonical `Vec3` definition in `mmo-schema::client` that implements standard vector arithmetic, byte codecs, serialization, and coordinate conversion traits, and is re-exported by `mmo-core::spatial`.
 
 #### Scenario: Vector Representation Consistency
@@ -51,7 +54,7 @@ The codebase SHALL maintain a single canonical `Vec3` definition in `mmo-schema:
 
 ---
 
-### Capability: Generic Edge Packet Interception
+### Requirement: Generic Edge Packet Interception
 `crates/gateway` SHALL provide an `EdgePacketInterceptor` trait allowing edge modules to intercept and handle client packets without hardcoding specific game services into the core gateway packet loop.
 
 #### Scenario: Edge Interceptor Dispatch

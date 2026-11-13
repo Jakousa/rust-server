@@ -1,5 +1,8 @@
 # Specification: Web Visual Inspector
 
+## Purpose
+Defines dynamic gateway URL and `/cert-hash` discovery, per-tab guest session isolation, binary `EntityDeltaBatch` decoding, interactive orbit/zoom camera controls, and 3D village prefab rendering in the browser visual inspector.
+
 ## Requirements
 
 ### Requirement: Dynamic Gateway Connection & Session Isolation

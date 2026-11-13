@@ -1,15 +1,21 @@
-# Specification: Core Primitives & Voxel Engine Audit Hardening
+# Core Primitives & Voxel Engine Audit Hardening Specification
 
-## Capability: Core Event Lifecycle & Memory Hygiene
+## Purpose
+Defines memory hygiene and retention bounds for `EventQueue`, multi-sector AABB spatial query completeness, chunk-level concurrency and bounds safety in `mmo-plugin-voxel`, and cycle-safe hierarchy transform propagation in `mmo-core`.
 
-### Scenario: Ephemeral Per-Tick Events Cleared at Tick Boundaries
+## Requirements
+
+### Requirement: Core Event Lifecycle & Memory Hygiene
+The core `EventQueue` SHALL support clearing ephemeral per-tick events at tick boundaries and bounding retained non-ephemeral events to prevent unbounded heap growth.
+
+#### Scenario: Ephemeral Per-Tick Events Cleared at Tick Boundaries
 - **GIVEN** an `EventQueue` with registered ephemeral event types (such as `ActionProgressEvent` and `VoxelChangeEvent`)
 - **WHEN** multiple ephemeral events are pushed into the event queue during a simulation tick
 - **AND** `clear_ephemeral()` is invoked at the end-of-tick boundary
 - **THEN** all queued ephemeral events SHALL be purged from memory
 - **AND** non-ephemeral domain events (such as `DamageEvent` or `EntityIncapacitatedEvent`) SHALL remain intact until explicitly drained.
 
-### Scenario: EventQueue Memory Retention Limits
+#### Scenario: EventQueue Memory Retention Limits
 - **GIVEN** an `EventQueue` receiving non-ephemeral events without a consumer draining them
 - **WHEN** `retain_recent(N)` is called
 - **THEN** the number of events retained per `TypeId` SHALL NOT exceed `N`
@@ -17,31 +23,33 @@
 
 ---
 
-## Capability: Spatial Sector Query Completeness
+### Requirement: Spatial Sector Query Completeness
+`SectorSpatialIndex` SHALL expand AABB queries by tracked `max_extent` so objects spanning sector boundaries are accurately discovered and dynamically update `max_extent` on removal.
 
-### Scenario: Objects Spanning Sector Boundaries
+#### Scenario: Objects Spanning Sector Boundaries
 - **GIVEN** a `SectorSpatialIndex` containing a `WorldObject` whose origin `transform.position` resides in sector `(0, 0, 0)`
 - **AND** the object's `bounds` extend across the sector boundary into sector `(1, 0, 0)`
 - **WHEN** `query_aabb` is executed for a bounding box strictly located inside sector `(1, 0, 0)` that intersects the object's bounds
 - **THEN** `SectorSpatialIndex` SHALL evaluate sector `(0, 0, 0)` via `max_extent` expansion
 - **AND** the object SHALL be returned in the query results.
 
-### Scenario: Removal of Max-Extent Object
+#### Scenario: Removal of Max-Extent Object
 - **GIVEN** a `SectorSpatialIndex` with indexed objects of varying spatial extents
 - **WHEN** the object with the largest spatial extent is removed via `remove(guid)`
 - **THEN** `SectorSpatialIndex::max_extent()` SHALL dynamically update to the maximum extent of the remaining objects.
 
 ---
 
-## Capability: Voxel Engine Concurrency & Robustness
+### Requirement: Voxel Engine Concurrency & Robustness
+`VoxelWorld` and `PaletteChunk` SHALL release global rate-limiter locks before per-chunk lock acquisition and handle out-of-bounds indices without panicking.
 
-### Scenario: Chunk-Level Concurrency in Voxel Modification
+#### Scenario: Chunk-Level Concurrency in Voxel Modification
 - **GIVEN** two concurrent threads attempting to modify voxels in different chunks
 - **WHEN** `VoxelWorld::modify_voxel` is called by each thread
 - **THEN** the global rate limiter Mutex SHALL be released prior to acquiring the per-chunk write lock
 - **AND** neither thread SHALL be blocked by the other thread's palette repacking or write lock acquisition.
 
-### Scenario: Safe Out-of-Bounds Palette Chunk Access
+#### Scenario: Safe Out-of-Bounds Palette Chunk Access
 - **GIVEN** a `PaletteChunk` instance
 - **WHEN** `get(idx)` or `set(idx, val)` is invoked with an index `idx >= CHUNK_VOXELS` (e.g. 4096)
 - **THEN** the call SHALL NOT panic
@@ -49,14 +57,15 @@
 
 ---
 
-## Capability: Numeric Safety & Hierarchy Cycle Protection
+### Requirement: Numeric Safety & Hierarchy Cycle Protection
+Core attribute clamping and entity hierarchy transform propagation SHALL guard against inverted/NaN bounds and cyclic parent-child graphs without panicking or looping infinitely.
 
-### Scenario: Non-Panicking Attribute Clamping
+#### Scenario: Non-Panicking Attribute Clamping
 - **GIVEN** an `AttributeSet` or `AttributeValue`
 - **WHEN** an attribute's effective max or current value is queried or modified with inverted bounds (`min > max`) or `NaN`
 - **THEN** `safe_clamp` SHALL NOT panic and SHALL return a safe fallback value.
 
-### Scenario: Hierarchy Transform Cycle Safety
+#### Scenario: Hierarchy Transform Cycle Safety
 - **GIVEN** an `EntityStore` containing entities whose parent-child relationships form a closed cycle
 - **WHEN** `propagate_hierarchy_transforms(root_guid)` is invoked
 - **THEN** the traversal SHALL terminate cleanly without an infinite loop or stack/heap exhaustion

@@ -1,9 +1,12 @@
-# Specification: Volumetric Voxel & Deformable Terrain Plugin
+# Volumetric Voxel & Deformable Terrain Plugin Specification
 
-## Domain: `plugins::voxel`
+## Purpose
+Defines the modular volumetric 3D voxel and deformable terrain plugin (`crates/plugins/voxel`), including bit-packed palette chunks, RLE serialization, authoritative excavation validation, boundary mesh generation, modular packet streaming, write-behind persistence, and client WASM mesh decoding.
 
-### Feature: Bit-Packed Palette Chunk Storage
-The system must store volumetric 3D voxel chunks (16×16×16 = 4,096 voxels) in bit-packed, palette-compressed representations to minimize memory usage.
+## Requirements
+
+### Requirement: Bit-Packed Palette Chunk Storage
+The system SHALL store volumetric 3D voxel chunks (16×16×16 = 4,096 voxels) in bit-packed, palette-compressed representations to minimize memory usage.
 
 #### Scenario: Homogeneous Chunk Compression
 - **GIVEN** a newly created chunk filled entirely with a single voxel type (e.g. Air `0` or Solid Stone `1`)
@@ -26,8 +29,8 @@ The system must store volumetric 3D voxel chunks (16×16×16 = 4,096 voxels) in 
 
 ---
 
-### Feature: Authoritative Digging, Mining & Deformation
-The server must validate all voxel manipulation requests authoritatively to prevent speed-mining, out-of-reach edits, and invalid block placement.
+### Requirement: Authoritative Digging, Mining & Deformation
+The server SHALL validate all voxel manipulation requests authoritatively to prevent speed-mining, out-of-reach edits, and invalid block placement.
 
 #### Scenario: Negative Coordinate Mathematical Safety
 - **GIVEN** world coordinates residing in negative space (e.g. `x = -17`, `y = -5`, `z = -65`)
@@ -55,8 +58,8 @@ The server must validate all voxel manipulation requests authoritatively to prev
 
 ---
 
-### Feature: Boundary Mesh Generation
-The plugin must generate clean boundary meshes (culled faces / greedy meshing) for modified chunks to support collision detection and client rendering without lock-inversion deadlocks.
+### Requirement: Boundary Mesh Generation
+The plugin SHALL generate clean boundary meshes (culled faces) for modified chunks to support collision detection and client rendering without lock-inversion deadlocks.
 
 #### Scenario: Internal Face Culling & Unloaded Neighbor Policy
 - **GIVEN** a 2×2×2 block of solid voxels surrounded by air
@@ -72,8 +75,8 @@ The plugin must generate clean boundary meshes (culled faces / greedy meshing) f
 
 ---
 
-### Feature: Modular Network Packet Streaming
-Voxel replication must use the decoupled `ModularPacketRouter` framework with designated module ID `0x00A0`.
+### Requirement: Modular Network Packet Streaming
+Voxel replication SHALL use the decoupled `ModularPacketRouter` framework with designated module ID `0x00A0`.
 
 #### Scenario: Full Chunk Delivery
 - **GIVEN** an observing client entering a new sector
@@ -87,8 +90,8 @@ Voxel replication must use the decoupled `ModularPacketRouter` framework with de
 
 ---
 
-### Feature: Asynchronous Write-Behind Persistence
-Modified voxel chunks must persist to database storage asynchronously without blocking the 20 Hz simulation loop.
+### Requirement: Asynchronous Write-Behind Persistence
+Modified voxel chunks SHALL persist to database storage asynchronously without blocking the 20 Hz simulation loop.
 
 #### Scenario: Dirty Chunk Coalescing
 - **GIVEN** a chunk that undergoes 10 voxel modifications within a 1-second window
@@ -98,8 +101,8 @@ Modified voxel chunks must persist to database storage asynchronously without bl
 
 ---
 
-### Feature: Client-Side WebAssembly Decoding
-The client WASM crate (`crates/client-wasm`) must be able to decode compressed voxel chunks and produce flat WebGL-compatible vertex arrays.
+### Requirement: Client-Side WebAssembly Decoding
+The client WASM crate (`crates/client-wasm`) SHALL decode compressed voxel chunks and produce flat WebGL-compatible vertex arrays.
 
 #### Scenario: Client WASM Mesh Buffer Extraction
 - **GIVEN** a serialized chunk binary buffer received in WebAssembly

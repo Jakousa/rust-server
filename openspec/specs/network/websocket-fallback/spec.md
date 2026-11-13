@@ -1,8 +1,7 @@
-# Specification: WebSocket / TLS Fallback Transport
+# WebSocket / TLS Fallback Transport Specification
 
 ## Purpose
-
-Defines the Edge Gateway WebSocket (`ws://` / `wss://`) fallback transport, binary `0x4D4D` framing and DoS bounds parity, and automatic browser WebTransport-to-WebSocket fallback for restricted network environments.
+Defines the TCP-based WebSocket (`ws://`) and TLS WebSocket (`wss://`) fallback ingress transport in `mmo-gateway` and automatic WebTransport-to-WebSocket fallback in the browser client (`web/src/transport.js`).
 
 ## Requirements
 
