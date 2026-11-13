@@ -668,6 +668,17 @@ export async function autoFetchCertHash() {
   }
 }
 
+/**
+ * Formats a transport or handshake failure into a concise HUD-safe error string.
+ */
+export function formatConnectionError(err) {
+  if (!err) return "Connection failed.";
+  const raw = typeof err === "string" ? err : err?.message || String(err);
+  const trimmed = raw.trim();
+  if (!trimmed) return "Connection failed.";
+  return trimmed.length > 180 ? `${trimmed.slice(0, 177)}...` : trimmed;
+}
+
 // Application Bootstrap
 if (typeof window !== "undefined") {
   window.addEventListener("DOMContentLoaded", async () => {
@@ -781,7 +792,15 @@ if (typeof window !== "undefined") {
   });
 
   transport.onStatus(({ status, error }) => {
-    ui.setConnectionState(status);
+    const statusText =
+      status === "connected"
+        ? "Connected"
+        : status === "connecting"
+        ? "Connecting"
+        : "Disconnected";
+    const errorMsg =
+      status === "disconnected" && error ? formatConnectionError(error) : "";
+    ui.setConnectionState(status, statusText, errorMsg);
     if (status === "disconnected") {
       hasSyncedInitialPosition = false;
       world.clear();
@@ -811,6 +830,7 @@ if (typeof window !== "undefined") {
   ui.initEvents({
     onConnect: async (url, certHash) => {
       try {
+        ui.setConnectionState("connecting", "Connecting", "");
         await transport.connect(url, certHash);
         // Send AuthRequest handshake upon connection with isolated session token
         const sessionToken = getOrCreateSessionToken();
@@ -822,7 +842,9 @@ if (typeof window !== "undefined") {
           performInspect({ id: 0 });
         }, 200);
       } catch (err) {
-        console.warn("Failed to connect via WebTransport:", err?.message || err);
+        const errorMsg = formatConnectionError(err);
+        console.warn("Failed to connect via WebTransport:", errorMsg);
+        ui.setConnectionState("disconnected", "Disconnected", errorMsg);
       }
     },
     onDisconnect: async () => {

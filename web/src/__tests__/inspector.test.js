@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { PlayerControls } from "../controls.js";
 import { WorldObjectRenderer } from "../world.js";
 import { WorldRenderer, disposeHierarchy } from "../renderer.js";
-import { ClientWorldBridge, getOrCreateSessionToken } from "../main.js";
+import { ClientWorldBridge, getOrCreateSessionToken, formatConnectionError } from "../main.js";
 import { UIController } from "../ui.js";
 import { deriveWebSocketUrl, WebTransportClient } from "../transport.js";
 import {
@@ -863,7 +863,7 @@ describe("UIController Village HUD", () => {
   let elements;
 
   function createMockElement(id = "", className = "") {
-    return {
+    const el = {
       id,
       className,
       style: {},
@@ -925,10 +925,34 @@ describe("UIController Village HUD", () => {
         return findRecursive(this) || createMockElement();
       },
     };
+    el.classList = {
+      add(...tokens) {
+        const current = new Set((el.className || "").split(/\s+/).filter(Boolean));
+        tokens.forEach((t) => current.add(t));
+        el.className = Array.from(current).join(" ");
+      },
+      remove(...tokens) {
+        const current = new Set((el.className || "").split(/\s+/).filter(Boolean));
+        tokens.forEach((t) => current.delete(t));
+        el.className = Array.from(current).join(" ");
+      },
+      contains(token) {
+        return (el.className || "").split(/\s+/).filter(Boolean).includes(token);
+      },
+      toggle(token, force) {
+        const has = this.contains(token);
+        const shouldAdd = force !== undefined ? Boolean(force) : !has;
+        if (shouldAdd) this.add(token);
+        else this.remove(token);
+        return shouldAdd;
+      },
+    };
+    return el;
   }
 
   beforeEach(() => {
     elements = new Map();
+    elements.set("connection-error", createMockElement("connection-error", "connection-error hidden"));
     globalThis.document = {
       getElementById(id) {
         if (!elements.has(id)) {
@@ -1067,6 +1091,123 @@ describe("UIController Village HUD", () => {
 
     ui.hidePlayerTrade();
     expect(modal.style.display).toBe("none");
+  });
+
+  it("displays connection failures in #connection-error and clears/hides on connecting or connected", () => {
+    const ui = new UIController();
+    const errorEl = document.getElementById("connection-error");
+    const statusDot = document.getElementById("status-dot");
+    const btnConnect = document.getElementById("btn-connect");
+    const btnDisconnect = document.getElementById("btn-disconnect");
+
+    expect(errorEl.classList.contains("hidden")).toBe(true);
+    expect(errorEl.textContent).toBe("");
+
+    // Connection failure surfaces error message
+    ui.setConnectionState(
+      "disconnected",
+      "Disconnected",
+      "WebTransportError: Opening handshake failed."
+    );
+    expect(statusDot.className).toBe("status-indicator disconnected");
+    expect(btnConnect.disabled).toBe(false);
+    expect(btnDisconnect.disabled).toBe(true);
+    expect(errorEl.classList.contains("hidden")).toBe(false);
+    expect(errorEl.textContent).toBe("WebTransportError: Opening handshake failed.");
+
+    // Subsequent connecting attempt clears and hides the error
+    ui.setConnectionState("connecting", "Connecting");
+    expect(statusDot.className).toBe("status-indicator connecting");
+    expect(btnConnect.disabled).toBe(true);
+    expect(btnDisconnect.disabled).toBe(false);
+    expect(errorEl.classList.contains("hidden")).toBe(true);
+    expect(errorEl.textContent).toBe("");
+
+    // Another failure shows again, then connected clears and hides it
+    ui.setConnectionState("disconnected", "Disconnected", "WebSocket connection failed to ws://127.0.0.1:8443");
+    expect(errorEl.classList.contains("hidden")).toBe(false);
+    expect(errorEl.textContent).toBe("WebSocket connection failed to ws://127.0.0.1:8443");
+
+    ui.setConnectionState("connected", "Connected");
+    expect(statusDot.className).toBe("status-indicator connected");
+    expect(btnConnect.disabled).toBe(true);
+    expect(btnDisconnect.disabled).toBe(false);
+    expect(errorEl.classList.contains("hidden")).toBe(true);
+    expect(errorEl.textContent).toBe("");
+
+    // Clean disconnect without error keeps #connection-error hidden and empty
+    ui.setConnectionState("disconnected", "Disconnected", "");
+    expect(errorEl.classList.contains("hidden")).toBe(true);
+    expect(errorEl.textContent).toBe("");
+  });
+
+  it("formats connection errors and clears HUD error across failed-then-successful transport attempts", async () => {
+    expect(formatConnectionError(new Error("Opening handshake failed."))).toBe(
+      "Opening handshake failed."
+    );
+    expect(formatConnectionError("")).toBe("Connection failed.");
+    expect(formatConnectionError("x".repeat(220)).length).toBe(180);
+
+    const ui = new UIController();
+    const client = new WebTransportClient();
+    const errorEl = document.getElementById("connection-error");
+
+    client.onStatus(({ status, error }) => {
+      const statusText =
+        status === "connected"
+          ? "Connected"
+          : status === "connecting"
+          ? "Connecting"
+          : "Disconnected";
+      const errorMsg =
+        status === "disconnected" && error ? formatConnectionError(error) : "";
+      ui.setConnectionState(status, statusText, errorMsg);
+    });
+
+    vi.stubGlobal(
+      "WebTransport",
+      vi.fn().mockImplementation(() => ({
+        ready: Promise.reject(new Error("WebTransportError: Opening handshake failed.")),
+        closed: Promise.resolve(),
+        close: vi.fn(),
+      }))
+    );
+
+    let failWs = true;
+    class MockWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.binaryType = "";
+        this.readyState = 0;
+        this.send = vi.fn();
+        this.close = vi.fn();
+        queueMicrotask(() => {
+          if (failWs) {
+            if (this.onerror) this.onerror(new Error("ECONNREFUSED"));
+          } else {
+            this.readyState = 1;
+            if (this.onopen) this.onopen();
+          }
+        });
+      }
+    }
+    vi.stubGlobal("WebSocket", MockWebSocket);
+
+    await expect(client.connect("https://127.0.0.1:4433", "", { wsPort: 8443 })).rejects.toThrow(
+      "WebSocket connection failed to ws://127.0.0.1:8443"
+    );
+    expect(errorEl.classList.contains("hidden")).toBe(false);
+    expect(errorEl.textContent).toBe("WebSocket connection failed to ws://127.0.0.1:8443");
+
+    // Retry succeeds -> #connection-error cleared and hidden
+    failWs = false;
+    await client.connect("https://127.0.0.1:4433", "", { wsPort: 8443 });
+    expect(client.connected).toBe(true);
+    expect(errorEl.classList.contains("hidden")).toBe(true);
+    expect(errorEl.textContent).toBe("");
+
+    await client.disconnect();
+    vi.unstubAllGlobals();
   });
 });
 
