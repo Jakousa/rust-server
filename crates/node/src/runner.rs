@@ -313,19 +313,59 @@ fn is_transient_transport_error(status: &tonic::Status) -> bool {
     )
 }
 
+fn read_process_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages_str) = statm.split_whitespace().nth(1) {
+                if let Ok(rss_pages) = rss_pages_str.parse::<u64>() {
+                    return rss_pages.saturating_mul(4096);
+                }
+            }
+        }
+    }
+    0
+}
+
+fn next_retry_delay(
+    retry_interval: Duration,
+    lease: Option<(std::time::Instant, Duration)>,
+) -> Option<Duration> {
+    match lease {
+        Some((last_ack, lease_timeout)) => {
+            let remaining = lease_timeout.saturating_sub(last_ack.elapsed());
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(retry_interval.min(remaining))
+            }
+        }
+        None => Some(retry_interval),
+    }
+}
+
 async fn register_until_acknowledged(
     client: &mut Option<DirectorServiceClient<tonic::transport::Channel>>,
     endpoint: &str,
+    config: &DirectorHeartbeatConfig,
     reg_req: &RegisterNodeRequest,
-    node_id: u16,
     telemetry: &mmo_core::TelemetryServer,
-    retry_interval: Duration,
-    rpc_timeout: Duration,
-) -> std::time::Instant {
+    last_ack: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let node_id = config.node_id;
+    let lease = last_ack.zip(config.lease_timeout);
+
     loop {
+        if let Some((ack_at, lease_timeout)) = lease {
+            if ack_at.elapsed() >= lease_timeout {
+                telemetry.mark_unready();
+                return None;
+            }
+        }
+
         if client.is_none() {
             match tokio::time::timeout(
-                rpc_timeout,
+                config.rpc_timeout,
                 DirectorServiceClient::connect(endpoint.to_string()),
             )
             .await
@@ -335,7 +375,11 @@ async fn register_until_acknowledged(
                     *client = Some(c);
                 }
                 Ok(Err(_)) | Err(_) => {
-                    tokio::time::sleep(retry_interval).await;
+                    let Some(sleep_dur) = next_retry_delay(config.retry_interval, lease) else {
+                        telemetry.mark_unready();
+                        return None;
+                    };
+                    tokio::time::sleep(sleep_dur).await;
                     continue;
                 }
             }
@@ -345,7 +389,7 @@ async fn register_until_acknowledged(
             continue;
         };
 
-        match tokio::time::timeout(rpc_timeout, c.register_node(reg_req.clone())).await {
+        match tokio::time::timeout(config.rpc_timeout, c.register_node(reg_req.clone())).await {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
                 println!(
@@ -354,7 +398,7 @@ async fn register_until_acknowledged(
                 );
                 if inner.success {
                     telemetry.mark_ready();
-                    return std::time::Instant::now();
+                    return Some(std::time::Instant::now());
                 }
                 eprintln!(
                     "[Node {node_id}] Director rejected registration: {}",
@@ -373,7 +417,11 @@ async fn register_until_acknowledged(
             }
         }
 
-        tokio::time::sleep(retry_interval).await;
+        let Some(sleep_dur) = next_retry_delay(config.retry_interval, lease) else {
+            telemetry.mark_unready();
+            return None;
+        };
+        tokio::time::sleep(sleep_dur).await;
     }
 }
 
@@ -389,23 +437,28 @@ pub async fn run_director_registration_and_heartbeat_loop(
     let endpoint = normalize_endpoint(&config.director_endpoint);
     println!("[Node {node_id}] Attempting connection to Director at {endpoint}...");
 
-    let reg_req = RegisterNodeRequest {
+    let mut current_bounds = config.bounds;
+    let initial_reg_req = RegisterNodeRequest {
         node_id: u32::from(node_id),
         listen_addr: config.listen_addr.to_string(),
-        bounds: build_bounds_proto(&config.bounds),
+        bounds: build_bounds_proto(&current_bounds),
     };
 
     let mut client: Option<DirectorServiceClient<tonic::transport::Channel>> = None;
     let mut last_ack = register_until_acknowledged(
         &mut client,
         &endpoint,
-        &reg_req,
-        node_id,
+        &config,
+        &initial_reg_req,
         &telemetry,
-        config.retry_interval,
-        config.rpc_timeout,
+        None,
     )
-    .await;
+    .await
+    .expect("initial registration without lease timeout cannot expire");
+
+    let mut prev_tick_counter = sim.read().await.tick_counter;
+    let mut prev_hb_at = std::time::Instant::now();
+    let mut rolling_tick_rate: Option<f32> = None;
 
     let mut hb_interval = tokio::time::interval(config.heartbeat_interval);
     hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -419,6 +472,7 @@ pub async fn run_director_registration_and_heartbeat_loop(
                 eprintln!(
                     "[Node {node_id}] Director heartbeat lease expired ({elapsed:?} > {limit:?}). Self-fencing simulation."
                 );
+                telemetry.mark_unready();
                 let _ = fenced_tx
                     .send("Director heartbeat lease expired".to_string())
                     .await;
@@ -442,12 +496,12 @@ pub async fn run_director_registration_and_heartbeat_loop(
             }
         }
 
-        let (entity_count, tick_duration_ms, entity_centroid) = {
+        let (entity_count, tick_duration_ms, entity_centroid, curr_tick_counter, active_instances) = {
             let s = sim.read().await;
             let count = s.entity_store.count() as u32;
             let dur = s.last_tick_duration_ms();
             let centroid = if count > 0 {
-                let c = s.compute_clamped_centroid(&s.octree.bounds);
+                let c = s.compute_clamped_centroid(&current_bounds);
                 Some(Vector3 {
                     x: c.0,
                     y: c.1,
@@ -456,8 +510,34 @@ pub async fn run_director_registration_and_heartbeat_loop(
             } else {
                 None
             };
-            (count, dur, centroid)
+            let ticks = s.tick_counter;
+            let instances = s.instances.active_instance_heartbeats();
+            (count, dur, centroid, ticks, instances)
         };
+
+        let now_instant = std::time::Instant::now();
+        let elapsed_secs = now_instant.duration_since(prev_hb_at).as_secs_f32();
+        let delta_ticks = curr_tick_counter.saturating_sub(prev_tick_counter);
+        let instant_tps = if elapsed_secs > 1e-3 {
+            delta_ticks as f32 / elapsed_secs
+        } else {
+            0.0
+        };
+        let tick_rate = match rolling_tick_rate {
+            Some(prev) => 0.5 * prev + 0.5 * instant_tps,
+            None => instant_tps,
+        };
+        rolling_tick_rate = Some(tick_rate);
+        prev_tick_counter = curr_tick_counter;
+        prev_hb_at = now_instant;
+
+        let tick_budget_ms = TickSimulation::TICK_INTERVAL.as_secs_f32() * 1000.0;
+        let cpu_percent = if tick_budget_ms > 0.0 {
+            (tick_duration_ms / tick_budget_ms * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let memory_bytes = read_process_rss_bytes();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -466,10 +546,10 @@ pub async fn run_director_registration_and_heartbeat_loop(
 
         let hb = HeartbeatRequest {
             node_id: u32::from(node_id),
-            tick_rate: 20.0,
+            tick_rate,
             entity_count,
-            cpu_percent: 5.0,
-            memory_bytes: 10_000_000,
+            cpu_percent,
+            memory_bytes,
             timestamp: now,
             tick_duration_ms,
             entity_centroid,
@@ -486,35 +566,87 @@ pub async fn run_director_registration_and_heartbeat_loop(
                     eprintln!(
                         "[Node {node_id}] Director did not acknowledge heartbeat (director may have restarted); re-registering..."
                     );
-                    last_ack = register_until_acknowledged(
+                    let rereg_req = RegisterNodeRequest {
+                        node_id: u32::from(node_id),
+                        listen_addr: config.listen_addr.to_string(),
+                        bounds: build_bounds_proto(&current_bounds),
+                    };
+                    match register_until_acknowledged(
                         &mut client,
                         &endpoint,
-                        &reg_req,
-                        node_id,
+                        &config,
+                        &rereg_req,
                         &telemetry,
-                        config.retry_interval,
-                        config.rpc_timeout,
+                        Some(last_ack),
                     )
-                    .await;
-                    continue;
+                    .await
+                    {
+                        Some(ack_time) => {
+                            last_ack = ack_time;
+                            continue;
+                        }
+                        None => {
+                            eprintln!(
+                                "[Node {node_id}] Director heartbeat lease expired during re-registration. Self-fencing simulation."
+                            );
+                            telemetry.mark_unready();
+                            let _ = fenced_tx
+                                .send("Director heartbeat lease expired".to_string())
+                                .await;
+                            break;
+                        }
+                    }
                 }
 
                 last_ack = std::time::Instant::now();
 
+                for (instance_id, player_count, total_entity_count, is_idle) in active_instances {
+                    let inst_hb = mmo_schema::cluster::InstanceHeartbeatRequest {
+                        instance_id,
+                        node_id: u32::from(node_id),
+                        player_count,
+                        total_entity_count,
+                        is_idle,
+                    };
+                    if let Ok(Ok(inst_resp)) =
+                        tokio::time::timeout(config.rpc_timeout, c.instance_heartbeat(inst_hb))
+                            .await
+                    {
+                        if inst_resp.into_inner().should_terminate {
+                            let mut s = sim.write().await;
+                            let _ = s.instances.teardown_instance(instance_id);
+                        }
+                    }
+                }
+
                 if inner.should_split {
                     let split_req = mmo_schema::cluster::SplitReportRequest {
                         node_id: u32::from(node_id),
-                        original_bounds: build_bounds_proto(&config.bounds),
+                        original_bounds: build_bounds_proto(&current_bounds),
                         child_bounds: vec![],
                         total_entities: entity_count,
                     };
                     if let Ok(Ok(split_resp)) =
                         tokio::time::timeout(config.rpc_timeout, c.report_split(split_req)).await
                     {
+                        let split_inner = split_resp.into_inner();
                         println!(
                             "[Node {node_id}] Split reported, assigned nodes: {:?}",
-                            split_resp.into_inner().assigned_node_ids
+                            split_inner.assigned_node_ids
                         );
+                        if split_inner.acknowledged && !split_inner.assigned_node_ids.is_empty() {
+                            let children = current_bounds.subdivide();
+                            let self_id = u32::from(node_id);
+                            if let Some(idx) = split_inner
+                                .assigned_node_ids
+                                .iter()
+                                .position(|&assigned| assigned == self_id)
+                            {
+                                if let Some(&next_bounds) = children.get(idx) {
+                                    current_bounds = next_bounds;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -524,6 +656,7 @@ pub async fn run_director_registration_and_heartbeat_loop(
                     eprintln!(
                         "[Node {node_id}] Fenced by Director (split-brain prevention): {e}. Halting simulation."
                     );
+                    telemetry.mark_unready();
                     let _ = fenced_tx.send(e.to_string()).await;
                     break;
                 }

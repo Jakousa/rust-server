@@ -25,14 +25,16 @@ pub struct RegisteredNode {
 
 impl RegisteredNode {
     /// Computes composite load score:
-    /// Load = 0.5 * entities + 0.25 * cpu_percent + 0.25 * tick_duration_ms
+    /// Load = 0.5 * entities + 0.25 * cpu_percent + 0.25 * tick_duration_ms + 10.0 * assigned_bounds.len()
     pub fn load_score(&self) -> f32 {
         let w_entities = 0.5;
         let w_cpu = 0.25;
         let w_tick = 0.25;
+        let w_partitions = 10.0;
         (self.entity_count as f32 * w_entities)
             + (self.cpu_percent * w_cpu)
             + (self.tick_duration_ms * w_tick)
+            + (self.assigned_bounds.len() as f32 * w_partitions)
     }
 }
 
@@ -654,9 +656,33 @@ impl GatewayRegistry {
         }
     }
 
-    /// Scans for stale gateways exceeding `timeout`, marks them `Offline`, and returns their IDs.
+    /// Default retention window before `Offline` gateways are evicted from the registry.
+    pub const DEFAULT_OFFLINE_RETENTION: Duration = Duration::from_secs(30);
+
+    /// Scans for stale gateways exceeding `timeout`, marks them `Offline`, evicts gateways
+    /// that have remained offline past the retention window, and returns newly offlined IDs.
     pub fn remove_stale_gateways(&mut self, timeout: Duration) -> Vec<String> {
+        let retention = timeout
+            .saturating_mul(5)
+            .max(Self::DEFAULT_OFFLINE_RETENTION);
+        self.remove_stale_gateways_with_retention(timeout, retention)
+    }
+
+    /// Scans for stale gateways exceeding `timeout`, marks newly stale ones `Offline`,
+    /// evicts `Offline` gateways exceeding `timeout + offline_retention`, and returns newly offlined IDs.
+    pub fn remove_stale_gateways_with_retention(
+        &mut self,
+        timeout: Duration,
+        offline_retention: Duration,
+    ) -> Vec<String> {
         let now = Instant::now();
+        let eviction_threshold = timeout.saturating_add(offline_retention);
+
+        self.gateways.retain(|_, g| {
+            !(g.status == GatewayStatus::Offline
+                && now.duration_since(g.last_heartbeat) > eviction_threshold)
+        });
+
         let stale_gateways: Vec<String> = self
             .gateways
             .iter()
@@ -781,5 +807,31 @@ mod gateway_tests {
         let g = registry.get_gateway("gw-stale-1").unwrap();
         assert_eq!(g.status, GatewayStatus::Offline);
         assert!(registry.get_active_gateways().is_empty());
+
+        // Fast-forward past offline retention threshold and verify eviction
+        let long_stale_time = Instant::now() - Duration::from_secs(60);
+        registry.set_last_heartbeat("gw-stale-1", long_stale_time);
+        let stale_again = registry.remove_stale_gateways(Duration::from_secs(3));
+        assert!(stale_again.is_empty());
+        assert_eq!(registry.gateway_count(), 0);
+        assert!(registry.get_gateway("gw-stale-1").is_none());
+    }
+
+    #[test]
+    fn test_load_score_factors_assigned_bounds_count() {
+        let mut registry = NodeRegistry::new();
+        let b1 = BoundingBox3D::new((0.0, 0.0, 0.0), (10.0, 10.0, 10.0));
+        let b2 = BoundingBox3D::new((10.0, 0.0, 0.0), (20.0, 10.0, 10.0));
+
+        let id1 = registry.register_node("127.0.0.1:50051".to_string(), vec![b1, b2]);
+        let id2 = registry.register_node("127.0.0.1:50052".to_string(), vec![]);
+
+        let s1 = registry.get_node(id1).unwrap().load_score();
+        let s2 = registry.get_node(id2).unwrap().load_score();
+        assert!(
+            s1 > s2,
+            "node with 2 bounds must have higher load_score ({s1}) than 0 bounds ({s2})"
+        );
+        assert_eq!(registry.find_least_loaded_node(&[]), Some(id2));
     }
 }
