@@ -107,135 +107,31 @@ pub async fn run_node_daemon_with_sim(
 
     // 2. Connect and register with Director (with retry backoff)
     let (fenced_tx, mut fenced_rx) = tokio::sync::mpsc::channel::<String>(1);
-    let director_endpoint = director_addr.clone();
+    let lease_timeout = std::env::var("DIRECTOR_LEASE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis);
+    let hb_config = DirectorHeartbeatConfig {
+        node_id,
+        listen_addr,
+        bounds,
+        director_endpoint: director_addr.clone(),
+        retry_interval: Duration::from_secs(1),
+        heartbeat_interval: Duration::from_secs(1),
+        rpc_timeout: Duration::from_secs(2),
+        lease_timeout,
+    };
     let sim_clone = Arc::clone(&sim);
     let telemetry_clone = telemetry.clone();
     let heartbeat_handle = tokio::spawn(async move {
-        println!("[Node {node_id}] Attempting connection to Director at {director_endpoint}...");
-        let mut client = loop {
-            match DirectorServiceClient::connect(director_endpoint.clone()).await {
-                Ok(c) => {
-                    println!("[Node {node_id}] Connected to Director.");
-                    break c;
-                }
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        };
-
-        // Register node
-        let proto_bounds = Some(BoundingBox {
-            min: Some(Vector3 {
-                x: bounds.min.0,
-                y: bounds.min.1,
-                z: bounds.min.2,
-            }),
-            max: Some(Vector3 {
-                x: bounds.max.0,
-                y: bounds.max.1,
-                z: bounds.max.2,
-            }),
-        });
-
-        let reg_req = RegisterNodeRequest {
-            node_id: u32::from(node_id),
-            listen_addr: listen_addr.to_string(),
-            bounds: proto_bounds,
-        };
-
-        match client.register_node(reg_req).await {
-            Ok(resp) => {
-                let success = resp.into_inner().success;
-                println!("[Node {node_id}] Registered with Director: success={success}");
-                if success {
-                    telemetry_clone.mark_ready();
-                }
-            }
-            Err(e) => {
-                eprintln!("[Node {node_id}] Failed to register with Director: {e}");
-            }
-        }
-
-        // Heartbeat loop
-        let mut hb_interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            hb_interval.tick().await;
-            let (entity_count, tick_duration_ms, entity_centroid) = {
-                let s = sim_clone.read().await;
-                let count = s.entity_store.count() as u32;
-                let dur = s.last_tick_duration_ms();
-                let centroid = if count > 0 {
-                    let c = s.compute_clamped_centroid(&s.octree.bounds);
-                    Some(Vector3 {
-                        x: c.0,
-                        y: c.1,
-                        z: c.2,
-                    })
-                } else {
-                    None
-                };
-                (count, dur, centroid)
-            };
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-
-            let hb = HeartbeatRequest {
-                node_id: u32::from(node_id),
-                tick_rate: 20.0,
-                entity_count,
-                cpu_percent: 5.0,
-                memory_bytes: 10_000_000,
-                timestamp: now,
-                tick_duration_ms,
-                entity_centroid,
-            };
-
-            match client.heartbeat(hb).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    if inner.should_split {
-                        let proto_bounds = Some(BoundingBox {
-                            min: Some(Vector3 {
-                                x: bounds.min.0,
-                                y: bounds.min.1,
-                                z: bounds.min.2,
-                            }),
-                            max: Some(Vector3 {
-                                x: bounds.max.0,
-                                y: bounds.max.1,
-                                z: bounds.max.2,
-                            }),
-                        });
-                        let split_req = mmo_schema::cluster::SplitReportRequest {
-                            node_id: u32::from(node_id),
-                            original_bounds: proto_bounds,
-                            child_bounds: vec![],
-                            total_entities: entity_count,
-                        };
-                        if let Ok(split_resp) = client.report_split(split_req).await {
-                            println!(
-                                "[Node {node_id}] Split reported, assigned nodes: {:?}",
-                                split_resp.into_inner().assigned_node_ids
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[Node {node_id}] Heartbeat send failed: {e}");
-                    if e.code() == tonic::Code::FailedPrecondition {
-                        eprintln!(
-                            "[Node {node_id}] Fenced by Director (split-brain prevention): {e}. Halting simulation."
-                        );
-                        let _ = fenced_tx.send(e.to_string()).await;
-                        break;
-                    }
-                }
-            }
-        }
+        run_director_registration_and_heartbeat_loop(
+            hb_config,
+            sim_clone,
+            telemetry_clone,
+            fenced_tx,
+        )
+        .await;
     });
 
     // 3. AoI Broadcast Delivery Decoupler & Gateway Worker
@@ -369,4 +265,276 @@ pub async fn run_node_daemon_with_sim(
     let _ = tokio::time::timeout(Duration::from_secs(2), grpc_handle).await;
     println!("[Node {node_id}] Clean shutdown complete.");
     Ok(())
+}
+
+/// Configuration for the simulation node's Director registration and heartbeat loop.
+#[derive(Debug, Clone)]
+pub struct DirectorHeartbeatConfig {
+    pub node_id: u16,
+    pub listen_addr: SocketAddr,
+    pub bounds: BoundingBox3D,
+    pub director_endpoint: String,
+    pub retry_interval: Duration,
+    pub heartbeat_interval: Duration,
+    pub rpc_timeout: Duration,
+    pub lease_timeout: Option<Duration>,
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn build_bounds_proto(bounds: &BoundingBox3D) -> Option<BoundingBox> {
+    Some(BoundingBox {
+        min: Some(Vector3 {
+            x: bounds.min.0,
+            y: bounds.min.1,
+            z: bounds.min.2,
+        }),
+        max: Some(Vector3 {
+            x: bounds.max.0,
+            y: bounds.max.1,
+            z: bounds.max.2,
+        }),
+    })
+}
+
+fn is_transient_transport_error(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+    )
+}
+
+async fn register_until_acknowledged(
+    client: &mut Option<DirectorServiceClient<tonic::transport::Channel>>,
+    endpoint: &str,
+    reg_req: &RegisterNodeRequest,
+    node_id: u16,
+    telemetry: &mmo_core::TelemetryServer,
+    retry_interval: Duration,
+    rpc_timeout: Duration,
+) -> std::time::Instant {
+    loop {
+        if client.is_none() {
+            match tokio::time::timeout(
+                rpc_timeout,
+                DirectorServiceClient::connect(endpoint.to_string()),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    println!("[Node {node_id}] Connected to Director.");
+                    *client = Some(c);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    tokio::time::sleep(retry_interval).await;
+                    continue;
+                }
+            }
+        }
+
+        let Some(ref mut c) = client else {
+            continue;
+        };
+
+        match tokio::time::timeout(rpc_timeout, c.register_node(reg_req.clone())).await {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                println!(
+                    "[Node {node_id}] Registered with Director: success={}",
+                    inner.success
+                );
+                if inner.success {
+                    telemetry.mark_ready();
+                    return std::time::Instant::now();
+                }
+                eprintln!(
+                    "[Node {node_id}] Director rejected registration: {}",
+                    inner.message
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!("[Node {node_id}] Failed to register with Director: {e}");
+                if is_transient_transport_error(&e) {
+                    *client = None;
+                }
+            }
+            Err(_) => {
+                eprintln!("[Node {node_id}] Director register_node timed out");
+                *client = None;
+            }
+        }
+
+        tokio::time::sleep(retry_interval).await;
+    }
+}
+
+/// Runs the resilient Director registration and heartbeat loop with automatic retry on startup
+/// and self-healing re-registration if Director restarts and loses in-memory state.
+pub async fn run_director_registration_and_heartbeat_loop(
+    config: DirectorHeartbeatConfig,
+    sim: Arc<RwLock<TickSimulation>>,
+    telemetry: mmo_core::TelemetryServer,
+    fenced_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    let node_id = config.node_id;
+    let endpoint = normalize_endpoint(&config.director_endpoint);
+    println!("[Node {node_id}] Attempting connection to Director at {endpoint}...");
+
+    let reg_req = RegisterNodeRequest {
+        node_id: u32::from(node_id),
+        listen_addr: config.listen_addr.to_string(),
+        bounds: build_bounds_proto(&config.bounds),
+    };
+
+    let mut client: Option<DirectorServiceClient<tonic::transport::Channel>> = None;
+    let mut last_ack = register_until_acknowledged(
+        &mut client,
+        &endpoint,
+        &reg_req,
+        node_id,
+        &telemetry,
+        config.retry_interval,
+        config.rpc_timeout,
+    )
+    .await;
+
+    let mut hb_interval = tokio::time::interval(config.heartbeat_interval);
+    hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        hb_interval.tick().await;
+
+        if let Some(limit) = config.lease_timeout {
+            let elapsed = last_ack.elapsed();
+            if elapsed > limit {
+                eprintln!(
+                    "[Node {node_id}] Director heartbeat lease expired ({elapsed:?} > {limit:?}). Self-fencing simulation."
+                );
+                let _ = fenced_tx
+                    .send("Director heartbeat lease expired".to_string())
+                    .await;
+                break;
+            }
+        }
+
+        if client.is_none() {
+            match tokio::time::timeout(
+                config.rpc_timeout,
+                DirectorServiceClient::connect(endpoint.clone()),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    client = Some(c);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    continue;
+                }
+            }
+        }
+
+        let (entity_count, tick_duration_ms, entity_centroid) = {
+            let s = sim.read().await;
+            let count = s.entity_store.count() as u32;
+            let dur = s.last_tick_duration_ms();
+            let centroid = if count > 0 {
+                let c = s.compute_clamped_centroid(&s.octree.bounds);
+                Some(Vector3 {
+                    x: c.0,
+                    y: c.1,
+                    z: c.2,
+                })
+            } else {
+                None
+            };
+            (count, dur, centroid)
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let hb = HeartbeatRequest {
+            node_id: u32::from(node_id),
+            tick_rate: 20.0,
+            entity_count,
+            cpu_percent: 5.0,
+            memory_bytes: 10_000_000,
+            timestamp: now,
+            tick_duration_ms,
+            entity_centroid,
+        };
+
+        let Some(ref mut c) = client else {
+            continue;
+        };
+
+        match tokio::time::timeout(config.rpc_timeout, c.heartbeat(hb)).await {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                if !inner.acknowledged {
+                    eprintln!(
+                        "[Node {node_id}] Director did not acknowledge heartbeat (director may have restarted); re-registering..."
+                    );
+                    last_ack = register_until_acknowledged(
+                        &mut client,
+                        &endpoint,
+                        &reg_req,
+                        node_id,
+                        &telemetry,
+                        config.retry_interval,
+                        config.rpc_timeout,
+                    )
+                    .await;
+                    continue;
+                }
+
+                last_ack = std::time::Instant::now();
+
+                if inner.should_split {
+                    let split_req = mmo_schema::cluster::SplitReportRequest {
+                        node_id: u32::from(node_id),
+                        original_bounds: build_bounds_proto(&config.bounds),
+                        child_bounds: vec![],
+                        total_entities: entity_count,
+                    };
+                    if let Ok(Ok(split_resp)) =
+                        tokio::time::timeout(config.rpc_timeout, c.report_split(split_req)).await
+                    {
+                        println!(
+                            "[Node {node_id}] Split reported, assigned nodes: {:?}",
+                            split_resp.into_inner().assigned_node_ids
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("[Node {node_id}] Heartbeat send failed: {e}");
+                if e.code() == tonic::Code::FailedPrecondition {
+                    eprintln!(
+                        "[Node {node_id}] Fenced by Director (split-brain prevention): {e}. Halting simulation."
+                    );
+                    let _ = fenced_tx.send(e.to_string()).await;
+                    break;
+                }
+                if is_transient_transport_error(&e) {
+                    client = None;
+                }
+            }
+            Err(_) => {
+                eprintln!("[Node {node_id}] Heartbeat RPC timed out");
+                client = None;
+            }
+        }
+    }
 }
