@@ -235,7 +235,44 @@ async fn test_marketplace_e2e_lifecycle_and_simulation_bypass() {
     assert_eq!(query_res.listings.len(), 1);
     assert_eq!(query_res.listings[0].listing_id, listing_id);
 
-    // 5. Buyer purchases the listing
+    // 5. Attempting unpaid purchase without currency in payment_container must fail!
+    let unpaid_buy_req = ClientPacket::MarketBuyRequest(MarketBuyRequestPacket {
+        listing_id: listing_id.clone(),
+        buyer_container_id: buyer_container,
+        payment_container_id: payment_container,
+        price: 250,
+    });
+    buyer_stream
+        .write_all(&unpaid_buy_req.encode())
+        .await
+        .expect("write unpaid buy req");
+
+    let unpaid_buy_res = timeout(
+        Duration::from_secs(2),
+        read_next_packet(&mut buyer_stream, &mut buyer_buf),
+    )
+    .await
+    .expect("unpaid buy timeout")
+    .expect_market_response();
+    assert!(
+        !unpaid_buy_res.success,
+        "Unpaid purchase without currency items must fail"
+    );
+
+    // Seed authoritative buyer currency (300) into payment_container and retry purchase
+    let buyer_gold = mmo_storage::models::ItemRecord::builder("buyer-gold-1")
+        .character_guid(buyer_guid.raw())
+        .container_id(payment_container)
+        .slot(0)
+        .item_def_id(mmo_storage::marketplace::DEFAULT_CURRENCY_ITEM_DEF_ID)
+        .quantity(300)
+        .build();
+    CharacterRepository::new(db.clone())
+        .add_item(&buyer_gold)
+        .await
+        .unwrap();
+
+    // 5b. Buyer purchases the listing
     let buy_req = ClientPacket::MarketBuyRequest(MarketBuyRequestPacket {
         listing_id: listing_id.clone(),
         buyer_container_id: buyer_container,
@@ -258,19 +295,27 @@ async fn test_marketplace_e2e_lifecycle_and_simulation_bypass() {
     assert!(buy_res.success);
     assert_eq!(buy_res.request_type, 2);
 
-    // Verify item is now in buyer container
+    // Verify item is now in buyer container with synced character_guid, and currency settled
     let crepo = ContainerRepository::new(db.clone());
     let buyer_items = crepo.get_container_items(buyer_container).await.unwrap();
     assert_eq!(buyer_items.len(), 1);
     assert_eq!(buyer_items[0].item_instance_id, "item-sword-42");
+    assert_eq!(buyer_items[0].character_guid, buyer_guid.raw());
+
+    let pay_items = crepo.get_container_items(payment_container).await.unwrap();
+    assert_eq!(pay_items.len(), 1);
+    assert_eq!(pay_items[0].quantity, 50);
 
     // 6. Test Listing Cancellation
-    // Create another item in seller container slot 0
-    create_item(&db, "item-shield-99", seller_container, 0, 888).await;
+    // Seller container slot 0 holds earned 250 currency; place shield at slot 1
+    let seller_items_after_sale = crepo.get_container_items(seller_container).await.unwrap();
+    assert_eq!(seller_items_after_sale.len(), 1);
+    assert_eq!(seller_items_after_sale[0].quantity, 250);
+    create_item(&db, "item-shield-99", seller_container, 1, 888).await;
     let list_req_2 = ClientPacket::MarketListRequest(MarketListRequestPacket {
         item_instance_id: "item-shield-99".to_string(),
         src_container_id: seller_container,
-        src_slot: 0,
+        src_slot: 1,
         price: 500,
         duration_secs: 3600,
     });
@@ -309,15 +354,22 @@ async fn test_marketplace_e2e_lifecycle_and_simulation_bypass() {
 
     // Verify item refunded to seller container
     let seller_items = crepo.get_container_items(seller_container).await.unwrap();
-    assert_eq!(seller_items.len(), 1);
-    assert_eq!(seller_items[0].item_instance_id, "item-shield-99");
+    assert_eq!(seller_items.len(), 2);
+    assert!(seller_items
+        .iter()
+        .any(|i| i.item_instance_id == "item-shield-99"));
 
     // 7. Test Unauthorized Cancellation: Buyer tries to cancel Seller's listing
     // Create another listing for seller
+    let shield_slot = seller_items
+        .iter()
+        .find(|i| i.item_instance_id == "item-shield-99")
+        .unwrap()
+        .slot;
     let list_req_3 = ClientPacket::MarketListRequest(MarketListRequestPacket {
         item_instance_id: "item-shield-99".to_string(),
         src_container_id: seller_container,
-        src_slot: 0,
+        src_slot: shield_slot,
         price: 600,
         duration_secs: 3600,
     });

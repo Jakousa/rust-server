@@ -1,7 +1,9 @@
 //! Character, Inventory, and Entity repository providing CRUD, inventory management,
 //! ACID player-to-player trading, and snapshot persistence operations.
 
-use crate::db::{compute_free_slots, current_time_secs, Database, DbBackend, StorageError};
+use crate::db::{
+    compute_free_slots, current_time_ms, current_time_secs, Database, DbBackend, StorageError,
+};
 use crate::models::{
     AccountRecord, CharacterRecord, EntitySnapshot, InventoryRecord, ItemRecord, TradeRecord,
     TradeStatus,
@@ -693,6 +695,7 @@ impl CharacterRepository {
         );
 
         let now = current_time_secs();
+        let now_ms = current_time_ms();
 
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
             // 1. Dialect-specific row locking in ascending numerical order
@@ -725,15 +728,28 @@ impl CharacterRepository {
                 .map(|r| r.try_get::<i32, _>("capacity").unwrap_or(30))
                 .unwrap_or(30) as u32;
 
-            // 3. Fetch recipient occupied slots
-            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE character_guid = ?"))
+            // 3. Fetch recipient occupied and reserved slots
+            let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
                 .bind(recipient_guid as i64)
                 .fetch_all(&mut *conn)
                 .await?;
-            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+            let mut occupied_slots: std::collections::HashSet<u32> = occupied_rows
                 .into_iter()
                 .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
                 .collect();
+
+            let reserved_dst_rows = sqlx::query(&q!(
+                "SELECT slot FROM container_reservations WHERE container_id = ? AND expires_at_epoch_ms > ?"
+            ))
+            .bind(recipient_guid as i64)
+            .bind(now_ms)
+            .fetch_all(&mut *conn)
+            .await?;
+            for r in reserved_dst_rows {
+                if let Ok(slot) = r.try_get::<i32, _>("slot") {
+                    occupied_slots.insert(slot as u32);
+                }
+            }
 
             let free_slots = compute_free_slots(&occupied_slots, capacity);
 
@@ -741,17 +757,13 @@ impl CharacterRepository {
                 return Err(StorageError::InventoryFull(recipient_guid, capacity));
             }
 
-            // 4. Verify sender owns each item
-            let mut q_str = String::from(
-                "SELECT item_instance_id, character_guid FROM items WHERE item_instance_id IN (",
+            // 4. Verify sender owns each item in their inventory container (not in escrow/other container)
+            let placeholders = vec!["?"; item_instance_ids.len()].join(", ");
+            let q_str = format!(
+                "SELECT item_instance_id, character_guid, container_id, slot FROM items WHERE item_instance_id IN ({}){}",
+                placeholders,
+                lock_suffix!()
             );
-            for i in 0..item_instance_ids.len() {
-                if i > 0 {
-                    q_str.push_str(", ");
-                }
-                q_str.push('?');
-            }
-            q_str.push(')');
 
             let q_cow = q!(&q_str);
             let mut query = sqlx::query(&q_cow);
@@ -761,17 +773,20 @@ impl CharacterRepository {
 
             let rows = query.fetch_all(&mut *conn).await?;
 
-            let mut owner_map = std::collections::HashMap::with_capacity(rows.len());
+            let mut item_info_map: std::collections::HashMap<String, (i64, i64, i32)> =
+                std::collections::HashMap::with_capacity(rows.len());
             for r in rows {
                 let id: String = r.try_get("item_instance_id")?;
                 let owner: i64 = r.try_get("character_guid")?;
-                owner_map.insert(id, owner);
+                let container_id: i64 = r.try_get("container_id")?;
+                let slot: i32 = r.try_get("slot")?;
+                item_info_map.insert(id, (owner, container_id, slot));
             }
 
             for item_id in item_instance_ids {
-                match owner_map.get(item_id) {
-                    Some(&owner) => {
-                        if owner as u64 != sender_guid {
+                match item_info_map.get(item_id) {
+                    Some(&(owner, container_id, _slot)) => {
+                        if owner as u64 != sender_guid || container_id as u64 != sender_guid {
                             return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
                         }
                     }
@@ -781,18 +796,78 @@ impl CharacterRepository {
                 }
             }
 
+            // 4b. Reject items or slots locked by active 2PC reservations
+            let res_q_str = format!(
+                "SELECT container_id, slot, item_instance_id FROM container_reservations WHERE (container_id = ? OR item_instance_id IN ({})) AND expires_at_epoch_ms > ?",
+                placeholders
+            );
+            let res_q_cow = q!(&res_q_str);
+            let mut res_query = sqlx::query(&res_q_cow).bind(sender_guid as i64);
+            for item_id in item_instance_ids {
+                res_query = res_query.bind(item_id);
+            }
+            res_query = res_query.bind(now_ms);
+            let res_rows = res_query.fetch_all(&mut *conn).await?;
+
+            let mut reserved_src_slots = std::collections::HashSet::new();
+            let mut reserved_item_ids = std::collections::HashSet::new();
+            for r in res_rows {
+                let r_cid: i64 = r.try_get("container_id")?;
+                let r_slot: i32 = r.try_get("slot")?;
+                let r_item: Option<String> = r.try_get("item_instance_id")?;
+                if r_cid as u64 == sender_guid {
+                    reserved_src_slots.insert(r_slot);
+                }
+                if let Some(id) = r_item {
+                    reserved_item_ids.insert(id);
+                }
+            }
+
+            for item_id in item_instance_ids {
+                let &(_, _, slot) = item_info_map
+                    .get(item_id)
+                    .expect("validated item_id present in item_info_map");
+                if reserved_src_slots.contains(&slot) || reserved_item_ids.contains(item_id) {
+                    return Err(StorageError::SlotReserved(slot as u32, sender_guid));
+                }
+            }
+
+            // 4c. Reject items with active marketplace listings
+            let mkt_q_str = format!(
+                "SELECT item_instance_id FROM market_listings WHERE item_instance_id IN ({}) AND status IN ('Active', 'ExpiredPendingClaim')",
+                placeholders
+            );
+            let mkt_q_cow = q!(&mkt_q_str);
+            let mut mkt_query = sqlx::query(&mkt_q_cow);
+            for item_id in item_instance_ids {
+                mkt_query = mkt_query.bind(item_id);
+            }
+            if let Some(row) = mkt_query.fetch_optional(&mut *conn).await? {
+                let listed_id: String = row.try_get("item_instance_id")?;
+                return Err(StorageError::TradeError(format!(
+                    "Item {} is currently listed on the marketplace",
+                    listed_id
+                )));
+            }
+
             // 5. Transfer items to recipient free slots
             for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
-                sqlx::query(&q!(
-                    "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                let move_res = sqlx::query(&q!(
+                    "UPDATE items SET character_guid = ?, container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ? AND character_guid = ? AND container_id = ?"
                 ))
                 .bind(recipient_guid as i64)
                 .bind(recipient_guid as i64)
                 .bind(*target_slot as i32)
                 .bind(now)
                 .bind(item_id)
+                .bind(sender_guid as i64)
+                .bind(sender_guid as i64)
                 .execute(&mut *conn)
                 .await?;
+
+                if move_res.rows_affected() != 1 {
+                    return Err(StorageError::ItemNotFound(item_id.clone(), sender_guid));
+                }
             }
 
             // 6. Record audit trail
@@ -1423,5 +1498,139 @@ mod tests {
         repo.save_snapshot(&snapshot).await.unwrap();
         let loaded = repo.load_snapshot(9999).await.unwrap();
         assert_eq!(loaded, Some(snapshot));
+    }
+
+    #[tokio::test]
+    async fn test_execute_trade_rejects_reservations_listings_and_container_mismatch() {
+        let db = Database::connect_memory().await.unwrap();
+        let repo = CharacterRepository::new(db.clone());
+        let crepo = crate::container_repo::ContainerRepository::new(db.clone());
+        let tx_coord = crate::transaction_coord::TransactionCoordinator::new(db.clone());
+        let mkt_repo = crate::marketplace::MarketplaceRepository::new(db.clone());
+
+        repo.create_account("acc_7101", "sender_7101")
+            .await
+            .unwrap();
+        repo.create_account("acc_7102", "recipient_7102")
+            .await
+            .unwrap();
+        repo.create_character("acc_7101", 7101, "Sender", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        repo.create_character("acc_7102", 7102, "Recipient", (0.0, 0.0, 0.0))
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &crate::models::ContainerRecordBuilder::new(7101)
+                    .owner_id("7101")
+                    .capacity(30)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &crate::models::ContainerRecordBuilder::new(7102)
+                    .owner_id("7102")
+                    .capacity(30)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &crate::models::ContainerRecordBuilder::new(7199)
+                    .owner_type("system")
+                    .owner_id("escrow")
+                    .capacity(30)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // 1. Item with stale character_guid=7101 inside different container_id=7199 must be rejected
+        let mismatched = ItemRecord {
+            item_instance_id: "trade_mismatch_item".to_string(),
+            character_guid: 7101,
+            container_id: 7199,
+            item_def_id: 50,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&mismatched).await.unwrap();
+        let mismatch_err = repo
+            .execute_trade(
+                "trade_mismatch",
+                7101,
+                7102,
+                &["trade_mismatch_item".to_string()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatch_err, StorageError::ItemNotFound(_, 7101)));
+
+        // 2. Item in inventory slot locked by active 2PC reservation must be rejected
+        let inv_item = ItemRecord {
+            item_instance_id: "trade_res_item".to_string(),
+            character_guid: 7101,
+            container_id: 0,
+            item_def_id: 51,
+            slot: 0,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&inv_item).await.unwrap();
+        tx_coord
+            .prepare_transfer("tx_trade_res", 7101, 0, 7102, 5, 5000)
+            .await
+            .unwrap();
+        let res_err = repo
+            .execute_trade("trade_res", 7101, 7102, &["trade_res_item".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(res_err, StorageError::SlotReserved(0, 7101)));
+        tx_coord.abort_transfer("tx_trade_res").await.unwrap();
+
+        // 3. Listed item in active market_listings must be rejected (container mismatch & listing check)
+        let listed_item = ItemRecord {
+            item_instance_id: "trade_listed_item".to_string(),
+            character_guid: 7101,
+            container_id: 0,
+            item_def_id: 52,
+            slot: 1,
+            quantity: 1,
+            durability: 100,
+            attributes: serde_json::json!({}),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        repo.add_item(&listed_item).await.unwrap();
+        mkt_repo
+            .create_listing(7101, 7101, 1, 100, 3600, 7199)
+            .await
+            .unwrap();
+        // Force stale character_guid back to 7101 to prove listing check also blocks even if guid was stale
+        sqlx::query("UPDATE items SET character_guid = 7101, container_id = 7101 WHERE item_instance_id = 'trade_listed_item'")
+            .execute(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        let list_err = repo
+            .execute_trade(
+                "trade_listed",
+                7101,
+                7102,
+                &["trade_listed_item".to_string()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(list_err, StorageError::TradeError(_)));
     }
 }
