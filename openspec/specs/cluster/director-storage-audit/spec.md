@@ -8,10 +8,10 @@
 - **THEN** `DirectorServiceImpl::heartbeat` MUST return `tonic::Status::failed_precondition` containing node fencing instructions
 - **AND** the node heartbeat client MUST detect `FailedPrecondition` and trigger immediate simulation shutdown to prevent split-brain simulation.
 
-### Scenario: Unknown node heartbeat rejected with failed_precondition
-- **GIVEN** an unregistered node ID
+### Scenario: Unknown non-evicted node heartbeat returns unacknowledged response
+- **GIVEN** an unregistered node ID that has not been evicted (such as after a `Director` restart)
 - **WHEN** the unknown node sends a `HeartbeatRequest`
-- **THEN** `DirectorServiceImpl::heartbeat` MUST return `tonic::Status::failed_precondition` rather than unacknowledged success.
+- **THEN** `DirectorServiceImpl::heartbeat` MUST return `Ok(HeartbeatResponse { acknowledged: false, should_split: false, topology_epoch })` so the node can automatically re-register (superseded from `failed_precondition` by `cluster/node-registration-resilience/spec.md`).
 
 ---
 
