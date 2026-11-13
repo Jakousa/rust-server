@@ -37,7 +37,12 @@ export class ClientWorldBridge {
     this.onInteractionResultCallback = null;
     this.onAuthResponseCallback = null;
     this.onMovementCorrectionCallback = null;
+    this.onLocalPlayerKeyframeCallback = null;
     this.onServerTickCallback = null;
+  }
+
+  onLocalPlayerKeyframe(callback) {
+    this.onLocalPlayerKeyframeCallback = callback;
   }
 
   onServerTick(callback) {
@@ -350,6 +355,7 @@ export class ClientWorldBridge {
           // Entity replica update
           const entityType = Number((rawEntityId >> 48n) & 0xffffn);
           let ent = this.entities.get(entityId);
+          const isNewEntity = !ent;
           if (!ent) {
             ent = {
               id: entityId,
@@ -393,6 +399,20 @@ export class ClientWorldBridge {
             }
             if (stateFlags !== null) ent.stateFlags = stateFlags;
             if (actionId !== null) ent.actionId = actionId;
+          }
+
+          if (
+            this.onLocalPlayerKeyframeCallback &&
+            BigInt(entityId) === BigInt(this.localPlayerGuid) &&
+            (isNewEntity || hasKeyframe)
+          ) {
+            this.onLocalPlayerKeyframeCallback({
+              entityId,
+              x: ent.x,
+              y: ent.y,
+              z: ent.z,
+              yaw: ent.yaw,
+            });
           }
         }
       } catch (err) {
@@ -738,9 +758,21 @@ if (typeof window !== "undefined") {
   });
 
   // Authoritative server movement correction listener
+  let hasSyncedInitialPosition = false;
+  world.onAuthResponse(() => {
+    hasSyncedInitialPosition = false;
+  });
+  world.onLocalPlayerKeyframe((state) => {
+    if (!hasSyncedInitialPosition) {
+      controls.setPosition(state.x, state.y, state.z);
+      hasSyncedInitialPosition = true;
+    }
+  });
+
   world.onMovementCorrection((corr) => {
     if (BigInt(corr.entityId) === BigInt(world.localPlayerGuid)) {
       controls.reconcile(corr.sequence, corr.x, corr.y, corr.z);
+      hasSyncedInitialPosition = true;
     }
   });
 
@@ -755,6 +787,7 @@ if (typeof window !== "undefined") {
   transport.onStatus(({ status, error }) => {
     ui.setConnectionState(status);
     if (status === "disconnected") {
+      hasSyncedInitialPosition = false;
       world.clear();
       renderer.clear();
     }

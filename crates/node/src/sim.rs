@@ -59,6 +59,7 @@ pub struct TickSimulation {
     pub history: crate::history::SpatialHistoryBuffer,
     pub script_reloader: Option<Arc<dyn mmo_core::script::ScriptReloadable>>,
     pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
+    pub default_spawn_position: (f32, f32, f32),
 }
 
 /// Ingress packet queued from a gateway client session, drained at tick boundaries.
@@ -193,6 +194,7 @@ impl TickSimulation {
             history: crate::history::SpatialHistoryBuffer::default(),
             script_reloader: None,
             combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
+            default_spawn_position: (0.0, 0.0, 0.0),
         }
     }
 
@@ -242,10 +244,10 @@ impl TickSimulation {
             }
             let initial_snapshot = match &input.packet {
                 mmo_schema::client::ClientPacket::Movement(m)
-                    if self
-                        .octree
-                        .bounds
-                        .contains((m.position.x, m.position.y, m.position.z)) =>
+                    if self.is_spawn_position_traversable(
+                        (m.position.x, m.position.y, m.position.z),
+                        (0.4, 0.9, 0.4),
+                    ) =>
                 {
                     Some(mmo_storage::EntitySnapshot {
                         guid: guid.raw(),
@@ -451,6 +453,100 @@ impl TickSimulation {
     ) -> Self {
         self.collision_world = collision_world;
         self
+    }
+
+    /// Configures the default unobstructed spawn position for new player sessions.
+    pub fn with_default_spawn_position(mut self, position: (f32, f32, f32)) -> Self {
+        self.default_spawn_position = position;
+        self
+    }
+
+    /// Updates the default unobstructed spawn position for new player sessions.
+    pub fn set_default_spawn_position(&mut self, position: (f32, f32, f32)) {
+        self.default_spawn_position = position;
+    }
+
+    /// Returns `true` if `pos` is finite, inside world bounds, and free of static obstacle collisions
+    /// for an entity with `collider_half_extents`.
+    pub fn is_spawn_position_traversable(
+        &self,
+        pos: (f32, f32, f32),
+        collider_half_extents: (f32, f32, f32),
+    ) -> bool {
+        if !pos.0.is_finite() || !pos.1.is_finite() || !pos.2.is_finite() {
+            return false;
+        }
+        if !self.octree.bounds.contains(pos) {
+            return false;
+        }
+        let Ok(cw) = self.collision_world.read() else {
+            return false;
+        };
+        let point = mmo_core::Vec3::new(pos.0, pos.1, pos.2);
+        if !cw.is_point_traversable(point) {
+            return false;
+        }
+        if collider_half_extents.0 > 0.0
+            && collider_half_extents.1 > 0.0
+            && collider_half_extents.2 > 0.0
+        {
+            let aabb = BoundingBox3D::new(
+                (
+                    pos.0 - collider_half_extents.0,
+                    pos.1 - collider_half_extents.1,
+                    pos.2 - collider_half_extents.2,
+                ),
+                (
+                    pos.0 + collider_half_extents.0,
+                    pos.1 + collider_half_extents.1,
+                    pos.2 + collider_half_extents.2,
+                ),
+            );
+            if cw
+                .sweep_test(
+                    &aabb,
+                    mmo_core::Vec3::new(1e-4, 0.0, 0.0),
+                    mmo_core::SpatialQueryFilter::all(),
+                )
+                .is_some()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Resolves a traversable spawn position from `candidate`, falling back to
+    /// `self.default_spawn_position` or a nearby unobstructed XZ offset if obstructed.
+    fn resolve_traversable_spawn_position(&self, candidate: (f32, f32, f32)) -> (f32, f32, f32) {
+        const PLAYER_HALF_EXTENTS: (f32, f32, f32) = (0.4, 0.9, 0.4);
+        if self.is_spawn_position_traversable(candidate, PLAYER_HALF_EXTENTS) {
+            return candidate;
+        }
+        let base = self.default_spawn_position;
+        if self.is_spawn_position_traversable(base, PLAYER_HALF_EXTENTS) {
+            return base;
+        }
+        const RADII: [f32; 4] = [1.5, 3.0, 5.0, 8.0];
+        const DIRS: [(f32, f32); 8] = [
+            (0.0, 1.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (-1.0, 0.0),
+            (0.707_106_77, 0.707_106_77),
+            (-0.707_106_77, 0.707_106_77),
+            (0.707_106_77, -0.707_106_77),
+            (-0.707_106_77, -0.707_106_77),
+        ];
+        for radius in RADII {
+            for (dx, dz) in DIRS {
+                let probe = (base.0 + dx * radius, base.1, base.2 + dz * radius);
+                if self.is_spawn_position_traversable(probe, PLAYER_HALF_EXTENTS) {
+                    return probe;
+                }
+            }
+        }
+        base
     }
 
     /// Authoritatively registers a world object and synchronizes its bounds with the collision world.
@@ -869,9 +965,10 @@ impl TickSimulation {
                 .unwrap_or((0.0, 0.0, 0.0));
         }
 
-        let (pos, rot) = saved_snapshot
+        let (candidate_pos, rot) = saved_snapshot
             .map(|s| (s.position, s.rotation))
-            .unwrap_or(((0.0, 0.0, 0.0), 0.0));
+            .unwrap_or((self.default_spawn_position, 0.0));
+        let pos = self.resolve_traversable_spawn_position(candidate_pos);
 
         let mut entity = mmo_core::Entity::new(guid, pos);
         entity.rotation = rot;
@@ -3003,6 +3100,102 @@ mod tests {
         assert!(
             progress_events.is_empty(),
             "ActionProgressEvent must be cleared at tick boundary"
+        );
+    }
+
+    #[test]
+    fn test_hydrate_player_session_falls_back_from_obstructed_spawn() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds).with_default_spawn_position((0.0, 0.0, 5.0));
+
+        // Register a static obstacle at the origin (mimicking the Village Well)
+        let obstacle_guid = Guid::new(EntityType::DynamicObject, 1, 1);
+        if let Ok(mut cw) = sim.collision_world.write() {
+            cw.register_obstacle(
+                obstacle_guid,
+                BoundingBox3D::new((-1.25, -1.0, -1.25), (1.25, 1.0, 1.25)),
+            );
+        }
+
+        // 1. Fresh session without snapshot should spawn at default_spawn_position (0, 0, 5)
+        let player_guid = Guid::new(EntityType::Player, 1, 101);
+        let pos = sim.hydrate_player_session(player_guid, 5001, 1, None, 50.0);
+        assert_eq!(pos, (0.0, 0.0, 5.0));
+
+        // Forward movement from (0, 0, 5) should succeed without kinematic violation
+        assert!(sim
+            .process_client_move_deterministic(player_guid, (0.0, 0.0, 5.35), 0.05)
+            .is_ok());
+
+        // 2. Session with an obstructed saved snapshot at (0, 0, 0) must also fall back to (0, 0, 5)
+        let player_guid_2 = Guid::new(EntityType::Player, 1, 102);
+        let obstructed_snap = mmo_storage::EntitySnapshot {
+            guid: player_guid_2.raw(),
+            position: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            attributes: serde_json::Value::Null,
+            state_blob: None,
+            version: 1,
+            timestamp: 0,
+        };
+        let pos_2 =
+            sim.hydrate_player_session(player_guid_2, 5002, 1, Some(&obstructed_snap), 50.0);
+        assert_eq!(pos_2, (0.0, 0.0, 5.0));
+    }
+
+    #[test]
+    fn test_process_client_input_rejects_obstructed_initial_movement_spawn() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds).with_default_spawn_position((0.0, 0.0, 5.0));
+
+        let obstacle_guid = Guid::new(EntityType::DynamicObject, 1, 1);
+        if let Ok(mut cw) = sim.collision_world.write() {
+            cw.register_obstacle(
+                obstacle_guid,
+                BoundingBox3D::new((-1.25, -1.0, -1.25), (1.25, 1.0, 1.25)),
+            );
+        }
+
+        let player_guid = Guid::new(EntityType::Player, 1, 202);
+        let input = QueuedClientInput {
+            session_id: 6001,
+            entity_guid: player_guid.raw(),
+            session_epoch: 1,
+            packet: mmo_schema::client::ClientPacket::Movement(
+                mmo_schema::client::MovementPacket {
+                    entity_id: player_guid.raw(),
+                    position: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                    velocity: mmo_schema::client::Vec3::new(0.0, 0.0, 0.0),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    timestamp: 0,
+                    sequence: 1,
+                },
+            ),
+        };
+        sim.handle_client_input(input);
+
+        // Player entity must be placed at the unobstructed default spawn, not inside the obstacle
+        let ent = sim
+            .entity_store
+            .get_by_guid(player_guid)
+            .expect("player should be hydrated");
+        assert_eq!(ent.position, (0.0, 0.0, 5.0));
+
+        // Client at (0,0,0) should receive a MovementCorrection snapping it to (0,0,5)
+        let has_correction = sim.pending_broadcast_jobs.iter().any(|job| {
+            job.packets.iter().any(|pkt| {
+                matches!(
+                    pkt,
+                    mmo_schema::client::ClientPacket::MovementCorrection(corr)
+                        if (corr.corrected_position.x, corr.corrected_position.y, corr.corrected_position.z)
+                            == (0.0, 0.0, 5.0)
+                )
+            })
+        });
+        assert!(
+            has_correction,
+            "expected MovementCorrection to (0.0, 0.0, 5.0)"
         );
     }
 }
