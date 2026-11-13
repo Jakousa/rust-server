@@ -47,10 +47,16 @@ describe("PlayerControls", () => {
     expect(controls.keys.s).toBe(true);
     keydownHandler({ key: "d" });
     expect(controls.keys.d).toBe(true);
-    keydownHandler({ key: "q" });
-    expect(controls.keys.q).toBe(true);
-    keydownHandler({ key: "e" });
-    expect(controls.keys.e).toBe(true);
+    keydownHandler({ key: "ArrowUp", code: "ArrowUp" });
+    expect(controls.keys.arrowUp).toBe(true);
+    keydownHandler({ key: "ArrowDown", code: "ArrowDown" });
+    expect(controls.keys.arrowDown).toBe(true);
+    keydownHandler({ key: "ArrowLeft", code: "ArrowLeft" });
+    expect(controls.keys.arrowLeft).toBe(true);
+    keydownHandler({ key: "ArrowRight", code: "ArrowRight" });
+    expect(controls.keys.arrowRight).toBe(true);
+    keydownHandler({ key: "e", code: "KeyE" });
+    expect(controls.keys.e).toBeUndefined();
     keydownHandler({ key: " ", code: "Space" });
     expect(controls.keys.space).toBe(true);
 
@@ -63,10 +69,14 @@ describe("PlayerControls", () => {
     expect(controls.keys.s).toBe(false);
     keyupHandler({ key: "d" });
     expect(controls.keys.d).toBe(false);
-    keyupHandler({ key: "q" });
-    expect(controls.keys.q).toBe(false);
-    keyupHandler({ key: "e" });
-    expect(controls.keys.e).toBe(false);
+    keyupHandler({ key: "ArrowUp", code: "ArrowUp" });
+    expect(controls.keys.arrowUp).toBe(false);
+    keyupHandler({ key: "ArrowDown", code: "ArrowDown" });
+    expect(controls.keys.arrowDown).toBe(false);
+    keyupHandler({ key: "ArrowLeft", code: "ArrowLeft" });
+    expect(controls.keys.arrowLeft).toBe(false);
+    keyupHandler({ key: "ArrowRight", code: "ArrowRight" });
+    expect(controls.keys.arrowRight).toBe(false);
     keyupHandler({ key: " ", code: "Space" });
     expect(controls.keys.space).toBe(false);
 
@@ -161,17 +171,27 @@ describe("PlayerControls", () => {
     expect(controls.sequence).toBe(11);
   });
 
-  it("rotates yaw with q and e keys and increments sequence monotonically", () => {
+  it("rotates yaw with A/D and ArrowLeft/ArrowRight keys and increments sequence monotonically", () => {
     const controls = new PlayerControls();
     const initialYaw = controls.yaw;
     const dt = 0.1;
 
-    controls.keys.q = true;
+    controls.keys.a = true;
     controls.update(dt);
     expect(controls.yaw).toBeGreaterThan(initialYaw);
 
-    controls.keys.q = false;
-    controls.keys.e = true;
+    controls.keys.a = false;
+    controls.keys.d = true;
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(initialYaw, 5);
+
+    controls.keys.d = false;
+    controls.keys.arrowLeft = true;
+    controls.update(dt);
+    expect(controls.yaw).toBeGreaterThan(initialYaw);
+
+    controls.keys.arrowLeft = false;
+    controls.keys.arrowRight = true;
     controls.update(dt);
     expect(controls.yaw).toBeCloseTo(initialYaw, 5);
 
@@ -182,6 +202,53 @@ describe("PlayerControls", () => {
     expect(s1.sequence).toBe(1);
     expect(s2.sequence).toBe(2);
     expect(s3.sequence).toBe(3);
+  });
+
+  it("does not mutate yaw when KeyE is pressed while A/D and ArrowLeft/ArrowRight rotate yaw", () => {
+    const addEventListenerMock = vi.fn();
+    vi.stubGlobal("window", { addEventListener: addEventListenerMock });
+
+    const controls = new PlayerControls();
+    const keydownHandler = addEventListenerMock.mock.calls.find((call) => call[0] === "keydown")[1];
+    const keyupHandler = addEventListenerMock.mock.calls.find((call) => call[0] === "keyup")[1];
+
+    const initialYaw = controls.yaw;
+    const dt = 0.2;
+
+    // Pressing E / KeyE must not change yaw
+    keydownHandler({ key: "e", code: "KeyE" });
+    controls.update(dt);
+    expect(controls.yaw).toBe(initialYaw);
+    keyupHandler({ key: "e", code: "KeyE" });
+
+    keydownHandler({ key: "E", code: "KeyE" });
+    controls.update(dt);
+    expect(controls.yaw).toBe(initialYaw);
+    keyupHandler({ key: "E", code: "KeyE" });
+
+    // A / D mutate yaw
+    keydownHandler({ key: "a", code: "KeyA" });
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(initialYaw + controls.turnSpeed * dt, 5);
+    keyupHandler({ key: "a", code: "KeyA" });
+
+    keydownHandler({ key: "d", code: "KeyD" });
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(initialYaw, 5);
+    keyupHandler({ key: "d", code: "KeyD" });
+
+    // ArrowLeft / ArrowRight mutate yaw
+    keydownHandler({ key: "ArrowLeft", code: "ArrowLeft" });
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(initialYaw + controls.turnSpeed * dt, 5);
+    keyupHandler({ key: "ArrowLeft", code: "ArrowLeft" });
+
+    keydownHandler({ key: "ArrowRight", code: "ArrowRight" });
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(initialYaw, 5);
+    keyupHandler({ key: "ArrowRight", code: "ArrowRight" });
+
+    vi.unstubAllGlobals();
   });
 
   it("initializes at unobstructed plaza spawn (0, 0, 5) with speed headroom below 10.0 m/s", () => {
