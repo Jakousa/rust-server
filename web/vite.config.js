@@ -7,4 +7,7 @@ export default defineConfig({
   build: {
     target: 'esnext',
   },
+  test: {
+    include: ['src/**/*.test.js'],
+  },
 });
