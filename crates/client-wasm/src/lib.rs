@@ -158,8 +158,12 @@ impl WasmClientWorld {
                     if Some(entity_id) == self.local_player_id {
                         let server_pos = replica.position;
                         if self.prediction_buffer.pending_input_count() == 0 {
-                            if delta.field_mask & delta_flags::MASK_KEYFRAME != 0
-                                || delta.field_mask & delta_flags::MASK_DELTA_POS_X != 0
+                            if delta.field_mask
+                                & (delta_flags::MASK_KEYFRAME
+                                    | delta_flags::MASK_DELTA_POS_X
+                                    | delta_flags::MASK_DELTA_POS_Y
+                                    | delta_flags::MASK_DELTA_POS_Z)
+                                != 0
                             {
                                 let reconciled = self.prediction_buffer.reconcile(0, server_pos);
                                 replica.position =
@@ -204,8 +208,6 @@ impl WasmClientWorld {
 
                 let tick = if self.latest_server_tick > 0 {
                     self.latest_server_tick
-                } else if state.timestamp > 0 {
-                    state.timestamp / 50
                 } else {
                     0
                 };
@@ -1157,6 +1159,160 @@ mod tests {
         // Hard snap threshold exceeded -> hard snap reconciled
         assert_eq!(world.prediction_buffer.pending_input_count(), 0);
         assert_eq!(world.get_entity_position(local_id), Some((50.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_state_snapshot_before_delta_batch_does_not_freeze_interpolation() {
+        let mut world = WasmClientWorld::new();
+        let remote_id = (1u64 << 48) | 700;
+
+        // EntityState arrives before any EntityDeltaBatch, carrying a Unix epoch ms timestamp
+        let init_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: remote_id,
+            position: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(20.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 1_763_000_000_000,
+        });
+        world.process_packet(&init_state.encode()).unwrap();
+
+        // Subsequent EntityDeltaBatch packets arrive with real low server ticks 1, 2
+        let batch1 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 1,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: remote_id,
+                field_mask: delta_flags::MASK_DELTA_POS_X | delta_flags::MASK_YAW,
+                position: (4.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.5,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch1.encode()).unwrap();
+
+        let batch2 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 2,
+            baseline_tick: 1,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: remote_id,
+                field_mask: delta_flags::MASK_DELTA_POS_X | delta_flags::MASK_YAW,
+                position: (6.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 1.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch2.encode()).unwrap();
+
+        // Advance past render_delay (0.10s): halfway between tick 1 (t=0.05) and tick 2 (t=0.10) is client_time=0.175
+        world.update(0.175);
+        let pos_mid = world.get_entity_position(remote_id).unwrap();
+        assert!(
+            (pos_mid.0 - 7.0).abs() < 0.2,
+            "Expected interpolated X near 7.0 between 4.0 and 10.0, got {:?}",
+            pos_mid
+        );
+
+        // Advance to render_time == 0.10 (client_time == 0.20) -> reaches 10.0
+        world.update(0.025);
+        let pos_end = world.get_entity_position(remote_id).unwrap();
+        assert!(
+            (pos_end.0 - 10.0).abs() < 1e-4,
+            "Expected entity X to reach 10.0, got {:?}",
+            pos_end
+        );
+    }
+
+    #[test]
+    fn test_idle_local_player_reconciles_y_and_z_deltas() {
+        let mut world = WasmClientWorld::new();
+        let local_id = (1u64 << 48) | 888;
+        world.set_local_player_id(local_id);
+
+        let init_state = ClientPacket::EntityState(mmo_schema::client::EntityStatePacket {
+            entity_id: local_id,
+            position: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            timestamp: 0,
+        });
+        world.process_packet(&init_state.encode()).unwrap();
+        assert_eq!(world.prediction_buffer().pending_input_count(), 0);
+
+        // Pure vertical Y delta when idle
+        let batch_y = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 1,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: local_id,
+                field_mask: delta_flags::MASK_DELTA_POS_Y,
+                position: (0.0, 2.5, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch_y.encode()).unwrap();
+        let pos_after_y = world.get_entity_position(local_id).unwrap();
+        assert!((pos_after_y.1 - 2.5).abs() < 0.05);
+        assert!((world.prediction_buffer().current_sim_pos.1 - 2.5).abs() < 0.05);
+
+        // Pure Z delta when idle
+        let batch_z = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 2,
+            baseline_tick: 1,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: local_id,
+                field_mask: delta_flags::MASK_DELTA_POS_Z,
+                position: (0.0, 0.0, -3.5),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch_z.encode()).unwrap();
+        let pos_after_z = world.get_entity_position(local_id).unwrap();
+        assert!((pos_after_z.2 + 3.5).abs() < 0.05);
+        assert!((world.prediction_buffer().current_sim_pos.2 + 3.5).abs() < 0.05);
+
+        // Next update(dt) must keep the reconciled Y/Z position instead of reverting to (0,0,0)
+        world.update(0.05);
+        let pos_after_update = world.get_entity_position(local_id).unwrap();
+        assert!((pos_after_update.1 - 2.5).abs() < 0.05);
+        assert!((pos_after_update.2 + 3.5).abs() < 0.05);
     }
 
     proptest! {

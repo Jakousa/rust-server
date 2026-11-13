@@ -294,27 +294,40 @@ export class WebTransportClient {
    * Extracts one or more 0x4D4D-framed binary packets from a WebSocket message.
    */
   _processWebSocketBinary(bytes) {
+    this._extractFrames(bytes, false);
+  }
+
+  /**
+   * Extracts complete 0x4D4D-framed binary packets from `bytes`.
+   * Returns the number of consumed bytes (or `bytes.byteLength` on invalid magic).
+   */
+  _extractFrames(bytes, allowPartial = false) {
     let offset = 0;
     while (offset + HEADER_SIZE <= bytes.byteLength) {
       if (bytes[offset] !== MAGIC_0 || bytes[offset + 1] !== MAGIC_1) {
-        console.warn("Invalid 0x4D4D magic header in WebSocket frame");
-        break;
+        console.warn(
+          `Invalid 0x4D4D magic header in ${allowPartial ? "QUIC stream" : "WebSocket"} frame`
+        );
+        return bytes.byteLength;
       }
       const view = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_SIZE);
       const payloadLen = view.getUint32(4, true);
       const totalLen = HEADER_SIZE + payloadLen;
       if (offset + totalLen > bytes.byteLength) {
-        console.warn("Truncated 0x4D4D frame in WebSocket message");
+        if (!allowPartial) {
+          console.warn("Truncated 0x4D4D frame in WebSocket message");
+        }
         break;
       }
       const frameSlice = bytes.subarray(offset, offset + totalLen);
       try {
         this.handleIncomingPacket(frameSlice);
       } catch (packetErr) {
-        console.warn("Error processing WebSocket packet:", packetErr);
+        console.warn("Error processing incoming packet:", packetErr);
       }
       offset += totalLen;
     }
+    return offset;
   }
 
   /**
@@ -388,17 +401,36 @@ export class WebTransportClient {
   }
 
   /**
-   * Streams data from a single incoming bidirectional stream.
+   * Streams data from a single incoming bidirectional stream, reassembling 0x4D4D frames across chunks.
    */
   async handleIncomingStream(readableStream) {
     const reader = readableStream.getReader();
+    let buffer = new Uint8Array(0);
     try {
       while (this.connected) {
         const { value, done } = await reader.read();
         if (done) break;
-        if (value) {
+        if (value && value.byteLength > 0) {
           this.trackIngress(value.byteLength);
-          this.handleIncomingPacket(value);
+          const chunk =
+            value instanceof Uint8Array
+              ? value
+              : value instanceof ArrayBuffer
+              ? new Uint8Array(value)
+              : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+          if (buffer.byteLength === 0) {
+            const consumed = this._extractFrames(chunk, true);
+            if (consumed < chunk.byteLength) {
+              buffer = chunk.slice(consumed);
+            }
+          } else {
+            const combined = new Uint8Array(buffer.byteLength + chunk.byteLength);
+            combined.set(buffer, 0);
+            combined.set(chunk, buffer.byteLength);
+            const consumed = this._extractFrames(combined, true);
+            buffer = consumed < combined.byteLength ? combined.slice(consumed) : new Uint8Array(0);
+          }
         }
       }
     } catch (err) {

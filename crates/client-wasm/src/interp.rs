@@ -112,6 +112,11 @@ impl InterpolationBuffer {
                     let min_ts = back.timestamp_sec + tick_delta * 0.05;
                     timestamp_sec.max(min_ts)
                 }
+            } else if tick > 0 && back.tick == 0 {
+                // Initial StateSnapshot arrived before any StateDeltaBatch (tick == 0).
+                // Rebase onto the authoritative tick timeline instead of discarding tick > 0 updates.
+                let min_ts = back.timestamp_sec + 0.05;
+                timestamp_sec.max(min_ts)
             } else {
                 // Unticked snapshot fallback
                 if timestamp_sec <= back.timestamp_sec {
@@ -357,5 +362,33 @@ mod tests {
         assert_eq!(queue[1].tick, 11);
         assert_eq!(queue[2].tick, 12);
         assert_eq!(queue[1].position.0, 10.0);
+    }
+
+    #[test]
+    fn test_tick_zero_snapshot_rebased_by_authoritative_ticks() {
+        let mut buffer = InterpolationBuffer::new(0.10);
+        let entity_id = 505;
+
+        // Initial StateSnapshot arrives with tick 0 before any StateDeltaBatch
+        buffer.push_snapshot(entity_id, 0, 1.0, (0.0, 0.0, 0.0), (10.0, 0.0, 0.0), 0.0);
+        // Subsequent StateDeltaBatch updates arrive at ticks 1 and 2 (even in the same frame t=1.0)
+        buffer.push_snapshot(entity_id, 1, 1.0, (5.0, 0.0, 0.0), (10.0, 0.0, 0.0), 0.5);
+        buffer.push_snapshot(entity_id, 2, 1.0, (10.0, 0.0, 0.0), (10.0, 0.0, 0.0), 1.0);
+
+        let queue = buffer
+            .history
+            .get(&entity_id)
+            .expect("must have entity history");
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].tick, 0);
+        assert_eq!(queue[1].tick, 1);
+        assert_eq!(queue[2].tick, 2);
+
+        // Render halfway between tick 1 (ts=1.05) and tick 2 (ts=1.10): current_time = 1.175 -> render_time = 1.075
+        let (pos, yaw) = buffer
+            .sample(entity_id, 1.175)
+            .expect("must interpolate after tick 0 rebase");
+        assert!((pos.0 - 7.5).abs() < 1e-3);
+        assert!((yaw - 0.75).abs() < 1e-3);
     }
 }
