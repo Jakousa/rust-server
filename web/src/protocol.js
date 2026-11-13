@@ -208,11 +208,13 @@ export function readVarintString(view, offset) {
 }
 
 /**
- * Skips a serialized PropertyMap in a DataView at given byte offset.
+ * Decodes a serialized PropertyMap (`count: varint_u32`, then `count` key/value varint strings)
+ * from a DataView at given byte offset.
  */
-export function skipPropertyMap(view, offset) {
+export function readPropertyMap(view, offset) {
   let curOffset = offset;
-  if (curOffset >= view.byteLength) return 0;
+  const properties = {};
+  if (curOffset >= view.byteLength) return { value: properties, bytesRead: 0 };
   const { value: count, bytesRead } = readVarintU32(view, curOffset);
   curOffset += bytesRead;
   for (let i = 0; i < count; i++) {
@@ -220,27 +222,18 @@ export function skipPropertyMap(view, offset) {
     const keyRes = readVarintString(view, curOffset);
     curOffset += keyRes.bytesRead;
     if (curOffset >= view.byteLength) break;
-    const tag = view.getUint8(curOffset);
-    curOffset += 1;
-    if (tag === 0) {
-      // Null
-    } else if (tag === 1) {
-      // Bool
-      curOffset += 1;
-    } else if (tag === 2) {
-      // Int
-      const v = readVarintU64(view, curOffset);
-      curOffset += v.bytesRead;
-    } else if (tag === 3) {
-      // Float
-      curOffset += 8;
-    } else if (tag === 4 || tag === 5) {
-      // String or Bytes
-      const s = readVarintString(view, curOffset);
-      curOffset += s.bytesRead;
-    }
+    const valRes = readVarintString(view, curOffset);
+    curOffset += valRes.bytesRead;
+    properties[keyRes.value] = valRes.value;
   }
-  return curOffset - offset;
+  return { value: properties, bytesRead: curOffset - offset };
+}
+
+/**
+ * Skips a serialized PropertyMap in a DataView at given byte offset.
+ */
+export function skipPropertyMap(view, offset) {
+  return readPropertyMap(view, offset).bytesRead;
 }
 
 /**

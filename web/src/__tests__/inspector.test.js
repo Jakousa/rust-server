@@ -1527,3 +1527,189 @@ describe("Spherical Orbit Camera Calculations", () => {
     expect(renderer.camera.position.z).toBeCloseTo(15.0, 4);
   });
 });
+
+describe("Issue #217 Transport Stream Framing, WorldObjectDelta, and Entity Interpolation", () => {
+  function buildFrame(opcode, payloadBytes) {
+    const payload = payloadBytes instanceof Uint8Array ? payloadBytes : new Uint8Array(payloadBytes);
+    const frame = new Uint8Array(8 + payload.length);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, opcode, true);
+    view.setUint32(4, payload.length, true);
+    frame.set(payload, 8);
+    return frame;
+  }
+
+  function encodeVarintString(str, out) {
+    const bytes = new TextEncoder().encode(str);
+    putVarintU64(bytes.length, out);
+    bytes.forEach((b) => out.push(b));
+  }
+
+  it("WebTransportClient.handleIncomingStream reassembles split, partial, and concatenated 0x4D4D frames", async () => {
+    const client = new WebTransportClient();
+    client.connected = true;
+
+    const received = [];
+    client.onPacket((frame) => {
+      received.push(new Uint8Array(frame));
+    });
+
+    const frame1 = buildFrame(OPCODES.ENTITY_DESPAWN, [1, 0, 0, 0, 0, 0, 0, 0]); // 16 bytes
+    const frame2 = buildFrame(OPCODES.INTERACTION_RESULT, new Uint8Array(17).fill(0xab)); // 25 bytes
+    const frame3 = buildFrame(OPCODES.WORLD_OBJECT_DESPAWN, [0x99, 0x01]); // 10 bytes
+
+    // Chunk 1: first 4 bytes of frame1 (partial 8-byte header)
+    // Chunk 2: remaining 12 bytes of frame1 + ALL of frame2 + first 6 bytes of frame3
+    // Chunk 3: remaining 4 bytes of frame3
+    const chunk1 = frame1.slice(0, 4);
+    const chunk2 = new Uint8Array(12 + frame2.length + 6);
+    chunk2.set(frame1.slice(4), 0);
+    chunk2.set(frame2, 12);
+    chunk2.set(frame3.slice(0, 6), 12 + frame2.length);
+    const chunk3 = frame3.slice(6);
+
+    const chunks = [
+      { value: chunk1, done: false },
+      { value: chunk2, done: false },
+      { value: chunk3, done: false },
+      { value: undefined, done: true },
+    ];
+    let idx = 0;
+    const mockReadableStream = {
+      getReader: () => ({
+        read: async () => chunks[idx++],
+        releaseLock: vi.fn(),
+      }),
+    };
+
+    await client.handleIncomingStream(mockReadableStream);
+
+    expect(received.length).toBe(3);
+    expect(Array.from(received[0])).toEqual(Array.from(frame1));
+    expect(Array.from(received[1])).toEqual(Array.from(frame2));
+    expect(Array.from(received[2])).toEqual(Array.from(frame3));
+  });
+
+  it("ClientWorldBridge decodes OPCODES.WORLD_OBJECT_DELTA (0x000C) and gates stale revisions", () => {
+    const bridge = new ClientWorldBridge();
+    const objId = 9001n;
+
+    // 1. Spawn object at revision 1
+    const spawnPayload = [];
+    putVarintU64(objId, spawnPayload);
+    putVarintU64(11, spawnPayload); // prefab_id
+    const floats = new Uint8Array(64);
+    const fView = new DataView(floats.buffer);
+    fView.setFloat32(0, 5.0, true);
+    fView.setFloat32(24, 1.0, true);
+    fView.setFloat32(28, 1.0, true);
+    fView.setFloat32(32, 1.0, true);
+    fView.setFloat32(36, 1.0, true);
+    floats.forEach((b) => spawnPayload.push(b));
+    spawnPayload.push(0x01); // state_flags = 1
+    spawnPayload.push(0x00); // owner_type
+    spawnPayload.push(0x00); // owner_id = ""
+    spawnPayload.push(0x01, 100, 100); // has_health = 1, 100/100
+    spawnPayload.push(0x00); // properties count = 0
+    spawnPayload.push(0x01); // revision = 1
+
+    bridge.processPacket(buildFrame(OPCODES.WORLD_OBJECT_SPAWN, spawnPayload));
+    expect(bridge.worldObjects.get(objId).revision).toBe(1);
+    expect(bridge.worldObjects.get(objId).hpPct).toBeCloseTo(1.0, 5);
+
+    // 2. Stale delta (revision 1 <= existing revision 1) must be ignored
+    const staleDelta = [];
+    putVarintU64(objId, staleDelta);
+    putVarintU64(1, staleDelta); // revision 1
+    staleDelta.push(1, 99); // state_flags = 99
+    staleDelta.push(1, 10, 100); // health 10/100
+    staleDelta.push(0); // properties count = 0
+    bridge.processPacket(buildFrame(OPCODES.WORLD_OBJECT_DELTA, staleDelta));
+    expect(bridge.worldObjects.get(objId).stateFlags).toBe(1);
+    expect(bridge.worldObjects.get(objId).hpPct).toBeCloseTo(1.0, 5);
+
+    // 3. Newer delta (revision 2) updates stateFlags, hpPct, and properties
+    const validDelta = [];
+    putVarintU64(objId, validDelta);
+    putVarintU64(2, validDelta); // revision 2
+    validDelta.push(1, 16); // state_flags = 16 (DAMAGED)
+    validDelta.push(1, 45, 100); // health 45/100
+    validDelta.push(1); // 1 property
+    encodeVarintString("owner_note", validDelta);
+    encodeVarintString("repaired", validDelta);
+    bridge.processPacket(buildFrame(OPCODES.WORLD_OBJECT_DELTA, validDelta));
+
+    const updated = bridge.worldObjects.get(objId);
+    expect(updated.revision).toBe(2);
+    expect(updated.stateFlags).toBe(16);
+    expect(updated.hpPct).toBeCloseTo(0.45, 5);
+    expect(updated.properties.owner_note).toBe("repaired");
+
+    const renderBuf = bridge.getWorldObjectsRenderBuffer();
+    expect(renderBuf[12]).toBe(16);
+    expect(renderBuf[13]).toBeCloseTo(0.45, 5);
+    expect(renderBuf[14]).toBe(2);
+  });
+
+  it("ClientWorldBridge smoothly interpolates remote entity position and shortest-arc yaw in update(dt)", () => {
+    const bridge = new ClientWorldBridge();
+    bridge.localPlayerGuid = 1;
+    const remoteGuid = (1n << 48n) | 500n;
+    const remoteKey = Number(remoteGuid);
+
+    // 1. Initial EntityState before any EntityDeltaBatch (tick = 0)
+    const stateBuf = new Uint8Array(60);
+    const sView = new DataView(stateBuf.buffer);
+    sView.setBigUint64(0, remoteGuid, true);
+    sView.setFloat32(8, 0.0, true); // x
+    sView.setFloat32(12, 0.0, true); // y
+    sView.setFloat32(16, 0.0, true); // z
+    sView.setFloat32(32, Math.PI * 2.0 - 0.2, true); // yaw near 2*PI
+    sView.setUint32(40, 100, true);
+    sView.setUint32(44, 100, true);
+    bridge.processPacket(buildFrame(OPCODES.ENTITY_STATE, stateBuf));
+
+    // 2. EntityDeltaBatch ticks 1 and 2 advancing X (0 -> 4 -> 10) and wrapping yaw across 0/2*PI
+    const makeBatch = (tick, baseline, posX, yawByte) => {
+      const p = [];
+      putVarintU64(tick, p);
+      putVarintU64(baseline, p);
+      p.push(0); // 0 despawns
+      p.push(1); // 1 delta
+      putVarintU64(remoteGuid, p);
+      const mask = DELTA_FLAGS.MASK_KEYFRAME | DELTA_FLAGS.MASK_YAW;
+      p.push(mask & 0xff, (mask >> 8) & 0xff);
+      const f = new ArrayBuffer(12);
+      const fv = new DataView(f);
+      fv.setFloat32(0, posX, true);
+      fv.setFloat32(4, 0.0, true);
+      fv.setFloat32(8, 0.0, true);
+      new Uint8Array(f).forEach((b) => p.push(b));
+      p.push(yawByte);
+      return buildFrame(OPCODES.ENTITY_DELTA_BATCH, p);
+    };
+
+    // Yaw byte 0 = 0 rad, byte 8 = 8/256 * 2*PI ~= 0.196 rad
+    bridge.processPacket(makeBatch(1, 0, 4.0, 0));
+    bridge.processPacket(makeBatch(2, 1, 10.0, 8));
+
+    // Snapshots sit at t=0.0 (tick 0, x=0), t=0.05 (tick 1, x=4), t=0.10 (tick 2, x=10).
+    // renderDelaySec = 0.10 -> at clientTime = 0.175, renderTime = 0.075 (halfway between tick 1 and tick 2).
+    bridge.update(0.175);
+    const mid = bridge.entities.get(remoteKey);
+    expect(mid.x).toBeCloseTo(7.0, 3);
+    // Shortest-arc yaw between 0 and ~0.19635 is ~0.098 rad (not ~PI)
+    expect(mid.yaw).toBeCloseTo((8 / 256) * Math.PI, 2);
+
+    // At clientTime = 0.125, renderTime = 0.025 (halfway between tick 0 and tick 1: x=2, yaw wraps from 2*PI-0.2 to 0 -> 2*PI-0.1)
+    const bridgeWrap = new ClientWorldBridge();
+    bridgeWrap.processPacket(buildFrame(OPCODES.ENTITY_STATE, stateBuf));
+    bridgeWrap.processPacket(makeBatch(1, 0, 4.0, 0));
+    bridgeWrap.update(0.125);
+    const wrapMid = bridgeWrap.entities.get(remoteKey);
+    expect(wrapMid.x).toBeCloseTo(2.0, 3);
+    expect(wrapMid.yaw).toBeCloseTo(Math.PI * 2.0 - 0.1, 2);
+  });
+});

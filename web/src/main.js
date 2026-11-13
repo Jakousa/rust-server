@@ -17,8 +17,19 @@ import {
   readVarintU64,
   readVarintU32,
   readVarintString,
-  skipPropertyMap,
+  readPropertyMap,
 } from "./protocol.js";
+
+/**
+ * Shortest-arc angular interpolation in radians wrapped to [0, 2*PI).
+ */
+export function lerpAngle(a0, a1, t) {
+  const twoPi = Math.PI * 2.0;
+  const mod = (v) => ((v % twoPi) + twoPi) % twoPi;
+  const diff = mod(a1 - a0);
+  const shortestDiff = diff > Math.PI ? diff - twoPi : diff;
+  return mod(a0 + shortestDiff * t);
+}
 
 /**
  * JS/WASM World Adapter providing unified interface for packet ingestion,
@@ -28,6 +39,12 @@ export class ClientWorldBridge {
   constructor() {
     this.entities = new Map();
     this.worldObjects = new Map();
+    this.interpHistory = new Map();
+    this.renderDelaySec = 0.10;
+    this.snapbackThreshold = 20.0;
+    this.maxExtrapolationSec = 0.20;
+    this.clampTimeoutSec = 0.25;
+    this.maxInterpHistory = 32;
     this.latestServerTick = 0;
     this.latestBaselineTick = 0;
     this.receivedPackets = 0;
@@ -52,6 +69,7 @@ export class ClientWorldBridge {
   clear() {
     this.entities.clear();
     this.worldObjects.clear();
+    this.interpHistory.clear();
     this.latestServerTick = 0;
     this.latestBaselineTick = 0;
     this.receivedPackets = 0;
@@ -163,22 +181,60 @@ export class ClientWorldBridge {
       const x = view.getFloat32(16, true);
       const y = view.getFloat32(20, true);
       const z = view.getFloat32(24, true);
+      const vx = view.getFloat32(28, true);
+      const vy = view.getFloat32(32, true);
+      const vz = view.getFloat32(36, true);
       const yaw = view.getFloat32(40, true);
       const health = view.getUint32(48, true);
       const maxHealth = view.getUint32(52, true);
 
       const entityType = Number((rawEntityId >> 48n) & 0xffffn);
+      const existing = this.entities.get(entityId);
 
-      this.entities.set(entityId, {
-        id: entityId,
-        x,
-        y,
-        z,
-        yaw,
-        hpPct: maxHealth > 0 ? health / maxHealth : 1.0,
-        castPct: 0.0,
-        type: entityType,
-      });
+      if (!existing) {
+        this.entities.set(entityId, {
+          id: entityId,
+          x,
+          y,
+          z,
+          serverX: x,
+          serverY: y,
+          serverZ: z,
+          vx,
+          vy,
+          vz,
+          yaw,
+          serverYaw: yaw,
+          hpPct: maxHealth > 0 ? health / maxHealth : 1.0,
+          castPct: 0.0,
+          type: entityType,
+        });
+      } else {
+        existing.serverX = x;
+        existing.serverY = y;
+        existing.serverZ = z;
+        existing.vx = vx;
+        existing.vy = vy;
+        existing.vz = vz;
+        existing.serverYaw = yaw;
+        existing.hpPct = maxHealth > 0 ? health / maxHealth : 1.0;
+        existing.type = entityType;
+      }
+
+      if (BigInt(entityId) !== BigInt(this.localPlayerGuid)) {
+        this._pushInterpSnapshot(
+          entityId,
+          this.latestServerTick,
+          this.clientTime,
+          x,
+          y,
+          z,
+          vx,
+          vy,
+          vz,
+          yaw
+        );
+      }
       return;
     }
 
@@ -187,6 +243,7 @@ export class ClientWorldBridge {
       const rawEntityId = view.getBigUint64(8, true);
       const entityId = rawEntityId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawEntityId) : rawEntityId;
       this.entities.delete(entityId);
+      this.interpHistory.delete(entityId);
       return;
     }
 
@@ -228,6 +285,7 @@ export class ClientWorldBridge {
           const rawId = dRes.value;
           const entId = rawId <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rawId) : rawId;
           this.entities.delete(entId);
+          this.interpHistory.delete(entId);
         }
 
         // 3. deltas (LEB128 varint u32 length, then EntityDeltaState)
@@ -362,10 +420,14 @@ export class ClientWorldBridge {
               x: posX,
               y: posY,
               z: posZ,
+              serverX: posX,
+              serverY: posY,
+              serverZ: posZ,
               vx,
               vy,
               vz,
               yaw: yaw ?? 0.0,
+              serverYaw: yaw ?? 0.0,
               pitch: pitch ?? 0.0,
               health: health ?? 100,
               maxHealth: maxHealth ?? 100,
@@ -375,22 +437,27 @@ export class ClientWorldBridge {
             };
             this.entities.set(entityId, ent);
           } else {
-            // Apply updates
+            if (ent.serverX === undefined) ent.serverX = ent.x;
+            if (ent.serverY === undefined) ent.serverY = ent.y;
+            if (ent.serverZ === undefined) ent.serverZ = ent.z;
+            if (ent.serverYaw === undefined) ent.serverYaw = ent.yaw;
+
+            // Apply authoritative updates to server state (visual state interpolates smoothly in update())
             if (hasKeyframe) {
-              ent.x = posX;
-              ent.y = posY;
-              ent.z = posZ;
+              ent.serverX = posX;
+              ent.serverY = posY;
+              ent.serverZ = posZ;
             } else {
-              if (hasDeltaX) ent.x += deltaX;
-              if (hasDeltaY) ent.y += deltaY;
-              if (hasDeltaZ) ent.z += deltaZ;
+              if (hasDeltaX) ent.serverX += deltaX;
+              if (hasDeltaY) ent.serverY += deltaY;
+              if (hasDeltaZ) ent.serverZ += deltaZ;
             }
             if (hasVelocity) {
               ent.vx = vx;
               ent.vy = vy;
               ent.vz = vz;
             }
-            if (yaw !== null) ent.yaw = yaw;
+            if (yaw !== null) ent.serverYaw = yaw;
             if (pitch !== null) ent.pitch = pitch;
             if (health !== null) ent.health = health;
             if (maxHealth !== null) ent.maxHealth = maxHealth;
@@ -401,17 +468,36 @@ export class ClientWorldBridge {
             if (actionId !== null) ent.actionId = actionId;
           }
 
+          if (BigInt(entityId) !== BigInt(this.localPlayerGuid)) {
+            this._pushInterpSnapshot(
+              entityId,
+              this.latestServerTick,
+              this.clientTime,
+              ent.serverX,
+              ent.serverY,
+              ent.serverZ,
+              ent.vx ?? 0.0,
+              ent.vy ?? 0.0,
+              ent.vz ?? 0.0,
+              ent.serverYaw
+            );
+          }
+
           if (
             this.onLocalPlayerKeyframeCallback &&
             BigInt(entityId) === BigInt(this.localPlayerGuid) &&
             (isNewEntity || hasKeyframe)
           ) {
+            ent.x = ent.serverX;
+            ent.y = ent.serverY;
+            ent.z = ent.serverZ;
+            ent.yaw = ent.serverYaw;
             this.onLocalPlayerKeyframeCallback({
               entityId,
-              x: ent.x,
-              y: ent.y,
-              z: ent.z,
-              yaw: ent.yaw,
+              x: ent.serverX,
+              y: ent.serverY,
+              z: ent.serverZ,
+              yaw: ent.serverYaw,
             });
           }
         }
@@ -436,6 +522,7 @@ export class ClientWorldBridge {
       let hpPct = 1.0;
       let revision = 1;
 
+      let properties = {};
       if (view.byteLength >= offset + 16 * 4) {
         x = view.getFloat32(offset, true);
         y = view.getFloat32(offset + 4, true);
@@ -469,8 +556,9 @@ export class ClientWorldBridge {
                 offset += maxHp.bytesRead;
                 hpPct = maxHp.value > 0 ? curHp.value / maxHp.value : 1.0;
               }
-              const propBytes = skipPropertyMap(view, offset);
-              offset += propBytes;
+              const propRes = readPropertyMap(view, offset);
+              properties = propRes.value;
+              offset += propRes.bytesRead;
               if (offset < view.byteLength) {
                 const revRes = readVarintU64(view, offset);
                 revision = Number(revRes.value);
@@ -495,8 +583,62 @@ export class ClientWorldBridge {
         sz,
         stateFlags,
         hpPct,
+        properties,
         revision,
       });
+      return;
+    }
+
+    // Opcode 0x000C: WorldObjectDelta
+    if (opcode === OPCODES.WORLD_OBJECT_DELTA && view.byteLength >= 12) {
+      let offset = 8;
+      const { value: objIdBig, bytesRead: b1 } = readVarintU64(view, offset);
+      offset += b1;
+      if (offset >= view.byteLength) return;
+      const { value: revBig, bytesRead: b2 } = readVarintU64(view, offset);
+      offset += b2;
+      const revision = Number(revBig);
+
+      if (offset >= view.byteLength) return;
+      const hasFlags = view.getUint8(offset);
+      offset += 1;
+      let stateFlags = null;
+      if (hasFlags !== 0) {
+        if (offset >= view.byteLength) return;
+        const sfRes = readVarintU32(view, offset);
+        stateFlags = sfRes.value;
+        offset += sfRes.bytesRead;
+      }
+
+      if (offset >= view.byteLength) return;
+      const hasHealth = view.getUint8(offset);
+      offset += 1;
+      let hpPct = null;
+      if (hasHealth !== 0) {
+        if (offset >= view.byteLength) return;
+        const curHp = readVarintU32(view, offset);
+        offset += curHp.bytesRead;
+        if (offset >= view.byteLength) return;
+        const maxHp = readVarintU32(view, offset);
+        offset += maxHp.bytesRead;
+        hpPct = maxHp.value > 0 ? Math.max(0.0, Math.min(1.0, curHp.value / maxHp.value)) : 1.0;
+      }
+
+      let properties = {};
+      if (offset < view.byteLength) {
+        const propRes = readPropertyMap(view, offset);
+        properties = propRes.value;
+      }
+
+      const existing = this.worldObjects.get(objIdBig) ?? this.worldObjects.get(Number(objIdBig));
+      if (existing && revision > existing.revision) {
+        existing.revision = revision;
+        if (stateFlags !== null) existing.stateFlags = stateFlags;
+        if (hpPct !== null) existing.hpPct = hpPct;
+        if (Object.keys(properties).length > 0) {
+          existing.properties = { ...(existing.properties || {}), ...properties };
+        }
+      }
       return;
     }
 
@@ -509,8 +651,128 @@ export class ClientWorldBridge {
     }
   }
 
+  _pushInterpSnapshot(entityId, tick, timestampSec, x, y, z, vx, vy, vz, yaw) {
+    let queue = this.interpHistory.get(entityId);
+    if (!queue) {
+      queue = [];
+      this.interpHistory.set(entityId, queue);
+    }
+
+    let effectiveTs = timestampSec;
+    if (queue.length > 0) {
+      const back = queue[queue.length - 1];
+      if (tick > 0 && back.tick > 0) {
+        if (tick < back.tick) {
+          const frontTick = queue[0].tick;
+          if (tick <= frontTick || queue.some((s) => s.tick === tick)) {
+            return;
+          }
+          const insertIdx = queue.findIndex((s) => s.tick > tick);
+          const idx = insertIdx === -1 ? queue.length : insertIdx;
+          const prevS = queue[idx - 1];
+          const nextS = queue[idx];
+          const frac = (tick - prevS.tick) / (nextS.tick - prevS.tick);
+          const ts = prevS.timestampSec + frac * (nextS.timestampSec - prevS.timestampSec);
+          queue.splice(idx, 0, { tick, timestampSec: ts, x, y, z, vx, vy, vz, yaw });
+          while (queue.length > this.maxInterpHistory) {
+            queue.shift();
+          }
+          return;
+        } else if (tick === back.tick) {
+          return;
+        } else {
+          const tickDelta = tick - back.tick;
+          const minTs = back.timestampSec + tickDelta * 0.05;
+          effectiveTs = Math.max(timestampSec, minTs);
+        }
+      } else if (tick > 0 && back.tick === 0) {
+        const minTs = back.timestampSec + 0.05;
+        effectiveTs = Math.max(timestampSec, minTs);
+      } else {
+        if (timestampSec <= back.timestampSec) {
+          return;
+        }
+      }
+    }
+
+    queue.push({ tick, timestampSec: effectiveTs, x, y, z, vx, vy, vz, yaw });
+    while (queue.length > this.maxInterpHistory) {
+      queue.shift();
+    }
+  }
+
+  _sampleInterp(entityId, currentTimeSec) {
+    const queue = this.interpHistory.get(entityId);
+    if (!queue || queue.length === 0) return null;
+
+    const renderTime = currentTimeSec - this.renderDelaySec;
+    if (queue.length === 1) {
+      const s = queue[0];
+      return { x: s.x, y: s.y, z: s.z, yaw: s.yaw };
+    }
+
+    const oldest = queue[0];
+    const newest = queue[queue.length - 1];
+
+    if (renderTime <= oldest.timestampSec) {
+      return { x: oldest.x, y: oldest.y, z: oldest.z, yaw: oldest.yaw };
+    }
+
+    if (renderTime >= newest.timestampSec) {
+      const delta = renderTime - newest.timestampSec;
+      if (delta > this.clampTimeoutSec) {
+        return { x: newest.x, y: newest.y, z: newest.z, yaw: newest.yaw };
+      }
+      const extrapDt = Math.min(delta, this.maxExtrapolationSec);
+      return {
+        x: newest.x + newest.vx * extrapDt,
+        y: newest.y + newest.vy * extrapDt,
+        z: newest.z + newest.vz * extrapDt,
+        yaw: newest.yaw,
+      };
+    }
+
+    for (let i = 0; i < queue.length - 1; i++) {
+      const s0 = queue[i];
+      const s1 = queue[i + 1];
+      if (s0.timestampSec <= renderTime && renderTime <= s1.timestampSec) {
+        const span = s1.timestampSec - s0.timestampSec;
+        if (span <= 1e-6) {
+          return { x: s1.x, y: s1.y, z: s1.z, yaw: s1.yaw };
+        }
+        const dx = s1.x - s0.x;
+        const dy = s1.y - s0.y;
+        const dz = s1.z - s0.z;
+        const distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq > this.snapbackThreshold * this.snapbackThreshold) {
+          return { x: s1.x, y: s1.y, z: s1.z, yaw: s1.yaw };
+        }
+        const alpha = Math.max(0.0, Math.min(1.0, (renderTime - s0.timestampSec) / span));
+        return {
+          x: s0.x + dx * alpha,
+          y: s0.y + dy * alpha,
+          z: s0.z + dz * alpha,
+          yaw: lerpAngle(s0.yaw, s1.yaw, alpha),
+        };
+      }
+    }
+
+    return { x: newest.x, y: newest.y, z: newest.z, yaw: newest.yaw };
+  }
+
   update(dt) {
     this.clientTime += dt;
+    const localGuidBig = BigInt(this.localPlayerGuid);
+    for (const [entityId, ent] of this.entities.entries()) {
+      if (BigInt(entityId) === localGuidBig) continue;
+      const sampled = this._sampleInterp(entityId, this.clientTime);
+      if (sampled) {
+        ent.x = sampled.x;
+        ent.y = sampled.y;
+        ent.z = sampled.z;
+        ent.yaw = sampled.yaw;
+      }
+    }
   }
 
   getRenderBuffer(localPlayerPos, localPlayerYaw) {
