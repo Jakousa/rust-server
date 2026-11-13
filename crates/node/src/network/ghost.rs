@@ -105,7 +105,7 @@ impl GhostStore {
 
     /// Inserts or updates a ghost entity. Returns `true` if inserted, `false` if updated.
     pub fn insert_or_update(&self, mut record: GhostRecord) -> bool {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if record.local_tick == 0 {
             record.local_tick = self.current_tick();
         }
@@ -162,7 +162,7 @@ impl GhostStore {
 
     /// Upserts a ghost record from a protobuf [`GhostEntity`].
     pub fn upsert_from_proto(&self, source_node_id: u32, proto: &GhostEntity) -> bool {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         Self::upsert_proto_into_map(
             &mut inner.ghosts,
             source_node_id,
@@ -174,7 +174,7 @@ impl GhostStore {
     /// Updates or inserts all ghosts contained in a [`GhostSyncRequest`].
     /// Returns the number of synced ghost entities.
     pub fn update_from_request(&self, req: &GhostSyncRequest) -> usize {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let tick = self.current_tick();
         let mut count = 0;
         for ghost in &req.ghosts {
@@ -189,7 +189,7 @@ impl GhostStore {
     ///
     /// Returns the count of pruned records.
     pub fn prune_stale(&self, current_tick: u64, ttl_ticks: u64) -> usize {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before = inner.ghosts.len();
         inner
             .ghosts
@@ -203,44 +203,44 @@ impl GhostStore {
 
     /// Retrieves an immutable copy of a ghost entity by its GUID.
     pub fn get(&self, guid: Guid) -> Option<GhostRecord> {
-        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.get(&guid).cloned()
     }
 
     /// Returns `true` if the ghost entity exists in this store.
     pub fn contains(&self, guid: Guid) -> bool {
-        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.contains_key(&guid)
     }
 
     /// Removes a ghost entity by its GUID, returning the removed record if found.
     pub fn remove(&self, guid: Guid) -> Option<GhostRecord> {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.remove(&guid)
     }
 
     /// Returns the total number of ghost entities in storage.
     pub fn len(&self) -> usize {
-        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.len()
     }
 
     /// Returns `true` if the store contains no ghost entities.
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.is_empty()
     }
 
     /// Clears all ghost entities from storage.
     pub fn clear(&self) {
-        let mut inner = self.inner.write().expect("GhostStore poisoned lock");
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.ghosts.clear();
     }
 
     /// Queries all ghost entities within radial distance from `center`.
     pub fn query_radius(&self, center: (f32, f32, f32), radius: f32) -> Vec<GhostRecord> {
         let r_sq = radius * radius;
-        let inner = self.inner.read().expect("GhostStore poisoned lock");
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner
             .ghosts
             .values()

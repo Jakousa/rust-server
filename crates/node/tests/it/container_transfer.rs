@@ -23,13 +23,20 @@ async fn test_e2e_cross_partition_container_transfer_and_escrow_lifecycle() {
     let bounds_node1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
     let bounds_node2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
 
-    let sim_node1 = TickSimulation::new(1, bounds_node1).into_shared();
-    let sim_node2 = TickSimulation::new(2, bounds_node2).into_shared();
+    let raw_sim1 = TickSimulation::new(1, bounds_node1);
+    let tx1 = raw_sim1.input_sender();
+    let gs1 = raw_sim1.ghost_store.clone();
+    let sim_node1 = raw_sim1.into_shared();
+
+    let raw_sim2 = TickSimulation::new(2, bounds_node2);
+    let tx2 = raw_sim2.input_sender();
+    let gs2 = raw_sim2.ghost_store.clone();
+    let sim_node2 = raw_sim2.into_shared();
 
     let service_node1 =
-        NodeServiceImpl::with_coordinator(Arc::clone(&sim_node1), Arc::clone(&coord));
+        NodeServiceImpl::with_coordinator(Arc::clone(&sim_node1), tx1, gs1, Arc::clone(&coord));
     let service_node2 =
-        NodeServiceImpl::with_coordinator(Arc::clone(&sim_node2), Arc::clone(&coord));
+        NodeServiceImpl::with_coordinator(Arc::clone(&sim_node2), tx2, gs2, Arc::clone(&coord));
 
     // 2. Setup Containers:
     // C1: Player Personal Vault on Node 1 (Container ID 10001)

@@ -20,8 +20,11 @@ async fn test_scenario_runner_e2e_cluster_lifecycle() {
 
     // 1. Initialize authoritative simulation node
     let bounds = BoundingBox3D::new((-500.0, -500.0, -500.0), (500.0, 500.0, 500.0));
-    let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(1, bounds)));
-    let node_service = NodeServiceImpl::new(Arc::clone(&sim));
+    let tick_sim = TickSimulation::new(1, bounds);
+    let input_tx = tick_sim.input_sender();
+    let ghost_store = tick_sim.ghost_store.clone();
+    let sim = Arc::new(tokio::sync::RwLock::new(tick_sim));
+    let node_service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
 
     let node_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral node port");

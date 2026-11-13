@@ -156,10 +156,10 @@ impl TestClusterBuilder {
                 (-100.0, -100.0, -100.0),
                 (100.0, 100.0, 100.0),
             ));
-            let sim = Arc::new(tokio::sync::RwLock::new(TickSimulation::new(
-                config.id,
-                primary_bound,
-            )));
+            let tick_sim = TickSimulation::new(config.id, primary_bound);
+            let input_tx = tick_sim.input_sender();
+            let ghost_store = tick_sim.ghost_store.clone();
+            let sim = Arc::new(tokio::sync::RwLock::new(tick_sim));
 
             let (addr_str, socket_addr) = if self.spawn_grpc {
                 let listener = match &config.addr {
@@ -174,7 +174,7 @@ impl TestClusterBuilder {
                     .local_addr()
                     .expect("Failed to read node local_addr");
 
-                let service = NodeServiceImpl::new(Arc::clone(&sim));
+                let service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
                 tokio::spawn(async move {
                     let _ = tonic::transport::Server::builder()
                         .add_service(service.into_server())

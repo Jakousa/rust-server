@@ -135,7 +135,7 @@ impl WriteBehindSnapshotter {
 
     /// Stages a dirty snapshot in the coalescing dirty map without notifying the background worker.
     fn stage_dirty_without_notify(&self, guid: Guid, snapshot: EntitySnapshot) -> bool {
-        let mut map = self.dirty_map.lock().unwrap();
+        let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get_mut(&guid) {
             if snapshot.version >= existing.version {
                 *existing = snapshot;
@@ -182,7 +182,10 @@ impl WriteBehindSnapshotter {
 
     /// Returns the number of currently queued dirty entities.
     pub fn dirty_count(&self) -> usize {
-        self.dirty_map.lock().unwrap().len()
+        self.dirty_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Returns the configured maximum dirty queue capacity.
@@ -200,7 +203,11 @@ impl WriteBehindSnapshotter {
     pub fn start_worker(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut shutdown_rx = self.shutdown_rx.clone();
-            let mut rx = self.channel_rx.lock().unwrap().take();
+            let mut rx = self
+                .channel_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             let debounce = self.debounce_duration;
 
             loop {
@@ -294,7 +301,7 @@ impl WriteBehindSnapshotter {
     /// Drains all currently queued dirty snapshots using $O(1)$ buffer swapping and batch-saves them to the database.
     pub async fn flush_batch(&self) -> usize {
         let batch: Vec<EntitySnapshot> = {
-            let mut map = self.dirty_map.lock().unwrap();
+            let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
             let swapped = std::mem::take(&mut *map);
             metrics::gauge!("mmo_node_snapshot_dirty_queue").set(0.0);
             swapped.into_values().collect()
@@ -319,7 +326,7 @@ impl WriteBehindSnapshotter {
                     );
                     metrics::counter!("mmo_node_snapshot_flush_errors_total").increment(1);
                     // Pro Review mitigation: Merge failed records back into dirty_map so they are retried on the next flush cycle
-                    let mut map = self.dirty_map.lock().unwrap();
+                    let mut map = self.dirty_map.lock().unwrap_or_else(|e| e.into_inner());
                     for snapshot in chunk {
                         let guid = Guid::from_raw(snapshot.guid);
                         if let Some(existing) = map.get_mut(&guid) {

@@ -70,23 +70,13 @@ pub struct NodeServiceImpl {
     input_tx: tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
 }
 
-/// Grabs the simulation's ingress sender and cloned ghost store once at service construction.
-fn ingress_and_ghost_store(
-    sim: &Arc<tokio::sync::RwLock<TickSimulation>>,
-) -> (
-    tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
-    crate::network::ghost::GhostStore,
-) {
-    let guard = sim
-        .try_read()
-        .expect("simulation must not be write-locked while constructing NodeServiceImpl");
-    (guard.input_sender(), guard.ghost_store.clone())
-}
-
 impl NodeServiceImpl {
-    /// Creates a new `NodeServiceImpl` sharing the simulation state.
-    pub fn new(sim: Arc<tokio::sync::RwLock<TickSimulation>>) -> Self {
-        let (input_tx, ghost_store) = ingress_and_ghost_store(&sim);
+    /// Creates a new `NodeServiceImpl` sharing the simulation state, ingress sender, and ghost store.
+    pub fn new(
+        sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+        input_tx: tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
+        ghost_store: crate::network::ghost::GhostStore,
+    ) -> Self {
         Self {
             sim,
             ghost_store,
@@ -98,9 +88,10 @@ impl NodeServiceImpl {
     /// Creates a new `NodeServiceImpl` configured with a distributed transaction coordinator.
     pub fn with_coordinator(
         sim: Arc<tokio::sync::RwLock<TickSimulation>>,
+        input_tx: tokio::sync::mpsc::Sender<crate::sim::QueuedClientInput>,
+        ghost_store: crate::network::ghost::GhostStore,
         coord: Arc<mmo_storage::TransactionCoordinator>,
     ) -> Self {
-        let (input_tx, ghost_store) = ingress_and_ghost_store(&sim);
         Self {
             sim,
             ghost_store,
