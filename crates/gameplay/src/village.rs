@@ -778,6 +778,9 @@ impl GameplayPlugin for VillagePlugin {
 
 /// Bootstraps the village world by installing plugins and placing structures and NPCs.
 pub fn bootstrap_village_world(sim: &mut mmo_node::TickSimulation) {
+    // Place default player spawn in the open cobblestone plaza south of the Village Well
+    sim.set_default_spawn_position((0.0, 0.0, 5.0));
+
     // 1. Install required gameplay plugins
     sim.add_plugin(Box::new(InventoryPlugin));
     sim.add_plugin(Box::new(NpcMovementPlugin));
@@ -1031,6 +1034,21 @@ mod tests {
         assert_eq!(vaino_merchant.recipes.len(), 2);
         assert!(vaino.get_component::<WaypointComponent>().is_some());
         assert!(vaino.get_component::<NavAgentComponent>().is_some());
+    }
+
+    #[test]
+    fn test_village_default_spawn_is_unobstructed_and_movable() {
+        let mut sim = setup_village_sim();
+        let player_guid = Guid::new(EntityType::Player, sim.node_id, 500);
+        let spawn_pos = sim.hydrate_player_session(player_guid, 7001, 1, None, 80.0);
+        assert_eq!(spawn_pos, (0.0, 0.0, 5.0));
+
+        // Moving forward (+Z) from the plaza spawn at 7.5 m/s over a 50ms tick (0.375m) must succeed
+        assert!(
+            sim.process_client_move_deterministic(player_guid, (0.0, 0.0, 5.375), 0.05)
+                .is_ok(),
+            "forward movement from village default spawn must not trigger kinematic correction"
+        );
     }
 
     #[test]
