@@ -1,7 +1,4 @@
-schema: 1.0.0
-change:
-  name: node-director-registration-resilience
-  title: "Resilient Node Registration and Director Restart Recovery"
-  issue: 197
-  author: MMO Engineering Team
-  status: draft
+schema: spec-driven
+created: 2026-11-12
+goal: Resilient simulation node registration and automatic Director restart recovery
+x-issue: 197

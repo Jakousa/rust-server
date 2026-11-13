@@ -3,7 +3,7 @@
 ## Purpose
 Defines requirements for the isolated, fuel-metered WebAssembly scripting engine, authoritative host API bindings, and atomic hot-reloading pipeline.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Sandboxed WASM Module Execution
 The engine SHALL execute WebAssembly modules in a strictly isolated virtual environment without direct access to the host filesystem, sockets, hardware clocks, or raw OS memory.

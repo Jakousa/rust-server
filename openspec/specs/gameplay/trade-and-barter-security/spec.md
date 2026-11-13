@@ -1,8 +1,12 @@
-# Specification: Trade & Barter Security Hardening
+# Trade & Barter Security Hardening Specification
 
-## Capability: gameplay/trade-and-barter-security
+## Purpose
+Defines server-authoritative anti-forgery, anti-IDOR authorization, distance verification, symmetric lock/accept progression, overflow-safe NPC barter currency arithmetic, and HUD DOM XSS prevention.
 
-### Feature: Player Trade Validation & Anti-Forgery
+## Requirements
+
+### Requirement: Player Trade Validation & Anti-Forgery
+The server MUST validate all player trade offers against authoritative inventory state, rejecting zero-quantity, unowned, or over-committed item stacks and canonicalizing item metadata.
 
 #### Scenario: Zero-quantity item offer rejection
 - **GIVEN** an active trade session between Player A and Player B
@@ -32,7 +36,8 @@
 - **WHEN** Player A modifies their offer via sub-opcode 4
 - **THEN** BOTH Player A's lock (`locked_a`) and Player B's lock (`locked_b`) MUST be reset to `false`.
 
-### Feature: Trade Session Authorization (Anti-IDOR)
+### Requirement: Trade Session Authorization (Anti-IDOR)
+The server MUST enforce that only verified participants of a trade session may modify, lock, accept, or cancel that trade session.
 
 #### Scenario: Non-participant attempts to cancel trade session
 - **GIVEN** an active trade session between Player A and Player B with session ID `42`
@@ -45,7 +50,8 @@
 - **WHEN** Player A submits sub-opcode 6 with `session_id = 42`
 - **THEN** the server MUST cancel the session and clear player-to-session mappings.
 
-### Feature: Trade Distance Verification & Lifecycle Symmetry
+### Requirement: Trade Distance Verification & Lifecycle Symmetry
+Active trade sessions MUST enforce maximum interaction distance (`MAX_TRADE_DISTANCE = 5.0m`), clean up on movement or despawn, and require symmetric lock-then-accept progression.
 
 #### Scenario: Distance exceeded at commit time
 - **GIVEN** an active trade session where both players locked and accepted
@@ -74,7 +80,8 @@
 - **WHEN** Player A and Player B subsequently submit sub-opcode 5
 - **THEN** both players transition to accepted and the swap executes.
 
-### Feature: Safe NPC Barter Currency Arithmetic
+### Requirement: Safe NPC Barter Currency Arithmetic
+NPC barter exchanges MUST validate sufficient player currency and guard against `u64` addition overflow before mutating inventory state.
 
 #### Scenario: Insufficient currency during NPC barter
 - **GIVEN** a player with currency `10`
@@ -86,7 +93,8 @@
 - **WHEN** a barter attempts to reward positive currency
 - **THEN** the transaction MUST fail cleanly with an overflow error and rollback all inventory changes.
 
-### Feature: HUD DOM XSS Prevention
+### Requirement: HUD DOM XSS Prevention
+The browser HUD MUST render item names and dynamic strings using safe text nodes rather than raw HTML interpolation.
 
 #### Scenario: Malicious item name rendering
 - **GIVEN** an inventory containing an item with name `<img src=x onerror=alert(1)>`

@@ -1,10 +1,14 @@
-# Specification: Persistent World Objects, Dynamic Prefabs & Spatial Sector Streaming
+# Persistent World Objects, Dynamic Prefabs & Spatial Sector Streaming Specification
 
-## 1. Generalized World Object Data Model
+## Purpose
+Defines the generalized `WorldObject` data model, $64\text{m}^3$ spatial sector indexing, server-authoritative object placement and interaction validation, bandwidth-paced AoI sector streaming, and coalesced write-behind persistence.
+
+## Requirements
 
 ### Requirement: Uniform World Object Abstraction
 The system SHALL represent stationary, interactive, and constructible world state using a generic `WorldObject` structure identified by a 64-bit generational `Guid`.
 
+#### Scenario: Instantiating or persisting a WorldObject
 - **GIVEN** an interactive or persistent entity in the world (such as a door, chest, mining node, or player barricade)
 - **WHEN** instantiated in memory or stored in persistence
 - **THEN** it SHALL be represented by `WorldObject` containing:
@@ -21,6 +25,7 @@ The system SHALL represent stationary, interactive, and constructible world stat
 ### Requirement: Discrete Spatial Sector Coordinate Indexing
 World objects SHALL be spatially grouped into uniform cubic sectors of $64\text{m} \times 64\text{m} \times 64\text{m}$ indexed by integer coordinates $(S_x, S_y, S_z)$.
 
+#### Scenario: Computing containing spatial sector coordinates
 - **GIVEN** world coordinates $(x, y, z)$ in floating-point meters
 - **WHEN** calculating the containing sector
 - **THEN** sector coordinates SHALL be $\lfloor x / 64.0 \rfloor, \lfloor y / 64.0 \rfloor, \lfloor z / 64.0 \rfloor$
@@ -28,11 +33,10 @@ World objects SHALL be spatially grouped into uniform cubic sectors of $64\text{
 
 ---
 
-## 2. Authoritative Object Placement & Anti-Cheat Validation
-
 ### Requirement: Server-Authoritative Placement Verification
 All object placements (construction, deployment, dropped interactables) SHALL be validated strictly on the authoritative simulation node.
 
+#### Scenario: Validating PlaceObjectRequest on simulation node
 - **GIVEN** a client sending a `PlaceObjectRequest`
 - **WHEN** processed by the simulation node
 - **THEN** the node SHALL verify:
@@ -47,6 +51,7 @@ All object placements (construction, deployment, dropped interactables) SHALL be
 ### Requirement: Authoritative Interaction & State Transition
 State transitions (opening chests, unlocking doors, harvesting nodes, dealing damage to structures) SHALL be authoritatively validated.
 
+#### Scenario: Validating object interaction eligibility
 - **GIVEN** an interaction request directed at `object_id`
 - **WHEN** evaluating interaction eligibility
 - **THEN** the node SHALL verify distance ($D \le 6.0\text{m}$), line-of-sight raycast, ownership/access credentials, and state flags (e.g. not destroyed)
@@ -54,11 +59,10 @@ State transitions (opening chests, unlocking doors, harvesting nodes, dealing da
 
 ---
 
-## 3. Spatial Sector Partitioning & AoI Streaming
-
 ### Requirement: Area of Interest Sector Observation & Queue Pruning
 The AoI observation system SHALL track visible spatial sectors for each observer and manage sector object lifecycles (`entered`, `updated`, `exited`).
 
+#### Scenario: Updating visible sectors and pruning exited spawn queues
 - **GIVEN** a player observer with position $P$ and observation radius $R$
 - **WHEN** calculating visible sectors in the tick loop
 - **THEN** all sectors intersecting the observation sphere $(P, R)$ SHALL be marked visible
@@ -69,6 +73,7 @@ The AoI observation system SHALL track visible spatial sectors for each observer
 ### Requirement: Bandwidth-Paced Object Delivery
 World object initial state packets SHALL be prioritized and bandwidth-throttled.
 
+#### Scenario: Proximity-ordered and rate-capped object streaming
 - **GIVEN** multiple world objects entering an observer's AoI simultaneously
 - **WHEN** dispatching object state packets
 - **THEN** transmissions SHALL be prioritized by Euclidean proximity to the observer
@@ -77,29 +82,30 @@ World object initial state packets SHALL be prioritized and bandwidth-throttled.
 ### Requirement: Reliable Delta State Synchronization
 All incremental state modifications (health changes, state flag flips, destruction) SHALL be broadcast over reliable stream channels.
 
+#### Scenario: Broadcasting WorldObjectDeltaPacket and handling resync requests
 - **GIVEN** an in-world state change on a `WorldObject`
 - **WHEN** broadcasting to nearby observers
 - **THEN** updates SHALL be sent via `WorldObjectDeltaPacket` carrying monotonic `dirty_revision` numbers over reliable stream sinks
-- **AND** if a client detects a revision sequence gap, it SHALL transmit `WorldObjectResyncRequest` to fetch the authoritative current state.
+- **AND** if a client detects a revision sequence gap, it SHALL transmit `WorldObjectResyncRequest` to fetch the authoritative current state
 - **AND** `WorldObjectResyncRequest` SHALL be rate-limited by the session token-bucket to prevent state-serialization DOS attacks.
 
 ---
 
-## 4. Asynchronous Write-Behind Persistence
-
 ### Requirement: Non-Blocking Coalesced Object Persistence
 Modified world objects SHALL be persisted asynchronously without stalling the 20 Hz simulation tick loop.
 
+#### Scenario: Coalesced batch upsert with monotonic revision protection
 - **GIVEN** dirty world object modifications during tick execution
 - **WHEN** staging objects into `WorldObjectWriteBehindSnapshotter`
 - **THEN** staging SHALL only acquire an in-memory lock ($< 1\,\mu\text{s}$) to clone the object record
 - **AND** multiple modifications to the same object within the flush interval SHALL coalesce into the same queued record
-- **AND** a dedicated background worker SHALL execute SQL batch upserts with monotonic revision protection: `ON CONFLICT (world_id, object_id) DO UPDATE SET ... WHERE world_objects.dirty_revision < EXCLUDED.dirty_revision`.
+- **AND** a dedicated background worker SHALL execute SQL batch upserts with monotonic revision protection: `ON CONFLICT (world_id, object_id) DO UPDATE SET ... WHERE world_objects.dirty_revision < EXCLUDED.dirty_revision`
 - **AND** if a database flush fails, unpersisted dirty records SHALL be preserved and merged back into the retry queue to guarantee zero data loss without overwriting newer in-memory revisions.
 
 ### Requirement: Dual-Engine Schema Migration
 The storage tier SHALL provide migration `V4__world_objects.sql` supporting PostgreSQL and SQLite.
 
+#### Scenario: Applying V4 world_objects migration
 - **GIVEN** a database managed by `mmo-storage`
 - **WHEN** migrations run
 - **THEN** table `world_objects` SHALL be created with primary key `(world_id, object_id)` and spatial index on `(world_id, sector_x, sector_y, sector_z)`.

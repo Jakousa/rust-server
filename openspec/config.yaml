@@ -4,8 +4,9 @@ context: |
   ARCHITECTURAL FOUNDATION & GENRE-AGNOSTIC DESIGN PRINCIPLE:
   1. This repository is an unopinionated, genre-agnostic distributed MMO virtual world server platform.
   2. The engine core (`crates/core`, `crates/node`, `crates/schema`, `crates/storage`, `crates/gateway`, `crates/director`) MUST NOT contain genre-specific, game-specific, or design-specific hardcoded mechanics (e.g. specific RPG classes, magic systems, voxel sandbox blocks, specific auction house fees, crafting trees).
-  3. All genre-, game-, or design-specific features MUST be decoupled and implemented either as pluggable `GameplayPlugin` modules (in `crates/gameplay`) or as optional extension crates.
-  4. Core primitives must always remain generalized: spatial queries, timed cancellable actions, generic containers with access policies, generic entity stores, and transport codecs.
+  3. All genre-, game-, or design-specific features MUST be decoupled and implemented either as pluggable `GameplayPlugin` modules (in `crates/gameplay`) or as optional extension crates (such as `crates/plugins/voxel`).
+  4. Client-specific crates (`crates/client-wasm`) and web assets (`web/`) are strict leaf packages; core server crates must never depend on browser/WASM runtime packages.
+  5. Core primitives must always remain generalized: spatial queries, timed cancellable actions, generic containers with access policies, generic entity stores, and transport codecs.
 
   LOCAL SUBAGENT INTEGRATION:
   1. To conserve cloud tokens and accelerate iteration, agents should utilize available local models and specialized subagents when configured in the environment.
@@ -13,19 +14,22 @@ context: |
 
 rules:
   proposal:
-    - Verify that proposed capabilities are generic and unopinionated for any virtual world or MMO genre
-    - Require any game-specific, genre-specific, or sandbox mechanics to be structured as decoupled plugins or optional modules
+    - "Verify that proposed capabilities are generic and unopinionated for any virtual world or MMO genre"
+    - "Require any game-specific, genre-specific, or sandbox mechanics to be structured as decoupled plugins or optional modules"
+  specs:
+    - "Use canonical OpenSpec delta sections (## ADDED Requirements, ## MODIFIED Requirements, ## REMOVED Requirements, ## RENAMED Requirements) and include '## Purpose' when introducing a new capability"
+    - "Every requirement heading must use '### Requirement: <name>' with an uppercase RFC 2119 keyword (SHALL or MUST) in its description and at least one '#### Scenario: <name>' block using GIVEN/WHEN/THEN"
+  design:
+    - "Preserve server-authoritative anti-cheat invariants (never trust client delta-time or coordinates), non-blocking 20 Hz tick hot paths, and lock-ordering discipline"
   tasks:
-    - Structure tasks to allow delegating self-contained implementations and test writing to local subagents where appropriate
+    - "Structure tasks to allow delegating self-contained implementations and test writing to local subagents where appropriate"
+    - "Include explicit verification steps (cargo fmt --all -- --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace, and openspec validate --all)"
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+operations:
+  apply:
+    guidance:
+      - "Run cargo fmt --all -- --check, cargo clippy --workspace --all-targets -- -D warnings, and targeted crate tests (cargo test -p <crate>) before marking implementation tasks complete"
+      - "If web/ or crates/client-wasm is modified, also run npm --prefix web test -- --run and npm --prefix web run build"
+  archive:
+    guidance:
+      - "Always sync delta specs to openspec/specs/ and verify openspec validate --all passes with zero errors and zero warnings before finishing archive"

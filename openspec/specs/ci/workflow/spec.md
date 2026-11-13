@@ -9,8 +9,9 @@ Automates continuous integration quality checks across all crates in the MMO wor
 The repository SHALL contain an automated GitHub Actions CI workflow executing on pull requests and commits to the `main` branch, reporting the required check `Lint, Test & Verify` on every execution.
 
 #### Scenario: Non-code pull request (documentation / specifications)
-- **WHEN** a pull request modifies only non-code files (e.g. `**.md`, `openspec/**`, `docs/**`, `.github/dependabot.yml`)
-- **THEN** heavy compilation, linting, testing, and mutation jobs SHALL be skipped via path filtering
+- **WHEN** a pull request modifies only non-code files (e.g. `**.md`, `openspec/**`, `docs/**`, `.agents/**`, `.github/dependabot.yml`)
+- **THEN** heavy compilation, linting, testing, and mutation jobs SHALL be skipped via explicit positive `code` path filtering
+- **AND** if `openspec/**` is modified, `Validate OpenSpec Specifications` (`openspec validate --all`) SHALL execute and succeed
 - **AND** the required gate job `Lint, Test & Verify` SHALL execute, verify `filter` succeeded, ensure no downstream jobs were cancelled or failed, and report success to GitHub.
 
 #### Scenario: Code pull request quality gate execution

@@ -1,9 +1,9 @@
-# System Specification: Resilience, Concurrency, and State-Consistency
+# Resilience, Concurrency, and State-Consistency Specification
 
-## Overview
-Authoritative guarantees across distributed transactions, edge concurrency, spatial topology updates, gameplay validation, and plugin write-behind backpressure.
+## Purpose
+Defines authoritative guarantees across distributed 2PC transactions, container lock ordering, edge gateway session/topic cleanup, gameplay float/slot validation, voxel backpressure, director topology splitting, and node migration lease timeouts.
 
----
+## Requirements
 
 ### Requirement: Atomic 2PC Abort and Audit
 The storage 2PC transfer coordinator MUST execute `abort_transfer` within an atomic transaction. If the transfer reservation exists, it must query the reservation's source container, target container, and item instance ID, delete the reservation row, and insert an audit record preserving the original container and item identifiers with `'aborted'` status.
@@ -46,33 +46,49 @@ Multi-item container operations (`create_escrow`, `execute_trade`) MUST reject c
 ---
 
 ### Requirement: Edge Gateway Session and Topic Cleanup
-When an edge client session disconnects or is removed:
-1. All subscribed bus listeners (including whisper and broadcast topics) MUST be unsubscribed if no remaining active sessions are listening.
-2. The `SocialBus` MUST provide an `unsubscribe` method which cleans up Redis subscription tasks or in-memory channel mappings.
-3. `SessionDropGuard` MUST trigger session removal upon drop, preventing listener leaks on abrupt disconnects.
+When an edge client session disconnects or is removed, all subscribed bus listeners MUST be unsubscribed when no active listeners remain, and `SessionDropGuard` MUST guarantee cleanup on drop.
+
+#### Scenario: Session disconnect revokes topic subscriptions
+- **GIVEN** an edge client session subscribed to whisper and broadcast topics
+- **WHEN** the session disconnects or `SessionDropGuard` is dropped
+- **THEN** all subscribed bus listeners with no remaining active sessions are unsubscribed via `SocialBus::unsubscribe` without leaking subscription tasks.
 
 ---
 
 ### Requirement: Gameplay Float and Boundary Safety
-1. `ThreatTableComponent` MUST reject `NaN`, infinite, or negative/zero threat additions and use `f32::total_cmp` when evaluating target rankings to prevent comparison panics.
-2. `InventoryPacketHandler` MUST validate equipment slot index `<= 4` and return `MalformedPayload` for out-of-range slots. When replacing equipped items, the unequipped item MUST be returned directly to the vacated inventory slot rather than scanning from slot 0.
-3. `PerceptionScanSystem` MUST prune dead, despawned, or out-of-range targets from `PerceptionComponent::spotted_targets` on each scan.
+Gameplay components MUST reject non-finite/non-positive threat values, validate equipment slot boundaries (`<= 4`), and prune stale targets on perception scans.
+
+#### Scenario: Threat table NaN rejection and equipment slot validation
+- **GIVEN** `ThreatTableComponent`, `InventoryPacketHandler`, and `PerceptionScanSystem`
+- **WHEN** `NaN` threat is added, an out-of-range equipment slot (`> 4`) is requested, or targets despawn/move out of range
+- **THEN** `ThreatTableComponent` rejects `NaN` and sorts safely via `f32::total_cmp`, `InventoryPacketHandler` returns `MalformedPayload` (or swaps back into the vacated slot on valid replacement), and `PerceptionScanSystem` prunes stale targets.
 
 ---
 
 ### Requirement: Voxel Plugin Backpressure and Entity Validation
-1. If `VoxelWriteBehindService::enqueue` fails due to full coalescing queue capacity, `VoxelTickSystem` MUST NOT mark the chunk clean and MUST re-mark the chunk dirty so it retries on subsequent ticks.
-2. `VoxelPacketHandler` MUST reject modification packets if `entity_guid` is not found in the entity store, returning `VoxelModifyResponsePacket` with status `1` (OutOfReach).
+`VoxelTickSystem` MUST preserve dirty chunk state on write-behind queue backpressure, and `VoxelPacketHandler` MUST reject modifications from unknown entities.
+
+#### Scenario: Write-behind queue full and unknown entity modification
+- **GIVEN** a full `VoxelWriteBehindService` coalescing queue or a modification packet for a missing `entity_guid`
+- **WHEN** `VoxelTickSystem` flushes dirty chunks or `VoxelPacketHandler` handles the packet
+- **THEN** `VoxelTickSystem` re-marks the chunk dirty for retry on subsequent ticks, and `VoxelPacketHandler` returns status `1` (`OutOfReach`).
 
 ---
 
 ### Requirement: Director Topology Splitting and Fallback Gateway
-1. `GlobalOctreeCoordinator::handle_split` MUST verify `self.root.split_at` succeeds before mutating `NodeRegistry` or advancing `topology_epoch`. If the target octant cannot be split, it returns empty assignments without modifying state.
-2. `DirectorServiceImpl` MUST store a configurable fallback gateway address (from `GATEWAY_GRPC_ADDR` or default) and pass it when broadcasting route reassignments during node deregistration.
+`GlobalOctreeCoordinator::handle_split` MUST verify `split_at` succeeds before mutating `NodeRegistry` or advancing `topology_epoch`, and `DirectorServiceImpl` MUST provide a configurable fallback gateway address during node deregistration.
+
+#### Scenario: Unsplittable octant and node deregistration fallback gateway
+- **GIVEN** an octant that cannot be split or a node deregistering from `DirectorServiceImpl`
+- **WHEN** `handle_split` or node deregistration executes
+- **THEN** an unsplittable octant leaves `NodeRegistry` and `topology_epoch` unchanged, and deregistration broadcasts route reassignments using the configured fallback gateway address.
 
 ---
 
 ### Requirement: Node Migration Leases and Timeouts
-1. `TickSimulation::step` MUST sweep migrating leases older than 5 seconds and forward `ContainerTransferNotification` items directly into `event_queue`.
-2. Outbound migration RPCs in `mmo_node::network::migration` MUST be wrapped in a 5-second `tokio::time::timeout`. On timeout, leases must be released, rollback metrics recorded, and `MigrationError::RpcFailed` returned.
-3. `ActionTickSystem::update` MUST evaluate `cancel_on_movement`, `cancel_on_stun`, and `cancel_on_target_lost` flags, dispatching `ActionInterruptedEvent` on interruption, `ActionProgressEvent` while advancing, and `ActionCompletedEvent` on completion.
+`TickSimulation::step` MUST sweep expired migration leases (> 5s), wrap outbound migration RPCs in a 5-second timeout, and evaluate action cancellation flags on every tick.
+
+#### Scenario: Migration RPC timeout and action interruption evaluation
+- **GIVEN** an outbound migration RPC exceeding 5 seconds or an active `TimedAction` on a moving/stunned entity
+- **WHEN** the timeout expires or `ActionTickSystem::update` runs
+- **THEN** migration leases are released with rollback metrics and `MigrationError::RpcFailed`, and interrupted actions emit `ActionInterruptedEvent`.

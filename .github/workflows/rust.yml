@@ -28,6 +28,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       schema: ${{ steps.filter.outputs.schema }}
       k8s: ${{ steps.filter.outputs.k8s }}
+      openspec: ${{ steps.filter.outputs.openspec }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,15 +39,22 @@ jobs:
         with:
           filters: |
             code:
-              - '!**.md'
-              - '!openspec/**'
-              - '!docs/**'
-              - '!k8s/**'
-              - '!.github/dependabot.yml'
+              - 'crates/**'
+              - 'web/**'
+              - 'scripts/**'
+              - '.cargo/**'
+              - '.github/workflows/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - 'Dockerfile*'
+              - 'docker-compose.yml'
             schema:
               - 'crates/schema/**'
             k8s:
               - 'k8s/**'
+            openspec:
+              - 'openspec/**'
 
   lint:
     name: Lint & Audit
@@ -234,9 +242,26 @@ jobs:
           fi
           echo "All Kustomize overlays validated successfully."
 
+  openspec:
+    name: Validate OpenSpec Specifications
+    needs: [filter]
+    if: needs.filter.outputs.openspec == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate OpenSpec specs and changes
+        run: npx --yes @fission-ai/openspec@2.0.0 validate --all
+
   verify:
     name: Lint, Test & Verify
-    needs: [filter, lint, test, mutants, k8s]
+    needs: [filter, lint, test, mutants, k8s, openspec]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -249,7 +274,7 @@ jobs:
           fi
 
           # 2. Reject any failure or cancellation across all downstream jobs
-          for res in "${{ needs.lint.result }}" "${{ needs.test.result }}" "${{ needs.mutants.result }}" "${{ needs.k8s.result }}"; do
+          for res in "${{ needs.lint.result }}" "${{ needs.test.result }}" "${{ needs.mutants.result }}" "${{ needs.k8s.result }}" "${{ needs.openspec.result }}"; do
             if [ "$res" == "failure" ] || [ "$res" == "cancelled" ]; then
               echo "A downstream CI job failed or was cancelled (status: $res)"
               exit 1
@@ -280,6 +305,14 @@ jobs:
           if [ "${{ needs.filter.outputs.k8s }}" == "true" ]; then
             if [ "${{ needs.k8s.result }}" != "success" ]; then
               echo "K8s modified, but K8s validation job did not succeed (status: ${{ needs.k8s.result }})"
+              exit 1
+            fi
+          fi
+
+          # 6. If openspec changed, openspec validation job MUST have executed and succeeded
+          if [ "${{ needs.filter.outputs.openspec }}" == "true" ]; then
+            if [ "${{ needs.openspec.result }}" != "success" ]; then
+              echo "OpenSpec modified, but OpenSpec validation job did not succeed (status: ${{ needs.openspec.result }})"
               exit 1
             fi
           fi

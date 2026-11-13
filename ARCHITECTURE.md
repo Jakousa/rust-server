@@ -11,16 +11,16 @@ The system separates edge connection termination, authoritative spatial simulati
 ```mermaid
 flowchart TD
     subgraph Clients["Clients"]
-        WCLIENT["Web Browser Inspector\n(HTTP/3 WebTransport + WASM)"]
-        NCLIENT["Native Game Client\n(QUIC / UDP / TLS 1.3)"]
+        WCLIENT["Web Browser Inspector\n(HTTP/3 WebTransport or WSS Fallback + WASM)"]
+        NCLIENT["Native Game Client\n(QUIC / UDP / TLS 1.3 or TCP)"]
     end
 
     subgraph EdgeTier["Edge Ingress Tier"]
-        GW["Edge Gateway (mmo-gateway)\n- TLS 1.3 / HTTP/3 Termination\n- Lock-Free Session Router (DashMap)\n- Ephemeral Datagram & Reliable Stream Sinks"]
+        GW["Edge Gateway (mmo-gateway)\n- WebTransport, QUIC, WebSocket/TLS & TCP Termination\n- Lock-Free Session Router (DashMap)\n- Ephemeral Datagram & Reliable Stream Sinks"]
     end
 
     subgraph SimTier["Authoritative Simulation Cluster"]
-        DIR["Cluster Director (mmo-director)\n- Global Octree Spatial Balancing\n- Node Discovery & Heartbeat Aggregation\n- Automated 3.5s Orphan Partition Recovery"]
+        DIR["Cluster Director (mmo-director)\n- Global Octree Spatial Balancing\n- Resilient Node Discovery & Heartbeat Aggregation\n- Automated 3.5s Orphan Partition Recovery"]
         
         N1["Simulation Node 1 (mmo-node)\n- 20 Hz Fixed Tick Loop\n- Kinematic Anti-Cheat & Action Timers\n- 3D Octree AoI Density Throttling"]
         
@@ -28,12 +28,12 @@ flowchart TD
     end
 
     subgraph StorageTier["Persistence & PubSub Tier"]
-        PG[("PostgreSQL / SQLite\n- Asynchronous Write-Behind DB\n- Deadlock-Free ACID Player Trades\n- Schema Migrations")]
+        PG[("PostgreSQL / SQLite\n- Asynchronous Write-Behind DB\n- Deadlock-Free ACID Player Trades & 2PC\n- Schema Migrations")]
         BUS["Social & Event Bus\n- Whispers, Global Chat, Party Sync\n(Memory / Redis)"]
     end
 
-    WCLIENT <-->|WebTransport| GW
-    NCLIENT <-->|QUIC UDP| GW
+    WCLIENT <-->|WebTransport / WSS| GW
+    NCLIENT <-->|QUIC UDP / TCP| GW
     GW <-->|gRPC / Internal Stream| N1
     GW <-->|gRPC / Internal Stream| N2
     DIR <-->|gRPC Heartbeat / Control| N1
@@ -41,6 +41,7 @@ flowchart TD
     N1 <-->|gRPC ClusterNode| N2
     N1 -->|Async Snapshot Batch| PG
     N2 -->|Async Snapshot Batch| PG
+    GW <-->|Pub/Sub| BUS
     N1 <-->|Pub/Sub| BUS
     N2 <-->|Pub/Sub| BUS
 ```
@@ -57,7 +58,7 @@ sequenceDiagram
     participant Sim as Simulation Tick (50ms)
     participant Pipe as Compensation Pipeline
     participant Kin as Kinematics Anti-Cheat
-    participant Plugin as Gameplay Plugins & Systems
+    participant Plugin as Gameplay & Voxel Plugins
     participant Octree as 3D Spatial Octree
     participant AoI as AoI Broadcast & Delta Pack
     participant Mig as Two-Phase Migration
@@ -66,13 +67,13 @@ sequenceDiagram
     Sim->>Pipe: Drain Cross-Node Compensation Queue (refund failed RPCs)
     Sim->>Kin: Process Ingested Client Movement Packets
     Note over Kin: Validate sequence, displacement & speed limits<br/>Abort active actions if moved
-    Sim->>Plugin: Execute Scheduled Systems (Actions, Attributes, Combat, AI)
+    Sim->>Plugin: Execute Scheduled Systems (Actions, Attributes, Combat, AI, Voxel)
     Sim->>Octree: Update Dynamic Entity Bounding Boxes
     Sim->>AoI: Query Visible Entity Sets (density throttled O(N))
     Note over AoI: Encode EntityDeltaBatch with LEB128 varints & fixed-point packing
     Sim->>Mig: Check Partition Boundaries (hysteresis margin = 1.0m)
     Note over Mig: Execute 2-Phase Live Migration for crossing entities
-    Sim->>DB: Enqueue Dirty Entity Snapshots (write-behind coalesced)
+    Sim->>DB: Enqueue Dirty Entity & WorldObject Snapshots (write-behind coalesced)
 ```
 
 ### Tick Overrun Protection
@@ -102,7 +103,7 @@ sequenceDiagram
     Note over GW: Atomically updates DashMap routing entry
     GW-->>NodeA: RouteUpdated(Success)
     NodeA->>DB: Synchronize Session Route Cache
-    NodeA->>NodeA: Remove Entity from Donor Octree & Drop Lease
+    NodeA->>NodeA: Tombstone & Remove Entity from Donor Octree, Drop Lease
     Note over Client: Client continues sending movement packets seamlessly<br/>Gateway immediately forwards to NodeB
 ```
 
@@ -115,10 +116,11 @@ sequenceDiagram
 
 ## 4. Network Wire Protocol & Compression
 
-The network protocol operates across three transport mechanisms:
-1. **HTTP/3 WebTransport (Browser)**: Multiplexes datagrams (movement, deltas) and streams (reliable actions).
-2. **Native QUIC UDP (Client)**: TLS 1.3 encryption with sub-millisecond datagram delivery.
-3. **Framed TCP (Fallback)**: 8-byte header (`[0x4D, 0x4D]`, opcode `u16`, length `u32`).
+The network protocol operates across four transport mechanisms sharing the same `0x4D4D` binary framing:
+1. **HTTP/3 WebTransport (Browser Primary)**: Multiplexes unreliable datagrams (movement, deltas) and reliable streams (actions, trades).
+2. **WebSocket / TLS over TCP (`ws://` / `wss://` Browser Fallback)**: Automatic fallback for restricted networks blocking UDP/HTTP/3, multiplexing biased `SessionSink` channels over binary WebSocket frames.
+3. **Native QUIC UDP (Client)**: TLS 1.3 encryption with sub-millisecond datagram delivery.
+4. **Framed TCP (Bot Swarm & Legacy Fallback)**: 8-byte header (`[0x4D, 0x4D]`, opcode `u16`, length `u32`).
 
 ### Bit-Packing & Quantization
 To minimize network egress bandwidth:
@@ -133,14 +135,15 @@ To minimize network egress bandwidth:
 
 | Crate | Responsibility | Key Abstractions |
 | :--- | :--- | :--- |
-| **`mmo-core`** | Fundamental primitives & math | `Guid`, `ComponentStore`, `SparseOctree`, `HookDispatcher`, `EventQueue`, `TelemetryServer` |
+| **`mmo-core`** | Fundamental primitives & math | `Guid`, `ComponentStore`, `SparseOctree`, `CollisionWorld`, `HookDispatcher`, `EventQueue`, `TelemetryServer` |
 | **`mmo-schema`** | Wire serialization & RPCs | `ClientPacket`, `BitWriter`, `BitReader`, `EntityDeltaState`, `ClusterNode`, `GatewayService` |
 | **`mmo-node`** | Authoritative 20 Hz simulation | `TickSimulation`, `KinematicsValidator`, `AoiManager`, `MigrationCoordinator`, `CrossNodeDispatcher` |
 | **`mmo-director`** | Cluster topology & health | `ClusterDirector`, `SpatialRegistry`, `HeartbeatTracker`, `OrphanRecoveryCoordinator` |
-| **`mmo-gateway`** | Edge connection ingress | `GatewayServer`, `SessionRouter`, `WebTransportServer`, `SessionSink`, `SessionDropGuard` |
-| **`mmo-storage`** | Distributed SQL persistence | `StorageEngine`, `PostgresRepository`, `SqliteRepository`, `TradeCoordinator`, `SocialBus` |
-| **`mmo-gameplay`** | Pluggable game rules | `CombatPlugin`, `ThreatPlugin`, `InventoryPlugin`, `TradePlugin`, `AbilityPlugin`, `MonsterAiPlugin` |
-| **`mmo-client-wasm`** | Zero-duplication browser WASM | `WasmClientWorld`, `InterpolationBuffer`, `ClientEntityReplica` |
+| **`mmo-gateway`** | Edge connection ingress | `GatewayServer`, `SessionRouter`, `WebTransportServer`, `WebSocketServer`, `SessionSink`, `SessionDropGuard` |
+| **`mmo-storage`** | Distributed SQL persistence | `StorageEngine`, `PostgresRepository`, `SqliteRepository`, `TransactionCoordinator`, `TradeCoordinator`, `SocialBus` |
+| **`mmo-gameplay`** | Pluggable game rules | `CombatPlugin`, `ThreatPlugin`, `InventoryPlugin`, `TradePlugin`, `BarterPlugin`, `MonsterAiPlugin`, `ScriptEngine` |
+| **`mmo-plugin-voxel`** | Volumetric 3D voxel terrain | `VoxelPlugin`, `VoxelWorld`, `PaletteChunk`, `VoxelPacketHandler`, `VoxelWriteBehindService` |
+| **`mmo-client-wasm`** | Zero-duplication browser WASM | `WasmClientWorld`, `InterpolationBuffer`, `ClientEntityReplica`, `decode_voxel_chunk_mesh` |
 | **`mmo-loadtest`** | Scale & chaos load harness | `BotSwarm`, `BotSession`, `MovementProfile`, `MetricsCollector` |
 
 ---
@@ -148,6 +151,6 @@ To minimize network egress bandwidth:
 ## 6. Storage & Write-Behind Persistence
 
 The storage tier separates high-frequency simulation state updates from relational database persistence:
-- **Write-Behind Coalesced Snapshotting**: Dirty entity state changes are coalesced in memory during the tick and flushed asynchronously in batches using parameterized multi-row `INSERT ... ON CONFLICT DO UPDATE` queries.
-- **Atomic Two-Player Item Trading**: Player-to-player item exchanges execute under strict GUID-ordered row locking (`SELECT ... FOR UPDATE`) in PostgreSQL, preventing deadlocks and guaranteeing zero item duplication even under network drops.
+- **Write-Behind Coalesced Snapshotting**: Dirty entity and world-object state changes are coalesced in memory during the tick and flushed asynchronously in batches using parameterized multi-row `INSERT ... ON CONFLICT DO UPDATE` queries.
+- **Atomic Two-Player Item Trading & 2PC Containers**: Player-to-player item exchanges and cross-container 2PC transfers execute under strict ascending GUID-ordered row locking (`SELECT ... FOR UPDATE`), preventing deadlocks and guaranteeing zero item duplication even under network drops.
 - **Session Caching**: Dynamic gateway route lookups fall back to a distributed cache layer with automatic TTL-based expiration.
