@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use mmo_core::{EntityDespawnEvent, GameplayPlugin, Guid, PluginContext, TickContext, TickSystem};
 
-use crate::combat::{DamageEvent, HealthComponent};
+use crate::combat::{DamageEvent, EntityDiedEvent, HealthComponent};
 use crate::navigation::LeashComponent;
 use crate::perception::HostileSpottedEvent;
 
@@ -170,8 +170,12 @@ impl TickSystem for ThreatSystem {
 
         // 3. Inspect leash reset and target validity for all entities with ThreatTableComponent
         let despawns = ctx.events.drain::<EntityDespawnEvent>();
+        let deaths = ctx.events.drain::<EntityDiedEvent>();
         let mut invalid_targets: std::collections::HashSet<Guid> =
             despawns.iter().map(|e| e.guid).collect();
+        for death in &deaths {
+            invalid_targets.insert(death.entity);
+        }
 
         // Collect unique current targets to evaluate
         let mut targets_to_check = Vec::new();
@@ -217,9 +221,12 @@ impl TickSystem for ThreatSystem {
             }
         }
 
-        // Re-push despawn events so other systems can process them
+        // Re-push despawn and death events so other systems can process them
         for despawn in despawns {
             ctx.events.push(despawn);
+        }
+        for death in deaths {
+            ctx.events.push(death);
         }
     }
 }
@@ -371,5 +378,96 @@ mod tests {
         table.add_threat(g3, 25.0);
         assert_eq!(table.current_target, Some(g3));
         table.add_threat(g1, f32::NAN);
+    }
+
+    #[test]
+    fn test_threat_system_preserves_entity_died_and_damage_events_across_plugin_orders() {
+        use crate::combat::DamageProcessingSystem;
+
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+
+        let monster = Guid::new(mmo_core::EntityType::Npc, 1, 1);
+        let player_a = Guid::new(mmo_core::EntityType::Player, 1, 2);
+        let player_b = Guid::new(mmo_core::EntityType::Player, 1, 3);
+
+        let m_key = store.spawn(monster, (0.0, 0.0, 0.0));
+        store
+            .get_mut(m_key)
+            .unwrap()
+            .add_component(ThreatTableComponent::default_combat());
+        store
+            .get_mut(m_key)
+            .unwrap()
+            .add_component(HealthComponent::new(100.0, 0.0));
+
+        let a_key = store.spawn(player_a, (1.0, 0.0, 0.0));
+        store
+            .get_mut(a_key)
+            .unwrap()
+            .add_component(HealthComponent::new(20.0, 0.0));
+
+        let b_key = store.spawn(player_b, (2.0, 0.0, 0.0));
+        store
+            .get_mut(b_key)
+            .unwrap()
+            .add_component(HealthComponent::new(100.0, 0.0));
+
+        // Player B hits monster earlier, Player A hits monster harder -> Player A is current target
+        store
+            .get_mut(m_key)
+            .unwrap()
+            .get_component_mut::<ThreatTableComponent>()
+            .unwrap()
+            .add_threat(player_b, 20.0);
+
+        events.push(DamageEvent {
+            source: player_a,
+            target: monster,
+            raw_damage: 40.0,
+        });
+        // Monster deals lethal damage to Player A
+        events.push(DamageEvent {
+            source: monster,
+            target: player_a,
+            raw_damage: 50.0,
+        });
+
+        let mut damage_sys = DamageProcessingSystem::default();
+        let mut threat_sys = ThreatSystem;
+
+        // Run DamageProcessingSystem BEFORE ThreatSystem
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.05,
+                tick: 1,
+                collision_world: None,
+            };
+            damage_sys.update(&mut ctx);
+            threat_sys.update(&mut ctx);
+            damage_sys.end_of_tick(&mut ctx);
+            threat_sys.end_of_tick(&mut ctx);
+        }
+
+        // ThreatSystem must have seen DamageEvent (added player_a) AND EntityDiedEvent / death (removed player_a, fell back to player_b)
+        let table = store
+            .get(m_key)
+            .unwrap()
+            .get_component::<ThreatTableComponent>()
+            .unwrap();
+        assert_eq!(table.current_target, Some(player_b));
+        assert_eq!(table.get_threat(player_a), 0.0);
+
+        // Downstream listener MUST still receive EntityDiedEvent for player_a
+        let died_events = events.drain::<EntityDiedEvent>();
+        assert_eq!(died_events.len(), 1);
+        assert_eq!(died_events[0].entity, player_a);
     }
 }

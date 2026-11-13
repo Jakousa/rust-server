@@ -45,6 +45,9 @@ impl GuildVault {
     }
 
     pub fn deposit(&mut self, item: ItemStack) -> Result<usize, &'static str> {
+        if item.quantity == 0 {
+            return Err("Item quantity must be greater than zero");
+        }
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(item);
@@ -224,8 +227,8 @@ impl GuildManager {
             .ok_or("No item in specified slot")?;
 
         if let Err(err) = guild.vault.deposit(item.clone()) {
-            // Rollback item back to player inventory
-            let _ = inv.add_item(item);
+            // Rollback item back to its original inventory slot
+            inv.slots[inv_slot] = Some(item);
             return Err(err);
         }
 
@@ -264,8 +267,8 @@ impl GuildManager {
             .ok_or("No item in specified vault slot")?;
 
         if let Err(err) = inv.add_item(item.clone()) {
-            // Rollback item back into vault
-            let _ = guild.vault.deposit(item);
+            // Rollback item directly back into its original vault slot
+            guild.vault.slots[vault_slot] = Some(item);
             return Err(err);
         }
 
@@ -383,5 +386,48 @@ mod tests {
         let leader_b = Guid::new(EntityType::Player, 1, 300);
         let g2 = mgr.create_guild("Beta", leader_b, 5);
         assert!(mgr.add_member(g2, member, GuildRank::Officer).is_ok());
+    }
+
+    #[test]
+    fn test_guild_vault_rejects_zero_quantity_and_withdraw_restores_exact_slot() {
+        let leader_guid = Guid::new(EntityType::Player, 1, 500);
+        let mut mgr = GuildManager::new();
+        let guild_id = mgr.create_guild("Vault Guards", leader_guid, 4);
+
+        // 1. Zero quantity deposit must be rejected
+        let zero_item = ItemStack::new(100, "Phantom Coin", 0, 0.1);
+        assert_eq!(
+            mgr.get_guild_mut(guild_id)
+                .unwrap()
+                .vault
+                .deposit(zero_item),
+            Err("Item quantity must be greater than zero")
+        );
+
+        // 2. Put item A in slot 0 and item B in slot 1, leave slot 0 occupied, withdraw slot 1 into full inv
+        let item_a = ItemStack::new(101, "Alpha", 1, 1.0);
+        let item_b = ItemStack::new(102, "Beta", 2, 1.0);
+        {
+            let vault = &mut mgr.get_guild_mut(guild_id).unwrap().vault;
+            assert_eq!(vault.deposit(item_a.clone()), Ok(0));
+            assert_eq!(vault.deposit(item_b.clone()), Ok(1));
+        }
+        // Empty slot 0 so we verify rollback restores slot 1 specifically rather than first free slot 0
+        let _ = mgr.get_guild_mut(guild_id).unwrap().vault.withdraw(0);
+
+        let mut leader_ent = Entity::new(leader_guid, (0.0, 0.0, 0.0));
+        let mut full_inv = InventoryComponent::new(1, 100.0);
+        full_inv
+            .add_item(ItemStack::new(103, "Filler", 1, 1.0))
+            .unwrap();
+        leader_ent.add_component(full_inv);
+
+        assert_eq!(
+            mgr.withdraw_item(leader_guid, 1, &mut leader_ent),
+            Err("Inventory is full")
+        );
+        let vault = &mgr.get_guild(guild_id).unwrap().vault;
+        assert_eq!(vault.slots[0], None);
+        assert_eq!(vault.slots[1], Some(item_b));
     }
 }

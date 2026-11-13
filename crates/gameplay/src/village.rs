@@ -300,7 +300,7 @@ impl HookHandler for TradeDistanceHook {
                         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
                         if dist > TradeManager::MAX_TRADE_DISTANCE {
                             let session_id = session.session_id;
-                            trade_mgr.cancel_session(session_id);
+                            let _ = trade_mgr.cancel_session(session_id, *entity);
                         }
                     }
                 }
@@ -308,7 +308,7 @@ impl HookHandler for TradeDistanceHook {
             Event::OnDespawn { entity } => {
                 if let Some(session) = trade_mgr.get_session_by_player(*entity) {
                     let session_id = session.session_id;
-                    trade_mgr.cancel_session(session_id);
+                    let _ = trade_mgr.cancel_session(session_id, *entity);
                 }
             }
             _ => {}
@@ -703,20 +703,16 @@ impl ModularPacketHandler for VillageTradePacketHandler {
                         }
                     })?;
 
-                let session = trade_mgr.get_session(req.session_id).ok_or_else(|| {
-                    PacketHandlerError::Custom(format!(
+                if trade_mgr.get_session(req.session_id).is_none() {
+                    return Err(PacketHandlerError::Custom(format!(
                         "Active trade session {} not found",
                         req.session_id
-                    ))
-                })?;
-
-                if session.player_a != entity_guid && session.player_b != entity_guid {
-                    return Err(PacketHandlerError::Custom(
-                        "Caller is not a participant in this trade session".to_string(),
-                    ));
+                    )));
                 }
 
-                trade_mgr.cancel_session(req.session_id);
+                trade_mgr
+                    .cancel_session(req.session_id, entity_guid)
+                    .map_err(|e| PacketHandlerError::Custom(e.to_string()))?;
                 let resp =
                     build_state_response(entity_guid, entities, &trade_mgr, None, false, None);
                 let json = serde_json::to_vec(&resp)
@@ -1632,5 +1628,38 @@ mod tests {
         assert_eq!(inv.currency, u64::MAX - 5);
         // Did not consume Iron Ore
         assert!(inv.has_item_stack(&ItemStack::new(1001, "Iron Ore", 3, 2.0)));
+    }
+
+    #[test]
+    fn test_village_self_trade_and_proximity_rejected() {
+        let mut sim = setup_village_sim();
+        let p1 = Guid::new(EntityType::Player, sim.node_id, 801);
+        let p2 = Guid::new(EntityType::Player, sim.node_id, 802);
+
+        sim.spawn_entity(p1, (0.0, 0.0, 0.0));
+        sim.spawn_entity(p2, (20.0, 0.0, 0.0)); // > MAX_TRADE_DISTANCE (5.0m)
+
+        let trade_mgr = Arc::new(std::sync::Mutex::new(TradeManager::new()));
+        let handler = VillageTradePacketHandler::new(trade_mgr);
+
+        // Self-trade rejected
+        let self_trade = serde_json::to_vec(&PlayerTradeStartRequest {
+            target_guid: p1.raw(),
+        })
+        .unwrap();
+        let err = handler
+            .handle(p1, 3, &self_trade, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(matches!(err, PacketHandlerError::Custom(msg) if msg.contains("self")));
+
+        // Distant player trade rejected
+        let far_trade = serde_json::to_vec(&PlayerTradeStartRequest {
+            target_guid: p2.raw(),
+        })
+        .unwrap();
+        let err = handler
+            .handle(p1, 3, &far_trade, &mut sim.entity_store)
+            .unwrap_err();
+        assert!(matches!(err, PacketHandlerError::Custom(msg) if msg.contains("far apart")));
     }
 }
