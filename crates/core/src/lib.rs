@@ -60,9 +60,10 @@ pub use world::{
 /// Awaits an asynchronous termination signal (Ctrl+C / SIGINT or Unix SIGTERM).
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("[Core] Failed to install Ctrl+C handler: {e}");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
@@ -72,7 +73,7 @@ pub async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(e) => {
-                eprintln!("[Core] Failed to install SIGTERM handler: {e}");
+                tracing::error!("[Core] Failed to install SIGTERM handler: {e}");
                 std::future::pending::<()>().await;
             }
         }

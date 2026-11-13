@@ -8,6 +8,12 @@ use crate::combat::HealthComponent;
 /// Default maximum memory allocation per WASM guest script (32 MB).
 pub const DEFAULT_MAX_WASM_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 
+/// Maximum individual message/payload byte length accepted by `script_log` and `dispatch_event` (4 KiB).
+pub const MAX_WASM_HOST_PAYLOAD_BYTES: usize = 4096;
+
+/// Maximum number of `script_log` entries or `dispatch_event` items allowed per WASM invocation.
+pub const MAX_WASM_HOST_ITEMS_PER_CALL: usize = 64;
+
 /// Generates default store resource limits.
 pub fn default_store_limits() -> StoreLimits {
     StoreLimitsBuilder::new()
@@ -254,12 +260,17 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
                         }
 
                         if died {
+                            entity.state_flags |= mmo_core::entity::state_flags::INCAPACITATED;
                             let events_ptr = caller.data().events_ptr;
                             if !events_ptr.is_null() {
                                 let events = unsafe { &mut *events_ptr };
                                 events.push(crate::combat::EntityDiedEvent {
                                     entity: target_guid,
                                     killer: None,
+                                });
+                                events.push(mmo_core::plugin::EntityIncapacitatedEvent {
+                                    entity: target_guid,
+                                    instigator: None,
                                 });
                             }
                         }
@@ -286,6 +297,12 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
              payload_ptr: i32,
              payload_len: i32|
              -> i32 {
+                if caller.data().dispatched_events.len() >= MAX_WASM_HOST_ITEMS_PER_CALL {
+                    return -1;
+                }
+                if payload_len < 0 || (payload_len as usize) > MAX_WASM_HOST_PAYLOAD_BYTES {
+                    return -1;
+                }
                 let payload = if payload_len > 0 {
                     let (memory, p, l) =
                         match validate_memory_bounds(&mut caller, payload_ptr, payload_len) {
@@ -316,7 +333,10 @@ pub fn register_host_api(linker: &mut Linker<HostContext>) -> Result<(), ScriptE
             "env",
             "script_log",
             |mut caller: Caller<'_, HostContext>, level: i32, msg_ptr: i32, msg_len: i32| -> i32 {
-                if msg_len <= 0 {
+                if caller.data().logs.len() >= MAX_WASM_HOST_ITEMS_PER_CALL {
+                    return -1;
+                }
+                if msg_len <= 0 || (msg_len as usize) > MAX_WASM_HOST_PAYLOAD_BYTES {
                     return -1;
                 }
                 let (memory, p, l) = match validate_memory_bounds(&mut caller, msg_ptr, msg_len) {
@@ -491,5 +511,61 @@ mod tests {
             .get_component::<HealthComponent>()
             .unwrap();
         assert_eq!(updated_hp.current_hp, 75.0);
+    }
+
+    #[test]
+    fn test_script_log_and_dispatch_event_caps_size_and_count() {
+        let engine = Engine::default();
+        let mut linker = Linker::new(&engine);
+        register_host_api(&mut linker).unwrap();
+
+        let mut store = Store::new(&engine, HostContext::empty());
+        let wat = r#"
+        (module
+            (import "env" "script_log" (func $log (param i32 i32 i32) (result i32)))
+            (import "env" "dispatch_event" (func $dispatch (param i32 i64 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "try_log") (param i32) (result i32)
+                (call $log (i32.const 1) (i32.const 0) (local.get 0))
+            )
+            (func (export "try_dispatch") (param i32) (result i32)
+                (call $dispatch (i32.const 7) (i64.const 99) (i32.const 0) (local.get 0))
+            )
+        )
+        "#;
+        let module = Module::new(&engine, wat).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let try_log = instance
+            .get_typed_func::<i32, i32>(&mut store, "try_log")
+            .unwrap();
+        let try_dispatch = instance
+            .get_typed_func::<i32, i32>(&mut store, "try_dispatch")
+            .unwrap();
+
+        // Oversized (> 4096 bytes) rejected immediately
+        assert_eq!(try_log.call(&mut store, 4097).unwrap(), -1);
+        assert_eq!(try_dispatch.call(&mut store, 4097).unwrap(), -1);
+        assert!(store.data().logs.is_empty());
+        assert!(store.data().dispatched_events.is_empty());
+
+        // Max payload size (4096 bytes) accepted up to 64 items per invocation
+        for _ in 0..MAX_WASM_HOST_ITEMS_PER_CALL {
+            assert_eq!(try_log.call(&mut store, 4096).unwrap(), 0);
+            assert_eq!(try_dispatch.call(&mut store, 4096).unwrap(), 0);
+        }
+        assert_eq!(store.data().logs.len(), MAX_WASM_HOST_ITEMS_PER_CALL);
+        assert_eq!(
+            store.data().dispatched_events.len(),
+            MAX_WASM_HOST_ITEMS_PER_CALL
+        );
+
+        // 65th item in the same invocation is rejected
+        assert_eq!(try_log.call(&mut store, 16).unwrap(), -1);
+        assert_eq!(try_dispatch.call(&mut store, 16).unwrap(), -1);
+        assert_eq!(store.data().logs.len(), MAX_WASM_HOST_ITEMS_PER_CALL);
+        assert_eq!(
+            store.data().dispatched_events.len(),
+            MAX_WASM_HOST_ITEMS_PER_CALL
+        );
     }
 }

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-12
+goal: Add WebSocket (WS/WSS) over TCP fallback transport in crates/gateway and automatic WebTransport-to-WebSocket fallback in web/src/transport.js
+x-issue: 189

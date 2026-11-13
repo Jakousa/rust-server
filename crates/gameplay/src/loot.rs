@@ -42,9 +42,17 @@ impl LootEntry {
     /// Evaluates if this entry drops given a normalized roll in [0.0, 1.0].
     pub fn roll(&self, roll_val: f32, count_val: f32) -> Option<ItemStack> {
         if roll_val <= self.drop_chance {
+            let safe_count_val = if count_val.is_finite() {
+                count_val.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let span = (self.max_count - self.min_count) as f32;
-            let qty = self.min_count + (span * count_val).round() as u32;
+            let qty = self.min_count + (span * safe_count_val).round() as u32;
             let final_qty = qty.clamp(self.min_count, self.max_count);
+            if final_qty == 0 {
+                return None;
+            }
             Some(ItemStack::new(
                 self.item_id,
                 self.name.clone(),
@@ -190,5 +198,24 @@ mod tests {
         assert_eq!(transferred, 2);
         assert_eq!(container.count(), 1); // 1 item remaining in corpse/chest
         assert_eq!(container.items[0].item_id, 12); // Ruby was left over
+    }
+
+    #[test]
+    fn test_loot_entry_roll_never_emits_zero_quantity_stack() {
+        let zero_only = LootEntry::new(1, "Nothing", 1.0, 0, 0, 1.0);
+        assert!(zero_only.roll(0.0, 0.5).is_none());
+
+        let optional = LootEntry::new(2, "Herbs", 1.0, 0, 3, 0.5);
+        assert!(optional.roll(0.5, 0.0).is_none());
+        let rolled = optional.roll(0.5, 1.0).unwrap();
+        assert_eq!(rolled.quantity, 3);
+
+        let mut table = LootTable::new(500);
+        table.add_entry(optional);
+        let mut inv = InventoryComponent::new(4, 100.0);
+        for drop in table.roll_loot(123) {
+            assert!(drop.quantity > 0);
+            inv.add_item(drop).unwrap();
+        }
     }
 }

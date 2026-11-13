@@ -52,13 +52,20 @@ impl SectorCoord3D {
         )
     }
 
-    /// Returns all 27 immediate spatial neighbor sector coordinates (including self).
+    /// Returns all immediate spatial neighbor sector coordinates (including self)
+    /// within representable `i32` bounds without overflowing.
     pub fn neighborhood(&self) -> Vec<SectorCoord3D> {
         let mut neighbors = Vec::with_capacity(27);
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    neighbors.push(SectorCoord3D::new(self.x + dx, self.y + dy, self.z + dz));
+                    if let (Some(x), Some(y), Some(z)) = (
+                        self.x.checked_add(dx),
+                        self.y.checked_add(dy),
+                        self.z.checked_add(dz),
+                    ) {
+                        neighbors.push(SectorCoord3D::new(x, y, z));
+                    }
                 }
             }
         }
@@ -291,7 +298,7 @@ impl SectorSpatialIndex {
         let old_extent = self.object_extents.insert(object_id, new_extent);
         if new_extent >= self.max_extent {
             self.max_extent = new_extent;
-        } else if old_extent == Some(self.max_extent) {
+        } else if old_extent.is_some_and(|old| old >= self.max_extent) {
             self.max_extent = self.object_extents.values().copied().fold(0.0f32, f32::max);
         }
 
@@ -328,7 +335,7 @@ impl SectorSpatialIndex {
     pub fn remove(&mut self, object_id: Guid) -> Option<WorldObject> {
         let sector = self.object_to_sector.remove(&object_id)?;
         if let Some(extent) = self.object_extents.remove(&object_id) {
-            if (extent - self.max_extent).abs() < f32::EPSILON {
+            if extent >= self.max_extent {
                 self.max_extent = self.object_extents.values().copied().fold(0.0f32, f32::max);
             }
         }
@@ -351,8 +358,8 @@ impl SectorSpatialIndex {
 
     /// Retrieves a mutable reference to a world object by its GUID.
     ///
-    /// Note: if modifying `transform.position`, re-insertion via `insert`
-    /// should be invoked to update the containing sector index if the sector changed.
+    /// Note: if modifying `transform.position` or `bounds`, re-insertion via `insert`
+    /// should be invoked to update the containing sector index and cached extents.
     pub fn get_mut(&mut self, object_id: Guid) -> Option<&mut WorldObject> {
         let sector = self.object_to_sector.get(&object_id)?;
         self.sectors
@@ -766,5 +773,53 @@ mod tests {
 
         let nan_query = BoundingBox3D::new((f32::NAN, 0.0, 0.0), (10.0, 10.0, 10.0));
         assert!(index.query_aabb(&nan_query).is_empty());
+    }
+
+    #[test]
+    fn test_sector_neighborhood_extremes_no_overflow() {
+        let max_corner = SectorCoord3D::new(i32::MAX, i32::MIN, i32::MAX);
+        let neighbors = max_corner.neighborhood();
+        // Only 2 valid steps per axis (-1, 0 on MAX; 0, +1 on MIN; -1, 0 on MAX) -> 2*2*2 = 8
+        assert_eq!(neighbors.len(), 8);
+        assert!(neighbors.contains(&max_corner));
+        assert!(neighbors.contains(&SectorCoord3D::new(
+            i32::MAX - 1,
+            i32::MIN + 1,
+            i32::MAX - 1
+        )));
+
+        let edge = SectorCoord3D::new(i32::MAX, 0, 0);
+        let edge_neighbors = edge.neighborhood();
+        // 2 * 3 * 3 = 18 unique coordinates
+        assert_eq!(edge_neighbors.len(), 18);
+    }
+
+    #[test]
+    fn test_sector_spatial_index_remove_large_extent() {
+        let mut index = SectorSpatialIndex::new();
+        let id1 = Guid::new(EntityType::DynamicObject, 1, 1);
+        let id2 = Guid::new(EntityType::DynamicObject, 1, 2);
+
+        let large_obj = WorldObject::new(
+            id1,
+            1,
+            Transform3D::from_position((0.0, 0.0, 0.0)),
+            BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0)),
+            ContainerOwner::System("system".into()),
+        );
+        let small_obj = WorldObject::new(
+            id2,
+            1,
+            Transform3D::from_position((0.0, 0.0, 0.0)),
+            BoundingBox3D::new((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0)),
+            ContainerOwner::System("system".into()),
+        );
+
+        index.insert(large_obj);
+        index.insert(small_obj);
+        assert_eq!(index.max_extent(), 100.0);
+
+        index.remove(id1);
+        assert_eq!(index.max_extent(), 2.0);
     }
 }

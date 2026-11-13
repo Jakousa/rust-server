@@ -1,6 +1,9 @@
 //! Distributed Two-Phase Commit (2PC / Sagas) Transaction Coordinator for containers.
 
-use crate::db::{current_time_ms, current_time_secs, Database, DbBackend, StorageError};
+use crate::db::{
+    current_time_ms, current_time_secs, resolve_container_owner_guid, Database, DbBackend,
+    StorageError,
+};
 use crate::models::{ContainerTransactionRecord, ReservationRecord};
 use crate::with_dialect_tx;
 use sqlx::Row;
@@ -56,8 +59,11 @@ impl TransactionCoordinator {
             src_container_id.max(dst_container_id),
         );
 
+        let is_same_container = src_container_id == dst_container_id;
+        let is_same_slot = is_same_container && src_slot == dst_slot;
+
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
-            // 1. Verify both containers exist
+            // 1. Verify both containers exist (locking only once when src == dst)
             let q_c = format!(
                 "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
@@ -65,23 +71,27 @@ impl TransactionCoordinator {
             let c1 = sqlx::query(&q!(&q_c))
                 .bind(first_id as i64)
                 .fetch_optional(&mut *conn)
-                .await?;
-            let c2 = sqlx::query(&q!(&q_c))
-                .bind(second_id as i64)
-                .fetch_optional(&mut *conn)
-                .await?;
+                .await?
+                .ok_or(StorageError::ContainerNotFound(first_id))?;
 
-            if c1.is_none() {
-                return Err(StorageError::ContainerNotFound(first_id));
-            }
-            if c2.is_none() {
-                return Err(StorageError::ContainerNotFound(second_id));
-            }
+            let c2 = if first_id != second_id {
+                Some(
+                    sqlx::query(&q!(&q_c))
+                        .bind(second_id as i64)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .ok_or(StorageError::ContainerNotFound(second_id))?,
+                )
+            } else {
+                None
+            };
 
             let dst_capacity: i32 = if dst_container_id == first_id {
-                c1.unwrap().try_get("capacity")?
+                c1.try_get("capacity")?
             } else {
-                c2.unwrap().try_get("capacity")?
+                c2.as_ref()
+                    .expect("second container loaded when first_id != second_id")
+                    .try_get("capacity")?
             };
 
             if dst_slot >= dst_capacity as u32 {
@@ -89,13 +99,15 @@ impl TransactionCoordinator {
             }
 
             // 2. Fetch source item
-            let src_item = sqlx::query(&q!(
-                "SELECT item_instance_id FROM items WHERE container_id = ? AND slot = ?"
-            ))
-            .bind(src_container_id as i64)
-            .bind(src_slot as i32)
-            .fetch_optional(&mut *conn)
-            .await?;
+            let item_sql = format!(
+                "SELECT item_instance_id FROM items WHERE container_id = ? AND slot = ?{}",
+                lock_suffix!()
+            );
+            let src_item = sqlx::query(&q!(&item_sql))
+                .bind(src_container_id as i64)
+                .bind(src_slot as i32)
+                .fetch_optional(&mut *conn)
+                .await?;
 
             let item_instance_id: String = match src_item {
                 Some(row) => row.try_get("item_instance_id")?,
@@ -107,25 +119,28 @@ impl TransactionCoordinator {
                 }
             };
 
-            // 3. Check destination slot is not occupied
-            let dst_occupied = sqlx::query(&q!(
-                "SELECT 1 FROM items WHERE container_id = ? AND slot = ?"
-            ))
-            .bind(dst_container_id as i64)
-            .bind(dst_slot as i32)
-            .fetch_optional(&mut *conn)
-            .await?;
+            // 3. Check destination slot is not occupied (skip when src == dst slot in same container)
+            if !is_same_slot {
+                let dst_occupied = sqlx::query(&q!(
+                    "SELECT 1 FROM items WHERE container_id = ? AND slot = ?"
+                ))
+                .bind(dst_container_id as i64)
+                .bind(dst_slot as i32)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-            if dst_occupied.is_some() {
-                return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
+                if dst_occupied.is_some() {
+                    return Err(StorageError::SlotOccupied(dst_slot, dst_container_id));
+                }
             }
 
             // 4. Check for active non-expired reservations on source or destination slot
             let active_src_res = sqlx::query(&q!(
-                "SELECT 1 FROM container_reservations WHERE container_id = ? AND slot = ? AND expires_at_epoch_ms > ?"
+                "SELECT 1 FROM container_reservations WHERE ((container_id = ? AND slot = ?) OR item_instance_id = ?) AND expires_at_epoch_ms > ?"
             ))
             .bind(src_container_id as i64)
             .bind(src_slot as i32)
+            .bind(&item_instance_id)
             .bind(now_ms)
             .fetch_optional(&mut *conn)
             .await?;
@@ -134,17 +149,19 @@ impl TransactionCoordinator {
                 return Err(StorageError::SlotReserved(src_slot, src_container_id));
             }
 
-            let active_dst_res = sqlx::query(&q!(
-                "SELECT 1 FROM container_reservations WHERE container_id = ? AND slot = ? AND expires_at_epoch_ms > ?"
-            ))
-            .bind(dst_container_id as i64)
-            .bind(dst_slot as i32)
-            .bind(now_ms)
-            .fetch_optional(&mut *conn)
-            .await?;
+            if !is_same_slot {
+                let active_dst_res = sqlx::query(&q!(
+                    "SELECT 1 FROM container_reservations WHERE container_id = ? AND slot = ? AND expires_at_epoch_ms > ?"
+                ))
+                .bind(dst_container_id as i64)
+                .bind(dst_slot as i32)
+                .bind(now_ms)
+                .fetch_optional(&mut *conn)
+                .await?;
 
-            if active_dst_res.is_some() {
-                return Err(StorageError::SlotReserved(dst_slot, dst_container_id));
+                if active_dst_res.is_some() {
+                    return Err(StorageError::SlotReserved(dst_slot, dst_container_id));
+                }
             }
 
             // Clean up any stale expired reservations for these slots
@@ -163,36 +180,54 @@ impl TransactionCoordinator {
             let src_res_id = format!("{}_src", tx_id);
             let dst_res_id = format!("{}_dst", tx_id);
 
-            sqlx::query(&q!(
-                r#"
-                INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
-                VALUES (?, ?, ?, ?, ?, 'transfer_out', ?, ?)
-                "#
-            ))
-            .bind(&src_res_id)
-            .bind(tx_id)
-            .bind(src_container_id as i64)
-            .bind(src_slot as i32)
-            .bind(&item_instance_id)
-            .bind(expires_at_ms)
-            .bind(now_ms)
-            .execute(&mut *conn)
-            .await?;
+            if is_same_slot {
+                sqlx::query(&q!(
+                    r#"
+                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+                    VALUES (?, ?, ?, ?, ?, 'transfer_in_place', ?, ?)
+                    "#
+                ))
+                .bind(&src_res_id)
+                .bind(tx_id)
+                .bind(src_container_id as i64)
+                .bind(src_slot as i32)
+                .bind(&item_instance_id)
+                .bind(expires_at_ms)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await?;
+            } else {
+                sqlx::query(&q!(
+                    r#"
+                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+                    VALUES (?, ?, ?, ?, ?, 'transfer_out', ?, ?)
+                    "#
+                ))
+                .bind(&src_res_id)
+                .bind(tx_id)
+                .bind(src_container_id as i64)
+                .bind(src_slot as i32)
+                .bind(&item_instance_id)
+                .bind(expires_at_ms)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await?;
 
-            sqlx::query(&q!(
-                r#"
-                INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
-                VALUES (?, ?, ?, ?, NULL, 'transfer_in', ?, ?)
-                "#
-            ))
-            .bind(&dst_res_id)
-            .bind(tx_id)
-            .bind(dst_container_id as i64)
-            .bind(dst_slot as i32)
-            .bind(expires_at_ms)
-            .bind(now_ms)
-            .execute(&mut *conn)
-            .await?;
+                sqlx::query(&q!(
+                    r#"
+                    INSERT INTO container_reservations (reservation_id, tx_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms, created_at_epoch_ms)
+                    VALUES (?, ?, ?, ?, NULL, 'transfer_in', ?, ?)
+                    "#
+                ))
+                .bind(&dst_res_id)
+                .bind(tx_id)
+                .bind(dst_container_id as i64)
+                .bind(dst_slot as i32)
+                .bind(expires_at_ms)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await?;
+            }
 
             Ok(ReservationRecord {
                 reservation_id: src_res_id,
@@ -200,7 +235,11 @@ impl TransactionCoordinator {
                 container_id: src_container_id,
                 slot: src_slot,
                 item_instance_id: Some(item_instance_id),
-                reservation_type: "transfer_out".to_string(),
+                reservation_type: if is_same_slot {
+                    "transfer_in_place".to_string()
+                } else {
+                    "transfer_out".to_string()
+                },
                 expires_at_epoch_ms: expires_at_ms,
                 created_at_epoch_ms: now_ms,
             })
@@ -375,14 +414,47 @@ impl TransactionCoordinator {
             }
 
             // 1. Fetch reservation details
-            let rows = sqlx::query(&q!(
-                "SELECT reservation_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms FROM container_reservations WHERE tx_id = ?"
-            ))
-            .bind(tx_id)
-            .fetch_all(&mut *conn)
-            .await?;
+            let res_sql = format!(
+                "SELECT reservation_id, container_id, slot, item_instance_id, reservation_type, expires_at_epoch_ms FROM container_reservations WHERE tx_id = ?{}",
+                lock_suffix!()
+            );
+            let rows = sqlx::query(&q!(&res_sql))
+                .bind(tx_id)
+                .fetch_all(&mut *conn)
+                .await?;
 
-            if rows.len() != 2 {
+            let mut src_info = None;
+            let mut dst_info = None;
+            let mut expected_res_count: u64 = 2;
+
+            if rows.len() == 1 {
+                let r = &rows[0];
+                let res_type: String = r.try_get("reservation_type")?;
+                if res_type == "transfer_in_place" {
+                    let cid: i64 = r.try_get("container_id")?;
+                    let slot: i32 = r.try_get("slot")?;
+                    let item_id: Option<String> = r.try_get("item_instance_id")?;
+                    let item_id = item_id.unwrap_or_default();
+                    src_info = Some((cid as u64, slot as u32, item_id));
+                    dst_info = Some((cid as u64, slot as u32));
+                    expected_res_count = 1;
+                }
+            } else if rows.len() == 2 {
+                for r in rows {
+                    let res_type: String = r.try_get("reservation_type")?;
+                    let cid: i64 = r.try_get("container_id")?;
+                    let slot: i32 = r.try_get("slot")?;
+                    let item_id: Option<String> = r.try_get("item_instance_id")?;
+
+                    if res_type == "transfer_out" {
+                        src_info = Some((cid as u64, slot as u32, item_id.unwrap_or_default()));
+                    } else if res_type == "transfer_in" {
+                        dst_info = Some((cid as u64, slot as u32));
+                    }
+                }
+            }
+
+            if src_info.is_none() || dst_info.is_none() {
                 // Re-query container_transactions in case of concurrent commit race
                 let race_tx = sqlx::query(&q!(
                     "SELECT tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms FROM container_transactions WHERE tx_id = ?"
@@ -410,28 +482,46 @@ impl TransactionCoordinator {
                 return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
             }
 
-            let mut src_info = None;
-            let mut dst_info = None;
+            let (src_cid, src_slot, item_id) = src_info.unwrap();
+            let (dst_cid, dst_slot) = dst_info.unwrap();
 
-            for r in rows {
-                let res_type: String = r.try_get("reservation_type")?;
-                let cid: i64 = r.try_get("container_id")?;
-                let slot: i32 = r.try_get("slot")?;
-                let item_id: Option<String> = r.try_get("item_instance_id")?;
+            // 2. Lock source and destination containers in deterministic ascending order
+            //    and resolve destination container owner GUID.
+            let (c_low, c_high) = (src_cid.min(dst_cid), src_cid.max(dst_cid));
+            let lock_c_sql = format!(
+                "SELECT container_id, owner_type, owner_id FROM containers WHERE container_id = ?{}",
+                lock_suffix!()
+            );
+            let low_row = sqlx::query(&q!(&lock_c_sql))
+                .bind(c_low as i64)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(StorageError::ContainerNotFound(c_low))?;
 
-                if res_type == "transfer_out" {
-                    src_info = Some((cid as u64, slot as u32, item_id.unwrap_or_default()));
-                } else if res_type == "transfer_in" {
-                    dst_info = Some((cid as u64, slot as u32));
-                }
-            }
+            let high_row = if c_low != c_high {
+                Some(
+                    sqlx::query(&q!(&lock_c_sql))
+                        .bind(c_high as i64)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .ok_or(StorageError::ContainerNotFound(c_high))?,
+                )
+            } else {
+                None
+            };
 
-            let (src_cid, _src_slot, item_id) = src_info
-                .ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
-            let (dst_cid, dst_slot) = dst_info
-                .ok_or_else(|| StorageError::ReservationExpiredOrAborted(tx_id.to_string()))?;
+            let dst_row = if dst_cid == c_low {
+                &low_row
+            } else {
+                high_row
+                    .as_ref()
+                    .expect("high container loaded when c_low != c_high")
+            };
+            let dst_owner_type: String = dst_row.try_get("owner_type")?;
+            let dst_owner_id: String = dst_row.try_get("owner_id")?;
+            let dst_owner_guid = resolve_container_owner_guid(&dst_owner_type, &dst_owner_id);
 
-            // 2. Atomic check-and-delete verifying lease is still valid
+            // 3. Atomic check-and-delete verifying lease is still valid
             let deleted = sqlx::query(&q!(
                 "DELETE FROM container_reservations WHERE tx_id = ? AND expires_at_epoch_ms > ?"
             ))
@@ -441,7 +531,7 @@ impl TransactionCoordinator {
             .await?
             .rows_affected();
 
-            if deleted < 2 {
+            if deleted < expected_res_count {
                 // Re-query container_transactions in case of concurrent commit race
                 let race_tx = sqlx::query(&q!(
                     "SELECT tx_id, src_container_id, dst_container_id, item_instance_id, status, timestamp_epoch_ms FROM container_transactions WHERE tx_id = ?"
@@ -469,19 +559,25 @@ impl TransactionCoordinator {
                 return Err(StorageError::ReservationExpiredOrAborted(tx_id.to_string()));
             }
 
-            // 3. Move the item
-            sqlx::query(&q!(
-                "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+            // 4. Move the item, enforcing source container/slot ownership and syncing character_guid
+            let move_res = sqlx::query(&q!(
+                "UPDATE items SET container_id = ?, slot = ?, character_guid = ?, updated_at = ? WHERE item_instance_id = ? AND container_id = ? AND slot = ?"
             ))
             .bind(dst_cid as i64)
             .bind(dst_slot as i32)
+            .bind(dst_owner_guid)
             .bind(now_secs)
             .bind(&item_id)
+            .bind(src_cid as i64)
+            .bind(src_slot as i32)
             .execute(&mut *conn)
             .await?;
 
-            // 4. Increment container versions in deterministic ascending order to prevent deadlocks
-            let (c_low, c_high) = (src_cid.min(dst_cid), src_cid.max(dst_cid));
+            if move_res.rows_affected() != 1 {
+                return Err(StorageError::ItemNotFound(item_id.clone(), src_cid));
+            }
+
+            // 5. Increment container versions in deterministic ascending order to prevent deadlocks
             sqlx::query(&q!(
                 "UPDATE containers SET version = version + 1, updated_at = ? WHERE container_id = ?"
             ))
@@ -556,6 +652,12 @@ impl TransactionCoordinator {
                     }
                 } else if res_type == "transfer_in" {
                     dst_cid = cid as u64;
+                } else if res_type == "transfer_in_place" {
+                    src_cid = cid as u64;
+                    dst_cid = cid as u64;
+                    if let Some(id) = item_opt {
+                        item_id = id;
+                    }
                 }
             }
 
@@ -1268,6 +1370,104 @@ mod tests {
             assert_eq!(rec.tx_id, "tx_idem_race");
             assert_eq!(rec.item_instance_id, "race_item");
         }
+    }
+
+    #[tokio::test]
+    async fn test_2pc_same_container_and_commit_verification_and_owner_guid() {
+        use crate::models::{ContainerRecordBuilder, ItemRecordBuilder};
+        let db = Database::connect_memory().await.unwrap();
+        let crepo = ContainerRepository::new(db.clone());
+        let char_repo = CharacterRepository::new(db.clone());
+        let coord = TransactionCoordinator::new(db.clone());
+
+        let c_p1 = 3001;
+        let c_p2 = 3002;
+        let c_guild = 3003;
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(c_p1)
+                    .owner_id("1001")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(c_p2)
+                    .owner_id("2002")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(c_guild)
+                    .owner_type("guild")
+                    .owner_id("9999")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let item = ItemRecordBuilder::new("same_cont_item")
+            .character_guid(1001)
+            .container_id(c_p1)
+            .slot(0)
+            .build();
+        char_repo.add_item(&item).await.unwrap();
+
+        // 1. Same-container transfer to different slot (c_p1:0 -> c_p1:2)
+        coord
+            .prepare_transfer("tx_same_diff", c_p1, 0, c_p1, 2, 5000)
+            .await
+            .unwrap();
+        let rec_diff = coord.commit_transfer("tx_same_diff").await.unwrap();
+        assert_eq!(rec_diff.status, "committed");
+        let items_p1 = crepo.get_container_items(c_p1).await.unwrap();
+        assert_eq!(items_p1[0].slot, 2);
+        assert_eq!(items_p1[0].character_guid, 1001);
+
+        // 2. Same-container same-slot move (c_p1:2 -> c_p1:2) must succeed without spurious SlotOccupied
+        coord
+            .prepare_transfer("tx_same_slot", c_p1, 2, c_p1, 2, 5000)
+            .await
+            .unwrap();
+        let rec_same = coord.commit_transfer("tx_same_slot").await.unwrap();
+        assert_eq!(rec_same.status, "committed");
+        assert_eq!(crepo.get_container_items(c_p1).await.unwrap()[0].slot, 2);
+
+        // 3. Transfer to guild container syncs character_guid to 0 (not guild ID)
+        coord
+            .prepare_transfer("tx_to_guild", c_p1, 2, c_guild, 0, 5000)
+            .await
+            .unwrap();
+        coord.commit_transfer("tx_to_guild").await.unwrap();
+        let items_guild = crepo.get_container_items(c_guild).await.unwrap();
+        assert_eq!(items_guild[0].character_guid, 0);
+
+        // 4. Transfer to player2 syncs character_guid to 2002
+        coord
+            .prepare_transfer("tx_to_p2", c_guild, 0, c_p2, 1, 5000)
+            .await
+            .unwrap();
+        coord.commit_transfer("tx_to_p2").await.unwrap();
+        let items_p2 = crepo.get_container_items(c_p2).await.unwrap();
+        assert_eq!(items_p2[0].character_guid, 2002);
+
+        // 5. If item is out-of-band moved/deleted before commit, commit_transfer must fail (rows_affected != 1)
+        coord
+            .prepare_transfer("tx_stale_commit", c_p2, 1, c_p1, 4, 5000)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE items SET slot = 9 WHERE item_instance_id = 'same_cont_item'")
+            .execute(db.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        let stale_err = coord.commit_transfer("tx_stale_commit").await.unwrap_err();
+        assert!(matches!(stale_err, StorageError::ItemNotFound(..)));
     }
 
     #[test]

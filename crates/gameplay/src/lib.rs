@@ -52,7 +52,8 @@ pub use perception::{
 pub use quest::{QuestLogComponent, QuestObjective, QuestPlugin, QuestRecord, QuestStatus};
 pub use scripting::{
     register_host_api, validate_memory_bounds, HostContext, ScriptHookHandler, ScriptHotReloader,
-    ScriptTickSystem, WasmRuntime, WasmScriptEngine, WasmScriptPlugin,
+    ScriptTickSystem, WasmDispatchedEvent, WasmInvocationOutputs, WasmRuntime, WasmScriptEngine,
+    WasmScriptPlugin, MAX_WASM_HOST_ITEMS_PER_CALL, MAX_WASM_HOST_PAYLOAD_BYTES,
 };
 pub use spawner::{
     SpawnCommandBuffer, SpawnEntityCommand, SpawnTemplate, SpawnerComponent, SpawnerPlugin,

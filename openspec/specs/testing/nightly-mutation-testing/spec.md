@@ -1,5 +1,8 @@
 # Specification: Nightly Mutation Testing Suite Hardening
 
+## Purpose
+Defines boundary-hardened unit test assertions and declarative `cargo-mutants` exclusions so nightly mutation testing completes deterministically with zero surviving mutants.
+
 ## Requirements
 
 ### Requirement 1: Schema Codec Exact Boundary Hardening

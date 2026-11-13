@@ -1,3 +1,22 @@
+const KEY_BINDINGS = {
+  w: "w",
+  a: "a",
+  s: "s",
+  d: "d",
+  arrowup: "arrowUp",
+  arrowdown: "arrowDown",
+  arrowleft: "arrowLeft",
+  arrowright: "arrowRight",
+};
+
+const CODE_BINDINGS = {
+  ArrowUp: "arrowUp",
+  ArrowDown: "arrowDown",
+  ArrowLeft: "arrowLeft",
+  ArrowRight: "arrowRight",
+  Space: "space",
+};
+
 /**
  * Keyboard and pointer controls for player character.
  */
@@ -8,8 +27,10 @@ export class PlayerControls {
       a: false,
       s: false,
       d: false,
-      q: false,
-      e: false,
+      arrowUp: false,
+      arrowDown: false,
+      arrowLeft: false,
+      arrowRight: false,
       space: false,
     };
 
@@ -25,32 +46,24 @@ export class PlayerControls {
     }
   }
 
+  setKeyState(e, pressed) {
+    const key = typeof e.key === "string" ? e.key.toLowerCase() : "";
+    const bound = KEY_BINDINGS[key] || CODE_BINDINGS[e.code];
+    if (bound) {
+      this.keys[bound] = pressed;
+    }
+    if (pressed && e.code === "Space" && this.onCastCallback) {
+      this.onCastCallback();
+    }
+  }
+
   initListeners() {
     window.addEventListener("keydown", (e) => {
-      const k = e.key.toLowerCase();
-      if (k === "w") this.keys.w = true;
-      if (k === "a") this.keys.a = true;
-      if (k === "s") this.keys.s = true;
-      if (k === "d") this.keys.d = true;
-      if (k === "q") this.keys.q = true;
-      if (k === "e") this.keys.e = true;
-      if (e.code === "Space") {
-        this.keys.space = true;
-        if (this.onCastCallback) {
-          this.onCastCallback();
-        }
-      }
+      this.setKeyState(e, true);
     });
 
     window.addEventListener("keyup", (e) => {
-      const k = e.key.toLowerCase();
-      if (k === "w") this.keys.w = false;
-      if (k === "a") this.keys.a = false;
-      if (k === "s") this.keys.s = false;
-      if (k === "d") this.keys.d = false;
-      if (k === "q") this.keys.q = false;
-      if (k === "e") this.keys.e = false;
-      if (e.code === "Space") this.keys.space = false;
+      this.setKeyState(e, false);
     });
   }
 
@@ -62,16 +75,16 @@ export class PlayerControls {
    * Advances player position based on active keys and delta time.
    */
   update(dt) {
-    // Yaw rotation with Q/E
-    if (this.keys.q) this.yaw += this.turnSpeed * dt;
-    if (this.keys.e) this.yaw -= this.turnSpeed * dt;
+    // Yaw rotation with A/D and ArrowLeft/ArrowRight (E is reserved for Interact/Barter)
+    if (this.keys.a || this.keys.arrowLeft) this.yaw += this.turnSpeed * dt;
+    if (this.keys.d || this.keys.arrowRight) this.yaw -= this.turnSpeed * dt;
 
     // Movement relative to facing direction
     let moveForward = 0.0;
     let moveStrafe = 0.0;
 
-    if (this.keys.w) moveForward += 1.0;
-    if (this.keys.s) moveForward -= 1.0;
+    if (this.keys.w || this.keys.arrowUp) moveForward += 1.0;
+    if (this.keys.s || this.keys.arrowDown) moveForward -= 1.0;
     if (this.keys.d) moveStrafe += 1.0;
     if (this.keys.a) moveStrafe -= 1.0;
 

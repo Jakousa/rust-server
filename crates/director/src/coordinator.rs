@@ -27,52 +27,63 @@ pub const DEFAULT_WORLD_BOUNDS: BoundingBox3D = BoundingBox3D {
 
 /// Subdivides a 3D bounding box into 8 equal child octants.
 pub fn subdivide_bounds(bounds: &BoundingBox3D) -> [BoundingBox3D; 8] {
-    let mid_x = (bounds.min.0 + bounds.max.0) * 0.5;
-    let mid_y = (bounds.min.1 + bounds.max.1) * 0.5;
-    let mid_z = (bounds.min.2 + bounds.max.2) * 0.5;
+    bounds.subdivide()
+}
 
-    [
-        // Index 0: ---
-        BoundingBox3D::new(
-            (bounds.min.0, bounds.min.1, bounds.min.2),
-            (mid_x, mid_y, mid_z),
-        ),
-        // Index 1: +--
-        BoundingBox3D::new(
-            (mid_x, bounds.min.1, bounds.min.2),
-            (bounds.max.0, mid_y, mid_z),
-        ),
-        // Index 2: -+-
-        BoundingBox3D::new(
-            (bounds.min.0, mid_y, bounds.min.2),
-            (mid_x, bounds.max.1, mid_z),
-        ),
-        // Index 3: ++-
-        BoundingBox3D::new(
-            (mid_x, mid_y, bounds.min.2),
-            (bounds.max.0, bounds.max.1, mid_z),
-        ),
-        // Index 4: --+
-        BoundingBox3D::new(
-            (bounds.min.0, bounds.min.1, mid_z),
-            (mid_x, mid_y, bounds.max.2),
-        ),
-        // Index 5: +-+
-        BoundingBox3D::new(
-            (mid_x, bounds.min.1, mid_z),
-            (bounds.max.0, mid_y, bounds.max.2),
-        ),
-        // Index 6: -++
-        BoundingBox3D::new(
-            (bounds.min.0, mid_y, mid_z),
-            (mid_x, bounds.max.1, bounds.max.2),
-        ),
-        // Index 7: +++
-        BoundingBox3D::new(
-            (mid_x, mid_y, mid_z),
-            (bounds.max.0, bounds.max.1, bounds.max.2),
-        ),
-    ]
+const BOUNDS_EPSILON: f32 = 1e-3;
+
+fn bounds_approx_eq(a: &BoundingBox3D, b: &BoundingBox3D) -> bool {
+    (a.min.0 - b.min.0).abs() < BOUNDS_EPSILON
+        && (a.min.1 - b.min.1).abs() < BOUNDS_EPSILON
+        && (a.min.2 - b.min.2).abs() < BOUNDS_EPSILON
+        && (a.max.0 - b.max.0).abs() < BOUNDS_EPSILON
+        && (a.max.1 - b.max.1).abs() < BOUNDS_EPSILON
+        && (a.max.2 - b.max.2).abs() < BOUNDS_EPSILON
+}
+
+fn bounds_contains_box(outer: &BoundingBox3D, inner: &BoundingBox3D) -> bool {
+    inner.min.0 >= outer.min.0 - BOUNDS_EPSILON
+        && inner.min.1 >= outer.min.1 - BOUNDS_EPSILON
+        && inner.min.2 >= outer.min.2 - BOUNDS_EPSILON
+        && inner.max.0 <= outer.max.0 + BOUNDS_EPSILON
+        && inner.max.1 <= outer.max.1 + BOUNDS_EPSILON
+        && inner.max.2 <= outer.max.2 + BOUNDS_EPSILON
+}
+
+fn is_octree_descendant(outer: &BoundingBox3D, target: &BoundingBox3D, depth_left: usize) -> bool {
+    if bounds_approx_eq(outer, target) {
+        return true;
+    }
+    if depth_left == 0 || !bounds_contains_box(outer, target) {
+        return false;
+    }
+    for child in subdivide_bounds(outer) {
+        if bounds_contains_box(&child, target)
+            && is_octree_descendant(&child, target, depth_left - 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn empty_slot_node() -> GlobalOctreeNode {
+    GlobalOctreeNode::Leaf {
+        bounds: BoundingBox3D::new((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        assigned_node_id: None,
+        entity_count: 0,
+    }
+}
+
+fn is_empty_slot(node: &GlobalOctreeNode) -> bool {
+    matches!(
+        node,
+        GlobalOctreeNode::Leaf {
+            bounds,
+            assigned_node_id: None,
+            ..
+        } if bounds.min == bounds.max
+    )
 }
 
 /// Computes the union bounding box that tightly encloses both `a` and `b`.
@@ -383,6 +394,126 @@ impl GlobalOctreeNode {
             }
         }
     }
+
+    fn map_bounds(
+        &mut self,
+        node_id: u32,
+        target: BoundingBox3D,
+        registry: &mut Option<&mut NodeRegistry>,
+    ) -> (bool, bool) {
+        match self {
+            GlobalOctreeNode::Leaf {
+                bounds,
+                assigned_node_id,
+                ..
+            } => {
+                if bounds_approx_eq(bounds, &target) {
+                    let changed = *assigned_node_id != Some(node_id);
+                    if let (Some(prev), Some(reg)) = (*assigned_node_id, registry.as_deref_mut()) {
+                        if prev != node_id {
+                            reg.remove_assigned_bounds(prev, bounds);
+                        }
+                    }
+                    *assigned_node_id = Some(node_id);
+                    (true, changed)
+                } else if bounds_contains_box(bounds, &target)
+                    && is_octree_descendant(bounds, &target, 6)
+                {
+                    let existing_owner = *assigned_node_id;
+                    let old_bounds = *bounds;
+                    let sub = subdivide_bounds(&old_bounds);
+                    if let (Some(prev), Some(reg)) = (existing_owner, registry.as_deref_mut()) {
+                        reg.remove_assigned_bounds(prev, &old_bounds);
+                        for b in &sub {
+                            reg.add_assigned_bounds(prev, *b);
+                        }
+                    }
+                    let children_vec: Vec<GlobalOctreeNode> = sub
+                        .into_iter()
+                        .map(|cb| GlobalOctreeNode::Leaf {
+                            bounds: cb,
+                            assigned_node_id: existing_owner,
+                            entity_count: 0,
+                        })
+                        .collect();
+                    let children: Box<[GlobalOctreeNode; 8]> = children_vec
+                        .into_boxed_slice()
+                        .try_into()
+                        .expect("subdivide_bounds always produces 8 octants");
+                    *self = GlobalOctreeNode::Branch {
+                        bounds: old_bounds,
+                        children,
+                    };
+                    let (mapped, _) = self.map_bounds(node_id, target, registry);
+                    (mapped, true)
+                } else if assigned_node_id.is_none() && bounds_contains_box(bounds, &target) {
+                    let children = Box::new([
+                        GlobalOctreeNode::Leaf {
+                            bounds: target,
+                            assigned_node_id: Some(node_id),
+                            entity_count: 0,
+                        },
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                    ]);
+                    *self = GlobalOctreeNode::Branch {
+                        bounds: *bounds,
+                        children,
+                    };
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            GlobalOctreeNode::Branch { bounds, children } => {
+                for child in children.iter_mut() {
+                    if !is_empty_slot(child) && bounds_contains_box(child.bounds(), &target) {
+                        let (mapped, changed) = child.map_bounds(node_id, target, registry);
+                        if mapped {
+                            return (true, changed);
+                        }
+                    }
+                }
+                for child in children.iter_mut() {
+                    if is_empty_slot(child) {
+                        *child = GlobalOctreeNode::Leaf {
+                            bounds: target,
+                            assigned_node_id: Some(node_id),
+                            entity_count: 0,
+                        };
+                        *bounds = union_bounds(bounds, &target);
+                        return (true, true);
+                    }
+                }
+                let prev = std::mem::replace(&mut children[7], empty_slot_node());
+                let branch_bounds = union_bounds(prev.bounds(), &target);
+                children[7] = GlobalOctreeNode::Branch {
+                    bounds: branch_bounds,
+                    children: Box::new([
+                        prev,
+                        GlobalOctreeNode::Leaf {
+                            bounds: target,
+                            assigned_node_id: Some(node_id),
+                            entity_count: 0,
+                        },
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                        empty_slot_node(),
+                    ]),
+                };
+                *bounds = union_bounds(bounds, &target);
+                (true, true)
+            }
+        }
+    }
 }
 
 /// Record of an orphaned partition being reassigned to a surviving node.
@@ -522,6 +653,74 @@ impl GlobalOctreeCoordinator {
                 *assigned_node_id = Some(node_id);
             }
         }
+    }
+
+    /// Maps or subdivides `bounds` in the global octree and assigns it to `node_id`.
+    ///
+    /// Supports initial root assignment, octree sub-octant mapping during multi-node startup
+    /// or Director restart re-registration, and arbitrary sub-box placement.
+    pub fn assign_or_map_node_bounds(&mut self, node_id: u32, bounds: BoundingBox3D) -> bool {
+        self.assign_or_map_node_bounds_with_registry(node_id, bounds, None)
+    }
+
+    /// Maps or subdivides `bounds` in the global octree and assigns it to `node_id`,
+    /// keeping `registry` bounds synchronized if an existing leaf is subdivided.
+    pub fn assign_or_map_node_bounds_with_registry(
+        &mut self,
+        node_id: u32,
+        bounds: BoundingBox3D,
+        mut registry: Option<&mut NodeRegistry>,
+    ) -> bool {
+        if !bounds.min.0.is_finite()
+            || !bounds.min.1.is_finite()
+            || !bounds.min.2.is_finite()
+            || !bounds.max.0.is_finite()
+            || !bounds.max.1.is_finite()
+            || !bounds.max.2.is_finite()
+            || bounds.min.0 >= bounds.max.0
+            || bounds.min.1 >= bounds.max.1
+            || bounds.min.2 >= bounds.max.2
+        {
+            return false;
+        }
+
+        let was_unassigned_root = matches!(
+            self.root,
+            GlobalOctreeNode::Leaf {
+                assigned_node_id: None,
+                ..
+            }
+        );
+
+        let (mapped, mut changed) = self.root.map_bounds(node_id, bounds, &mut registry);
+        if !mapped {
+            let old_root = std::mem::replace(&mut self.root, empty_slot_node());
+            let new_root_bounds = union_bounds(old_root.bounds(), &bounds);
+            self.root = GlobalOctreeNode::Branch {
+                bounds: new_root_bounds,
+                children: Box::new([
+                    old_root,
+                    GlobalOctreeNode::Leaf {
+                        bounds,
+                        assigned_node_id: Some(node_id),
+                        entity_count: 0,
+                    },
+                    empty_slot_node(),
+                    empty_slot_node(),
+                    empty_slot_node(),
+                    empty_slot_node(),
+                    empty_slot_node(),
+                    empty_slot_node(),
+                ]),
+            };
+            changed = true;
+        }
+
+        if changed && !was_unassigned_root {
+            self.topology_epoch += 1;
+        }
+
+        true
     }
 
     /// Finds the authoritative simulation node ID for the given position.
@@ -1425,5 +1624,78 @@ mod tests {
             coord.find_node_for_point((25.0, 25.0, 99.0)),
             Some(node_upper)
         );
+    }
+
+    #[test]
+    fn test_assign_or_map_node_bounds_multi_node_octants() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(root_bounds);
+        let octants = subdivide_bounds(&root_bounds);
+
+        assert!(coord.assign_or_map_node_bounds(1, octants[0]));
+        assert!(coord.assign_or_map_node_bounds(2, octants[1]));
+        assert!(coord.assign_or_map_node_bounds(3, octants[7]));
+
+        assert_eq!(coord.find_node_for_point((25.0, 25.0, 25.0)), Some(1));
+        assert_eq!(coord.find_node_for_point((75.0, 25.0, 25.0)), Some(2));
+        assert_eq!(coord.find_node_for_point((75.0, 75.0, 75.0)), Some(3));
+        assert_eq!(coord.find_node_for_point((25.0, 75.0, 75.0)), None);
+
+        assert_eq!(coord.get_assigned_bounds_for_node(1), vec![octants[0]]);
+        assert_eq!(coord.get_assigned_bounds_for_node(2), vec![octants[1]]);
+        assert_eq!(coord.get_assigned_bounds_for_node(3), vec![octants[7]]);
+    }
+
+    #[test]
+    fn test_assign_or_map_node_bounds_non_octant_default_world() {
+        let mut coord = GlobalOctreeCoordinator::default();
+        let b1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let b2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        assert!(coord.assign_or_map_node_bounds(1, b1));
+        assert!(coord.assign_or_map_node_bounds(2, b2));
+
+        assert_eq!(coord.find_node_for_point((-50.0, 0.0, 0.0)), Some(1));
+        assert_eq!(coord.find_node_for_point((50.0, 0.0, 0.0)), Some(2));
+        assert_eq!(coord.find_node_for_point((500.0, 500.0, 500.0)), None);
+    }
+
+    #[test]
+    fn test_recover_orphaned_partitions_distributes_across_surviving_nodes() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let octants = subdivide_bounds(&bounds);
+        // Node 1 owns 6 partitions; Nodes 2 and 3 each own 1 partition
+        let node1 = registry.register_node("127.0.0.1:50051".to_string(), octants[0..6].to_vec());
+        let node2 = registry.register_node("127.0.0.1:50052".to_string(), vec![octants[6]]);
+        let node3 = registry.register_node("127.0.0.1:50053".to_string(), vec![octants[7]]);
+
+        for &b in &octants[0..6] {
+            assert!(coord.assign_or_map_node_bounds(node1, b));
+        }
+        assert!(coord.assign_or_map_node_bounds(node2, octants[6]));
+        assert!(coord.assign_or_map_node_bounds(node3, octants[7]));
+
+        let _ = registry.deregister_node(node1);
+        let mut dead_addrs = std::collections::HashMap::new();
+        dead_addrs.insert(node1, "127.0.0.1:50051".to_string());
+
+        let events = coord.recover_orphaned_partitions(&[node1], &dead_addrs, &mut registry);
+        assert_eq!(events.len(), 6);
+
+        let n2_count = events.iter().filter(|e| e.new_node_id == node2).count();
+        let n3_count = events.iter().filter(|e| e.new_node_id == node3).count();
+        assert_eq!(
+            n2_count, 3,
+            "node2 should receive 3 of 6 orphaned partitions"
+        );
+        assert_eq!(
+            n3_count, 3,
+            "node3 should receive 3 of 6 orphaned partitions"
+        );
+        assert_eq!(registry.get_node(node2).unwrap().assigned_bounds.len(), 4);
+        assert_eq!(registry.get_node(node3).unwrap().assigned_bounds.len(), 4);
     }
 }

@@ -1,9 +1,0 @@
-schema: spec-driven
-name: websocket-fallback-transport
-title: WebSocket / TLS over TCP Fallback Transport for Restricted Networks
-version: 1.0.0
-description: Add a WebSocket (WS/WSS) over TCP fallback transport in crates/gateway and automatic WebTransport-to-WebSocket fallback in web/src/transport.js with full 0x4D4D binary and varint framing parity.
-authors:
-  - MMO Engineering Team
-related_issues:
-  - 189

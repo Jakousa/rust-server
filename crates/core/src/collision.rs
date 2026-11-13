@@ -471,18 +471,29 @@ impl CollisionWorld for AabbCollisionWorld {
             )
         };
 
-        let goal_cell = (
-            ((end.x - start.x) / STEP).round() as i32,
-            ((end.y - start.y) / STEP).round() as i32,
-            ((end.z - start.z) / STEP).round() as i32,
-        );
+        let to_goal_cell = |delta: f32| -> Option<i32> {
+            let cells = (f64::from(delta) / f64::from(STEP)).round();
+            if cells >= f64::from(i32::MIN) && cells <= f64::from(i32::MAX) {
+                Some(cells as i32)
+            } else {
+                None
+            }
+        };
+        let goal_cell = match (
+            to_goal_cell(end.x - start.x),
+            to_goal_cell(end.y - start.y),
+            to_goal_cell(end.z - start.z),
+        ) {
+            (Some(gx), Some(gy), Some(gz)) => Some((gx, gy, gz)),
+            _ => None,
+        };
 
         let heuristic = |c: (i32, i32, i32)| {
             let pos = cell_pos(c);
-            let dx = end.x - pos.x;
-            let dy = end.y - pos.y;
-            let dz = end.z - pos.z;
-            (dx * dx + dy * dy + dz * dz).sqrt()
+            let dx = f64::from(end.x) - f64::from(pos.x);
+            let dy = f64::from(end.y) - f64::from(pos.y);
+            let dz = f64::from(end.z) - f64::from(pos.z);
+            (dx * dx + dy * dy + dz * dz).sqrt() as f32
         };
 
         let mut open_set = BinaryHeap::new();
@@ -511,7 +522,7 @@ impl CollisionWorld for AabbCollisionWorld {
             // Goal condition: within <= 1.5 * STEP of end (or goal cell reached) and clear line to end
             let to_end = Vec3::new(end.x - curr_pos.x, end.y - curr_pos.y, end.z - curr_pos.z);
             let dist_to_end = to_end.length();
-            if (dist_to_end <= 1.5 * STEP || curr_coord == goal_cell)
+            if (dist_to_end <= 1.5 * STEP || goal_cell == Some(curr_coord))
                 && self.is_segment_clear(curr_pos, end, CLEARANCE)
             {
                 reached_goal_coord = Some(curr_coord);
@@ -528,19 +539,19 @@ impl CollisionWorld for AabbCollisionWorld {
             // Stack-allocated neighbor buffer (8 planar + up to 2 vertical); no per-expansion heap alloc.
             let mut neighbors = [((0i32, 0i32, 0i32), 0.0f32); 10];
             neighbors[..8].copy_from_slice(&[
-                ((cx + 1, cy, cz), 1.0),
-                ((cx - 1, cy, cz), 1.0),
-                ((cx, cy, cz + 1), 1.0),
-                ((cx, cy, cz - 1), 1.0),
-                ((cx + 1, cy, cz + 1), diag),
-                ((cx - 1, cy, cz + 1), diag),
-                ((cx + 1, cy, cz - 1), diag),
-                ((cx - 1, cy, cz - 1), diag),
+                ((cx.saturating_add(1), cy, cz), 1.0),
+                ((cx.saturating_sub(1), cy, cz), 1.0),
+                ((cx, cy, cz.saturating_add(1)), 1.0),
+                ((cx, cy, cz.saturating_sub(1)), 1.0),
+                ((cx.saturating_add(1), cy, cz.saturating_add(1)), diag),
+                ((cx.saturating_sub(1), cy, cz.saturating_add(1)), diag),
+                ((cx.saturating_add(1), cy, cz.saturating_sub(1)), diag),
+                ((cx.saturating_sub(1), cy, cz.saturating_sub(1)), diag),
             ]);
             let mut neighbor_count = 8;
             if check_vertical {
-                neighbors[8] = ((cx, cy + 1, cz), 1.0);
-                neighbors[9] = ((cx, cy - 1, cz), 1.0);
+                neighbors[8] = ((cx, cy.saturating_add(1), cz), 1.0);
+                neighbors[9] = ((cx, cy.saturating_sub(1), cz), 1.0);
                 neighbor_count = 10;
             }
 
@@ -1486,5 +1497,18 @@ mod tests {
         for i in 0..path.len() - 1 {
             assert!(world.is_segment_clear(path[i], path[i + 1], 0.2));
         }
+    }
+
+    #[test]
+    fn test_find_path_distant_coordinates_no_overflow() {
+        let mut world = AabbCollisionWorld::new();
+        // Place an obstacle between start and far-away end so A* runs (not fast-path line of sight)
+        world.register_obstacle(
+            Guid(1),
+            BoundingBox3D::new((4.0, -2.0, -2.0), (6.0, 2.0, 2.0)),
+        );
+        // Should cleanly hit MAX_EXPANDED_NODES and return None without integer or f32 heuristic overflow
+        let res = world.find_path(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0e12, 0.0, 0.0));
+        assert!(res.is_none());
     }
 }

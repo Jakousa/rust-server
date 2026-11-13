@@ -181,7 +181,9 @@ impl SpawnerSystem {
         // 1. Process despawns
         for guid in self.command_buffer.pending_despawns.drain(..) {
             if let Some(entity) = entities.despawn_by_guid(guid) {
-                octree.remove(guid, entity.position);
+                if !octree.remove(guid, entity.position) {
+                    octree.remove_by_guid(guid);
+                }
             }
         }
 
@@ -230,12 +232,14 @@ impl TickSystem for SpawnerSystem {
         }
 
         // Check health of tracked entities only (O(K_spawned) instead of O(N_world))
+        let mut dead_to_despawn = Vec::new();
         for guid in tracked_guids {
             match ctx.entities.get_by_guid(guid) {
                 Some(ent) => {
                     if let Some(health) = ent.get_component::<HealthComponent>() {
                         if health.is_dead {
                             dead_or_missing.insert(guid);
+                            dead_to_despawn.push(guid);
                         }
                     }
                 }
@@ -243,6 +247,10 @@ impl TickSystem for SpawnerSystem {
                     dead_or_missing.insert(guid);
                 }
             }
+        }
+
+        for guid in &dead_to_despawn {
+            self.command_buffer.push_despawn(*guid);
         }
 
         // 2. Evaluate spawners needing evaluation
@@ -298,6 +306,7 @@ impl TickSystem for SpawnerSystem {
 
         // Auto-flush structural commands into EntityStore and Octree if enabled
         if self.auto_flush {
+            let despawned_guids = self.command_buffer.pending_despawns.clone();
             let node_id = self.node_id;
             let mut seq = self.next_sequence;
             self.flush_commands(ctx.entities, ctx.octree, || {
@@ -305,6 +314,9 @@ impl TickSystem for SpawnerSystem {
                 Guid::new(mmo_core::EntityType::Npc, node_id, seq)
             });
             self.next_sequence = seq;
+            for guid in despawned_guids {
+                ctx.events.push(EntityDespawnEvent { guid });
+            }
         }
 
         // Re-push despawn events so subsequent systems can also consume them
@@ -530,5 +542,103 @@ mod tests {
         );
         assert_eq!(spawned.get_property_str("element"), Some("fire"));
         assert_eq!(spawned.get_property_str("loot_tier"), Some("legendary"));
+    }
+
+    #[test]
+    fn test_spawner_despawns_dead_npc_from_entities_and_octree_before_respawn() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+
+        let mut spawner_system = SpawnerSystem::new();
+        spawner_system.register_template(SpawnTemplate::new(1, "Slime", 30.0, 4.0, 5, 0, 10.0));
+
+        let spawner_guid = Guid::new(EntityType::Npc, 1, 1);
+        let spawner_key = store.spawn(spawner_guid, (0.0, 0.0, 0.0));
+        store
+            .get_mut(spawner_key)
+            .unwrap()
+            .add_component(SpawnerComponent::new(1, 1, 0.5, 2.0));
+
+        // Tick 1: initial spawn
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 1,
+                collision_world: None,
+            };
+            spawner_system.update(&mut ctx);
+        }
+
+        let first_npc = store
+            .get(spawner_key)
+            .unwrap()
+            .get_component::<SpawnerComponent>()
+            .unwrap()
+            .spawned_entities[0];
+        assert!(store.get_by_guid(first_npc).is_some());
+        assert!(octree
+            .query_radius((1.0, 0.0, 1.0), 5.0)
+            .contains(&first_npc));
+
+        // Mark NPC dead and simulate it having moved slightly
+        {
+            let npc = store.get_mut_by_guid(first_npc).unwrap();
+            npc.get_component_mut::<HealthComponent>().unwrap().is_dead = true;
+            octree.remove(first_npc, npc.position);
+            npc.position = (3.0, 0.0, 3.0);
+            octree.insert(first_npc, (3.0, 0.0, 3.0));
+        }
+
+        // Tick 2: dead NPC must be despawned from EntityStore and Octree (no corpse leak)
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 2,
+                collision_world: None,
+            };
+            spawner_system.update(&mut ctx);
+        }
+
+        assert!(store.get_by_guid(first_npc).is_none());
+        assert!(!octree
+            .query_radius((3.0, 0.0, 3.0), 5.0)
+            .contains(&first_npc));
+        let despawns = events.drain::<EntityDespawnEvent>();
+        assert!(despawns.iter().any(|e| e.guid == first_npc));
+
+        // Advance past respawn cooldown -> replacement spawns, entity count remains bounded
+        for tick in 3..=10 {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick,
+                collision_world: None,
+            };
+            spawner_system.update(&mut ctx);
+        }
+
+        let spawned = &store
+            .get(spawner_key)
+            .unwrap()
+            .get_component::<SpawnerComponent>()
+            .unwrap()
+            .spawned_entities;
+        assert_eq!(spawned.len(), 1);
+        assert_ne!(spawned[0], first_npc);
+        assert!(store.get_by_guid(first_npc).is_none());
+        assert!(store.get_by_guid(spawned[0]).is_some());
+        assert_eq!(store.count(), 2); // Only spawner + 1 live NPC
     }
 }

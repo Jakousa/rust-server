@@ -8,6 +8,7 @@ export class UIController {
     this.certHashInput = document.getElementById("cert-hash");
     this.btnConnect = document.getElementById("btn-connect");
     this.btnDisconnect = document.getElementById("btn-disconnect");
+    this.connectionError = document.getElementById("connection-error");
 
     this.valPing = document.getElementById("val-ping");
     this.valTick = document.getElementById("val-tick");
@@ -285,18 +286,54 @@ export class UIController {
     }
   }
 
-  setConnectionState(state) {
-    this.statusDot.className = `status-indicator ${state}`;
-    if (state === "connected") {
-      this.btnConnect.disabled = true;
-      this.btnDisconnect.disabled = false;
-    } else if (state === "disconnected") {
-      this.btnConnect.disabled = false;
-      this.btnDisconnect.disabled = true;
-    } else if (state === "connecting") {
-      this.btnConnect.disabled = true;
-      this.btnDisconnect.disabled = false;
+  setConnectionState(state, text = "", errorMessage = "") {
+    if (this.statusDot) {
+      this.statusDot.className = `status-indicator ${state}`;
+      if (text) {
+        this.statusDot.title = text;
+      }
     }
+    if (state === "connected") {
+      if (this.btnConnect) this.btnConnect.disabled = true;
+      if (this.btnDisconnect) this.btnDisconnect.disabled = false;
+    } else if (state === "disconnected") {
+      if (this.btnConnect) this.btnConnect.disabled = false;
+      if (this.btnDisconnect) this.btnDisconnect.disabled = true;
+    } else if (state === "connecting") {
+      if (this.btnConnect) this.btnConnect.disabled = true;
+      if (this.btnDisconnect) this.btnDisconnect.disabled = false;
+    }
+
+    if (this.connectionError) {
+      const normalizedError = typeof errorMessage === "string" ? errorMessage.trim() : "";
+      if (state !== "connected" && state !== "connecting" && normalizedError.length > 0) {
+        this.connectionError.textContent = normalizedError;
+        this._setElementHidden(this.connectionError, false);
+      } else {
+        this.connectionError.textContent = "";
+        this._setElementHidden(this.connectionError, true);
+      }
+    }
+  }
+
+  _setElementHidden(el, hidden) {
+    if (el.classList) {
+      if (hidden) {
+        el.classList.add("hidden");
+      } else {
+        el.classList.remove("hidden");
+      }
+      return;
+    }
+    const classes = (el.className || "").split(/\s+/).filter(Boolean);
+    const hasHidden = classes.includes("hidden");
+    if (hidden && !hasHidden) {
+      classes.push("hidden");
+    } else if (!hidden && hasHidden) {
+      const idx = classes.indexOf("hidden");
+      if (idx !== -1) classes.splice(idx, 1);
+    }
+    el.className = classes.join(" ");
   }
 
   updateTelemetry(telemetryJson, pingMs, bandwidthKb, pos) {

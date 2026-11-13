@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-12
+goal: Resilient simulation node registration and automatic Director restart recovery
+x-issue: 197

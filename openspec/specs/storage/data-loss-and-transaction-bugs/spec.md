@@ -1,5 +1,8 @@
 # Storage Data Loss, Concurrency, and Transaction Bugfixes Specification
 
+## Purpose
+Defines PostgreSQL 2PC positional parameter alignment, disjoint slot reservation cleanup, atomic Redis handover claiming, non-blocking escrow refund sweeps, marketplace expiry safety, and Redis Pub/Sub cross-node forwarding.
+
 ## Requirements
 
 ### Requirement: Positional Parameter Alignment in PostgreSQL 2PC

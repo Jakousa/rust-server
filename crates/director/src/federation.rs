@@ -3,11 +3,14 @@
 //! Provides the [`RealmFederationAuthority`] issuing and verifying cryptographically signed
 //! HMAC-SHA256 transfer claim tokens with 64-bit nonces, bounded TTL, and replay protection.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::hmac::{self, Key, HMAC_SHA256};
 use thiserror::Error;
+
+/// Default maximum number of unexpired nonces retained in the replay protection cache.
+pub const DEFAULT_MAX_NONCE_CACHE: usize = 100_000;
 
 /// Errors that can occur during realm transfer claim issuance or verification.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -17,6 +20,9 @@ pub enum FederationError {
 
     #[error("Transfer claim has expired")]
     Expired,
+
+    #[error("Transfer claim falls within evicted replay watermark window")]
+    ReplayWindowExceeded,
 
     #[error("Replay attack detected: nonce {0} was already redeemed")]
     ReplayDetected(u64),
@@ -44,8 +50,14 @@ pub struct RealmTransferClaim {
 pub struct RealmFederationAuthority {
     realm_id: String,
     secret_key: Vec<u8>,
-    /// Cache of redeemed nonces mapped to their expiry Instant.
-    redeemed_nonces: HashMap<u64, Instant>,
+    /// Cache of redeemed nonces mapped to `(expiry_instant, expires_at_epoch_ms)`.
+    redeemed_nonces: HashMap<u64, (Instant, u64)>,
+    /// Ordered index of `(expires_at_epoch_ms, nonce)` for O(log N) oldest-entry eviction.
+    expiry_order: BTreeSet<(u64, u64)>,
+    /// Floor watermark (in epoch ms) of evicted nonces; claims at or below this are rejected.
+    min_issued_at_ms: u64,
+    /// Maximum capacity of the redeemed nonce cache before oldest-entry eviction occurs.
+    max_nonce_cache: usize,
     /// Nonce counter for generating unique tokens.
     next_nonce: u64,
 }
@@ -53,6 +65,15 @@ pub struct RealmFederationAuthority {
 impl RealmFederationAuthority {
     /// Creates a new `RealmFederationAuthority` for the given `realm_id`.
     pub fn new(realm_id: impl Into<String>, secret_key: Vec<u8>) -> Result<Self, FederationError> {
+        Self::with_max_nonce_cache(realm_id, secret_key, DEFAULT_MAX_NONCE_CACHE)
+    }
+
+    /// Creates a new `RealmFederationAuthority` with a configurable nonce cache capacity.
+    pub fn with_max_nonce_cache(
+        realm_id: impl Into<String>,
+        secret_key: Vec<u8>,
+        max_nonce_cache: usize,
+    ) -> Result<Self, FederationError> {
         if secret_key.len() < 16 {
             return Err(FederationError::KeyTooShort);
         }
@@ -64,6 +85,9 @@ impl RealmFederationAuthority {
             realm_id: realm_id.into(),
             secret_key,
             redeemed_nonces: HashMap::new(),
+            expiry_order: BTreeSet::new(),
+            min_issued_at_ms: 0,
+            max_nonce_cache: max_nonce_cache.max(1),
             next_nonce: now_nanos,
         })
     }
@@ -71,6 +95,16 @@ impl RealmFederationAuthority {
     /// Returns the local realm identifier managed by this authority.
     pub fn realm_id(&self) -> &str {
         &self.realm_id
+    }
+
+    /// Returns the current replay eviction watermark (epoch milliseconds).
+    pub fn min_issued_at_ms(&self) -> u64 {
+        self.min_issued_at_ms
+    }
+
+    /// Returns the number of nonces currently tracked in the replay cache.
+    pub fn redeemed_nonce_count(&self) -> usize {
+        self.redeemed_nonces.len()
     }
 
     /// Constructs the canonical binary digest over which HMAC-SHA256 is evaluated.
@@ -162,6 +196,10 @@ impl RealmFederationAuthority {
             return Err(FederationError::Expired);
         }
 
+        if self.min_issued_at_ms > 0 && claim.expires_at_epoch_ms <= self.min_issued_at_ms {
+            return Err(FederationError::ReplayWindowExceeded);
+        }
+
         if self.redeemed_nonces.contains_key(&claim.nonce) {
             return Err(FederationError::ReplayDetected(claim.nonce));
         }
@@ -186,13 +224,24 @@ impl RealmFederationAuthority {
             .checked_add(safe_remaining)
             .unwrap_or_else(|| Instant::now() + max_ttl);
 
-        if self.redeemed_nonces.len() >= 100_000 {
+        if self.redeemed_nonces.len() >= self.max_nonce_cache {
             self.clean_expired_nonces();
-            if self.redeemed_nonces.len() >= 100_000 {
-                self.redeemed_nonces.clear();
+            while self.redeemed_nonces.len() >= self.max_nonce_cache {
+                let Some(&(oldest_exp_ms, oldest_nonce)) = self.expiry_order.first() else {
+                    break;
+                };
+                if oldest_exp_ms >= claim.expires_at_epoch_ms {
+                    return Err(FederationError::ReplayWindowExceeded);
+                }
+                self.expiry_order.remove(&(oldest_exp_ms, oldest_nonce));
+                self.redeemed_nonces.remove(&oldest_nonce);
+                self.min_issued_at_ms = self.min_issued_at_ms.max(oldest_exp_ms);
             }
         }
-        self.redeemed_nonces.insert(claim.nonce, expiry_instant);
+        self.redeemed_nonces
+            .insert(claim.nonce, (expiry_instant, claim.expires_at_epoch_ms));
+        self.expiry_order
+            .insert((claim.expires_at_epoch_ms, claim.nonce));
 
         Ok(())
     }
@@ -200,7 +249,16 @@ impl RealmFederationAuthority {
     /// Evicts expired nonce entries from the replay cache.
     pub fn clean_expired_nonces(&mut self) {
         let now = Instant::now();
-        self.redeemed_nonces.retain(|_, expiry| *expiry > now);
+        let expiry_order = &mut self.expiry_order;
+        self.redeemed_nonces
+            .retain(|&nonce, &mut (expiry, exp_ms)| {
+                if expiry > now {
+                    true
+                } else {
+                    expiry_order.remove(&(exp_ms, nonce));
+                    false
+                }
+            });
     }
 }
 
@@ -245,5 +303,90 @@ mod tests {
             .verify_and_redeem_claim(&claim)
             .expect_err("tampered claim must fail");
         assert_eq!(err, FederationError::InvalidSignature);
+    }
+
+    #[test]
+    fn test_nonce_cache_watermark_eviction_never_clears_unexpired_nonces() {
+        let secret = b"super-secret-cluster-federation-key-123456";
+        let mut source_auth =
+            RealmFederationAuthority::new("realm-us-east", secret.to_vec()).unwrap();
+        let mut target_auth =
+            RealmFederationAuthority::with_max_nonce_cache("realm-eu-central", secret.to_vec(), 3)
+                .unwrap();
+
+        let early_claim =
+            source_auth.issue_claim(1, "realm-eu-central", 1, Duration::from_secs(10));
+        let mid_claim_a =
+            source_auth.issue_claim(2, "realm-eu-central", 1, Duration::from_secs(60));
+        let mid_claim_b =
+            source_auth.issue_claim(3, "realm-eu-central", 1, Duration::from_secs(60));
+        let newer_claim =
+            source_auth.issue_claim(4, "realm-eu-central", 1, Duration::from_secs(120));
+
+        target_auth.verify_and_redeem_claim(&early_claim).unwrap();
+        target_auth.verify_and_redeem_claim(&mid_claim_a).unwrap();
+        target_auth.verify_and_redeem_claim(&mid_claim_b).unwrap();
+        assert_eq!(target_auth.redeemed_nonce_count(), 3);
+
+        // Redeeming newer_claim at capacity evicts only the oldest entry (early_claim)
+        // and advances min_issued_at_ms without clearing mid_claim_a/mid_claim_b.
+        target_auth.verify_and_redeem_claim(&newer_claim).unwrap();
+        assert_eq!(target_auth.redeemed_nonce_count(), 3);
+        assert_eq!(
+            target_auth.min_issued_at_ms(),
+            early_claim.expires_at_epoch_ms
+        );
+
+        // Unexpired nonces still in cache must still be rejected as replays
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&mid_claim_a),
+            Err(FederationError::ReplayDetected(mid_claim_a.nonce))
+        );
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&mid_claim_b),
+            Err(FederationError::ReplayDetected(mid_claim_b.nonce))
+        );
+
+        // Replaying the evicted early_claim must be blocked by the watermark floor
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&early_claim),
+            Err(FederationError::ReplayWindowExceeded)
+        );
+
+        // A claim older than or equal to the watermark must also be rejected
+        let stale_window_claim =
+            source_auth.issue_claim(5, "realm-eu-central", 1, Duration::from_secs(5));
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&stale_window_claim),
+            Err(FederationError::ReplayWindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_nonce_cache_at_capacity_rejects_older_claim_without_evicting_newer() {
+        let secret = b"super-secret-cluster-federation-key-123456";
+        let mut source_auth =
+            RealmFederationAuthority::new("realm-us-east", secret.to_vec()).unwrap();
+        let mut target_auth =
+            RealmFederationAuthority::with_max_nonce_cache("realm-eu-central", secret.to_vec(), 2)
+                .unwrap();
+
+        let long_a = source_auth.issue_claim(1, "realm-eu-central", 1, Duration::from_secs(120));
+        let long_b = source_auth.issue_claim(2, "realm-eu-central", 1, Duration::from_secs(120));
+        let shorter = source_auth.issue_claim(3, "realm-eu-central", 1, Duration::from_secs(30));
+
+        target_auth.verify_and_redeem_claim(&long_a).unwrap();
+        target_auth.verify_and_redeem_claim(&long_b).unwrap();
+
+        // Shorter claim cannot evict newer claims in cache
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&shorter),
+            Err(FederationError::ReplayWindowExceeded)
+        );
+        assert_eq!(target_auth.redeemed_nonce_count(), 2);
+        assert_eq!(
+            target_auth.verify_and_redeem_claim(&long_a),
+            Err(FederationError::ReplayDetected(long_a.nonce))
+        );
     }
 }

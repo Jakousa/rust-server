@@ -19,7 +19,7 @@ pub struct TradeOffer {
 }
 
 /// Active trade session between two entities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TradeSession {
     pub session_id: u64,
     pub player_a: Guid,
@@ -193,14 +193,22 @@ impl TradeManager {
         self.player_to_session.contains_key(&player)
     }
 
-    pub fn cancel_session(&mut self, session_id: u64) -> Option<TradeSession> {
-        if let Some(session) = self.sessions.remove(&session_id) {
-            self.player_to_session.remove(&session.player_a);
-            self.player_to_session.remove(&session.player_b);
-            Some(session)
-        } else {
-            None
+    pub fn cancel_session(
+        &mut self,
+        session_id: u64,
+        actor_guid: Guid,
+    ) -> Result<TradeSession, &'static str> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or("Trade session not found")?;
+        if session.player_a != actor_guid && session.player_b != actor_guid {
+            return Err("Caller is not a participant in this trade session");
         }
+        let session = self.sessions.remove(&session_id).unwrap();
+        self.player_to_session.remove(&session.player_a);
+        self.player_to_session.remove(&session.player_b);
+        Ok(session)
     }
 
     /// Aborts active session if a participant moves beyond maximum allowed distance.
@@ -218,7 +226,7 @@ impl TradeManager {
         let dist = distance_3d(e1.position, e2.position);
 
         if dist > Self::MAX_TRADE_DISTANCE {
-            self.cancel_session(session_id);
+            let _ = self.cancel_session(session_id, moved_guid);
             Some(session_id)
         } else {
             None
@@ -251,7 +259,7 @@ impl TradeManager {
         // Re-verify distance at commit time
         let dist = distance_3d(e1.position, e2.position);
         if dist > Self::MAX_TRADE_DISTANCE {
-            self.cancel_session(session_id);
+            let _ = self.cancel_session(session_id, p1);
             return Err("Players moved too far apart to complete trade");
         }
 
@@ -370,7 +378,7 @@ impl TradeManager {
         };
 
         // Clean up session mappings
-        self.cancel_session(session_id);
+        let _ = self.cancel_session(session_id, p1);
 
         Ok(completed_event)
     }
@@ -755,13 +763,21 @@ mod tests {
         assert_eq!(trade_mgr.check_distance_and_abort(p2, &store), None);
 
         // Cancel session non-existent
-        assert!(trade_mgr.cancel_session(999).is_none());
+        assert_eq!(
+            trade_mgr.cancel_session(999, p1),
+            Err("Trade session not found")
+        );
 
         // Allocate second session to check increment
         store.get_mut(k2).unwrap().position = (0.0, 0.0, 0.0);
         let s2 = trade_mgr.start_session(p1, p2, &store).unwrap();
         assert_eq!(s2, 2);
-        assert!(trade_mgr.cancel_session(s2).is_some());
+        let outsider = Guid::new(EntityType::Player, 1, 999);
+        assert_eq!(
+            trade_mgr.cancel_session(s2, outsider),
+            Err("Caller is not a participant in this trade session")
+        );
+        assert!(trade_mgr.cancel_session(s2, p1).is_ok());
     }
 
     #[test]
@@ -824,7 +840,7 @@ mod tests {
         assert!(trade_mgr.is_player_trading(p1));
         assert!(trade_mgr.is_player_trading(p2));
 
-        trade_mgr.cancel_session(sid);
+        trade_mgr.cancel_session(sid, p1).unwrap();
         assert!(!trade_mgr.is_player_trading(p1));
         assert!(!trade_mgr.is_player_trading(p2));
     }
@@ -936,7 +952,7 @@ mod tests {
             trade_mgr.execute_atomic_swap(sid2, &mut store),
             Err("Player A would exceed max weight")
         );
-        trade_mgr.cancel_session(sid2);
+        trade_mgr.cancel_session(sid2, p1).unwrap();
 
         // Now test Player B exceeding weight: Player B has 4.0 base, receives 6.1 -> 10.1 > 10.0
         let sid3 = trade_mgr.start_session(p1, p2, &store).unwrap();
@@ -968,7 +984,7 @@ mod tests {
             trade_mgr.execute_atomic_swap(sid3, &mut store),
             Err("Player B would exceed max weight")
         );
-        trade_mgr.cancel_session(sid3);
+        trade_mgr.cancel_session(sid3, p1).unwrap();
 
         // Test distance boundary > MAX_TRADE_DISTANCE (5.001) at session start
         store.get_mut(k2).unwrap().position = (5.001, 0.0, 0.0);
@@ -1079,7 +1095,7 @@ mod tests {
         assert!(!session.locked_b, "Player B lock should be reset");
 
         // Now test pre-validation missing inventory component resets locks
-        trade_mgr.cancel_session(sid);
+        trade_mgr.cancel_session(sid, p1).unwrap();
         let sid2 = trade_mgr.start_session(p1, p2, &store).unwrap();
         let session2 = trade_mgr.get_session_mut(sid2).unwrap();
         session2.lock(p1).unwrap();

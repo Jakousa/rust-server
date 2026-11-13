@@ -25,6 +25,7 @@ Because the MMO engine is written in Rust and runs a deterministic 20 Hz (`50ms`
 2. **Public IPv4 Address & Firewall / Security Group Rules**:
    Browser clients connect via **WebTransport (HTTP/3 over QUIC)**, which runs over **UDP**. Ensure your cloud provider's firewall allows:
    - **`UDP 4433`**: `mmo-gateway` WebTransport endpoint (browser game traffic: movement, entity deltas, barter, and trade).
+   - **`TCP 8443`**: `mmo-gateway` WebSocket fallback listener (`WEBSOCKET_ADDR`, automatic browser fallback when UDP/HTTP/3 is blocked).
    - **`TCP 8080`**: `mmo-gateway` TCP listener (`mmo-loadtest` synthetic bot traffic and TCP clients).
    - **`TCP 80` / `TCP 443` (or `TCP 3000`)**: `web/` static frontend asset serving (Vite / Nginx / Caddy) and `/cert-hash` discovery.
    - **`TCP 22`**: SSH administration.
