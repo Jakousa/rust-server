@@ -320,4 +320,44 @@ mod tests {
         // 4. Assigning to the same instance again should succeed (idempotent)
         assert!(mgr.assign_entity(entity_guid, instance_id_1, false).is_ok());
     }
+
+    #[test]
+    fn test_teardown_instance() {
+        let mut mgr = InstanceDomainManager::new();
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        // Create an instance
+        mgr.create_instance(999, 1, bounds, Duration::from_secs(60))
+            .expect("create instance");
+
+        // Add some entities
+        let p1 = Guid::from_raw(111);
+        let npc1 = Guid::from_raw(222);
+
+        mgr.assign_entity(p1, 999, true).unwrap();
+        mgr.assign_entity(npc1, 999, false).unwrap();
+
+        // Verify state before teardown
+        assert_eq!(mgr.len(), 1);
+        assert_eq!(mgr.get_entity_instance(p1), Some(999));
+        assert_eq!(mgr.get_entity_instance(npc1), Some(999));
+
+        // Test Success Path
+        let evicted = mgr.teardown_instance(999).unwrap();
+
+        // Verify return value
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&p1));
+        assert!(evicted.contains(&npc1));
+
+        // Verify state after teardown
+        assert!(mgr.is_empty());
+        assert!(mgr.get_instance(999).is_none());
+        assert_eq!(mgr.get_entity_instance(p1), None);
+        assert_eq!(mgr.get_entity_instance(npc1), None);
+
+        // Test Error Path
+        let result = mgr.teardown_instance(1000);
+        assert_eq!(result, Err(NodeInstanceError::NotFound(1000)));
+    }
 }
