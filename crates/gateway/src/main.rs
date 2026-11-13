@@ -10,6 +10,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let wt_bind_addr =
         std::env::var("WEBTRANSPORT_ADDR").unwrap_or_else(|_| "0.0.0.0:4433".to_string());
+    let ws_bind_addr =
+        std::env::var("WEBSOCKET_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
+    let ws_tls_enabled = std::env::var("WEBSOCKET_TLS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     let admin_addr: std::net::SocketAddr = std::env::var("ADMIN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:9091".to_string())
@@ -42,6 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Region              : {region}");
     println!("Listen Address      : {listen_addr} (TCP)");
     println!("WebTransport Address: {wt_bind_addr} (UDP)");
+    println!(
+        "WebSocket Address   : {ws_bind_addr} ({})",
+        if ws_tls_enabled { "WSS/TCP" } else { "WS/TCP" }
+    );
     println!("Probe Address       : {probe_addr}");
     println!("Capacity            : {capacity}");
     println!("Admin Address       : {admin_addr}");
@@ -312,6 +321,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[Gateway] Invalid WEBTRANSPORT_ADDR: {wt_bind_addr}");
     }
 
+    // Bind and launch WebSocket / TLS over TCP fallback listener
+    let mut ws_shutdown_tx = None;
+    if let Ok(ws_addr) = ws_bind_addr.parse::<std::net::SocketAddr>() {
+        let ws_res = if ws_tls_enabled {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            match mmo_gateway::generate_self_signed_cert(&["localhost", "127.0.0.1"]) {
+                Ok((certs, key)) => match rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                {
+                    Ok(cfg) => server.bind_websocket_tls(ws_addr, Arc::new(cfg)).await,
+                    Err(e) => Err(mmo_gateway::websocket::WebSocketError::Tls(e.to_string())),
+                },
+                Err(e) => Err(mmo_gateway::websocket::WebSocketError::Tls(e.to_string())),
+            }
+        } else {
+            server.bind_websocket(ws_addr).await
+        };
+
+        match ws_res {
+            Ok(ws_server) => {
+                let proto = if ws_server.is_tls() { "WSS" } else { "WS" };
+                println!("[Gateway] WebSocket ({proto}) fallback listener bound on TCP {ws_addr}");
+                let (_ws_handle, tx) = ws_server.run_background();
+                ws_shutdown_tx = Some(tx);
+            }
+            Err(e) => {
+                eprintln!("[Gateway] Failed to bind WebSocket fallback listener on {ws_addr}: {e}");
+            }
+        }
+    } else {
+        eprintln!("[Gateway] Invalid WEBSOCKET_ADDR: {ws_bind_addr}");
+    }
+
     let listener = server.bind(&listen_addr).await?;
     telemetry.mark_ready();
     println!("Edge Gateway actively listening for client connections on {listen_addr}");
@@ -374,6 +417,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     if let Some(tx) = wt_shutdown_tx {
+        let _ = tx.send(());
+    }
+    if let Some(tx) = ws_shutdown_tx {
         let _ = tx.send(());
     }
     let _ = grpc_shutdown_tx.send(());

@@ -13,6 +13,7 @@ pub mod quic;
 pub mod router;
 pub mod server;
 pub mod social;
+pub mod websocket;
 pub mod webtransport;
 
 pub use auth::{AuthError, AuthResult, EdgeAuthenticator, JwtClaims, TokenValidator};

@@ -973,6 +973,40 @@ impl GatewayServer {
         Ok(server)
     }
 
+    /// Binds a WebSocket (`ws://`) fallback TCP listener to the specified address.
+    pub async fn bind_websocket(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<crate::websocket::WebSocketServer, crate::websocket::WebSocketError> {
+        let mut server = crate::websocket::WebSocketServer::bind(
+            addr,
+            self.router.clone(),
+            self.session_sinks.clone(),
+            self.session_counter.clone(),
+            self.packet_tx.clone(),
+        )
+        .await?
+        .with_intercept_handler(self.intercept_handler());
+
+        if let Some(ref auth) = self.authenticator {
+            server = server.with_authenticator(auth.clone());
+        }
+        if let Some(ref node) = self.default_node_address {
+            server = server.with_default_node_address(node.clone());
+        }
+
+        Ok(server)
+    }
+
+    /// Binds a TLS-encrypted WebSocket (`wss://`) fallback TCP listener to the specified address.
+    pub async fn bind_websocket_tls(
+        &self,
+        addr: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+    ) -> Result<crate::websocket::WebSocketServer, crate::websocket::WebSocketError> {
+        Ok(self.bind_websocket(addr).await?.with_tls_config(tls_config))
+    }
+
     /// Handles an active client QUIC connection:
     /// Multiplexes unreliable datagrams (movement, entity state sync) and reliable streams (interactions, chat),
     /// decodes client packets, forwards routed packets to simulation nodes, and handles downstream broadcasts.

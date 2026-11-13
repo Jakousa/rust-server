@@ -6,4 +6,5 @@ mod cluster;
 mod marketplace;
 mod quic_gateway;
 mod social_pubsub;
+mod websocket;
 mod webtransport;

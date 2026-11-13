@@ -1,15 +1,46 @@
 import { OPCODES } from "./protocol.js";
 
+const HEADER_SIZE = 8;
+const MAGIC_0 = 0x4d;
+const MAGIC_1 = 0x4d;
+
 /**
- * WebTransport Network Client.
+ * Derives a fallback WebSocket URL from a WebTransport URL.
+ * Uses `wss:` when the page is served over HTTPS (mixed-content compliance)
+ * and `ws:` otherwise.
+ * @param {string} url
+ * @param {{ wsPort?: number, pageProtocol?: string }} [options]
+ * @returns {string}
+ */
+export function deriveWebSocketUrl(url, options = {}) {
+  if (url.startsWith("ws://") || url.startsWith("wss://")) {
+    return url;
+  }
+  const wsPort = options.wsPort ?? 8443;
+  const pageProto =
+    options.pageProtocol ??
+    (typeof window !== "undefined" ? window.location?.protocol : "http:");
+  const protocol = pageProto === "https:" ? "wss:" : "ws:";
+  try {
+    const parsed = new URL(url);
+    return `${protocol}//${parsed.hostname}:${wsPort}`;
+  } catch (_) {
+    return `${protocol}//127.0.0.1:${wsPort}`;
+  }
+}
+
+/**
+ * Network Transport Client with automatic WebTransport -> WebSocket fallback.
  *
- * Multiplexes high-frequency unreliable datagrams (movement, entity deltas)
- * and reliable bidirectional streams (interactions, chat, auth), with
- * support for SHA-256 certificate hash pinning for development self-signed certs.
+ * Primary mode uses HTTP/3 WebTransport (UDP datagrams + bidirectional streams).
+ * When WebTransport is unsupported, times out, or fails handshake (e.g. UDP blocked),
+ * automatically falls back to WebSocket over TCP with identical 0x4D4D binary framing.
  */
 export class WebTransportClient {
   constructor() {
     this.transport = null;
+    this.ws = null;
+    this.transportMode = null; // "webtransport" | "websocket" | null
     this.datagramWriter = null;
     this.streamWriter = null;
     this.connected = false;
@@ -39,21 +70,57 @@ export class WebTransportClient {
   }
 
   /**
-   * Connects to WebTransport endpoint.
-   * @param {string} url - Target URL e.g. "https://127.0.0.1:4433"
+   * Connects to the gateway via WebTransport, automatically falling back to
+   * WebSocket if WebTransport is unavailable or fails to establish.
+   * @param {string} url - Target URL e.g. "https://127.0.0.1:4433" or "ws://127.0.0.1:8443"
    * @param {string} certHashHex - SHA-256 fingerprint in dotted or raw hex format.
+   * @param {{ wsUrl?: string, wsPort?: number, wtTimeoutMs?: number, wsTimeoutMs?: number }} [options]
    */
-  async connect(url, certHashHex = "") {
+  async connect(url, certHashHex = "", options = {}) {
     if (this._isConnecting) {
       return;
     }
     this._isConnecting = true;
 
-    if (this.transport) {
+    if (this.transport || this.ws) {
       await this.disconnect();
     }
 
     this.notifyStatus("connecting");
+
+    try {
+      if (url.startsWith("ws://") || url.startsWith("wss://")) {
+        await this._connectWebSocket(url, options);
+        return;
+      }
+
+      try {
+        await this._connectWebTransport(url, certHashHex, options.wtTimeoutMs ?? 4000);
+      } catch (wtErr) {
+        const wsUrl = options.wsUrl || deriveWebSocketUrl(url, options);
+        console.warn(
+          `WebTransport failed (${wtErr?.message || wtErr}), falling back to WebSocket: ${wsUrl}`
+        );
+        await this._connectWebSocket(wsUrl, options);
+      }
+    } catch (err) {
+      console.error("All transport connection attempts failed:", err);
+      this.connected = false;
+      this.transportMode = null;
+      this.notifyStatus("disconnected", err?.message || String(err));
+      throw err;
+    } finally {
+      this._isConnecting = false;
+    }
+  }
+
+  /**
+   * Attempts HTTP/3 WebTransport connection with bounded handshake timeout.
+   */
+  async _connectWebTransport(url, certHashHex, timeoutMs) {
+    if (typeof WebTransport === "undefined") {
+      throw new Error("WebTransport is not supported by this browser.");
+    }
 
     const options = {};
     if (certHashHex && certHashHex.trim().length > 0) {
@@ -72,52 +139,181 @@ export class WebTransportClient {
       }
     }
 
+    const transport = new WebTransport(url, options);
+    // Prevent late unhandled promise rejections if QUIC handshake times out in background
+    transport.closed.catch(() => {});
+
+    let timer = null;
     try {
-      if (typeof WebTransport === "undefined") {
-        throw new Error("WebTransport is not supported by this browser.");
+      await Promise.race([
+        transport.ready,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            try {
+              transport.close();
+            } catch (_) {}
+            reject(new Error(`WebTransport handshake timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+    }
+
+    this.transport = transport;
+    this.transportMode = "webtransport";
+    this.connected = true;
+    this.datagramWriter = this.transport.datagrams.writable.getWriter();
+    this.notifyStatus("connected");
+
+    // Handle server-side disconnect or unexpected transport termination
+    this.transport.closed
+      .then(() => {
+        if (this.connected && this.transportMode === "webtransport") {
+          this.connected = false;
+          this.transportMode = null;
+          if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+          }
+          this.notifyStatus("disconnected");
+        }
+      })
+      .catch((err) => {
+        if (this.connected && this.transportMode === "webtransport") {
+          this.connected = false;
+          this.transportMode = null;
+          if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+          }
+          this.notifyStatus("disconnected", err?.message || String(err));
+        }
+      });
+
+    // Start reader loops
+    this.readDatagrams();
+    this.readIncomingStreams();
+    this.startPingLoop();
+  }
+
+  /**
+   * Connects via WebSocket (WS/WSS over TCP) with binary ArrayBuffer framing.
+   */
+  async _connectWebSocket(wsUrl, options = {}) {
+    if (typeof WebSocket === "undefined") {
+      throw new Error("WebSocket is not supported in this environment.");
+    }
+
+    const timeoutMs = options.wsTimeoutMs ?? 5000;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          try {
+            ws.close();
+          } catch (_) {}
+          reject(new Error(`WebSocket connection timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      ws.onopen = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+
+      ws.onerror = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error(`WebSocket connection failed to ${wsUrl}`));
+        }
+      };
+
+      ws.onclose = (ev) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error(`WebSocket closed during handshake (code ${ev?.code ?? "unknown"})`));
+        }
+      };
+    });
+
+    this.ws = ws;
+    this.transportMode = "websocket";
+    this.connected = true;
+    this.notifyStatus("connected");
+
+    ws.onmessage = (event) => {
+      if (!this.connected) return;
+      let bytes;
+      if (event.data instanceof ArrayBuffer) {
+        bytes = new Uint8Array(event.data);
+      } else if (ArrayBuffer.isView(event.data)) {
+        bytes = new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength);
+      } else {
+        return;
       }
 
-      this.transport = new WebTransport(url, options);
-      await this.transport.ready;
+      this.trackIngress(bytes.byteLength);
+      this._processWebSocketBinary(bytes);
+    };
 
-      this.connected = true;
-      this.datagramWriter = this.transport.datagrams.writable.getWriter();
-      this.notifyStatus("connected");
+    ws.onclose = (ev) => {
+      if (this.connected && this.transportMode === "websocket") {
+        this.connected = false;
+        this.transportMode = null;
+        if (this.pingInterval) {
+          clearInterval(this.pingInterval);
+          this.pingInterval = null;
+        }
+        const reason = ev?.reason || (ev?.code && ev.code !== 1000 ? `code ${ev.code}` : null);
+        this.notifyStatus("disconnected", reason);
+      }
+    };
 
-      // Handle server-side disconnect or unexpected transport termination
-      this.transport.closed
-        .then(() => {
-          if (this.connected) {
-            this.connected = false;
-            if (this.pingInterval) {
-              clearInterval(this.pingInterval);
-              this.pingInterval = null;
-            }
-            this.notifyStatus("disconnected");
-          }
-        })
-        .catch((err) => {
-          if (this.connected) {
-            this.connected = false;
-            if (this.pingInterval) {
-              clearInterval(this.pingInterval);
-              this.pingInterval = null;
-            }
-            this.notifyStatus("disconnected", err?.message || String(err));
-          }
-        });
+    ws.onerror = () => {
+      if (this.connected && this.transportMode === "websocket") {
+        console.warn("WebSocket transport error");
+      }
+    };
 
-      // Start reader loops
-      this.readDatagrams();
-      this.readIncomingStreams();
-      this.startPingLoop();
-    } catch (err) {
-      console.error("WebTransport connection failed:", err);
-      this.connected = false;
-      this.notifyStatus("disconnected", err.message);
-      throw err;
-    } finally {
-      this._isConnecting = false;
+    this.startPingLoop();
+  }
+
+  /**
+   * Extracts one or more 0x4D4D-framed binary packets from a WebSocket message.
+   */
+  _processWebSocketBinary(bytes) {
+    let offset = 0;
+    while (offset + HEADER_SIZE <= bytes.byteLength) {
+      if (bytes[offset] !== MAGIC_0 || bytes[offset + 1] !== MAGIC_1) {
+        console.warn("Invalid 0x4D4D magic header in WebSocket frame");
+        break;
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_SIZE);
+      const payloadLen = view.getUint32(4, true);
+      const totalLen = HEADER_SIZE + payloadLen;
+      if (offset + totalLen > bytes.byteLength) {
+        console.warn("Truncated 0x4D4D frame in WebSocket message");
+        break;
+      }
+      const frameSlice = bytes.subarray(offset, offset + totalLen);
+      try {
+        this.handleIncomingPacket(frameSlice);
+      } catch (packetErr) {
+        console.warn("Error processing WebSocket packet:", packetErr);
+      }
+      offset += totalLen;
     }
   }
 
@@ -127,7 +323,7 @@ export class WebTransportClient {
   handleIncomingPacket(value) {
     if (value && value.byteLength >= 8) {
       const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
-      if (view.getUint8(0) === 0x4d && view.getUint8(1) === 0x4d) {
+      if (view.getUint8(0) === MAGIC_0 && view.getUint8(1) === MAGIC_1) {
         const opcode = view.getUint16(2, true);
         if (opcode === OPCODES.PONG && value.byteLength >= 24) {
           const clientTimestamp = Number(view.getBigUint64(8, true));
@@ -213,10 +409,21 @@ export class WebTransportClient {
   }
 
   /**
-   * Sends an unreliable datagram to the gateway.
+   * Sends an unreliable datagram to the gateway (or WebSocket binary frame in fallback mode).
    */
   async sendDatagram(data) {
-    if (!this.connected || !this.datagramWriter) return;
+    if (!this.connected) return;
+    if (this.transportMode === "websocket") {
+      if (this.ws && this.ws.readyState === 1) {
+        try {
+          this.ws.send(data);
+        } catch (err) {
+          console.warn("Failed to send WebSocket datagram:", err);
+        }
+      }
+      return;
+    }
+    if (!this.datagramWriter) return;
     try {
       await this.datagramWriter.write(data);
     } catch (err) {
@@ -225,10 +432,21 @@ export class WebTransportClient {
   }
 
   /**
-   * Sends reliable bytes via a bidirectional stream.
+   * Sends reliable bytes via a bidirectional stream (or WebSocket binary frame in fallback mode).
    */
   async sendStream(data) {
-    if (!this.connected || !this.transport) return;
+    if (!this.connected) return;
+    if (this.transportMode === "websocket") {
+      if (this.ws && this.ws.readyState === 1) {
+        try {
+          this.ws.send(data);
+        } catch (err) {
+          console.warn("Failed to send WebSocket stream data:", err);
+        }
+      }
+      return;
+    }
+    if (!this.transport) return;
     try {
       if (!this.streamWriter) {
         const biStream = await this.transport.createBidirectionalStream();
@@ -251,8 +469,8 @@ export class WebTransportClient {
       this.lastPingSentTime = performance.now();
       // Client packet ping: Magic [0x4D, 0x4D], Opcode 0x0007 (OPCODES.PING), Payload timestamp (8 bytes)
       const pingBuf = new Uint8Array(16);
-      pingBuf[0] = 0x4d;
-      pingBuf[1] = 0x4d;
+      pingBuf[0] = MAGIC_0;
+      pingBuf[1] = MAGIC_1;
       const view = new DataView(pingBuf.buffer);
       view.setUint16(2, OPCODES.PING, true);
       view.setUint32(4, 8, true); // Payload len 8
@@ -270,7 +488,7 @@ export class WebTransportClient {
     const now = performance.now();
     const dt = (now - this.lastBytesTime) / 1000;
     if (dt >= 1.0) {
-      this.bandwidthBps = (this.bytesReceived / dt) / 1024; // KB/s
+      this.bandwidthBps = this.bytesReceived / dt / 1024; // KB/s
       this.bytesReceived = 0;
       this.lastBytesTime = now;
     }
@@ -278,12 +496,13 @@ export class WebTransportClient {
 
   notifyStatus(status, error = null) {
     if (this.onStatusCallback) {
-      this.onStatusCallback({ status, error });
+      this.onStatusCallback({ status, error, mode: this.transportMode });
     }
   }
 
   async disconnect() {
     this.connected = false;
+    this.transportMode = null;
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
@@ -294,11 +513,22 @@ export class WebTransportClient {
       } catch (_) {}
       this.datagramWriter = null;
     }
+    this.streamWriter = null;
     if (this.transport) {
       try {
         await this.transport.close();
       } catch (_) {}
       this.transport = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.onopen = null;
+        this.ws.onmessage = null;
+        this.ws.onclose = null;
+        this.ws.onerror = null;
+        this.ws.close();
+      } catch (_) {}
+      this.ws = null;
     }
     this.notifyStatus("disconnected");
   }

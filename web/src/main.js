@@ -696,14 +696,10 @@ if (typeof window !== "undefined") {
     await autoFetchCertHash();
   }
 
-  // Auto-connect if WebTransport is supported
-  if (typeof WebTransport !== "undefined") {
-    setTimeout(() => {
-      ui.btnConnect?.click();
-    }, 150);
-  } else {
-    console.warn("WebTransport is not supported in this browser environment.");
-  }
+  // Auto-connect (WebTransport with automatic WebSocket fallback)
+  setTimeout(() => {
+    ui.btnConnect?.click();
+  }, 150);
 
   let nearestTarget = null;
   let activeTradeSessionId = 0;

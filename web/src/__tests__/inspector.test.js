@@ -5,7 +5,7 @@ import { WorldObjectRenderer } from "../world.js";
 import { WorldRenderer, disposeHierarchy } from "../renderer.js";
 import { ClientWorldBridge, getOrCreateSessionToken } from "../main.js";
 import { UIController } from "../ui.js";
-import { WebTransportClient } from "../transport.js";
+import { deriveWebSocketUrl, WebTransportClient } from "../transport.js";
 import {
   OPCODES,
   INTERACTION_TYPES,
@@ -750,6 +750,111 @@ describe("WebTransportClient", () => {
     expect(client.pingInterval).toBeNull();
     expect(statusNotified.status).toBe("disconnected");
 
+    vi.unstubAllGlobals();
+  });
+
+  it("deriveWebSocketUrl converts https URLs to ws/wss based on page protocol and preserves explicit ws URLs", () => {
+    expect(deriveWebSocketUrl("https://example.com:4433", { pageProtocol: "http:" })).toBe(
+      "ws://example.com:8443"
+    );
+    expect(deriveWebSocketUrl("https://example.com:4433", { pageProtocol: "https:", wsPort: 9443 })).toBe(
+      "wss://example.com:9443"
+    );
+    expect(deriveWebSocketUrl("ws://127.0.0.1:8443")).toBe("ws://127.0.0.1:8443");
+    expect(deriveWebSocketUrl("wss://127.0.0.1:8443")).toBe("wss://127.0.0.1:8443");
+  });
+
+  it("falls back automatically to WebSocket when WebTransport handshake fails", async () => {
+    const client = new WebTransportClient();
+    const statuses = [];
+    client.onStatus((s) => statuses.push(s));
+
+    const failingTransport = {
+      ready: Promise.reject(new Error("UDP blocked")),
+      closed: Promise.resolve(),
+      close: vi.fn(),
+    };
+    vi.stubGlobal("WebTransport", vi.fn().mockImplementation(() => failingTransport));
+
+    let createdWs = null;
+    class MockWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.binaryType = "";
+        this.readyState = 0;
+        this.send = vi.fn();
+        this.close = vi.fn();
+        createdWs = this;
+        queueMicrotask(() => {
+          this.readyState = 1;
+          if (this.onopen) this.onopen();
+        });
+      }
+    }
+    vi.stubGlobal("WebSocket", MockWebSocket);
+
+    await client.connect("https://127.0.0.1:4433", "", { wsPort: 8443 });
+    expect(client.connected).toBe(true);
+    expect(client.transportMode).toBe("websocket");
+    expect(createdWs.url).toBe("ws://127.0.0.1:8443");
+    expect(createdWs.binaryType).toBe("arraybuffer");
+    expect(statuses.some((s) => s.status === "connected" && s.mode === "websocket")).toBe(true);
+
+    // sendDatagram & sendStream both route through WebSocket in fallback mode
+    const pkt1 = new Uint8Array([0x4d, 0x4d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    const pkt2 = new Uint8Array([0x4d, 0x4d, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    await client.sendDatagram(pkt1);
+    await client.sendStream(pkt2);
+    expect(createdWs.send).toHaveBeenCalledTimes(2);
+    expect(createdWs.send).toHaveBeenNthCalledWith(1, pkt1);
+    expect(createdWs.send).toHaveBeenNthCalledWith(2, pkt2);
+
+    // Coalesced multi-frame binary message slices each 0x4D4D frame
+    const received = [];
+    client.onPacket((frame) => received.push(new Uint8Array(frame)));
+    const coalesced = new Uint8Array(pkt1.length + pkt2.length);
+    coalesced.set(pkt1, 0);
+    coalesced.set(pkt2, pkt1.length);
+    createdWs.onmessage({ data: coalesced.buffer });
+    expect(received.length).toBe(2);
+    expect(received[0][2]).toBe(0x01);
+    expect(received[1][2]).toBe(0x03);
+
+    // Server close triggers disconnect status
+    createdWs.onclose({ code: 1000, reason: "" });
+    expect(client.connected).toBe(false);
+    expect(client.transportMode).toBeNull();
+    expect(statuses[statuses.length - 1].status).toBe("disconnected");
+
+    await client.disconnect();
+    vi.unstubAllGlobals();
+  });
+
+  it("connects directly via WebSocket when given an explicit ws:// URL", async () => {
+    const client = new WebTransportClient();
+    const wtSpy = vi.fn();
+    vi.stubGlobal("WebTransport", wtSpy);
+
+    class MockWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.binaryType = "";
+        this.readyState = 1;
+        this.send = vi.fn();
+        this.close = vi.fn();
+        queueMicrotask(() => {
+          if (this.onopen) this.onopen();
+        });
+      }
+    }
+    vi.stubGlobal("WebSocket", MockWebSocket);
+
+    await client.connect("ws://localhost:8443");
+    expect(wtSpy).not.toHaveBeenCalled();
+    expect(client.connected).toBe(true);
+    expect(client.transportMode).toBe("websocket");
+
+    await client.disconnect();
     vi.unstubAllGlobals();
   });
 });
