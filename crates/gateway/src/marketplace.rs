@@ -131,7 +131,8 @@ impl GatewayMarketplaceService {
             },
             Err(e) => {
                 let error_code = match &e {
-                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_) => {
+                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_)
+                    | mmo_storage::db::StorageError::UnauthorizedContainerAccess(_) => {
                         MARKET_ERROR_UNAUTHORIZED
                     }
                     _ => MARKET_ERROR_GENERIC,
@@ -175,7 +176,8 @@ impl GatewayMarketplaceService {
                 let error_code = match &e {
                     mmo_storage::db::StorageError::ListingNotFound(_) => MARKET_ERROR_NOT_FOUND,
                     mmo_storage::db::StorageError::ListingNotActive(..) => MARKET_ERROR_NOT_ACTIVE,
-                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_) => {
+                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_)
+                    | mmo_storage::db::StorageError::UnauthorizedContainerAccess(_) => {
                         MARKET_ERROR_UNAUTHORIZED
                     }
                     _ => MARKET_ERROR_GENERIC,
@@ -213,7 +215,8 @@ impl GatewayMarketplaceService {
                 let error_code = match &e {
                     mmo_storage::db::StorageError::ListingNotFound(_) => MARKET_ERROR_NOT_FOUND,
                     mmo_storage::db::StorageError::ListingNotActive(..) => MARKET_ERROR_NOT_ACTIVE,
-                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_) => {
+                    mmo_storage::db::StorageError::UnauthorizedMarketAction(_)
+                    | mmo_storage::db::StorageError::UnauthorizedContainerAccess(_) => {
                         MARKET_ERROR_UNAUTHORIZED
                     }
                     _ => MARKET_ERROR_GENERIC,

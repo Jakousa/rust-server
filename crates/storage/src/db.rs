@@ -148,6 +148,22 @@ pub fn find_first_free_slot(
     (0..capacity).find(|s| !occupied.contains(s))
 }
 
+/// Resolves the numeric character GUID for a container's `(owner_type, owner_id)`.
+///
+/// Returns the parsed character GUID for `"character"` or `"player"` owners,
+/// and `0` for non-character or non-numeric owners (e.g., `"system"`, `"guild"`, `"escrow"`).
+pub(crate) fn resolve_container_owner_guid(owner_type: &str, owner_id: &str) -> i64 {
+    if owner_type.eq_ignore_ascii_case("character") || owner_type.eq_ignore_ascii_case("player") {
+        owner_id
+            .trim()
+            .parse::<u64>()
+            .map(|id| id as i64)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 /// Macro for executing dialect-adapted transactional blocks across SQLite and PostgreSQL.
 #[macro_export]
 macro_rules! with_dialect_tx {

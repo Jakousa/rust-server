@@ -1,7 +1,8 @@
 //! Generic Asynchronous Escrow State Machine for conditional container exchanges.
 
 use crate::db::{
-    compute_free_slots, current_time_ms, current_time_secs, Database, DbBackend, StorageError,
+    compute_free_slots, current_time_ms, current_time_secs, resolve_container_owner_guid, Database,
+    DbBackend, StorageError,
 };
 use crate::models::{EscrowRecord, EscrowStatus};
 use crate::with_dialect_tx;
@@ -102,7 +103,7 @@ impl EscrowCoordinator {
         with_dialect_tx!(&self.db, |conn, is_pg| async move {
             // 1. Verify depositor and escrow containers exist, locking in ascending ID order to prevent deadlocks
             let c_lock_sql = format!(
-                "SELECT container_id, capacity FROM containers WHERE container_id = ?{}",
+                "SELECT container_id, owner_type, owner_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
             );
             let row_first = sqlx::query(&q!(&c_lock_sql))
@@ -125,16 +126,32 @@ impl EscrowCoordinator {
             }
             let esc_row = c_esc.ok_or(StorageError::ContainerNotFound(escrow_container_id))?;
             let esc_cap: i32 = esc_row.try_get("capacity")?;
+            let esc_owner_type: String = esc_row.try_get("owner_type")?;
+            let esc_owner_id: String = esc_row.try_get("owner_id")?;
+            let esc_owner_guid = resolve_container_owner_guid(&esc_owner_type, &esc_owner_id);
 
-            // 2. Fetch occupied slots in escrow container
+            // 2. Fetch occupied and reserved slots in escrow container
             let occupied_rows = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
                 .bind(escrow_container_id as i64)
                 .fetch_all(&mut *conn)
                 .await?;
-            let occupied_slots: std::collections::HashSet<u32> = occupied_rows
+            let mut occupied_slots: std::collections::HashSet<u32> = occupied_rows
                 .into_iter()
                 .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
                 .collect();
+
+            let reserved_rows = sqlx::query(&q!(
+                "SELECT slot FROM container_reservations WHERE container_id = ? AND expires_at_epoch_ms > ?"
+            ))
+            .bind(escrow_container_id as i64)
+            .bind(now_ms)
+            .fetch_all(&mut *conn)
+            .await?;
+            for r in reserved_rows {
+                if let Ok(slot) = r.try_get::<i32, _>("slot") {
+                    occupied_slots.insert(slot as u32);
+                }
+            }
 
             let free_slots = compute_free_slots(&occupied_slots, esc_cap as u32);
 
@@ -148,7 +165,7 @@ impl EscrowCoordinator {
             // 3. Move items into escrow container
             for (item_id, target_slot) in item_instance_ids.iter().zip(free_slots.iter()) {
                 let item_sql = format!(
-                    "SELECT container_id FROM items WHERE item_instance_id = ?{}",
+                    "SELECT container_id, slot FROM items WHERE item_instance_id = ?{}",
                     lock_suffix!()
                 );
                 let item_row = sqlx::query(&q!(&item_sql))
@@ -156,7 +173,7 @@ impl EscrowCoordinator {
                     .fetch_optional(&mut *conn)
                     .await?;
 
-                match item_row {
+                let item_slot: i32 = match item_row {
                     Some(r) => {
                         let cid: i64 = r.try_get("container_id")?;
                         if cid as u64 != depositor_container_id {
@@ -165,6 +182,7 @@ impl EscrowCoordinator {
                                 depositor_container_id,
                             ));
                         }
+                        r.try_get("slot")?
                     }
                     None => {
                         return Err(StorageError::ItemNotFound(
@@ -172,17 +190,44 @@ impl EscrowCoordinator {
                             depositor_container_id,
                         ));
                     }
+                };
+
+                // Reject if source item or slot has an active 2PC reservation
+                let active_res = sqlx::query(&q!(
+                    "SELECT 1 FROM container_reservations WHERE ((container_id = ? AND slot = ?) OR item_instance_id = ?) AND expires_at_epoch_ms > ?"
+                ))
+                .bind(depositor_container_id as i64)
+                .bind(item_slot)
+                .bind(item_id)
+                .bind(now_ms)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if active_res.is_some() {
+                    return Err(StorageError::SlotReserved(
+                        item_slot as u32,
+                        depositor_container_id,
+                    ));
                 }
 
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                let move_res = sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, character_guid = ?, updated_at = ? WHERE item_instance_id = ? AND container_id = ? AND slot = ?"
                 ))
                 .bind(escrow_container_id as i64)
                 .bind(*target_slot as i32)
+                .bind(esc_owner_guid)
                 .bind(now_secs)
                 .bind(item_id)
+                .bind(depositor_container_id as i64)
+                .bind(item_slot)
                 .execute(&mut *conn)
                 .await?;
+
+                if move_res.rows_affected() != 1 {
+                    return Err(StorageError::ItemNotFound(
+                        item_id.clone(),
+                        depositor_container_id,
+                    ));
+                }
             }
 
             // 4. Insert escrow record
@@ -261,36 +306,68 @@ impl EscrowCoordinator {
                 return Err(StorageError::EscrowSecretMismatch(escrow_id.to_string()));
             }
 
-            // Fetch beneficiary capacity
-            let ben_sql = format!(
-                "SELECT capacity FROM containers WHERE container_id = ?{}",
+            // Lock escrow and beneficiary containers in ascending order
+            let (first_cid, second_cid) = (esc_cid.min(ben_cid), esc_cid.max(ben_cid));
+            let c_lock_sql = format!(
+                "SELECT container_id, owner_type, owner_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
             );
-            let ben_row = sqlx::query(&q!(&ben_sql))
-                .bind(ben_cid)
+            let row_first = sqlx::query(&q!(&c_lock_sql))
+                .bind(first_cid)
                 .fetch_optional(&mut *conn)
                 .await?;
-            let ben_cap: i32 = ben_row
-                .ok_or(StorageError::ContainerNotFound(ben_cid as u64))?
-                .try_get("capacity")?;
+            let row_second = if first_cid != second_cid {
+                sqlx::query(&q!(&c_lock_sql))
+                    .bind(second_cid)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            } else {
+                None
+            };
+
+            let ben_row = if ben_cid == first_cid {
+                row_first
+            } else {
+                row_second
+            }
+            .ok_or(StorageError::ContainerNotFound(ben_cid as u64))?;
+            let ben_cap: i32 = ben_row.try_get("capacity")?;
+            let ben_owner_type: String = ben_row.try_get("owner_type")?;
+            let ben_owner_id: String = ben_row.try_get("owner_id")?;
+            let ben_owner_guid = resolve_container_owner_guid(&ben_owner_type, &ben_owner_id);
 
             let ben_occupied = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
                 .bind(ben_cid)
                 .fetch_all(&mut *conn)
                 .await?;
-            let occupied_slots: std::collections::HashSet<u32> = ben_occupied
+            let mut occupied_slots: std::collections::HashSet<u32> = ben_occupied
                 .into_iter()
                 .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
                 .collect();
 
-            let free_slots = compute_free_slots(&occupied_slots, ben_cap as u32);
-
-            let escrow_items = sqlx::query(&q!(
-                "SELECT item_instance_id FROM items WHERE container_id = ?"
+            let ben_reserved = sqlx::query(&q!(
+                "SELECT slot FROM container_reservations WHERE container_id = ? AND expires_at_epoch_ms > ?"
             ))
-            .bind(esc_cid)
+            .bind(ben_cid)
+            .bind(now_ms)
             .fetch_all(&mut *conn)
             .await?;
+            for r in ben_reserved {
+                if let Ok(slot) = r.try_get::<i32, _>("slot") {
+                    occupied_slots.insert(slot as u32);
+                }
+            }
+
+            let free_slots = compute_free_slots(&occupied_slots, ben_cap as u32);
+
+            let esc_items_sql = format!(
+                "SELECT item_instance_id, slot FROM items WHERE container_id = ? ORDER BY slot ASC{}",
+                lock_suffix!()
+            );
+            let escrow_items = sqlx::query(&q!(&esc_items_sql))
+                .bind(esc_cid)
+                .fetch_all(&mut *conn)
+                .await?;
 
             if free_slots.len() < escrow_items.len() {
                 return Err(StorageError::ContainerFull(ben_cid as u64, ben_cap as u32));
@@ -298,15 +375,37 @@ impl EscrowCoordinator {
 
             for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
                 let item_id: String = item_row.try_get("item_instance_id")?;
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                let item_slot: i32 = item_row.try_get("slot")?;
+
+                let active_res = sqlx::query(&q!(
+                    "SELECT 1 FROM container_reservations WHERE ((container_id = ? AND slot = ?) OR item_instance_id = ?) AND expires_at_epoch_ms > ?"
+                ))
+                .bind(esc_cid)
+                .bind(item_slot)
+                .bind(&item_id)
+                .bind(now_ms)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if active_res.is_some() {
+                    return Err(StorageError::SlotReserved(item_slot as u32, esc_cid as u64));
+                }
+
+                let move_res = sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, character_guid = ?, updated_at = ? WHERE item_instance_id = ? AND container_id = ? AND slot = ?"
                 ))
                 .bind(ben_cid)
                 .bind(*target_slot as i32)
+                .bind(ben_owner_guid)
                 .bind(now_secs)
                 .bind(&item_id)
+                .bind(esc_cid)
+                .bind(item_slot)
                 .execute(&mut *conn)
                 .await?;
+
+                if move_res.rows_affected() != 1 {
+                    return Err(StorageError::ItemNotFound(item_id, esc_cid as u64));
+                }
             }
 
             sqlx::query(&q!(
@@ -345,36 +444,68 @@ impl EscrowCoordinator {
                 return Ok(false);
             }
 
-            // Move items back to depositor
-            let dep_sql = format!(
-                "SELECT capacity FROM containers WHERE container_id = ?{}",
+            // Move items back to depositor (locking containers in ascending order)
+            let (first_cid, second_cid) = (esc_cid.min(dep_cid), esc_cid.max(dep_cid));
+            let c_lock_sql = format!(
+                "SELECT container_id, owner_type, owner_id, capacity FROM containers WHERE container_id = ?{}",
                 lock_suffix!()
             );
-            let dep_row = sqlx::query(&q!(&dep_sql))
-                .bind(dep_cid)
+            let row_first = sqlx::query(&q!(&c_lock_sql))
+                .bind(first_cid)
                 .fetch_optional(&mut *conn)
                 .await?;
-            let dep_cap: i32 = dep_row
-                .ok_or(StorageError::ContainerNotFound(dep_cid as u64))?
-                .try_get("capacity")?;
+            let row_second = if first_cid != second_cid {
+                sqlx::query(&q!(&c_lock_sql))
+                    .bind(second_cid)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            } else {
+                None
+            };
+
+            let dep_row = if dep_cid == first_cid {
+                row_first
+            } else {
+                row_second
+            }
+            .ok_or(StorageError::ContainerNotFound(dep_cid as u64))?;
+            let dep_cap: i32 = dep_row.try_get("capacity")?;
+            let dep_owner_type: String = dep_row.try_get("owner_type")?;
+            let dep_owner_id: String = dep_row.try_get("owner_id")?;
+            let dep_owner_guid = resolve_container_owner_guid(&dep_owner_type, &dep_owner_id);
 
             let dep_occupied = sqlx::query(&q!("SELECT slot FROM items WHERE container_id = ?"))
                 .bind(dep_cid)
                 .fetch_all(&mut *conn)
                 .await?;
-            let occupied_slots: std::collections::HashSet<u32> = dep_occupied
+            let mut occupied_slots: std::collections::HashSet<u32> = dep_occupied
                 .into_iter()
                 .filter_map(|r| r.try_get::<i32, _>("slot").ok().map(|s| s as u32))
                 .collect();
 
-            let free_slots = compute_free_slots(&occupied_slots, dep_cap as u32);
-
-            let escrow_items = sqlx::query(&q!(
-                "SELECT item_instance_id FROM items WHERE container_id = ?"
+            let dep_reserved = sqlx::query(&q!(
+                "SELECT slot FROM container_reservations WHERE container_id = ? AND expires_at_epoch_ms > ?"
             ))
-            .bind(esc_cid)
+            .bind(dep_cid)
+            .bind(now_ms)
             .fetch_all(&mut *conn)
             .await?;
+            for r in dep_reserved {
+                if let Ok(slot) = r.try_get::<i32, _>("slot") {
+                    occupied_slots.insert(slot as u32);
+                }
+            }
+
+            let free_slots = compute_free_slots(&occupied_slots, dep_cap as u32);
+
+            let esc_items_sql = format!(
+                "SELECT item_instance_id, slot FROM items WHERE container_id = ? ORDER BY slot ASC{}",
+                lock_suffix!()
+            );
+            let escrow_items = sqlx::query(&q!(&esc_items_sql))
+                .bind(esc_cid)
+                .fetch_all(&mut *conn)
+                .await?;
 
             if free_slots.len() < escrow_items.len() {
                 return Err(StorageError::ContainerFull(dep_cid as u64, dep_cap as u32));
@@ -382,15 +513,37 @@ impl EscrowCoordinator {
 
             for (item_row, target_slot) in escrow_items.iter().zip(free_slots.iter()) {
                 let item_id: String = item_row.try_get("item_instance_id")?;
-                sqlx::query(&q!(
-                    "UPDATE items SET container_id = ?, slot = ?, updated_at = ? WHERE item_instance_id = ?"
+                let item_slot: i32 = item_row.try_get("slot")?;
+
+                let active_res = sqlx::query(&q!(
+                    "SELECT 1 FROM container_reservations WHERE ((container_id = ? AND slot = ?) OR item_instance_id = ?) AND expires_at_epoch_ms > ?"
+                ))
+                .bind(esc_cid)
+                .bind(item_slot)
+                .bind(&item_id)
+                .bind(now_ms)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if active_res.is_some() {
+                    return Err(StorageError::SlotReserved(item_slot as u32, esc_cid as u64));
+                }
+
+                let move_res = sqlx::query(&q!(
+                    "UPDATE items SET container_id = ?, slot = ?, character_guid = ?, updated_at = ? WHERE item_instance_id = ? AND container_id = ? AND slot = ?"
                 ))
                 .bind(dep_cid)
                 .bind(*target_slot as i32)
+                .bind(dep_owner_guid)
                 .bind(now_secs)
                 .bind(&item_id)
+                .bind(esc_cid)
+                .bind(item_slot)
                 .execute(&mut *conn)
                 .await?;
+
+                if move_res.rows_affected() != 1 {
+                    return Err(StorageError::ItemNotFound(item_id, esc_cid as u64));
+                }
             }
 
             sqlx::query(&q!(
@@ -403,6 +556,11 @@ impl EscrowCoordinator {
 
             Ok(true)
         })
+    }
+
+    /// Cancels an active escrow and refunds all escrowed items back to the depositor.
+    pub async fn cancel_escrow(&self, escrow_id: &str) -> Result<bool, StorageError> {
+        self.refund_escrow(escrow_id).await
     }
 
     /// Background reaper: finds expired escrows in 'held' status and refunds them.
@@ -1183,5 +1341,123 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec2.status, EscrowStatus::Refunded);
+    }
+
+    #[tokio::test]
+    async fn test_escrow_rejects_reserved_items_and_syncs_owner_guid() {
+        let db = Database::connect_memory().await.unwrap();
+        let crepo = ContainerRepository::new(db.clone());
+        let char_repo = CharacterRepository::new(db.clone());
+        let escrow_coord = EscrowCoordinator::new(db.clone());
+        let tx_coord = crate::transaction_coord::TransactionCoordinator::new(db.clone());
+
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(9101)
+                    .owner_id("1001")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(9102)
+                    .owner_id("2002")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        crepo
+            .create_container(
+                &ContainerRecordBuilder::new(9103)
+                    .owner_type("system")
+                    .owner_id("escrow")
+                    .capacity(10)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let item_rel = ItemRecordBuilder::new("esc_sync_rel")
+            .character_guid(1001)
+            .container_id(9101)
+            .slot(0)
+            .build();
+        let item_can = ItemRecordBuilder::new("esc_sync_can")
+            .character_guid(1001)
+            .container_id(9101)
+            .slot(1)
+            .build();
+        char_repo.add_item(&item_rel).await.unwrap();
+        char_repo.add_item(&item_can).await.unwrap();
+
+        // 1. Active 2PC reservation blocks create_escrow
+        tx_coord
+            .prepare_transfer("tx_esc_block", 9101, 0, 9102, 0, 5000)
+            .await
+            .unwrap();
+        let err = escrow_coord
+            .create_escrow(
+                "esc_blocked",
+                9101,
+                9102,
+                9103,
+                &["esc_sync_rel".to_string()],
+                "sec",
+                60,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::SlotReserved(0, 9101)));
+        tx_coord.abort_transfer("tx_esc_block").await.unwrap();
+
+        // 2. create_escrow sets character_guid = 0 in system escrow container
+        escrow_coord
+            .create_escrow(
+                "esc_sync_1",
+                9101,
+                9102,
+                9103,
+                &["esc_sync_rel".to_string()],
+                "sec1",
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crepo.get_container_items(9103).await.unwrap()[0].character_guid,
+            0
+        );
+
+        // 3. release_escrow syncs character_guid = 2002 (beneficiary)
+        escrow_coord
+            .release_escrow("esc_sync_1", "sec1")
+            .await
+            .unwrap();
+        assert_eq!(
+            crepo.get_container_items(9102).await.unwrap()[0].character_guid,
+            2002
+        );
+
+        // 4. cancel_escrow syncs character_guid = 1001 (depositor)
+        escrow_coord
+            .create_escrow(
+                "esc_sync_2",
+                9101,
+                9102,
+                9103,
+                &["esc_sync_can".to_string()],
+                "sec2",
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(escrow_coord.cancel_escrow("esc_sync_2").await.unwrap());
+        assert_eq!(
+            crepo.get_container_items(9101).await.unwrap()[0].character_guid,
+            1001
+        );
     }
 }
