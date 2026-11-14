@@ -76,6 +76,23 @@ pub trait ComponentCodec: Send + Sync {
         &self,
         value: serde_json::Value,
     ) -> Result<Box<dyn Any + Send + Sync>, CodecError>;
+
+    /// Serializes a boxed component directly into MessagePack bytes without an intermediate JSON tree.
+    fn serialize_binary(
+        &self,
+        boxed: &(dyn Any + Send + Sync),
+        out: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
+        let val = self.serialize(boxed)?;
+        rmp_serde::encode::write_named(out, &val)?;
+        Ok(())
+    }
+
+    /// Deserializes MessagePack bytes directly into a type-erased component box.
+    fn deserialize_binary(&self, bytes: &[u8]) -> Result<Box<dyn Any + Send + Sync>, CodecError> {
+        let val: serde_json::Value = rmp_serde::from_slice(bytes)?;
+        self.deserialize(val)
+    }
 }
 
 /// Generic implementation of [`ComponentCodec`] for any serializable component.
@@ -123,6 +140,23 @@ impl<T: 'static + Send + Sync + Serialize + DeserializeOwned> ComponentCodec
                 type_name: self.name,
                 source,
             })?;
+        Ok(Box::new(concrete))
+    }
+
+    fn serialize_binary(
+        &self,
+        boxed: &(dyn Any + Send + Sync),
+        out: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
+        let concrete = boxed
+            .downcast_ref::<T>()
+            .ok_or(CodecError::DowncastFailed(self.name))?;
+        rmp_serde::encode::write_named(out, concrete)?;
+        Ok(())
+    }
+
+    fn deserialize_binary(&self, bytes: &[u8]) -> Result<Box<dyn Any + Send + Sync>, CodecError> {
+        let concrete: T = rmp_serde::from_slice(bytes)?;
         Ok(Box::new(concrete))
     }
 }
@@ -204,11 +238,47 @@ impl ComponentCodecRegistry {
         Ok(restored)
     }
 
-    /// Serializes all registered components from a `ComponentStore` into an opaque MessagePack binary byte vector.
+    /// Serializes all registered components from a `ComponentStore` into an opaque MessagePack binary byte vector
+    /// without allocating an intermediate `serde_json::Value` tree.
     pub fn serialize_all_binary(&self, store: &ComponentStore) -> Result<Vec<u8>, CodecError> {
-        let json_val = self.serialize_all(store);
-        let bytes = rmp_serde::to_vec_named(&json_val)?;
-        Ok(bytes)
+        use serde::ser::{SerializeMap, Serializer};
+
+        struct MsgPackBytes<'a>(&'a [u8]);
+        impl serde::Serialize for MsgPackBytes<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+
+        let mut comp_buf = Vec::new();
+        let mut entries: Vec<(&'static str, std::ops::Range<usize>)> =
+            Vec::with_capacity(store.len());
+
+        for (type_id, boxed) in store.iter() {
+            if let Some(codec) = self.by_type_id.get(type_id) {
+                let start = comp_buf.len();
+                match codec.serialize_binary(boxed.as_ref(), &mut comp_buf) {
+                    Ok(()) => entries.push((codec.type_name(), start..comp_buf.len())),
+                    Err(err) => {
+                        comp_buf.truncate(start);
+                        tracing::warn!(
+                            component = codec.type_name(),
+                            error = %err,
+                            "Failed to serialize component to binary"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(comp_buf.len() + entries.len() * 24 + 8);
+        let mut ser = rmp_serde::Serializer::new(&mut out).with_struct_map();
+        let mut map = ser.serialize_map(Some(entries.len()))?;
+        for (name, range) in entries {
+            map.serialize_entry(name, &MsgPackBytes(&comp_buf[range]))?;
+        }
+        map.end()?;
+        Ok(out)
     }
 
     /// Maximum allowed binary state blob size (16 MB) to prevent out-of-memory attacks on malformed input.
@@ -230,8 +300,177 @@ impl ComponentCodecRegistry {
         if blob.is_empty() {
             return Ok(0);
         }
-        let val: serde_json::Value = rmp_serde::from_slice(blob)?;
-        self.deserialize_into(&val, store)
+
+        enum ComponentBinaryValue<'de> {
+            Bytes(&'de [u8]),
+            OwnedBytes(Vec<u8>),
+            LegacyJson(serde_json::Value),
+        }
+
+        struct ComponentBinaryValueSeed;
+
+        impl<'de> serde::de::DeserializeSeed<'de> for ComponentBinaryValueSeed {
+            type Value = ComponentBinaryValue<'de>;
+
+            fn deserialize<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                struct ValueVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+                    type Value = ComponentBinaryValue<'de>;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("component binary bytes or legacy JSON-compatible value")
+                    }
+
+                    fn visit_borrowed_bytes<E: serde::de::Error>(
+                        self,
+                        v: &'de [u8],
+                    ) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::Bytes(v))
+                    }
+
+                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::OwnedBytes(v.to_vec()))
+                    }
+
+                    fn visit_byte_buf<E: serde::de::Error>(
+                        self,
+                        v: Vec<u8>,
+                    ) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::OwnedBytes(v))
+                    }
+
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        serde::Deserialize::deserialize(
+                            serde::de::value::MapAccessDeserializer::new(map),
+                        )
+                        .map(ComponentBinaryValue::LegacyJson)
+                    }
+
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        serde::Deserialize::deserialize(
+                            serde::de::value::SeqAccessDeserializer::new(seq),
+                        )
+                        .map(ComponentBinaryValue::LegacyJson)
+                    }
+
+                    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::Bool(v)))
+                    }
+
+                    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::Number(
+                            v.into(),
+                        )))
+                    }
+
+                    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::Number(
+                            v.into(),
+                        )))
+                    }
+
+                    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                        let num = serde_json::Number::from_f64(v).ok_or_else(|| {
+                            serde::de::Error::custom("non-finite float in component blob")
+                        })?;
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::Number(
+                            num,
+                        )))
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::String(
+                            v.to_string(),
+                        )))
+                    }
+
+                    fn visit_string<E: serde::de::Error>(
+                        self,
+                        v: String,
+                    ) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::String(
+                            v,
+                        )))
+                    }
+
+                    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                        Ok(ComponentBinaryValue::LegacyJson(serde_json::Value::Null))
+                    }
+                }
+
+                deserializer.deserialize_any(ValueVisitor)
+            }
+        }
+
+        struct ComponentMapVisitor<'a> {
+            registry: &'a ComponentCodecRegistry,
+            store: &'a mut ComponentStore,
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ComponentMapVisitor<'_> {
+            type Value = Result<usize, CodecError>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("MessagePack map of component name to component payload")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut restored = 0usize;
+                while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if let Some(codec) = self.registry.by_name.get(name.as_ref()) {
+                        let val = map.next_value_seed(ComponentBinaryValueSeed)?;
+                        let res = match val {
+                            ComponentBinaryValue::Bytes(bytes) => codec.deserialize_binary(bytes),
+                            ComponentBinaryValue::OwnedBytes(bytes) => {
+                                codec.deserialize_binary(&bytes)
+                            }
+                            ComponentBinaryValue::LegacyJson(json_val) => {
+                                codec.deserialize(json_val)
+                            }
+                        };
+                        match res {
+                            Ok(boxed) => {
+                                self.store.insert_raw(codec.component_type_id(), boxed);
+                                restored += 1;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    component = name.as_ref(),
+                                    error = %err,
+                                    "Failed to deserialize component from binary"
+                                );
+                                return Ok(Err(err));
+                            }
+                        }
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(Ok(restored))
+            }
+        }
+
+        let mut de = rmp_serde::Deserializer::from_read_ref(blob);
+        serde::Deserializer::deserialize_map(
+            &mut de,
+            ComponentMapVisitor {
+                registry: self,
+                store,
+            },
+        )?
     }
 }
 
@@ -655,5 +894,89 @@ mod tests {
         assert_eq!(queue.len(), 1);
         queue.clear_type::<MockHealEvent>();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_codec_registry_binary_direct_roundtrip_and_legacy_compat() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct MockCooldowns {
+            ability_cooldowns: HashMap<u32, f32>,
+            gcd: f32,
+        }
+
+        let mut registry = ComponentCodecRegistry::new();
+        registry.register::<MockHealth>("mock_health");
+        registry.register::<MockCooldowns>("mock_cooldowns");
+
+        let mut store = ComponentStore::new();
+        store.add_component(MockHealth {
+            hp: 42,
+            max_hp: 100,
+        });
+        let mut cooldowns = HashMap::new();
+        cooldowns.insert(101, 2.5);
+        cooldowns.insert(202, 0.75);
+        store.add_component(MockCooldowns {
+            ability_cooldowns: cooldowns.clone(),
+            gcd: 1.5,
+        });
+
+        let blob = registry.serialize_all_binary(&store).unwrap();
+        assert!(!blob.is_empty());
+
+        let mut restored_store = ComponentStore::new();
+        let restored = registry
+            .deserialize_binary_into(&blob, &mut restored_store)
+            .unwrap();
+        assert_eq!(restored, 2);
+        assert_eq!(
+            restored_store.get_component::<MockHealth>(),
+            Some(&MockHealth {
+                hp: 42,
+                max_hp: 100,
+            })
+        );
+        assert_eq!(
+            restored_store.get_component::<MockCooldowns>(),
+            Some(&MockCooldowns {
+                ability_cooldowns: cooldowns,
+                gcd: 1.5,
+            })
+        );
+
+        // Verify empty store roundtrip
+        let empty_blob = registry
+            .serialize_all_binary(&ComponentStore::new())
+            .unwrap();
+        let mut empty_restored = ComponentStore::new();
+        assert_eq!(
+            registry
+                .deserialize_binary_into(&empty_blob, &mut empty_restored)
+                .unwrap(),
+            0
+        );
+
+        // Verify backward compatibility with legacy serde_json::Value-encoded MessagePack blobs
+        let mut legacy_store = ComponentStore::new();
+        legacy_store.add_component(MockHealth {
+            hp: 88,
+            max_hp: 120,
+        });
+        let legacy_json = registry.serialize_all(&legacy_store);
+        let legacy_blob = rmp_serde::to_vec_named(&legacy_json).unwrap();
+        let mut legacy_restored = ComponentStore::new();
+        assert_eq!(
+            registry
+                .deserialize_binary_into(&legacy_blob, &mut legacy_restored)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            legacy_restored.get_component::<MockHealth>(),
+            Some(&MockHealth {
+                hp: 88,
+                max_hp: 120,
+            })
+        );
     }
 }

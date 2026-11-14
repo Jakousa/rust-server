@@ -84,21 +84,26 @@ pub fn query_sphere_targets(
     radius: f32,
     max_targets: usize,
 ) -> Vec<(Guid, f32)> {
+    if max_targets == 0 || radius < 0.0 || radius.is_nan() {
+        return Vec::new();
+    }
     let center_coords = (center.x, center.y, center.z);
-    let nearby = octree.query_radius_with_pos(center_coords, radius);
+    let mut nearby = Vec::new();
+    octree.query_radius_with_dist_sq_into(center_coords, radius, &mut nearby);
 
-    let mut scored: Vec<(Guid, f32)> = nearby
+    if nearby.len() > max_targets {
+        nearby.select_nth_unstable_by(max_targets, |a, b| {
+            a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        nearby.truncate(max_targets);
+    }
+
+    // Sort surviving results by ascending squared distance, computing sqrt only on final survivors
+    nearby.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    nearby
         .into_iter()
-        .map(|(guid, pos)| {
-            let dist = center.distance(&pos.into());
-            (guid, dist)
-        })
-        .collect();
-
-    // Sort by ascending distance deterministically
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(max_targets);
-    scored
+        .map(|(guid, _, dist_sq)| (guid, dist_sq.sqrt()))
+        .collect()
 }
 
 /// Candidate entity for spatial target selection (local entity or ghost replica).
@@ -139,21 +144,34 @@ pub fn gather_sphere_candidates(
     max_targets: usize,
     require_alive: bool,
 ) -> Vec<SpatialTargetCandidate> {
+    if max_targets == 0 || radius < 0.0 || radius.is_nan() {
+        return Vec::new();
+    }
+    let radius_sq = radius * radius;
     let mut scored: Vec<(&SpatialTargetCandidate, f32)> = candidates
         .iter()
         .filter(|c| !require_alive || c.is_alive)
         .filter_map(|c| {
-            let dist = center.distance(&c.position);
-            if dist <= radius {
-                Some((c, dist))
+            let dx = c.position.x - center.x;
+            let dy = c.position.y - center.y;
+            let dz = c.position.z - center.z;
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            if dist_sq <= radius_sq {
+                Some((c, dist_sq))
             } else {
                 None
             }
         })
         .collect();
 
+    if scored.len() > max_targets {
+        scored.select_nth_unstable_by(max_targets, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(max_targets);
+    }
+
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(max_targets);
     scored.into_iter().map(|(c, _)| c.clone()).collect()
 }
 

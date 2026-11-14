@@ -18,6 +18,7 @@ new_key_type! {
 #[derive(Default)]
 pub struct ComponentStore {
     components: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    revision: u64,
 }
 
 impl ComponentStore {
@@ -25,13 +26,21 @@ impl ComponentStore {
     pub fn new() -> Self {
         Self {
             components: HashMap::new(),
+            revision: 0,
         }
+    }
+
+    /// Returns the monotonic mutation revision counter for attached components.
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Attaches a component to the store. Replaces any existing component of the same type.
     pub fn add_component<T: 'static + Send + Sync>(&mut self, component: T) {
         self.components
             .insert(TypeId::of::<T>(), Box::new(component));
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Retrieves an immutable reference to the component of type `T`, if present.
@@ -43,16 +52,22 @@ impl ComponentStore {
 
     /// Retrieves a mutable reference to the component of type `T`, if present.
     pub fn get_component_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.components
+        let comp = self
+            .components
             .get_mut(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_mut::<T>())
+            .and_then(|boxed| boxed.downcast_mut::<T>())?;
+        self.revision = self.revision.wrapping_add(1);
+        Some(comp)
     }
 
     /// Removes and returns the component of type `T`, if present.
     pub fn remove_component<T: 'static>(&mut self) -> Option<Box<T>> {
-        self.components
+        let removed = self
+            .components
             .remove(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .and_then(|boxed| boxed.downcast::<T>().ok())?;
+        self.revision = self.revision.wrapping_add(1);
+        Some(removed)
     }
 
     /// Returns `true` if a component of type `T` exists in the store.
@@ -78,11 +93,15 @@ impl ComponentStore {
     /// Inserts a type-erased component box with the specified `TypeId`.
     pub fn insert_raw(&mut self, type_id: TypeId, component: Box<dyn Any + Send + Sync>) {
         self.components.insert(type_id, component);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Clears all attached components.
     pub fn clear(&mut self) {
-        self.components.clear();
+        if !self.components.is_empty() {
+            self.components.clear();
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 }
 

@@ -620,6 +620,103 @@ impl Octree {
         leaves
     }
 
+    #[inline]
+    fn is_near_bounds_faces(bounds: &BoundingBox3D, pos: (f32, f32, f32), margin: f32) -> bool {
+        (pos.0 - bounds.min.0).abs() <= margin
+            || (bounds.max.0 - pos.0).abs() <= margin
+            || (pos.1 - bounds.min.1).abs() <= margin
+            || (bounds.max.1 - pos.1).abs() <= margin
+            || (pos.2 - bounds.min.2).abs() <= margin
+            || (bounds.max.2 - pos.2).abs() <= margin
+    }
+
+    fn has_other_leaf_intersecting(
+        &self,
+        aabb: &BoundingBox3D,
+        exclude_bounds: &BoundingBox3D,
+    ) -> bool {
+        if !self.bounds.intersects(aabb) {
+            return false;
+        }
+        match &self.node {
+            OctreeNode::Leaf { .. } => self.bounds != *exclude_bounds,
+            OctreeNode::Branch { children } => children
+                .iter()
+                .any(|child| child.has_other_leaf_intersecting(aabb, exclude_bounds)),
+        }
+    }
+
+    /// Allocation-free check returning `true` if `pos` has at least one neighboring leaf octant
+    /// within `margin`.
+    pub fn has_boundary_neighbors(&self, pos: (f32, f32, f32), margin: f32) -> bool {
+        if margin <= 0.0 || self.is_leaf() {
+            return false;
+        }
+        let Some(current_leaf) = self.find_leaf(pos) else {
+            return false;
+        };
+        let b = &current_leaf.bounds;
+        let near_boundary = (pos.0 - b.min.0) <= margin
+            || (b.max.0 - pos.0) <= margin
+            || (pos.1 - b.min.1) <= margin
+            || (b.max.1 - pos.1) <= margin
+            || (pos.2 - b.min.2) <= margin
+            || (b.max.2 - pos.2) <= margin;
+        if !near_boundary {
+            return false;
+        }
+        let search_box = BoundingBox3D::new(
+            (pos.0 - margin, pos.1 - margin, pos.2 - margin),
+            (pos.0 + margin, pos.1 + margin, pos.2 + margin),
+        );
+        self.has_other_leaf_intersecting(&search_box, b)
+    }
+
+    /// Collects GUIDs of all entities in the octree located within `margin` of either the
+    /// outer domain boundary or an internal subdivided octant boundary, appending into `out`.
+    pub fn collect_boundary_entities(&self, margin: f32, out: &mut Vec<Guid>) {
+        if margin <= 0.0 || self.count == 0 {
+            return;
+        }
+        self.collect_boundary_entities_internal(self, &self.bounds, margin, out);
+    }
+
+    fn collect_boundary_entities_internal(
+        &self,
+        root: &Octree,
+        root_bounds: &BoundingBox3D,
+        margin: f32,
+        out: &mut Vec<Guid>,
+    ) {
+        if self.count == 0 {
+            return;
+        }
+        match &self.node {
+            OctreeNode::Leaf { entities } => {
+                let is_root_leaf = self.bounds == *root_bounds;
+                for &(guid, pos) in entities {
+                    if Self::is_near_bounds_faces(root_bounds, pos, margin) {
+                        out.push(guid);
+                    } else if !is_root_leaf && Self::is_near_bounds_faces(&self.bounds, pos, margin)
+                    {
+                        let search_box = BoundingBox3D::new(
+                            (pos.0 - margin, pos.1 - margin, pos.2 - margin),
+                            (pos.0 + margin, pos.1 + margin, pos.2 + margin),
+                        );
+                        if root.has_other_leaf_intersecting(&search_box, &self.bounds) {
+                            out.push(guid);
+                        }
+                    }
+                }
+            }
+            OctreeNode::Branch { children } => {
+                for child in children.iter() {
+                    child.collect_boundary_entities_internal(root, root_bounds, margin, out);
+                }
+            }
+        }
+    }
+
     /// Identifies all neighboring leaf octants that share a boundary face or edge within `margin`
     /// of an entity positioned at `pos`.
     pub fn find_boundary_neighbors(&self, pos: (f32, f32, f32), margin: f32) -> Vec<BoundingBox3D> {

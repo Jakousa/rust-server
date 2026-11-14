@@ -56,10 +56,20 @@ pub struct TickSimulation {
     pub container_transfer_receiver: tokio::sync::mpsc::Receiver<ContainerTransferNotification>,
     pub snapshot_sender: Option<tokio::sync::mpsc::Sender<crate::snapshotter::SnapshotPayload>>,
     pub snapshot_interval_ticks: u64,
+    last_snapshot_state: HashMap<Guid, SnapshotDigest>,
     pub history: crate::history::SpatialHistoryBuffer,
     pub script_reloader: Option<Arc<dyn mmo_core::script::ScriptReloadable>>,
     pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
     pub default_spawn_position: (f32, f32, f32),
+}
+
+/// Lightweight state digest used to skip re-serializing unchanged entities during periodic snapshots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SnapshotDigest {
+    position: (f32, f32, f32),
+    rotation: f32,
+    state_flags: u32,
+    component_revision: u64,
 }
 
 /// Ingress packet queued from a gateway client session, drained at tick boundaries.
@@ -147,7 +157,7 @@ impl TickSimulation {
         codecs.register::<mmo_core::action::CooldownTracker>("cooldown_tracker");
 
         let tick_systems: Vec<Box<dyn mmo_core::TickSystem>> = vec![
-            Box::new(mmo_core::ActionTickSystem),
+            Box::new(mmo_core::ActionTickSystem::new()),
             Box::new(mmo_core::AttributeTickSystem),
             Box::new(mmo_core::action::ActionCooldownSystem),
         ];
@@ -201,6 +211,7 @@ impl TickSimulation {
             container_transfer_receiver,
             snapshot_sender: None,
             snapshot_interval_ticks: 20,
+            last_snapshot_state: HashMap::new(),
             history: crate::history::SpatialHistoryBuffer::default(),
             script_reloader: None,
             combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
@@ -952,6 +963,7 @@ impl TickSimulation {
         self.migrating_leases.remove(&guid);
         self.last_migration_ticks.remove(&guid);
         self.session_epochs.remove(&guid);
+        self.last_snapshot_state.remove(&guid);
         self.tombstoned_entities.insert(guid, self.current_time);
         self.aoi.unregister_by_guid(guid);
         self.sectors.clear_rate_limit(guid);
@@ -1290,40 +1302,60 @@ impl TickSimulation {
             .update_world_object_observers(&self.entity_store, &self.sectors);
         self.pending_broadcast_jobs.append(&mut world_obj_jobs);
 
-        // 3.5. Periodic asynchronous write-behind snapshot dispatch
+        // 3.5. Periodic asynchronous write-behind snapshot dispatch (staggered across ticks + dirty-filtered)
         if let Some(ref sender) = self.snapshot_sender {
-            if self
-                .tick_counter
-                .is_multiple_of(self.snapshot_interval_ticks)
-            {
-                let now_sec = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+            let interval = self.snapshot_interval_ticks.max(1);
+            let target_bucket = self.tick_counter % interval;
+            let mut now_sec_opt: Option<u64> = None;
 
-                for (_key, entity) in self.entity_store.iter() {
-                    // Skip entities holding active migration leases
-                    if self.migrating_leases.contains_key(&entity.guid) {
-                        continue;
+            for (_key, entity) in self.entity_store.iter() {
+                // Stagger serialization evenly across `interval` ticks to prevent 1Hz spikes
+                if entity.guid.raw() % interval != target_bucket {
+                    continue;
+                }
+
+                // Skip entities holding active migration leases
+                if self.migrating_leases.contains_key(&entity.guid) {
+                    continue;
+                }
+
+                let digest = SnapshotDigest {
+                    position: entity.position,
+                    rotation: entity.rotation,
+                    state_flags: entity.state_flags,
+                    component_revision: entity.components.revision(),
+                };
+                if self.last_snapshot_state.get(&entity.guid) == Some(&digest) {
+                    continue;
+                }
+
+                let now_sec = *now_sec_opt.get_or_insert_with(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                });
+
+                let attributes = self.codecs.serialize_all(&entity.components);
+                let state_blob = self.codecs.serialize_all_binary(&entity.components).ok();
+                let payload = crate::snapshotter::SnapshotPayload {
+                    guid: entity.guid,
+                    position: entity.position,
+                    rotation: entity.rotation,
+                    attributes,
+                    state_blob,
+                    version: self.tick_counter,
+                    timestamp: now_sec,
+                };
+
+                match sender.try_send(payload) {
+                    Ok(()) => {
+                        self.last_snapshot_state.insert(entity.guid, digest);
                     }
-
-                    let attributes = self.codecs.serialize_all(&entity.components);
-                    let state_blob = self.codecs.serialize_all_binary(&entity.components).ok();
-                    let payload = crate::snapshotter::SnapshotPayload {
-                        guid: entity.guid,
-                        position: entity.position,
-                        rotation: entity.rotation,
-                        attributes,
-                        state_blob,
-                        version: self.tick_counter,
-                        timestamp: now_sec,
-                    };
-
-                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                        sender.try_send(payload)
-                    {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         metrics::counter!("mmo_node_snapshot_dropped_channel_full").increment(1);
                     }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                 }
             }
         }

@@ -4,6 +4,7 @@
 //! entity visibility deltas (`entered`, `updated`, `exited`), performs
 //! dynamic density-based radius throttling, and produces binary broadcast packets.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -123,13 +124,27 @@ pub struct ObserverTickSnapshot {
     pub states: HashMap<Guid, CachedEntityState>,
 }
 
+/// Per-tick differential record stored in [`BaselineTracker::history`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickDelta {
+    pub tick: u64,
+    pub upserts: Vec<(Guid, CachedEntityState)>,
+    pub removals: Vec<Guid>,
+    pub full_override: Option<HashMap<Guid, CachedEntityState>>,
+}
+
 /// Baseline tracking state for delta compression.
+///
+/// Maintains a materialized base snapshot at `history.front().tick` and stores
+/// only per-tick deltas for subsequent ticks, avoiding O(N) `HashMap` clones per tick.
 #[derive(Debug, Clone)]
 pub struct BaselineTracker {
     /// Confirmed baseline tick acknowledged by the client.
     pub confirmed_baseline_tick: Option<u64>,
-    /// Bounded ring buffer of recent tick snapshots sent to the client.
-    pub history: VecDeque<ObserverTickSnapshot>,
+    /// Materialized state at `history.front().tick`.
+    base_snapshot: Option<(u64, HashMap<Guid, CachedEntityState>)>,
+    /// Bounded ring buffer of recent tick deltas sent to the client.
+    pub history: VecDeque<TickDelta>,
     /// Maximum history depth before oldest snapshots are dropped.
     pub max_history_depth: usize,
 }
@@ -139,23 +154,150 @@ impl BaselineTracker {
         let capacity = max_depth.clamp(10, 120);
         Self {
             confirmed_baseline_tick: None,
+            base_snapshot: None,
             history: VecDeque::with_capacity(capacity),
             max_history_depth: capacity,
         }
     }
 
-    /// Records a new snapshot for `tick`. If history exceeds `max_history_depth`, drops the oldest.
-    pub fn record_snapshot(&mut self, tick: u64, states: HashMap<Guid, CachedEntityState>) {
-        if self.history.len() >= self.max_history_depth {
-            self.history.pop_front();
-        }
-        self.history
-            .push_back(ObserverTickSnapshot { tick, states });
+    /// Returns true if no tick history is currently recorded.
+    pub fn is_empty(&self) -> bool {
+        self.history.is_empty()
     }
 
-    /// Finds the snapshot for `tick`, if present.
-    pub fn get_snapshot(&self, tick: u64) -> Option<&ObserverTickSnapshot> {
-        self.history.iter().find(|s| s.tick == tick)
+    /// Pops the oldest entry and advances `base_snapshot` to the new front tick.
+    fn pop_front_and_advance_base(&mut self) {
+        if self.history.pop_front().is_none() {
+            return;
+        }
+        if let Some(next_front) = self.history.front_mut() {
+            let next_tick = next_front.tick;
+            if let Some(override_map) = next_front.full_override.take() {
+                self.base_snapshot = Some((next_tick, override_map));
+            } else if let Some((base_tick, base_map)) = &mut self.base_snapshot {
+                *base_tick = next_tick;
+                for guid in next_front.removals.drain(..) {
+                    base_map.remove(&guid);
+                }
+                for (guid, state) in next_front.upserts.drain(..) {
+                    base_map.insert(guid, state);
+                }
+            }
+        } else {
+            self.base_snapshot = None;
+        }
+    }
+
+    /// Records a full snapshot for `tick`. If history exceeds `max_history_depth`, drops the oldest.
+    pub fn record_snapshot(&mut self, tick: u64, states: HashMap<Guid, CachedEntityState>) {
+        if self.history.is_empty() {
+            self.base_snapshot = Some((tick, states));
+            self.history.push_back(TickDelta {
+                tick,
+                upserts: Vec::new(),
+                removals: Vec::new(),
+                full_override: None,
+            });
+            return;
+        }
+        if self.history.len() >= self.max_history_depth {
+            self.pop_front_and_advance_base();
+        }
+        if self.history.is_empty() {
+            self.base_snapshot = Some((tick, states));
+            self.history.push_back(TickDelta {
+                tick,
+                upserts: Vec::new(),
+                removals: Vec::new(),
+                full_override: None,
+            });
+        } else {
+            self.history.push_back(TickDelta {
+                tick,
+                upserts: Vec::new(),
+                removals: Vec::new(),
+                full_override: Some(states),
+            });
+        }
+    }
+
+    /// Records an incremental delta for `tick` without cloning unchanged entity states.
+    pub fn record_delta(
+        &mut self,
+        tick: u64,
+        upserts: Vec<(Guid, CachedEntityState)>,
+        removals: Vec<Guid>,
+    ) {
+        if self.history.is_empty() {
+            let mut map = HashMap::with_capacity(upserts.len());
+            for (guid, state) in upserts {
+                map.insert(guid, state);
+            }
+            for guid in removals {
+                map.remove(&guid);
+            }
+            self.base_snapshot = Some((tick, map));
+            self.history.push_back(TickDelta {
+                tick,
+                upserts: Vec::new(),
+                removals: Vec::new(),
+                full_override: None,
+            });
+            return;
+        }
+        if self.history.len() >= self.max_history_depth {
+            self.pop_front_and_advance_base();
+        }
+        if self.history.is_empty() {
+            let mut map = HashMap::with_capacity(upserts.len());
+            for (guid, state) in upserts {
+                map.insert(guid, state);
+            }
+            for guid in removals {
+                map.remove(&guid);
+            }
+            self.base_snapshot = Some((tick, map));
+            self.history.push_back(TickDelta {
+                tick,
+                upserts: Vec::new(),
+                removals: Vec::new(),
+                full_override: None,
+            });
+        } else {
+            self.history.push_back(TickDelta {
+                tick,
+                upserts,
+                removals,
+                full_override: None,
+            });
+        }
+    }
+
+    /// Returns the reconstructed snapshot for `tick`, borrowing directly when `tick` is the base.
+    pub fn get_snapshot(&self, tick: u64) -> Option<Cow<'_, HashMap<Guid, CachedEntityState>>> {
+        let (base_tick, base_map) = self.base_snapshot.as_ref()?;
+        if tick == *base_tick {
+            return Some(Cow::Borrowed(base_map));
+        }
+        if tick < *base_tick {
+            return None;
+        }
+        let target_idx = self.history.iter().position(|d| d.tick == tick)?;
+        let mut map: Option<HashMap<Guid, CachedEntityState>> = None;
+        for entry in self.history.iter().skip(1).take(target_idx) {
+            if let Some(ref full) = entry.full_override {
+                map = Some(full.clone());
+            } else {
+                let m = map.get_or_insert_with(|| base_map.clone());
+                for guid in &entry.removals {
+                    m.remove(guid);
+                }
+                for (guid, state) in &entry.upserts {
+                    m.insert(*guid, state.clone());
+                }
+            }
+        }
+        Some(Cow::Owned(map.unwrap_or_else(|| base_map.clone())))
     }
 
     /// Processes an incoming ACK from the client.
@@ -176,7 +318,7 @@ impl BaselineTracker {
         // Prune history older than the confirmed baseline tick
         while let Some(front) = self.history.front() {
             if front.tick < new_base {
-                self.history.pop_front();
+                self.pop_front_and_advance_base();
             } else {
                 break;
             }
@@ -244,8 +386,12 @@ pub struct ObserverState {
     pub observed_entities: HashMap<Guid, CachedEntityState>,
     pub baseline_tracker: BaselineTracker,
     pub observed_sectors: HashSet<SectorCoord3D>,
+    pub last_center_sector: Option<SectorCoord3D>,
+    pub last_view_radius_sectors: i32,
+    pub cached_visible_sectors: HashSet<SectorCoord3D>,
     pub known_world_objects: HashMap<Guid, u64>,
     pub pending_world_objects_egress: VecDeque<(Guid, SectorCoord3D, f32)>,
+    pub egress_dirty: bool,
 }
 
 impl ObserverState {
@@ -261,8 +407,12 @@ impl ObserverState {
             observed_entities: HashMap::new(),
             baseline_tracker: BaselineTracker::new(depth),
             observed_sectors: HashSet::new(),
+            last_center_sector: None,
+            last_view_radius_sectors: -1,
+            cached_visible_sectors: HashSet::new(),
             known_world_objects: HashMap::new(),
             pending_world_objects_egress: VecDeque::new(),
+            egress_dirty: false,
         }
     }
 
@@ -399,6 +549,7 @@ pub struct AoiManager {
     scratch_visible_guids: HashSet<Guid>,
     scratch_session_ids: Vec<u64>,
     scratch_exited_guids: Vec<Guid>,
+    scratch_baseline_upserts: Vec<(Guid, CachedEntityState)>,
 }
 
 impl Default for AoiManager {
@@ -418,6 +569,7 @@ impl AoiManager {
             scratch_visible_guids: HashSet::with_capacity(512),
             scratch_session_ids: Vec::with_capacity(64),
             scratch_exited_guids: Vec::with_capacity(128),
+            scratch_baseline_upserts: Vec::with_capacity(128),
         }
     }
 
@@ -643,6 +795,8 @@ impl AoiManager {
                 };
 
                 let mut batch_deltas = Vec::new();
+                self.scratch_baseline_upserts.clear();
+                let tracker_was_empty = observer.baseline_tracker.is_empty();
 
                 for &(visible_guid, pos, _) in &self.scratch_query {
                     let ent = match entity_store.get_by_guid(visible_guid) {
@@ -659,8 +813,9 @@ impl AoiManager {
 
                     let mut delta_entry = None;
 
-                    if let Some(base_state) =
-                        baseline_snapshot.and_then(|s| s.states.get(&visible_guid))
+                    if let Some(base_state) = baseline_snapshot
+                        .as_ref()
+                        .and_then(|s| s.get(&visible_guid))
                     {
                         let dx = pos.0 - base_state.position.0;
                         let dy = pos.1 - base_state.position.1;
@@ -805,19 +960,21 @@ impl AoiManager {
 
                     if let Some(entry) = delta_entry {
                         batch_deltas.push(entry);
-                        observer.observed_entities.insert(
-                            visible_guid,
-                            CachedEntityState {
-                                position: pos,
-                                velocity,
-                                yaw,
-                                health,
-                                max_health,
-                                state_flags,
-                                last_sent_tick: current_tick,
-                                attributes: Arc::from(attrs),
-                            },
-                        );
+                        let cached = CachedEntityState {
+                            position: pos,
+                            velocity,
+                            yaw,
+                            health,
+                            max_health,
+                            state_flags,
+                            last_sent_tick: current_tick,
+                            attributes: Arc::from(attrs),
+                        };
+                        if !tracker_was_empty {
+                            self.scratch_baseline_upserts
+                                .push((visible_guid, cached.clone()));
+                        }
+                        observer.observed_entities.insert(visible_guid, cached);
                     }
                 }
 
@@ -830,10 +987,22 @@ impl AoiManager {
                     }));
                 }
 
-                // Record tick snapshot into history buffer
-                observer
-                    .baseline_tracker
-                    .record_snapshot(current_tick, observer.observed_entities.clone());
+                // Record per-tick delta (or seed full state once when history starts empty)
+                if tracker_was_empty {
+                    observer
+                        .baseline_tracker
+                        .record_snapshot(current_tick, observer.observed_entities.clone());
+                } else {
+                    let upserts = std::mem::take(&mut self.scratch_baseline_upserts);
+                    let removals = if self.scratch_exited_guids.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.scratch_exited_guids.clone()
+                    };
+                    observer
+                        .baseline_tracker
+                        .record_delta(current_tick, upserts, removals);
+                }
             } else {
                 // === LEGACY UNCOMPRESSED MODE ===
                 for &exited_guid in &self.scratch_exited_guids {
@@ -964,73 +1133,101 @@ impl AoiManager {
                     None => continue,
                 };
 
-            let current_visible_sectors =
-                compute_visible_sectors(observer_pos, observer.effective_radius);
+            let center_sector = SectorCoord3D::from_world_pos(observer_pos);
+            let view_radius_sectors = if observer.effective_radius <= 0.0 {
+                0
+            } else {
+                (observer.effective_radius / mmo_core::world::SECTOR_SIZE).ceil() as i32
+            };
             let mut packets = Vec::new();
 
-            // 1. Sector exits: prune egress queue and despawn objects
-            let mut exited_sectors = Vec::new();
-            for sector in &observer.observed_sectors {
-                if !current_visible_sectors.contains(sector) {
-                    exited_sectors.push(*sector);
-                }
-            }
+            let needs_sector_update = observer.last_center_sector != Some(center_sector)
+                || observer.last_view_radius_sectors != view_radius_sectors
+                || (observer.observed_sectors.is_empty() && observer.effective_radius > 0.0);
 
-            for exited_sector in exited_sectors {
-                // Prune any unstreamed objects from this exited sector
-                observer.prune_sector_from_egress(exited_sector);
-                if let Some(sector_map) = sector_manager.query_sector(exited_sector) {
-                    for &obj_guid in sector_map.keys() {
-                        if observer.known_world_objects.remove(&obj_guid).is_some() {
-                            packets.push(ClientPacket::WorldObjectDespawn(
-                                WorldObjectDespawnPacket {
-                                    object_id: obj_guid.0,
-                                },
-                            ));
-                        }
+            if needs_sector_update {
+                let current_visible_sectors =
+                    compute_visible_sectors(observer_pos, observer.effective_radius);
+
+                // 1. Sector exits: prune egress queue and despawn objects
+                let mut exited_sectors = Vec::new();
+                for sector in &observer.observed_sectors {
+                    if !current_visible_sectors.contains(sector) {
+                        exited_sectors.push(*sector);
                     }
                 }
-            }
 
-            // 2. Sector entries: discover new sectors and enqueue resident objects
-            for sector in &current_visible_sectors {
-                if !observer.observed_sectors.contains(sector) {
-                    if let Some(sector_map) = sector_manager.query_sector(*sector) {
-                        for obj in sector_map.values() {
-                            if (observer_phase & obj.phase_mask) == 0 {
-                                continue;
-                            }
-                            if !observer.known_world_objects.contains_key(&obj.object_id)
-                                && !observer
-                                    .pending_world_objects_egress
-                                    .iter()
-                                    .any(|(g, _, _)| *g == obj.object_id)
-                            {
-                                let dx = obj.transform.position.0 - observer_pos.0;
-                                let dy = obj.transform.position.1 - observer_pos.1;
-                                let dz = obj.transform.position.2 - observer_pos.2;
-                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-                                observer.pending_world_objects_egress.push_back((
-                                    obj.object_id,
-                                    *sector,
-                                    dist,
+                for exited_sector in exited_sectors {
+                    // Prune any unstreamed objects from this exited sector
+                    observer.prune_sector_from_egress(exited_sector);
+                    if let Some(sector_map) = sector_manager.query_sector(exited_sector) {
+                        for &obj_guid in sector_map.keys() {
+                            if observer.known_world_objects.remove(&obj_guid).is_some() {
+                                packets.push(ClientPacket::WorldObjectDespawn(
+                                    WorldObjectDespawnPacket {
+                                        object_id: obj_guid.0,
+                                    },
                                 ));
                             }
                         }
                     }
                 }
+
+                // 2. Sector entries: discover new sectors and enqueue resident objects
+                let prev_len = observer.pending_world_objects_egress.len();
+                for sector in &current_visible_sectors {
+                    if !observer.observed_sectors.contains(sector) {
+                        if let Some(sector_map) = sector_manager.query_sector(*sector) {
+                            for obj in sector_map.values() {
+                                if (observer_phase & obj.phase_mask) == 0 {
+                                    continue;
+                                }
+                                if !observer.known_world_objects.contains_key(&obj.object_id)
+                                    && !observer
+                                        .pending_world_objects_egress
+                                        .iter()
+                                        .any(|(g, _, _)| *g == obj.object_id)
+                                {
+                                    let dx = obj.transform.position.0 - observer_pos.0;
+                                    let dy = obj.transform.position.1 - observer_pos.1;
+                                    let dz = obj.transform.position.2 - observer_pos.2;
+                                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                                    observer.pending_world_objects_egress.push_back((
+                                        obj.object_id,
+                                        *sector,
+                                        dist,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if observer.pending_world_objects_egress.len() > prev_len {
+                    observer.egress_dirty = true;
+                }
+
+                observer.cached_visible_sectors = current_visible_sectors.clone();
+                observer.observed_sectors = current_visible_sectors;
+                observer.last_center_sector = Some(center_sector);
+                observer.last_view_radius_sectors = view_radius_sectors;
             }
 
-            observer.observed_sectors = current_visible_sectors;
-
-            // 3. Sort pending egress queue by distance ascending
-            let mut egress_vec: Vec<(Guid, SectorCoord3D, f32)> =
-                observer.pending_world_objects_egress.drain(..).collect();
-            egress_vec.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+            // 3. Only sort pending egress queue when new sector objects were added
+            if observer.egress_dirty {
+                observer
+                    .pending_world_objects_egress
+                    .make_contiguous()
+                    .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+                observer.egress_dirty = false;
+            }
 
             // 4. Paced streaming: deliver up to MAX_PACED_WORLD_OBJECTS_PER_TICK
-            let to_stream = egress_vec.len().min(MAX_PACED_WORLD_OBJECTS_PER_TICK);
-            for (obj_id, _, _) in egress_vec.drain(..to_stream) {
+            let mut streamed = 0usize;
+            while streamed < MAX_PACED_WORLD_OBJECTS_PER_TICK {
+                let Some((obj_id, _, _)) = observer.pending_world_objects_egress.pop_front() else {
+                    break;
+                };
+                streamed += 1;
                 if let Some(obj) = sector_manager.get_object(obj_id) {
                     if (observer_phase & obj.phase_mask) == 0 {
                         continue;
@@ -1041,7 +1238,6 @@ impl AoiManager {
                         .insert(obj_id, obj.dirty_revision);
                 }
             }
-            observer.pending_world_objects_egress = egress_vec.into();
 
             // 5. Delta updates for active known objects
             let mut despawned_guids = Vec::new();
@@ -2043,5 +2239,144 @@ mod tests {
             }
             other => panic!("Expected WorldObjectDespawn on phase loss, got {:?}", other),
         }
+    }
+
+    fn make_cached_state(pos: (f32, f32, f32), tick: u64) -> CachedEntityState {
+        CachedEntityState {
+            position: pos,
+            velocity: (0.0, 0.0, 0.0),
+            yaw: 0.0,
+            health: 100,
+            max_health: 100,
+            state_flags: 0,
+            last_sent_tick: tick,
+            attributes: Arc::from(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn test_baseline_tracker_delta_equivalence_and_eviction() {
+        let mut tracker = BaselineTracker::new(10); // min clamped depth = 10
+        let g1 = make_guid(1);
+        let g2 = make_guid(2);
+        let g3 = make_guid(3);
+
+        // Tick 1: initial full snapshot with g1
+        let mut initial = HashMap::new();
+        initial.insert(g1, make_cached_state((1.0, 0.0, 0.0), 1));
+        tracker.record_snapshot(1, initial);
+
+        // Tick 2: g2 enters
+        tracker.record_delta(2, vec![(g2, make_cached_state((2.0, 0.0, 0.0), 2))], vec![]);
+        // Tick 3: g1 moves, g2 exits, g3 enters
+        tracker.record_delta(
+            3,
+            vec![
+                (g1, make_cached_state((5.0, 0.0, 0.0), 3)),
+                (g3, make_cached_state((3.0, 0.0, 0.0), 3)),
+            ],
+            vec![g2],
+        );
+
+        // Base tick 1 borrows without cloning
+        let snap1 = tracker.get_snapshot(1).expect("tick 1");
+        assert!(matches!(snap1, Cow::Borrowed(_)));
+        assert_eq!(snap1.len(), 1);
+        assert_eq!(snap1[&g1].position, (1.0, 0.0, 0.0));
+
+        // Newer tick 3 reconstructs accurately
+        let snap3 = tracker.get_snapshot(3).expect("tick 3");
+        assert_eq!(snap3.len(), 2);
+        assert_eq!(snap3[&g1].position, (5.0, 0.0, 0.0));
+        assert!(!snap3.contains_key(&g2));
+        assert_eq!(snap3[&g3].position, (3.0, 0.0, 0.0));
+
+        // Advance baseline to tick 3 via ACK -> base snapshot updates in-place
+        assert!(tracker.process_ack(3, 0, 3));
+        assert_eq!(tracker.history.len(), 1);
+        let snap3_base = tracker.get_snapshot(3).expect("tick 3 after ack");
+        assert!(matches!(snap3_base, Cow::Borrowed(_)));
+        assert_eq!(snap3_base[&g1].position, (5.0, 0.0, 0.0));
+        assert!(tracker.get_snapshot(2).is_none());
+
+        // Overflow max_history_depth (10) -> oldest ticks auto-evicted, base stays valid
+        for t in 4..=16 {
+            tracker.record_delta(
+                t,
+                vec![(g1, make_cached_state((t as f32, 0.0, 0.0), t))],
+                vec![],
+            );
+        }
+        assert_eq!(tracker.history.len(), 10);
+        assert_eq!(tracker.history.front().unwrap().tick, 7);
+        let snap7 = tracker.get_snapshot(7).expect("tick 7");
+        assert!(matches!(snap7, Cow::Borrowed(_)));
+        assert_eq!(snap7[&g1].position, (7.0, 0.0, 0.0));
+        let snap16 = tracker.get_snapshot(16).expect("tick 16");
+        assert_eq!(snap16[&g1].position, (16.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_observer_sector_cache_and_egress_dirty_flag() {
+        use mmo_core::container::ContainerOwner;
+        use mmo_core::world::{Transform3D, WorldObject};
+
+        let mut aoi = AoiManager::new();
+        let mut store = EntityStore::new();
+        let mut sectors = SectorManager::new();
+
+        let obs_guid = make_guid(701);
+        store.spawn(obs_guid, (10.0, 10.0, 0.0));
+        for i in 1..=12 {
+            let obj = WorldObject::new(
+                Guid(i),
+                1,
+                Transform3D::from_position((10.0 + i as f32, 10.0, 0.0)),
+                BoundingBox3D::new((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
+                ContainerOwner::Character(1),
+            );
+            sectors.insert_object(obj);
+        }
+
+        aoi.register_observer(
+            42,
+            obs_guid,
+            ObserverConfig {
+                base_radius: 50.0,
+                ..Default::default()
+            },
+        );
+
+        // Tick 1: populates cached_visible_sectors, last_center_sector, sorts egress, clears egress_dirty
+        let jobs1 = aoi.update_world_object_observers(&store, &sectors);
+        assert_eq!(jobs1[0].packets.len(), 10);
+        let obs = aoi.get_observer(42).unwrap();
+        assert_eq!(
+            obs.last_center_sector,
+            Some(SectorCoord3D::from_world_pos((10.0, 10.0, 0.0)))
+        );
+        assert!(!obs.cached_visible_sectors.is_empty());
+        assert!(!obs.egress_dirty);
+        assert_eq!(obs.pending_world_objects_egress.len(), 2);
+
+        // Move slightly inside the SAME sector -> cache stays valid, remaining 2 stream out
+        store.get_mut_by_guid(obs_guid).unwrap().position = (12.0, 12.0, 0.0);
+        let jobs2 = aoi.update_world_object_observers(&store, &sectors);
+        assert_eq!(jobs2[0].packets.len(), 2);
+        let obs2 = aoi.get_observer(42).unwrap();
+        assert_eq!(
+            obs2.last_center_sector,
+            Some(SectorCoord3D::from_world_pos((10.0, 10.0, 0.0)))
+        );
+        assert!(!obs2.egress_dirty);
+
+        // Move across sector boundary -> last_center_sector updates
+        store.get_mut_by_guid(obs_guid).unwrap().position = (200.0, 10.0, 0.0);
+        let _ = aoi.update_world_object_observers(&store, &sectors);
+        let obs3 = aoi.get_observer(42).unwrap();
+        assert_eq!(
+            obs3.last_center_sector,
+            Some(SectorCoord3D::from_world_pos((200.0, 10.0, 0.0)))
+        );
     }
 }

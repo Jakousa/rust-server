@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use mmo_core::world::SectorCoord3D;
 use mmo_core::{BoundingBox3D, EntityStore, Guid, Octree};
 use mmo_schema::cluster::node_service_client::NodeServiceClient;
 use mmo_schema::cluster::{GhostEntity, GhostSyncRequest, GhostSyncResponse, Vector3};
@@ -70,6 +71,47 @@ impl Default for GhostRecord {
 #[derive(Debug, Clone, Default)]
 struct GhostStoreInner {
     ghosts: HashMap<Guid, GhostRecord>,
+    sectors: HashMap<SectorCoord3D, HashSet<Guid>>,
+    ghost_sectors: HashMap<Guid, SectorCoord3D>,
+}
+
+impl GhostStoreInner {
+    fn upsert_record(&mut self, record: GhostRecord) -> bool {
+        let guid = record.guid;
+        let new_sector = SectorCoord3D::from_world_pos(record.position);
+        if let Some(old_sector) = self.ghost_sectors.insert(guid, new_sector) {
+            if old_sector != new_sector {
+                if let Some(set) = self.sectors.get_mut(&old_sector) {
+                    set.remove(&guid);
+                    if set.is_empty() {
+                        self.sectors.remove(&old_sector);
+                    }
+                }
+                self.sectors.entry(new_sector).or_default().insert(guid);
+            }
+        } else {
+            self.sectors.entry(new_sector).or_default().insert(guid);
+        }
+        self.ghosts.insert(guid, record).is_none()
+    }
+
+    fn remove_record(&mut self, guid: Guid) -> Option<GhostRecord> {
+        if let Some(sector) = self.ghost_sectors.remove(&guid) {
+            if let Some(set) = self.sectors.get_mut(&sector) {
+                set.remove(&guid);
+                if set.is_empty() {
+                    self.sectors.remove(&sector);
+                }
+            }
+        }
+        self.ghosts.remove(&guid)
+    }
+
+    fn clear(&mut self) {
+        self.ghosts.clear();
+        self.sectors.clear();
+        self.ghost_sectors.clear();
+    }
 }
 
 /// Dedicated storage container for ghost entities replicated from neighboring nodes.
@@ -86,9 +128,7 @@ impl GhostStore {
     /// Creates a new empty `GhostStore`.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(GhostStoreInner {
-                ghosts: HashMap::new(),
-            })),
+            inner: Arc::new(RwLock::new(GhostStoreInner::default())),
             current_tick: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -109,14 +149,12 @@ impl GhostStore {
         if record.local_tick == 0 {
             record.local_tick = self.current_tick();
         }
-        let is_new = !inner.ghosts.contains_key(&record.guid);
-        inner.ghosts.insert(record.guid, record);
-        is_new
+        inner.upsert_record(record)
     }
 
-    /// Internal helper upserting a single proto ghost into a mutable HashMap with finite validation.
-    fn upsert_proto_into_map(
-        ghosts: &mut HashMap<Guid, GhostRecord>,
+    /// Internal helper upserting a single proto ghost into [`GhostStoreInner`] with finite validation.
+    fn upsert_proto_into_inner(
+        inner: &mut GhostStoreInner,
         source_node_id: u32,
         proto: &GhostEntity,
         current_tick: u64,
@@ -156,19 +194,14 @@ impl GhostStore {
             source_node_id,
             local_tick: current_tick,
         };
-        ghosts.insert(guid, record);
+        inner.upsert_record(record);
         true
     }
 
     /// Upserts a ghost record from a protobuf [`GhostEntity`].
     pub fn upsert_from_proto(&self, source_node_id: u32, proto: &GhostEntity) -> bool {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        Self::upsert_proto_into_map(
-            &mut inner.ghosts,
-            source_node_id,
-            proto,
-            self.current_tick(),
-        )
+        Self::upsert_proto_into_inner(&mut inner, source_node_id, proto, self.current_tick())
     }
 
     /// Updates or inserts all ghosts contained in a [`GhostSyncRequest`].
@@ -178,7 +211,7 @@ impl GhostStore {
         let tick = self.current_tick();
         let mut count = 0;
         for ghost in &req.ghosts {
-            if Self::upsert_proto_into_map(&mut inner.ghosts, req.source_node_id, ghost, tick) {
+            if Self::upsert_proto_into_inner(&mut inner, req.source_node_id, ghost, tick) {
                 count += 1;
             }
         }
@@ -191,9 +224,25 @@ impl GhostStore {
     pub fn prune_stale(&self, current_tick: u64, ttl_ticks: u64) -> usize {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before = inner.ghosts.len();
-        inner
-            .ghosts
-            .retain(|_, record| current_tick.saturating_sub(record.local_tick) < ttl_ticks);
+        let GhostStoreInner {
+            ghosts,
+            sectors,
+            ghost_sectors,
+        } = &mut *inner;
+        ghosts.retain(|guid, record| {
+            let keep = current_tick.saturating_sub(record.local_tick) < ttl_ticks;
+            if !keep {
+                if let Some(sector) = ghost_sectors.remove(guid) {
+                    if let Some(set) = sectors.get_mut(&sector) {
+                        set.remove(guid);
+                        if set.is_empty() {
+                            sectors.remove(&sector);
+                        }
+                    }
+                }
+            }
+            keep
+        });
         let pruned = before - inner.ghosts.len();
         if pruned > 0 {
             metrics::counter!("mmo_node_ghosts_pruned_total").increment(pruned as u64);
@@ -216,7 +265,7 @@ impl GhostStore {
     /// Removes a ghost entity by its GUID, returning the removed record if found.
     pub fn remove(&self, guid: Guid) -> Option<GhostRecord> {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        inner.ghosts.remove(&guid)
+        inner.remove_record(guid)
     }
 
     /// Returns the total number of ghost entities in storage.
@@ -234,24 +283,82 @@ impl GhostStore {
     /// Clears all ghost entities from storage.
     pub fn clear(&self) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        inner.ghosts.clear();
+        inner.clear();
     }
 
-    /// Queries all ghost entities within radial distance from `center`.
+    /// Queries all ghost entities within radial distance from `center` using the spatial sector index.
     pub fn query_radius(&self, center: (f32, f32, f32), radius: f32) -> Vec<GhostRecord> {
+        if radius < 0.0
+            || !radius.is_finite()
+            || !center.0.is_finite()
+            || !center.1.is_finite()
+            || !center.2.is_finite()
+        {
+            return Vec::new();
+        }
         let r_sq = radius * radius;
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        inner
-            .ghosts
-            .values()
-            .filter(|g| {
-                let dx = g.position.0 - center.0;
-                let dy = g.position.1 - center.1;
-                let dz = g.position.2 - center.2;
-                dx * dx + dy * dy + dz * dz <= r_sq
-            })
-            .cloned()
-            .collect()
+        if inner.ghosts.is_empty() {
+            return Vec::new();
+        }
+
+        let min_sec = SectorCoord3D::from_world_pos((
+            center.0 - radius,
+            center.1 - radius,
+            center.2 - radius,
+        ));
+        let max_sec = SectorCoord3D::from_world_pos((
+            center.0 + radius,
+            center.1 + radius,
+            center.2 + radius,
+        ));
+        let span_x = (max_sec.x as i64 - min_sec.x as i64 + 1).max(0) as u64;
+        let span_y = (max_sec.y as i64 - min_sec.y as i64 + 1).max(0) as u64;
+        let span_z = (max_sec.z as i64 - min_sec.z as i64 + 1).max(0) as u64;
+        let sector_volume = span_x.saturating_mul(span_y).saturating_mul(span_z);
+
+        let mut results = Vec::new();
+        if sector_volume <= inner.sectors.len() as u64 {
+            for sx in min_sec.x..=max_sec.x {
+                for sy in min_sec.y..=max_sec.y {
+                    for sz in min_sec.z..=max_sec.z {
+                        let sector = SectorCoord3D::new(sx, sy, sz);
+                        if !sector.bounds().intersects_sphere(center, radius) {
+                            continue;
+                        }
+                        if let Some(guids) = inner.sectors.get(&sector) {
+                            for guid in guids {
+                                if let Some(g) = inner.ghosts.get(guid) {
+                                    let dx = g.position.0 - center.0;
+                                    let dy = g.position.1 - center.1;
+                                    let dz = g.position.2 - center.2;
+                                    if dx * dx + dy * dy + dz * dz <= r_sq {
+                                        results.push(g.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (&sector, guids) in &inner.sectors {
+                if !sector.bounds().intersects_sphere(center, radius) {
+                    continue;
+                }
+                for guid in guids {
+                    if let Some(g) = inner.ghosts.get(guid) {
+                        let dx = g.position.0 - center.0;
+                        let dy = g.position.1 - center.1;
+                        let dz = g.position.2 - center.2;
+                        if dx * dx + dy * dy + dz * dz <= r_sq {
+                            results.push(g.clone());
+                        }
+                    }
+                }
+            }
+        }
+        results
     }
 }
 
@@ -339,9 +446,36 @@ impl GhostBroadcaster {
         }
 
         // Check if octree identifies boundary neighbors (internal leaf boundaries)
-        !octree
-            .find_boundary_neighbors(pos, self.boundary_margin)
-            .is_empty()
+        octree.has_boundary_neighbors(pos, self.boundary_margin)
+    }
+
+    fn build_ghost_entity(entity: &mmo_core::Entity, tick: u64) -> GhostEntity {
+        let vel = entity
+            .get_component::<EntityVelocity>()
+            .map(|v| Vector3 {
+                x: v.x,
+                y: v.y,
+                z: v.z,
+            })
+            .unwrap_or(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            });
+
+        GhostEntity {
+            guid: entity.guid.raw(),
+            position: Some(Vector3 {
+                x: entity.position.0,
+                y: entity.position.1,
+                z: entity.position.2,
+            }),
+            velocity: Some(vel),
+            yaw: entity.rotation,
+            pitch: 0.0,
+            component_data: Vec::new(),
+            last_tick: tick,
+        }
     }
 
     /// Queries `Octree` and `EntityStore` to find all entities near octant boundary faces,
@@ -352,36 +486,28 @@ impl GhostBroadcaster {
         entity_store: &EntityStore,
         tick: u64,
     ) -> Vec<GhostEntity> {
+        if self.boundary_margin <= 0.0 || entity_store.count() == 0 {
+            return Vec::new();
+        }
+
         let mut ghosts = Vec::new();
+
+        // Fast path: prune entire interior subtrees directly in the octree when synchronized.
+        if !octree.is_empty() && octree.len() == entity_store.count() {
+            let mut candidate_guids = Vec::new();
+            octree.collect_boundary_entities(self.boundary_margin, &mut candidate_guids);
+            ghosts.reserve(candidate_guids.len());
+            for guid in candidate_guids {
+                if let Some(entity) = entity_store.get_by_guid(guid) {
+                    ghosts.push(Self::build_ghost_entity(entity, tick));
+                }
+            }
+            return ghosts;
+        }
 
         for (_key, entity) in entity_store.iter() {
             if self.is_entity_near_boundary(octree, entity.position) {
-                let vel = entity
-                    .get_component::<EntityVelocity>()
-                    .map(|v| Vector3 {
-                        x: v.x,
-                        y: v.y,
-                        z: v.z,
-                    })
-                    .unwrap_or(Vector3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    });
-
-                ghosts.push(GhostEntity {
-                    guid: entity.guid.raw(),
-                    position: Some(Vector3 {
-                        x: entity.position.0,
-                        y: entity.position.1,
-                        z: entity.position.2,
-                    }),
-                    velocity: Some(vel),
-                    yaw: entity.rotation,
-                    pitch: 0.0,
-                    component_data: Vec::new(),
-                    last_tick: tick,
-                });
+                ghosts.push(Self::build_ghost_entity(entity, tick));
             }
         }
 
@@ -742,5 +868,139 @@ mod tests {
             Some("127.0.0.1:50052".to_string())
         );
         assert_eq!(broadcaster.neighbors().len(), 0);
+    }
+
+    #[test]
+    fn test_ghost_store_spatial_sector_index_move_prune_remove() {
+        let store = GhostStore::new();
+        store.advance_tick(10);
+
+        let g1 = Guid::from_raw(101);
+        let g2 = Guid::from_raw(102);
+        let g3 = Guid::from_raw(103);
+
+        // Sector (0,0,0) and adjacent sector (1,0,0) and distant sector (5,0,0)
+        assert!(store.insert_or_update(GhostRecord::new(
+            g1,
+            (10.0, 10.0, 10.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        )));
+        assert!(store.insert_or_update(GhostRecord::new(
+            g2,
+            (66.0, 10.0, 10.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        )));
+        assert!(store.insert_or_update(GhostRecord::new(
+            g3,
+            (350.0, 10.0, 10.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        )));
+
+        // Query centered at (50, 10, 10) with r = 45 hits g1 (dist 40) and g2 (dist 16)
+        let mut res: Vec<u64> = store
+            .query_radius((50.0, 10.0, 10.0), 45.0)
+            .into_iter()
+            .map(|r| r.guid.raw())
+            .collect();
+        res.sort_unstable();
+        assert_eq!(res, vec![101, 102]);
+
+        // Move g3 from sector (5,0,0) into sector (0,0,0) near (50,10,10) -> sector index updates
+        assert!(!store.insert_or_update(GhostRecord::new(
+            g3,
+            (48.0, 10.0, 10.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            2,
+            2,
+        )));
+        // Large radius spanning many empty sectors falls back cleanly to non-empty sector scan
+        let mut large_res: Vec<u64> = store
+            .query_radius((50.0, 10.0, 10.0), 2000.0)
+            .into_iter()
+            .map(|r| r.guid.raw())
+            .collect();
+        large_res.sort_unstable();
+        assert_eq!(large_res, vec![101, 102, 103]);
+
+        // Remove g2 and prune g1 (tick 10 vs 15 with ttl=4 -> g1 pruned, g3 refreshed at tick 14 stays)
+        assert!(store.remove(g2).is_some());
+        store.advance_tick(14);
+        assert!(!store.insert_or_update(GhostRecord::new(
+            g3,
+            (48.0, 10.0, 10.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            3,
+            2,
+        )));
+        assert_eq!(store.prune_stale(15, 4), 1);
+
+        let after_prune: Vec<u64> = store
+            .query_radius((50.0, 10.0, 10.0), 100.0)
+            .into_iter()
+            .map(|r| r.guid.raw())
+            .collect();
+        assert_eq!(after_prune, vec![103]);
+    }
+
+    #[test]
+    fn test_ghost_broadcaster_find_boundary_entities_populated_octree() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut octree = Octree::new(bounds);
+        let mut entity_store = EntityStore::new();
+
+        // Populate >16 entities across multiple octants (<=16 per octant so leaves stay 50x50x50).
+        // Entities near center of an octant (e.g. (25, 25, 25) or (75, 75, 75)) are strictly interior;
+        // entity at (4.0, 25.0, 25.0) is near outer x=0 boundary;
+        // entity at (49.0, 25.0, 25.0) is near internal x=50 split face.
+        let mut expected_boundary = Vec::new();
+        for i in 1..=20u64 {
+            let guid = Guid::from_raw(i);
+            let pos = if i == 1 {
+                expected_boundary.push(i);
+                (4.0, 25.0, 25.0)
+            } else if i == 2 {
+                expected_boundary.push(i);
+                (49.0, 25.0, 25.0)
+            } else if i <= 14 {
+                // Cluster deep inside octant (0..50, 0..50, 0..50), well away from 0 and 50 faces
+                (20.0 + (i as f32) * 0.2, 25.0, 25.0)
+            } else {
+                // Cluster deep inside octant (50..100, 50..100, 50..100), well away from 50 and 100 faces
+                (72.0 + ((i - 14) as f32) * 0.2, 75.0, 75.0)
+            };
+            entity_store.spawn(guid, pos);
+            octree.insert(guid, pos);
+        }
+        assert!(octree.is_branch());
+
+        let broadcaster = GhostBroadcaster::new(1, 5.0);
+        let mut found: Vec<u64> = broadcaster
+            .find_boundary_entities(&octree, &entity_store, 50)
+            .into_iter()
+            .map(|g| g.guid)
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, expected_boundary);
     }
 }

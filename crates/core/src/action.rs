@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::entity::EntityKey;
 use crate::guid::Guid;
 use crate::plugin::{DomainEvent, EventQueue, TickContext, TickSystem};
 use crate::spatial::{
@@ -238,18 +239,21 @@ impl ActionQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ActionDecision {
+    Interrupt(u32, InterruptReason),
+    Progress,
+}
+
 /// Batch system executed during the simulation tick to advance active actions.
-pub struct ActionTickSystem;
+#[derive(Default)]
+pub struct ActionTickSystem {
+    decisions: Vec<(EntityKey, ActionDecision)>,
+}
 
 impl ActionTickSystem {
     pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for ActionTickSystem {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -261,15 +265,10 @@ impl TickSystem for ActionTickSystem {
     fn update(&mut self, ctx: &mut TickContext) {
         ctx.events.register_ephemeral::<ActionProgressEvent>();
 
-        enum ActionDecision {
-            Interrupt(u32, InterruptReason),
-            Progress,
-        }
-
-        let mut decisions: Vec<(Guid, ActionDecision)> = Vec::new();
+        self.decisions.clear();
 
         // Pass 1: Immutable inspect pass determining whether actions are interrupted or advanced
-        for (_key, entity) in ctx.entities.iter() {
+        for (key, entity) in ctx.entities.iter() {
             if let Some(queue) = entity.get_component::<ActionQueue>() {
                 if let Some(action) = queue.current() {
                     let mut interrupt_reason = None;
@@ -307,38 +306,42 @@ impl TickSystem for ActionTickSystem {
                     }
 
                     if let Some(reason) = interrupt_reason {
-                        decisions.push((
-                            entity.guid,
-                            ActionDecision::Interrupt(action.action_id, reason),
-                        ));
+                        self.decisions
+                            .push((key, ActionDecision::Interrupt(action.action_id, reason)));
                     } else {
-                        decisions.push((entity.guid, ActionDecision::Progress));
+                        self.decisions.push((key, ActionDecision::Progress));
                     }
                 }
             }
         }
 
-        // Pass 2: Mutable update pass applying decisions
-        let mut completed = Vec::new();
-        let mut interrupted = Vec::new();
-        let mut progressed = Vec::new();
-
-        for (entity_guid, decision) in decisions {
-            if let Some(entity) = ctx.entities.get_mut_by_guid(entity_guid) {
+        // Pass 2: Mutable update pass applying decisions via O(1) SlotMap key lookups and direct event emission
+        for &(entity_key, decision) in &self.decisions {
+            if let Some(entity) = ctx.entities.get_mut(entity_key) {
+                let entity_guid = entity.guid;
                 if let Some(queue) = entity.get_component_mut::<ActionQueue>() {
                     match decision {
                         ActionDecision::Interrupt(action_id, reason) => {
                             queue.current = None;
-                            interrupted.push((entity_guid, action_id, reason));
+                            ctx.events.push(ActionInterruptedEvent {
+                                entity: entity_guid,
+                                action_id,
+                                reason,
+                            });
                         }
                         ActionDecision::Progress => {
                             if let Some(ref mut action) = queue.current {
                                 action.elapsed_sec += ctx.dt_sec;
                                 if action.is_finished() {
                                     let finished_action = queue.current.take().unwrap();
-                                    completed.push((entity_guid, finished_action));
+                                    ctx.events.push(ActionCompletedEvent {
+                                        entity: entity_guid,
+                                        action_id: finished_action.action_id,
+                                        target_guid: finished_action.target_guid,
+                                        extra_data: finished_action.extra_data,
+                                    });
                                 } else {
-                                    progressed.push(ActionProgressEvent {
+                                    ctx.events.push(ActionProgressEvent {
                                         entity: entity_guid,
                                         action_id: action.action_id,
                                         elapsed_sec: action.elapsed_sec,
@@ -350,28 +353,6 @@ impl TickSystem for ActionTickSystem {
                     }
                 }
             }
-        }
-
-        for (entity, action_id, reason) in interrupted {
-            ctx.events.push(ActionInterruptedEvent {
-                entity,
-                action_id,
-                reason,
-            });
-        }
-
-        for ev in progressed {
-            ctx.events.push(ev);
-        }
-
-        // Emit ActionCompletedEvent for completed actions
-        for (entity, action) in completed {
-            ctx.events.push(ActionCompletedEvent {
-                entity,
-                action_id: action.action_id,
-                target_guid: action.target_guid,
-                extra_data: action.extra_data,
-            });
         }
     }
 }
@@ -544,7 +525,7 @@ mod tests {
         entities.get_mut(key).unwrap().add_component(queue);
 
         // Tick 1: dt = 0.05s (50ms) -> Action should be halfway done
-        let mut tick_system = ActionTickSystem;
+        let mut tick_system = ActionTickSystem::new();
         {
             let mut ctx = TickContext {
                 entities: &mut entities,
@@ -666,7 +647,7 @@ mod tests {
             .unwrap();
         entities.get_mut(caster_key).unwrap().add_component(queue);
 
-        let mut tick_system = ActionTickSystem;
+        let mut tick_system = ActionTickSystem::new();
 
         // Tick 1: dt = 0.2s -> Emits ActionProgressEvent
         {

@@ -126,6 +126,9 @@ pub struct AttributeValue {
     /// Unmodified ceiling used by [`AttributeSet::get_effective_max`].
     pub max: f32,
     pub regen_per_sec: f32,
+    /// Cached canonical [`AttributeId`] resolved at insertion time to avoid registry locks during lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<AttributeId>,
 }
 
 /// Robust clamp routine that safely handles NaN, Inf, and inverted bounds without panicking.
@@ -149,7 +152,14 @@ impl AttributeValue {
             min,
             max,
             regen_per_sec,
+            canonical_id: None,
         }
+    }
+
+    /// Attaches a cached canonical [`AttributeId`] to this [`AttributeValue`].
+    pub fn with_canonical_id(mut self, canonical_id: Option<AttributeId>) -> Self {
+        self.canonical_id = canonical_id;
+        self
     }
 }
 
@@ -196,9 +206,26 @@ pub struct AuraExpiredEvent {
 }
 impl DomainEvent for AuraExpiredEvent {}
 
+/// Deserializes `AttributeSet::attributes` and backfills missing `canonical_id` caches from the global registry.
+fn deserialize_attributes<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, AttributeValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut map = HashMap::<String, AttributeValue>::deserialize(deserializer)?;
+    for (name, val) in &mut map {
+        if val.canonical_id.is_none() {
+            val.canonical_id = canonical_id_for_name(name);
+        }
+    }
+    Ok(map)
+}
+
 /// Component holding all dynamic attributes and active modifiers for an entity.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttributeSet {
+    #[serde(deserialize_with = "deserialize_attributes")]
     pub attributes: HashMap<String, AttributeValue>,
     pub modifiers: Vec<TimedModifier>,
 }
@@ -217,10 +244,11 @@ impl AttributeSet {
         max: f32,
         regen_per_sec: f32,
     ) {
-        self.attributes.insert(
-            name.into(),
-            AttributeValue::new(base, min, max, regen_per_sec),
-        );
+        let name = name.into();
+        let canonical_id = canonical_id_for_name(&name);
+        let value =
+            AttributeValue::new(base, min, max, regen_per_sec).with_canonical_id(canonical_id);
+        self.attributes.insert(name, value);
     }
 
     /// Returns a reference to the raw [`AttributeValue`] if registered.
@@ -238,20 +266,18 @@ impl AttributeSet {
     /// Returns the current value of the attribute, clamped to its effective maximum.
     pub fn get_current(&self, name: &str) -> Option<f32> {
         let attr = self.attributes.get(name)?;
-        let effective_max = self.get_effective_max(name)?;
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
         Some(safe_clamp(attr.current, attr.min, effective_max))
     }
 
     /// Modifies the current value by `delta` (positive for heal/gain, negative for damage/loss),
     /// clamping strictly to `[min, effective_max]`.
     pub fn modify_current(&mut self, name: &str, delta: f32) -> Result<f32, &'static str> {
-        let effective_max = self
-            .get_effective_max(name)
-            .ok_or("Attribute not found in AttributeSet")?;
         let attr = self
             .attributes
             .get_mut(name)
             .ok_or("Attribute not found in AttributeSet")?;
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
 
         attr.current = safe_clamp(attr.current + delta, attr.min, effective_max);
         Ok(attr.current)
@@ -259,13 +285,11 @@ impl AttributeSet {
 
     /// Directly sets the current value, strictly clamped to `[min, effective_max]`.
     pub fn set_current(&mut self, name: &str, value: f32) -> Result<f32, &'static str> {
-        let effective_max = self
-            .get_effective_max(name)
-            .ok_or("Attribute not found in AttributeSet")?;
         let attr = self
             .attributes
             .get_mut(name)
             .ok_or("Attribute not found in AttributeSet")?;
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
 
         attr.current = safe_clamp(value, attr.min, effective_max);
         Ok(attr.current)
@@ -274,9 +298,8 @@ impl AttributeSet {
     /// Finds the raw [`AttributeValue`] matching a canonical [`AttributeId`].
     pub fn get_by_id(&self, id: AttributeId) -> Option<&AttributeValue> {
         self.attributes
-            .iter()
-            .find(|(k, _)| canonical_id_for_name(k) == Some(id))
-            .map(|(_, v)| v)
+            .values()
+            .find(|v| v.canonical_id == Some(id))
     }
 
     /// Returns the effective maximum value for the attribute matching the given [`AttributeId`].
@@ -284,7 +307,7 @@ impl AttributeSet {
         let (name, attr) = self
             .attributes
             .iter()
-            .find(|(k, _)| canonical_id_for_name(k) == Some(id))?;
+            .find(|(_, v)| v.canonical_id == Some(id))?;
         Some(compute_effective_max_for(name, attr, &self.modifiers))
     }
 
@@ -293,27 +316,50 @@ impl AttributeSet {
         let (name, attr) = self
             .attributes
             .iter()
-            .find(|(k, _)| canonical_id_for_name(k) == Some(id))?;
+            .find(|(_, v)| v.canonical_id == Some(id))?;
         let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
         Some(safe_clamp(attr.current, attr.min, effective_max))
     }
 
     /// Directly sets the current value for the attribute matching the given [`AttributeId`].
     pub fn set_current_by_id(&mut self, id: AttributeId, value: f32) -> Result<f32, &'static str> {
-        let name = self
+        let (name, attr) = self
             .attributes
-            .keys()
-            .find(|k| canonical_id_for_name(k) == Some(id))
-            .cloned()
+            .iter_mut()
+            .find(|(_, v)| v.canonical_id == Some(id))
             .ok_or("Attribute not found in AttributeSet")?;
-        self.set_current(&name, value)
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
+        attr.current = safe_clamp(value, attr.min, effective_max);
+        Ok(attr.current)
+    }
+
+    /// Modifies the current value by `delta` for the attribute matching the given [`AttributeId`].
+    pub fn modify_current_by_id(
+        &mut self,
+        id: AttributeId,
+        delta: f32,
+    ) -> Result<f32, &'static str> {
+        let (name, attr) = self
+            .attributes
+            .iter_mut()
+            .find(|(_, v)| v.canonical_id == Some(id))
+            .ok_or("Attribute not found in AttributeSet")?;
+        let effective_max = compute_effective_max_for(name, attr, &self.modifiers);
+        attr.current = safe_clamp(attr.current + delta, attr.min, effective_max);
+        Ok(attr.current)
     }
 
     /// Iterates over all registered attributes that map to a canonical [`AttributeId`].
     pub fn iter_indexed(&self) -> impl Iterator<Item = (AttributeId, &str, &AttributeValue)> {
-        self.attributes.iter().filter_map(|(name, val)| {
-            canonical_id_for_name(name).map(|id| (id, name.as_str(), val))
-        })
+        self.attributes
+            .iter()
+            .filter_map(|(name, val)| val.canonical_id.map(|id| (id, name.as_str(), val)))
+    }
+
+    /// Returns `true` if this `AttributeSet` has passive regeneration or active timed modifiers to tick.
+    #[inline]
+    pub fn needs_tick(&self) -> bool {
+        !self.modifiers.is_empty() || self.attributes.values().any(|a| a.regen_per_sec != 0.0)
     }
 
     /// Attaches a timed modifier, ignoring modifiers with non-finite values or durations.
@@ -405,8 +451,13 @@ impl TickSystem for AttributeTickSystem {
     fn update(&mut self, ctx: &mut TickContext) {
         for (_key, entity) in ctx.entities.iter_mut() {
             let entity_guid = entity.guid;
-            if let Some(attr_set) = entity.get_component_mut::<AttributeSet>() {
-                attr_set.tick(entity_guid, ctx.dt_sec, ctx.events);
+            let needs_tick = entity
+                .get_component::<AttributeSet>()
+                .is_some_and(AttributeSet::needs_tick);
+            if needs_tick {
+                if let Some(attr_set) = entity.get_component_mut::<AttributeSet>() {
+                    attr_set.tick(entity_guid, ctx.dt_sec, ctx.events);
+                }
             }
         }
     }
@@ -611,7 +662,8 @@ mod tests {
 
         // Test get_current_by_id safe clamp on NaN current and NaN max
         let mut set = AttributeSet::new();
-        let mut nan_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0);
+        let mut nan_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0)
+            .with_canonical_id(Some(AttributeId::PRIMARY_VITALITY));
         nan_val.current = f32::NAN;
         set.attributes.insert("health".to_string(), nan_val);
         // Must not panic on NaN current
@@ -622,7 +674,8 @@ mod tests {
 
         // Test NaN max: compute_effective_max_for yields 0.0 (via .max(min)), safe_clamp clamps to min without panicking
         let mut nan_max_set = AttributeSet::new();
-        let mut nan_max_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0);
+        let mut nan_max_val = AttributeValue::new(50.0, 0.0, 100.0, 0.0)
+            .with_canonical_id(Some(AttributeId::PRIMARY_VITALITY));
         nan_max_val.max = f32::NAN;
         nan_max_set
             .attributes
@@ -661,5 +714,64 @@ mod tests {
 
         assert!(set.modifiers.is_empty());
         assert_eq!(set.get_effective_max("health"), Some(100.0));
+    }
+
+    #[test]
+    fn test_cached_canonical_id_and_serde_backfill() {
+        let mut set = AttributeSet::new();
+        set.add_attribute("hull", 120.0, 0.0, 150.0, 0.0);
+        set.add_attribute("custom_heat", 10.0, 0.0, 100.0, 0.0);
+
+        // Cached canonical_id populated on insertion
+        assert_eq!(
+            set.get_attribute("hull").unwrap().canonical_id,
+            Some(AttributeId::PRIMARY_VITALITY)
+        );
+        assert_eq!(set.get_attribute("custom_heat").unwrap().canonical_id, None);
+
+        assert_eq!(
+            set.get_by_id(AttributeId::PRIMARY_VITALITY)
+                .map(|a| a.current),
+            Some(120.0)
+        );
+        assert_eq!(
+            set.get_effective_max_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(150.0)
+        );
+        assert_eq!(
+            set.set_current_by_id(AttributeId::PRIMARY_VITALITY, 90.0),
+            Ok(90.0)
+        );
+        assert_eq!(
+            set.modify_current_by_id(AttributeId::PRIMARY_VITALITY, -15.0),
+            Ok(75.0)
+        );
+        assert_eq!(
+            set.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(75.0)
+        );
+
+        // Deserializing legacy JSON without `canonical_id` field backfills `canonical_id`
+        let legacy_json = serde_json::json!({
+            "attributes": {
+                "health": {
+                    "base": 100.0,
+                    "current": 80.0,
+                    "min": 0.0,
+                    "max": 100.0,
+                    "regen_per_sec": 0.0
+                }
+            },
+            "modifiers": []
+        });
+        let deserialized: AttributeSet = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            deserialized.get_attribute("health").unwrap().canonical_id,
+            Some(AttributeId::PRIMARY_VITALITY)
+        );
+        assert_eq!(
+            deserialized.get_current_by_id(AttributeId::PRIMARY_VITALITY),
+            Some(80.0)
+        );
     }
 }
