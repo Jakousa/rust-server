@@ -120,7 +120,6 @@ pub struct GatewayServer {
     default_node_address: Option<String>,
     subscription_manager: Arc<GatewaySubscriptionManager>,
     interceptors: Vec<Arc<dyn EdgePacketInterceptor>>,
-    marketplace_service: Option<Arc<GatewayMarketplaceService>>,
     active_bus_subscriptions: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     handshake_timeout: Option<Duration>,
     connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
@@ -144,7 +143,6 @@ impl GatewayServer {
             default_node_address: None,
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
             interceptors: Vec::new(),
-            marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
             connection_semaphore: None,
@@ -171,7 +169,6 @@ impl GatewayServer {
             default_node_address: None,
             subscription_manager: Arc::new(GatewaySubscriptionManager::new()),
             interceptors: Vec::new(),
-            marketplace_service: None,
             active_bus_subscriptions: Arc::new(DashMap::new()),
             handshake_timeout: None,
             connection_semaphore: None,
@@ -297,8 +294,7 @@ impl GatewayServer {
 
     /// Configures an asynchronous marketplace service operating at the edge gateway.
     pub fn with_marketplace(mut self, marketplace_service: Arc<GatewayMarketplaceService>) -> Self {
-        self.interceptors.push(marketplace_service.clone());
-        self.marketplace_service = Some(marketplace_service);
+        self.interceptors.push(marketplace_service);
         self
     }
 
@@ -311,11 +307,6 @@ impl GatewayServer {
     /// Accesses the gateway subscription manager.
     pub fn subscription_manager(&self) -> &Arc<GatewaySubscriptionManager> {
         &self.subscription_manager
-    }
-
-    /// Accesses the marketplace service, if configured.
-    pub fn marketplace_service(&self) -> Option<&Arc<GatewayMarketplaceService>> {
-        self.marketplace_service.as_ref()
     }
 
     /// Constructs a `GatewayInterceptHandler` capturing current routing, subscription, and marketplace services.
@@ -894,27 +885,32 @@ impl GatewayServer {
         let handle_incoming_packet = |packet: ClientPacket| async {
             metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
                 .increment(1);
+            if let ClientPacket::AuthRequest(_) = &packet {
+                if self.authenticator.is_none() {
+                    let resp = handle_unauthenticated_auth_request(
+                        session_id,
+                        &self.router,
+                        self.default_node_address.as_deref(),
+                        Some(&intercept_handler),
+                    );
+                    let _ = self.send_packet_to_session(session_id, &resp).await;
+                    return Ok::<(), GatewayError>(());
+                }
+            }
             if let ClientPacket::Ping(ping) = &packet {
-                let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                    client_timestamp: ping.timestamp,
-                    server_timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64,
-                });
+                let pong = build_pong_packet(ping.timestamp);
                 let _ = self.send_packet_to_session(session_id, &pong).await;
                 return Ok::<(), GatewayError>(());
             }
 
-            if intercept_handler.handle_packet(session_id, &packet).await {
-                return Ok(());
-            }
-
-            let routed = self.dispatcher.dispatch_packet(session_id, packet)?;
-            if let Some(ref tx) = self.packet_tx {
-                let _ = tx.send(routed).await;
-            }
-            Ok(())
+            process_authenticated_packet(
+                session_id,
+                packet,
+                &self.dispatcher,
+                &self.packet_tx,
+                Some(&intercept_handler),
+            )
+            .await
         };
 
         if let Some(packet) = first_packet {
@@ -1074,6 +1070,7 @@ impl GatewayServer {
         let mut _stream_tasks = StreamTasksGuard(Vec::new());
         let bi_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BI_STREAMS));
 
+        let has_auth = self.authenticator.is_some();
         let spawn_stream_reader =
             |stream_send: Arc<tokio::sync::Mutex<quinn::SendStream>>,
              mut recv: quinn::RecvStream,
@@ -1082,6 +1079,8 @@ impl GatewayServer {
                 let dispatcher = self.dispatcher.clone();
                 let packet_tx = self.packet_tx.clone();
                 let intercept = intercept_handler.clone();
+                let router = self.router.clone();
+                let default_node_address = self.default_node_address.clone();
                 tokio::spawn(async move {
                 let _permit = permit;
                 let mut chunk = [0u8; 4096];
@@ -1093,14 +1092,23 @@ impl GatewayServer {
                             Ok(Some(pkt)) => {
                                 metrics::counter!("mmo_gateway_packets_received_total", "opcode" => pkt.opcode().as_str())
                                     .increment(1);
+                                if let ClientPacket::AuthRequest(_) = &pkt {
+                                    if !has_auth {
+                                        let resp = handle_unauthenticated_auth_request(
+                                            session_id,
+                                            &router,
+                                            default_node_address.as_deref(),
+                                            Some(&intercept),
+                                        );
+                                        let resp_bytes = resp.encode();
+                                        metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "AuthResponse").increment(1);
+                                        metrics::counter!("mmo_gateway_bytes_sent_total").increment(resp_bytes.len() as u64);
+                                        let _ = stream_send.lock().await.write_all(&resp_bytes).await;
+                                        continue;
+                                    }
+                                }
                                 if let ClientPacket::Ping(ref ping) = pkt {
-                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                                        client_timestamp: ping.timestamp,
-                                        server_timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis() as u64,
-                                    });
+                                    let pong = build_pong_packet(ping.timestamp);
                                     let pong_bytes = pong.encode();
                                     metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
                                     metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
@@ -1108,19 +1116,17 @@ impl GatewayServer {
                                     continue;
                                 }
 
-                                if intercept.handle_packet(session_id, &pkt).await {
-                                    continue;
-                                }
-
-                                match dispatcher.dispatch_packet(session_id, pkt) {
-                                    Ok(routed) => {
-                                        if let Some(ref tx) = packet_tx {
-                                            let _ = tx.send(routed).await;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
-                                    }
+                                if process_authenticated_packet(
+                                    session_id,
+                                    pkt,
+                                    &dispatcher,
+                                    &packet_tx,
+                                    Some(&intercept),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                                 }
                             }
                             Ok(None) => break,
@@ -1335,14 +1341,20 @@ impl GatewayServer {
                             while let Ok(Some(packet)) = ClientPacket::decode_frame(&mut dgram_buf) {
                                 metrics::counter!("mmo_gateway_packets_received_total", "opcode" => packet.opcode().as_str())
                                     .increment(1);
+                                if let ClientPacket::AuthRequest(_) = &packet {
+                                    if self.authenticator.is_none() {
+                                        let resp = handle_unauthenticated_auth_request(
+                                            session_id,
+                                            &self.router,
+                                            self.default_node_address.as_deref(),
+                                            Some(&intercept_handler),
+                                        );
+                                        let _ = self.send_packet_to_session(session_id, &resp).await;
+                                        continue;
+                                    }
+                                }
                                 if let ClientPacket::Ping(ref ping) = packet {
-                                    let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                                        client_timestamp: ping.timestamp,
-                                        server_timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis() as u64,
-                                    });
+                                    let pong = build_pong_packet(ping.timestamp);
                                     let pong_bytes = Bytes::from(pong.encode());
                                     metrics::counter!("mmo_gateway_packets_sent_total", "opcode" => "Pong").increment(1);
                                     metrics::counter!("mmo_gateway_bytes_sent_total").increment(pong_bytes.len() as u64);
@@ -1350,19 +1362,17 @@ impl GatewayServer {
                                     continue;
                                 }
 
-                                if intercept_handler.handle_packet(session_id, &packet).await {
-                                    continue;
-                                }
-
-                                match self.dispatcher.dispatch_packet(session_id, packet) {
-                                    Ok(routed) => {
-                                        if let Some(ref tx) = self.packet_tx {
-                                            let _ = tx.send(routed).await;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
-                                    }
+                                if process_authenticated_packet(
+                                    session_id,
+                                    packet,
+                                    &self.dispatcher,
+                                    &self.packet_tx,
+                                    Some(&intercept_handler),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    metrics::counter!("mmo_gateway_packets_dropped_total").increment(1);
                                 }
                             }
                         }

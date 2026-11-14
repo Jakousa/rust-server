@@ -3,7 +3,10 @@
 pub use mmo_core::combat::{CombatEffectOutcome, CombatResolver};
 use mmo_core::entity::state_flags;
 use mmo_core::plugin::EntityIncapacitatedEvent;
-use mmo_core::{ActionQueue, AttributeId, AttributeSet, Entity, EventQueue, Guid, InterruptReason};
+use mmo_core::{
+    ActionQueue, AttributeId, AttributeSet, Entity, EntityDamagedEvent, EventQueue, Guid,
+    InterruptReason,
+};
 
 /// Default unopinionated combat resolver applying direct primary vitality changes without genre curves.
 #[derive(Debug, Default, Clone, Copy)]
@@ -31,7 +34,8 @@ impl CombatResolver for DefaultCombatResolver {
         if damage > 0 {
             if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
                 let res = attrs
-                    .modify_current("vitality", -effective_damage)
+                    .modify_current_by_id(AttributeId::PRIMARY_VITALITY, -effective_damage)
+                    .or_else(|_| attrs.modify_current("vitality", -effective_damage))
                     .or_else(|_| attrs.modify_current("health", -effective_damage));
 
                 if let Ok(new_hp) = res {
@@ -67,6 +71,12 @@ impl CombatResolver for DefaultCombatResolver {
                 });
             }
 
+            event_queue.push(EntityDamagedEvent {
+                entity: target_guid,
+                amount: effective_damage,
+                instigator: caster_guid,
+            });
+
             // Interrupt active action if configured with cancel_on_damage
             if let Some(queue) = target_ent.components.get_component_mut::<ActionQueue>() {
                 let should_interrupt = queue
@@ -81,7 +91,8 @@ impl CombatResolver for DefaultCombatResolver {
             effective_healing = healing as f32;
             if let Some(attrs) = target_ent.components.get_component_mut::<AttributeSet>() {
                 let res = attrs
-                    .modify_current("vitality", effective_healing)
+                    .modify_current_by_id(AttributeId::PRIMARY_VITALITY, effective_healing)
+                    .or_else(|_| attrs.modify_current("vitality", effective_healing))
                     .or_else(|_| attrs.modify_current("health", effective_healing));
 
                 if let Ok(new_hp) = res {

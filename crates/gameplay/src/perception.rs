@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use mmo_core::{
-    DomainEvent, EntityType, GameplayPlugin, Guid, PluginContext, TickContext, TickSystem,
+    DomainEvent, EntityKey, EntityType, GameplayPlugin, Guid, PluginContext, TickContext,
+    TickSystem,
 };
 
 use crate::combat::HealthComponent;
@@ -50,21 +51,40 @@ pub struct HostileSpottedEvent {
 
 impl DomainEvent for HostileSpottedEvent {}
 
+#[derive(Clone, Copy)]
+struct PendingScan {
+    key: EntityKey,
+    guid: Guid,
+    pos: (f32, f32, f32),
+    sight_radius: f32,
+}
+
 /// Batch tick system querying the spatial octree for nearby entities and checking faction hostility.
 #[derive(Default)]
-pub struct PerceptionScanSystem;
+pub struct PerceptionScanSystem {
+    scratch_scans: Vec<PendingScan>,
+    scratch_candidates: Vec<Guid>,
+    scratch_events: Vec<(EntityKey, HostileSpottedEvent)>,
+    scratch_valid_targets: Vec<Guid>,
+}
+
+impl PerceptionScanSystem {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl TickSystem for PerceptionScanSystem {
     fn name(&self) -> &'static str {
         "PerceptionScanSystem"
     }
 
-    #[allow(clippy::type_complexity)]
     fn update(&mut self, ctx: &mut TickContext) {
-        // Collect observers ready to scan: (observer_guid, observer_pos, sight_radius, hostile_factions)
-        let mut scans: Vec<(Guid, (f32, f32, f32), f32, Vec<u32>)> = Vec::new();
+        self.scratch_scans.clear();
+        self.scratch_events.clear();
 
-        for (_key, entity) in ctx.entities.iter_mut() {
+        // Pass 1: Collect observers ready to scan without cloning hostile_factions
+        for (key, entity) in ctx.entities.iter_mut() {
             let entity_guid = entity.guid;
             let entity_pos = entity.position;
 
@@ -72,24 +92,38 @@ impl TickSystem for PerceptionScanSystem {
                 perception.scan_timer_secs -= ctx.dt_sec;
                 if perception.scan_timer_secs <= 0.0 {
                     perception.scan_timer_secs = perception.scan_interval_secs;
-                    scans.push((
-                        entity_guid,
-                        entity_pos,
-                        perception.sight_radius,
-                        perception.hostile_factions.clone(),
-                    ));
+                    self.scratch_scans.push(PendingScan {
+                        key,
+                        guid: entity_guid,
+                        pos: entity_pos,
+                        sight_radius: perception.sight_radius,
+                    });
                 }
             }
         }
 
-        // Perform spatial queries and faction filtering
-        let mut events_to_emit: Vec<HostileSpottedEvent> = Vec::new();
+        // Pass 2: Perform spatial queries and faction filtering using reusable scratch buffers
+        for &PendingScan {
+            key: obs_key,
+            guid: observer_guid,
+            pos: observer_pos,
+            sight_radius,
+        } in &self.scratch_scans
+        {
+            let Some(observer_ent) = ctx.entities.get(obs_key) else {
+                continue;
+            };
+            let Some(obs_perception) = observer_ent.get_component::<PerceptionComponent>() else {
+                continue;
+            };
+            let hostile_factions = &obs_perception.hostile_factions;
 
-        for (observer_guid, observer_pos, sight_radius, hostile_factions) in &scans {
-            let candidates = ctx.octree.query_radius(*observer_pos, *sight_radius);
+            self.scratch_candidates.clear();
+            ctx.octree
+                .query_radius_into(observer_pos, sight_radius, &mut self.scratch_candidates);
 
-            for candidate_guid in candidates {
-                if candidate_guid == *observer_guid {
+            for &candidate_guid in &self.scratch_candidates {
+                if candidate_guid == observer_guid {
                     continue;
                 }
 
@@ -124,20 +158,30 @@ impl TickSystem for PerceptionScanSystem {
                         let dz = candidate.position.2 - observer_pos.2;
                         let distance = (dx * dx + dy * dy + dz * dz).sqrt();
 
-                        events_to_emit.push(HostileSpottedEvent {
-                            observer: *observer_guid,
-                            spotted: candidate_guid,
-                            distance,
-                        });
+                        self.scratch_events.push((
+                            obs_key,
+                            HostileSpottedEvent {
+                                observer: observer_guid,
+                                spotted: candidate_guid,
+                                distance,
+                            },
+                        ));
                     }
                 }
             }
         }
 
-        // Prune stale targets for observers that performed a scan
-        for (observer_guid, observer_pos, sight_radius, _hostile_factions) in scans {
-            let mut valid_targets = Vec::new();
-            if let Some(observer_ent) = ctx.entities.get_by_guid(observer_guid) {
+        // Pass 3: Prune stale targets in-place reusing existing spotted_targets allocations
+        for &PendingScan {
+            key: obs_key,
+            pos: observer_pos,
+            sight_radius,
+            ..
+        } in &self.scratch_scans
+        {
+            self.scratch_valid_targets.clear();
+            let sight_radius_sq = sight_radius * sight_radius;
+            if let Some(observer_ent) = ctx.entities.get(obs_key) {
                 if let Some(perception) = observer_ent.get_component::<PerceptionComponent>() {
                     for &target_guid in &perception.spotted_targets {
                         if let Some(target_ent) = ctx.entities.get_by_guid(target_guid) {
@@ -149,24 +193,27 @@ impl TickSystem for PerceptionScanSystem {
                             let dy = target_ent.position.1 - observer_pos.1;
                             let dz = target_ent.position.2 - observer_pos.2;
                             let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if !is_dead && dist_sq <= sight_radius * sight_radius {
-                                valid_targets.push(target_guid);
+                            if !is_dead && dist_sq <= sight_radius_sq {
+                                self.scratch_valid_targets.push(target_guid);
                             }
                         }
                     }
                 }
             }
 
-            if let Some(observer_ent) = ctx.entities.get_mut_by_guid(observer_guid) {
+            if let Some(observer_ent) = ctx.entities.get_mut(obs_key) {
                 if let Some(perception) = observer_ent.get_component_mut::<PerceptionComponent>() {
-                    perception.spotted_targets = valid_targets;
+                    perception.spotted_targets.clear();
+                    perception
+                        .spotted_targets
+                        .extend_from_slice(&self.scratch_valid_targets);
                 }
             }
         }
 
-        // Emit events and update spotted_targets
-        for evt in events_to_emit {
-            if let Some(observer_ent) = ctx.entities.get_mut_by_guid(evt.observer) {
+        // Pass 4: Emit events and update spotted_targets
+        for (obs_key, evt) in self.scratch_events.drain(..) {
+            if let Some(observer_ent) = ctx.entities.get_mut(obs_key) {
                 if let Some(perception) = observer_ent.get_component_mut::<PerceptionComponent>() {
                     if !perception.spotted_targets.contains(&evt.spotted) {
                         perception.spotted_targets.push(evt.spotted);
@@ -188,7 +235,7 @@ impl GameplayPlugin for PerceptionPlugin {
 
     fn build(&self, ctx: &mut PluginContext) {
         ctx.codecs.register::<PerceptionComponent>("perception");
-        ctx.tick_systems.push(Box::new(PerceptionScanSystem));
+        ctx.tick_systems.push(Box::new(PerceptionScanSystem::new()));
     }
 }
 
@@ -248,7 +295,7 @@ mod tests {
         store.spawn(distant_guid, (30.0, 0.0, 0.0));
         octree.insert(distant_guid, (30.0, 0.0, 0.0));
 
-        let mut scan_system = PerceptionScanSystem;
+        let mut scan_system = PerceptionScanSystem::new();
 
         {
             let mut ctx = TickContext {

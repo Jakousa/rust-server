@@ -1,12 +1,17 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
-use super::dispatcher::DEFAULT_STREAM_CHANNEL_CAPACITY;
+use super::dispatcher::{PacketDispatcher, DEFAULT_STREAM_CHANNEL_CAPACITY};
+use super::intercept::GatewayInterceptHandler;
+use super::{GatewayError, RoutedPacket};
 use crate::router::SessionRouter;
 use crate::social::GatewaySubscriptionManager;
+use mmo_core::{EntityType, Guid};
+use mmo_schema::client::{AuthResponsePacket, ClientPacket, PongPacket};
 use mmo_storage::cache::SessionCacheBackend;
 
 /// Sinks for forwarding outgoing packets to a connected client session.
@@ -72,4 +77,65 @@ impl Drop for SessionDropGuard {
             }
         }
     }
+}
+
+/// Constructs a `ClientPacket::Pong` echoing `client_timestamp` with the current server UNIX epoch milliseconds.
+pub fn build_pong_packet(client_timestamp: u64) -> ClientPacket {
+    let server_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    ClientPacket::Pong(PongPacket {
+        client_timestamp,
+        server_timestamp,
+    })
+}
+
+/// Registers an unauthenticated (PoC) session in the router, subscribes it to `"chat:global"`,
+/// and returns the resulting `ClientPacket::AuthResponse`.
+pub fn handle_unauthenticated_auth_request(
+    session_id: u64,
+    router: &SessionRouter,
+    default_node_address: Option<&str>,
+    intercept_handler: Option<&GatewayInterceptHandler>,
+) -> ClientPacket {
+    let default_guid = Guid::new(EntityType::Player, 1, (session_id & 0xFFFF_FFFF) as u32);
+    let assigned_node = default_node_address
+        .unwrap_or("127.0.0.1:50052")
+        .to_string();
+    router.register_session(session_id, default_guid, assigned_node.clone());
+    if let Some(handler) = intercept_handler {
+        let _ = handler
+            .subscription_manager
+            .subscribe(session_id, "chat:global".to_string());
+    }
+    ClientPacket::AuthResponse(AuthResponsePacket {
+        success: true,
+        error_code: 0,
+        session_id,
+        player_guid: default_guid.raw(),
+        assigned_node,
+        error_message: String::new(),
+    })
+}
+
+/// Runs edge packet interceptors, dispatches the packet to the session's assigned node, and forwards it.
+pub async fn process_authenticated_packet(
+    session_id: u64,
+    packet: ClientPacket,
+    dispatcher: &PacketDispatcher,
+    packet_tx: &Option<mpsc::Sender<RoutedPacket>>,
+    intercept_handler: Option<&GatewayInterceptHandler>,
+) -> Result<(), GatewayError> {
+    if let Some(handler) = intercept_handler {
+        if handler.handle_packet(session_id, &packet).await {
+            return Ok(());
+        }
+    }
+
+    let routed = dispatcher.dispatch_packet(session_id, packet)?;
+    if let Some(ref tx) = packet_tx {
+        let _ = tx.send(routed).await;
+    }
+    Ok(())
 }

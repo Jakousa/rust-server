@@ -41,6 +41,7 @@ pub enum ContainerOwner {
     Character(u64),
     Guild(u64),
     Group(u64),
+    Organization(u64),
     WorldEntity(u64),
     System(String),
 }
@@ -52,6 +53,7 @@ impl ContainerOwner {
             Self::Character(_) => "character",
             Self::Guild(_) => "guild",
             Self::Group(_) => "group",
+            Self::Organization(_) => "organization",
             Self::WorldEntity(_) => "world_entity",
             Self::System(_) => "system",
         }
@@ -60,9 +62,11 @@ impl ContainerOwner {
     /// Returns the database-persisted owner identifier string.
     pub fn owner_id(&self) -> String {
         match self {
-            Self::Character(id) | Self::Guild(id) | Self::Group(id) | Self::WorldEntity(id) => {
-                id.to_string()
-            }
+            Self::Character(id)
+            | Self::Guild(id)
+            | Self::Group(id)
+            | Self::Organization(id)
+            | Self::WorldEntity(id) => id.to_string(),
             Self::System(s) => s.clone(),
         }
     }
@@ -87,6 +91,12 @@ impl ContainerOwner {
                     ContainerError::InvalidOwner(owner_type.to_string(), owner_id.to_string())
                 })?;
                 Ok(Self::Group(id))
+            }
+            "organization" => {
+                let id = owner_id.parse::<u64>().map_err(|_| {
+                    ContainerError::InvalidOwner(owner_type.to_string(), owner_id.to_string())
+                })?;
+                Ok(Self::Organization(id))
             }
             "world_entity" => {
                 let id = owner_id.parse::<u64>().map_err(|_| {
@@ -339,5 +349,17 @@ mod tests {
                 capacity: 3
             })
         );
+    }
+
+    #[test]
+    fn test_container_owner_organization_roundtrip() {
+        let org = ContainerOwner::Organization(42);
+        assert_eq!(org.owner_type(), "organization");
+        assert_eq!(org.owner_id(), "42");
+        assert_eq!(
+            ContainerOwner::from_parts("organization", "42"),
+            Ok(ContainerOwner::Organization(42))
+        );
+        assert!(ContainerOwner::from_parts("organization", "bad").is_err());
     }
 }

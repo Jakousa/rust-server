@@ -215,19 +215,19 @@ impl BackhaulPool {
         &self,
         node_address: &str,
     ) -> (Arc<BackhaulChannel>, Option<mpsc::Receiver<RoutedPacket>>) {
-        if let Some(ch) = self.channels.get(node_address) {
-            return (Arc::clone(&ch), None);
+        match self.channels.entry(node_address.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => (Arc::clone(entry.get()), None),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (tx, rx) = mpsc::channel(self.channel_capacity);
+                let channel = Arc::new(BackhaulChannel::with_probe_interval(
+                    node_address.to_string(),
+                    tx,
+                    self.probe_interval_ms,
+                ));
+                entry.insert(Arc::clone(&channel));
+                (channel, Some(rx))
+            }
         }
-
-        let (tx, rx) = mpsc::channel(self.channel_capacity);
-        let channel = Arc::new(BackhaulChannel::with_probe_interval(
-            node_address.to_string(),
-            tx,
-            self.probe_interval_ms,
-        ));
-        self.channels
-            .insert(node_address.to_string(), Arc::clone(&channel));
-        (channel, Some(rx))
     }
 
     /// Dispatches a routed packet across the node's persistent backhaul channel.
@@ -460,5 +460,36 @@ mod tests {
         ch1.record_success();
         assert_eq!(ch1.state(), BackhaulState::Connected);
         assert_eq!(pool.healthy_channels().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_backhaul_pool_concurrent_get_or_create_single_channel() {
+        let pool = Arc::new(BackhaulPool::new(16));
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut handles = Vec::with_capacity(16);
+
+        for _ in 0..16 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                pool.get_or_create("node-concurrent:50052")
+            }));
+        }
+
+        let mut channels = Vec::with_capacity(16);
+        let mut receivers = 0usize;
+        for handle in handles {
+            let (ch, rx) = handle.await.unwrap();
+            if rx.is_some() {
+                receivers += 1;
+            }
+            channels.push(ch);
+        }
+
+        assert_eq!(receivers, 1);
+        for ch in &channels[1..] {
+            assert!(Arc::ptr_eq(&channels[0], ch));
+        }
     }
 }

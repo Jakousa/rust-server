@@ -250,6 +250,17 @@ macro_rules! with_dialect_tx {
     };
 }
 
+/// Dispatches an operation uniformly across SQLite and PostgreSQL connection pools.
+#[macro_export]
+macro_rules! with_dialect_pool {
+    ($db:expr, |$pool:ident| $body:block) => {
+        match $db.backend() {
+            $crate::db::DbBackend::Sqlite($pool) => $body,
+            $crate::db::DbBackend::Postgres($pool) => $body,
+        }
+    };
+}
+
 /// Central database manager backed by SQLite or PostgreSQL connection pool.
 #[derive(Clone)]
 pub struct Database {

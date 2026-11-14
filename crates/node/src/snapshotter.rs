@@ -773,21 +773,47 @@ mod tests {
         sim.set_snapshot_sender(tx);
         sim.set_snapshot_interval_ticks(2);
 
-        let guid = Guid::new(EntityType::Player, 1, 555);
-        assert!(sim.spawn_entity(guid, (5.0, 10.0, 15.0)));
+        let guid_even = Guid::new(EntityType::Player, 1, 554);
+        let guid_odd = Guid::new(EntityType::Player, 1, 555);
+        assert!(sim.spawn_entity(guid_even, (5.0, 10.0, 15.0)));
+        assert!(sim.spawn_entity(guid_odd, (1.0, 2.0, 3.0)));
 
-        // Tick 1: interval not reached (1 % 2 != 0)
+        // Tick 1: staggered bucket 1 -> only odd guid dispatches
+        sim.step_tick();
+        let payload1 = rx
+            .try_recv()
+            .expect("Odd GUID payload should be dispatched on tick 1");
+        assert_eq!(payload1.guid, guid_odd);
+        assert_eq!(payload1.position, (1.0, 2.0, 3.0));
+        assert_eq!(payload1.version, 1);
+        assert!(rx.try_recv().is_err());
+
+        // Tick 2: staggered bucket 0 -> even guid dispatches
+        sim.step_tick();
+        let payload2 = rx
+            .try_recv()
+            .expect("Even GUID payload should be dispatched on tick 2");
+        assert_eq!(payload2.guid, guid_even);
+        assert_eq!(payload2.position, (5.0, 10.0, 15.0));
+        assert_eq!(payload2.version, 2);
+        assert!(rx.try_recv().is_err());
+
+        // Tick 3: odd guid is unchanged -> dirty filter skips re-serialization
         sim.step_tick();
         assert!(rx.try_recv().is_err());
 
-        // Tick 2: interval reached (2 % 2 == 0)
+        // Move even guid and step to Tick 4 -> dirty filter detects change and re-dispatches
+        sim.entity_store
+            .get_mut_by_guid(guid_even)
+            .unwrap()
+            .position = (6.0, 10.0, 15.0);
         sim.step_tick();
-        let payload = rx
+        let payload4 = rx
             .try_recv()
-            .expect("Payload should be dispatched on tick 2");
-        assert_eq!(payload.guid, guid);
-        assert_eq!(payload.position, (5.0, 10.0, 15.0));
-        assert_eq!(payload.version, 2);
+            .expect("Moved even GUID should be re-dispatched on tick 4");
+        assert_eq!(payload4.guid, guid_even);
+        assert_eq!(payload4.position, (6.0, 10.0, 15.0));
+        assert_eq!(payload4.version, 4);
     }
 
     #[tokio::test]

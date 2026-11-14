@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::entity::EntityKey;
 use crate::guid::Guid;
 use crate::plugin::{DomainEvent, EventQueue, TickContext, TickSystem};
 use crate::spatial::{
@@ -152,6 +153,16 @@ pub struct ActionInterruptedEvent {
 }
 impl DomainEvent for ActionInterruptedEvent {}
 
+/// Domain event signaling that an entity received damage/impact during the tick,
+/// triggering `ActionInterruptFlags::cancel_on_damage` in `ActionTickSystem`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDamagedEvent {
+    pub entity: Guid,
+    pub amount: f32,
+    pub instigator: Option<Guid>,
+}
+impl DomainEvent for EntityDamagedEvent {}
+
 /// Entity component managing an entity's current timed action.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActionQueue {
@@ -238,18 +249,21 @@ impl ActionQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ActionDecision {
+    Interrupt(u32, InterruptReason),
+    Progress,
+}
+
 /// Batch system executed during the simulation tick to advance active actions.
-pub struct ActionTickSystem;
+#[derive(Default)]
+pub struct ActionTickSystem {
+    decisions: Vec<(EntityKey, ActionDecision)>,
+}
 
 impl ActionTickSystem {
     pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for ActionTickSystem {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -260,16 +274,12 @@ impl TickSystem for ActionTickSystem {
 
     fn update(&mut self, ctx: &mut TickContext) {
         ctx.events.register_ephemeral::<ActionProgressEvent>();
+        ctx.events.register_ephemeral::<EntityDamagedEvent>();
 
-        enum ActionDecision {
-            Interrupt(u32, InterruptReason),
-            Progress,
-        }
-
-        let mut decisions: Vec<(Guid, ActionDecision)> = Vec::new();
+        self.decisions.clear();
 
         // Pass 1: Immutable inspect pass determining whether actions are interrupted or advanced
-        for (_key, entity) in ctx.entities.iter() {
+        for (key, entity) in ctx.entities.iter() {
             if let Some(queue) = entity.get_component::<ActionQueue>() {
                 if let Some(action) = queue.current() {
                     let mut interrupt_reason = None;
@@ -306,39 +316,55 @@ impl TickSystem for ActionTickSystem {
                         }
                     }
 
+                    // 4. cancel_on_damage: entity received damage/impact this tick
+                    if interrupt_reason.is_none()
+                        && action.interrupt_flags.cancel_on_damage
+                        && ctx
+                            .events
+                            .read::<EntityDamagedEvent>()
+                            .iter()
+                            .any(|e| e.entity == entity.guid)
+                    {
+                        interrupt_reason = Some(InterruptReason::Damage);
+                    }
+
                     if let Some(reason) = interrupt_reason {
-                        decisions.push((
-                            entity.guid,
-                            ActionDecision::Interrupt(action.action_id, reason),
-                        ));
+                        self.decisions
+                            .push((key, ActionDecision::Interrupt(action.action_id, reason)));
                     } else {
-                        decisions.push((entity.guid, ActionDecision::Progress));
+                        self.decisions.push((key, ActionDecision::Progress));
                     }
                 }
             }
         }
 
-        // Pass 2: Mutable update pass applying decisions
-        let mut completed = Vec::new();
-        let mut interrupted = Vec::new();
-        let mut progressed = Vec::new();
-
-        for (entity_guid, decision) in decisions {
-            if let Some(entity) = ctx.entities.get_mut_by_guid(entity_guid) {
+        // Pass 2: Mutable update pass applying decisions via O(1) SlotMap key lookups and direct event emission
+        for &(entity_key, decision) in &self.decisions {
+            if let Some(entity) = ctx.entities.get_mut(entity_key) {
+                let entity_guid = entity.guid;
                 if let Some(queue) = entity.get_component_mut::<ActionQueue>() {
                     match decision {
                         ActionDecision::Interrupt(action_id, reason) => {
                             queue.current = None;
-                            interrupted.push((entity_guid, action_id, reason));
+                            ctx.events.push(ActionInterruptedEvent {
+                                entity: entity_guid,
+                                action_id,
+                                reason,
+                            });
                         }
                         ActionDecision::Progress => {
                             if let Some(ref mut action) = queue.current {
                                 action.elapsed_sec += ctx.dt_sec;
                                 if action.is_finished() {
                                     let finished_action = queue.current.take().unwrap();
-                                    completed.push((entity_guid, finished_action));
+                                    ctx.events.push(ActionCompletedEvent {
+                                        entity: entity_guid,
+                                        action_id: finished_action.action_id,
+                                        target_guid: finished_action.target_guid,
+                                        extra_data: finished_action.extra_data,
+                                    });
                                 } else {
-                                    progressed.push(ActionProgressEvent {
+                                    ctx.events.push(ActionProgressEvent {
                                         entity: entity_guid,
                                         action_id: action.action_id,
                                         elapsed_sec: action.elapsed_sec,
@@ -351,34 +377,13 @@ impl TickSystem for ActionTickSystem {
                 }
             }
         }
-
-        for (entity, action_id, reason) in interrupted {
-            ctx.events.push(ActionInterruptedEvent {
-                entity,
-                action_id,
-                reason,
-            });
-        }
-
-        for ev in progressed {
-            ctx.events.push(ev);
-        }
-
-        // Emit ActionCompletedEvent for completed actions
-        for (entity, action) in completed {
-            ctx.events.push(ActionCompletedEvent {
-                entity,
-                action_id: action.action_id,
-                target_guid: action.target_guid,
-                extra_data: action.extra_data,
-            });
-        }
     }
 }
 
 /// Component tracking action cooldowns and the shared Global Cooldown (GCD).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CooldownTracker {
+    #[serde(alias = "action_cooldowns")]
     pub ability_cooldowns: HashMap<u32, f32>,
     pub gcd_remaining_sec: f32,
 }
@@ -386,6 +391,11 @@ pub struct CooldownTracker {
 impl CooldownTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a read-only view of per-action remaining cooldowns (in seconds).
+    pub fn action_cooldowns(&self) -> &HashMap<u32, f32> {
+        &self.ability_cooldowns
     }
 
     /// Checks if a specific action or the global cooldown is currently active.
@@ -502,6 +512,7 @@ mod tests {
     use super::*;
     use crate::guid::EntityType;
     use crate::octree::Octree;
+    use crate::{BoundingBox3D, EntityStore};
 
     #[test]
     fn test_instant_action_completes_immediately() {
@@ -544,7 +555,7 @@ mod tests {
         entities.get_mut(key).unwrap().add_component(queue);
 
         // Tick 1: dt = 0.05s (50ms) -> Action should be halfway done
-        let mut tick_system = ActionTickSystem;
+        let mut tick_system = ActionTickSystem::new();
         {
             let mut ctx = TickContext {
                 entities: &mut entities,
@@ -666,7 +677,7 @@ mod tests {
             .unwrap();
         entities.get_mut(caster_key).unwrap().add_component(queue);
 
-        let mut tick_system = ActionTickSystem;
+        let mut tick_system = ActionTickSystem::new();
 
         // Tick 1: dt = 0.2s -> Emits ActionProgressEvent
         {
@@ -812,8 +823,66 @@ mod tests {
         for bad_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             tracker.tick(bad_dt);
             assert!(tracker.is_on_cooldown(10));
-            assert_eq!(tracker.ability_cooldowns.get(&10).copied(), Some(5.0));
+            assert_eq!(tracker.action_cooldowns().get(&10).copied(), Some(5.0));
             assert_eq!(tracker.gcd_remaining_sec, 1.5);
         }
+    }
+
+    #[test]
+    fn test_action_tick_system_cancel_on_damage() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut tick_system = ActionTickSystem::new();
+
+        let caster_guid = Guid::new(EntityType::Player, 1, 77);
+        let attacker_guid = Guid::new(EntityType::Npc, 1, 88);
+        let caster_key = store.spawn(caster_guid, (0.0, 0.0, 0.0));
+        let mut queue = ActionQueue::new();
+        let flags = ActionInterruptFlags {
+            cancel_on_damage: true,
+            ..Default::default()
+        };
+        queue
+            .start_action(
+                caster_guid,
+                TimedAction::new(42, 2.0, flags, None),
+                QueuePolicy::RejectIfBusy,
+                &mut events,
+            )
+            .unwrap();
+        let _ = events.drain::<ActionStartedEvent>();
+        store.get_mut(caster_key).unwrap().add_component(queue);
+
+        events.push(EntityDamagedEvent {
+            entity: caster_guid,
+            amount: 15.0,
+            instigator: Some(attacker_guid),
+        });
+
+        let mut ctx = TickContext {
+            entities: &mut store,
+            octree: &mut octree,
+            events: &mut events,
+            dt_sec: 0.25,
+            tick: 1,
+            collision_world: None,
+        };
+        tick_system.update(&mut ctx);
+
+        let interrupted = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].entity, caster_guid);
+        assert_eq!(interrupted[0].action_id, 42);
+        assert_eq!(interrupted[0].reason, InterruptReason::Damage);
+        assert!(!store
+            .get_by_guid(caster_guid)
+            .unwrap()
+            .get_component::<ActionQueue>()
+            .unwrap()
+            .is_busy());
     }
 }

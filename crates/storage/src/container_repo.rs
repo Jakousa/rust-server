@@ -1,6 +1,6 @@
 //! Container storage repository for managing arbitrary storage containers.
 
-use crate::db::{current_time_secs, Database, DbBackend, StorageError};
+use crate::db::{current_time_secs, Database, StorageError};
 use crate::models::{ContainerRecord, ItemRecord};
 use sqlx::Row;
 
@@ -49,36 +49,20 @@ impl ContainerRepository {
         "#;
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&query_str)
-                    .bind(container.container_id as i64)
-                    .bind(&container.owner_type)
-                    .bind(&container.owner_id)
-                    .bind(&container.name)
-                    .bind(container.capacity as i32)
-                    .bind(&container.access_policy)
-                    .bind(container.version as i64)
-                    .bind(container.created_at)
-                    .bind(container.updated_at)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&query_str)
-                    .bind(container.container_id as i64)
-                    .bind(&container.owner_type)
-                    .bind(&container.owner_id)
-                    .bind(&container.name)
-                    .bind(container.capacity as i32)
-                    .bind(&container.access_policy)
-                    .bind(container.version as i64)
-                    .bind(container.created_at)
-                    .bind(container.updated_at)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&query_str)
+                .bind(container.container_id as i64)
+                .bind(&container.owner_type)
+                .bind(&container.owner_id)
+                .bind(&container.name)
+                .bind(container.capacity as i32)
+                .bind(&container.access_policy)
+                .bind(container.version as i64)
+                .bind(container.created_at)
+                .bind(container.updated_at)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(())
     }
@@ -91,30 +75,17 @@ impl ContainerRepository {
         let query = "SELECT container_id, owner_type, owner_id, name, capacity, access_policy, version, created_at, updated_at FROM containers WHERE container_id = ?";
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&query_str)
+                .bind(container_id as i64)
+                .fetch_optional(pool)
+                .await?;
 
-                match row {
-                    Some(r) => Ok(Some(parse_container_record!(r))),
-                    None => Ok(None),
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .fetch_optional(pool)
-                    .await?;
-
-                match row {
-                    Some(r) => Ok(Some(parse_container_record!(r))),
-                    None => Ok(None),
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(parse_container_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Retrieves all items residing inside a given container.
@@ -125,32 +96,18 @@ impl ContainerRepository {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE container_id = ? ORDER BY slot ASC";
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let rows = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .fetch_all(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let rows = sqlx::query(&query_str)
+                .bind(container_id as i64)
+                .fetch_all(pool)
+                .await?;
 
-                let mut items = Vec::with_capacity(rows.len());
-                for r in rows {
-                    items.push(crate::parse_item_record!(r));
-                }
-                Ok(items)
+            let mut items = Vec::with_capacity(rows.len());
+            for r in rows {
+                items.push(crate::parse_item_record!(r));
             }
-            DbBackend::Postgres(pool) => {
-                let rows = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .fetch_all(pool)
-                    .await?;
-
-                let mut items = Vec::with_capacity(rows.len());
-                for r in rows {
-                    items.push(crate::parse_item_record!(r));
-                }
-                Ok(items)
-            }
-        }
+            Ok(items)
+        })
     }
 
     /// Retrieves the item at a specific slot in a container, if any.
@@ -162,32 +119,18 @@ impl ContainerRepository {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE container_id = ? AND slot = ?";
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .bind(slot as i32)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&query_str)
+                .bind(container_id as i64)
+                .bind(slot as i32)
+                .fetch_optional(pool)
+                .await?;
 
-                match row {
-                    Some(r) => Ok(Some(crate::parse_item_record!(r))),
-                    None => Ok(None),
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(container_id as i64)
-                    .bind(slot as i32)
-                    .fetch_optional(pool)
-                    .await?;
-
-                match row {
-                    Some(r) => Ok(Some(crate::parse_item_record!(r))),
-                    None => Ok(None),
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(crate::parse_item_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Retrieves an item by its unique instance ID across all containers.
@@ -198,30 +141,17 @@ impl ContainerRepository {
         let query = "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?";
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(item_instance_id)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&query_str)
+                .bind(item_instance_id)
+                .fetch_optional(pool)
+                .await?;
 
-                match row {
-                    Some(r) => Ok(Some(crate::parse_item_record!(r))),
-                    None => Ok(None),
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(item_instance_id)
-                    .fetch_optional(pool)
-                    .await?;
-
-                match row {
-                    Some(r) => Ok(Some(crate::parse_item_record!(r))),
-                    None => Ok(None),
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(crate::parse_item_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Updates container capacity.
@@ -235,24 +165,14 @@ impl ContainerRepository {
         let query = "UPDATE containers SET capacity = ?, updated_at = ? WHERE container_id = ?";
         let query_str = self.db.sql(query);
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&query_str)
-                    .bind(new_capacity as i32)
-                    .bind(now)
-                    .bind(container_id as i64)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&query_str)
-                    .bind(new_capacity as i32)
-                    .bind(now)
-                    .bind(container_id as i64)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&query_str)
+                .bind(new_capacity as i32)
+                .bind(now)
+                .bind(container_id as i64)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(())
     }
@@ -262,18 +182,13 @@ impl ContainerRepository {
         let query = "DELETE FROM containers WHERE container_id = ?";
         let query_str = self.db.sql(query);
 
-        let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query(&query_str)
+        let rows_affected = crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&query_str)
                 .bind(container_id as i64)
                 .execute(pool)
                 .await?
-                .rows_affected(),
-            DbBackend::Postgres(pool) => sqlx::query(&query_str)
-                .bind(container_id as i64)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
+                .rows_affected()
+        });
 
         Ok(rows_affected > 0)
     }

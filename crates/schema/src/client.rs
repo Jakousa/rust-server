@@ -1077,6 +1077,29 @@ pub(crate) fn put_u16_str(dst: &mut BytesMut, s: &str) {
     dst.extend_from_slice(bytes);
 }
 
+/// Helper decoding a string with a 16-bit little-endian byte length, ensuring at least `trailing_min_bytes` remain afterward.
+pub(crate) fn get_u16_str(
+    src: &mut impl Buf,
+    trailing_min_bytes: usize,
+) -> Result<String, ClientCodecError> {
+    if src.remaining() < 2 {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: 2,
+            got: src.remaining(),
+        });
+    }
+    let len = src.get_u16_le() as usize;
+    let needed = len + trailing_min_bytes;
+    if src.remaining() < needed {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: needed,
+            got: src.remaining(),
+        });
+    }
+    let bytes = src.copy_to_bytes(len);
+    String::from_utf8(bytes.to_vec()).map_err(|e| ClientCodecError::InvalidData(e.to_string()))
+}
+
 /// Client acknowledgement carrying the latest observed server tick and a 32-tick loss recovery mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientAckPacket {
@@ -1523,22 +1546,7 @@ impl AuthRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let token_len = src.get_u16_le() as usize;
-        if src.remaining() < token_len + 4 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: token_len + 4,
-                got: src.remaining(),
-            });
-        }
-        let token_bytes = src.copy_to_bytes(token_len);
-        let token = String::from_utf8(token_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let token = get_u16_str(src, 4)?;
         let client_version = src.get_u32_le();
         Ok(Self {
             token,
@@ -1582,33 +1590,8 @@ impl AuthResponsePacket {
         let session_id = src.get_u64_le();
         let player_guid = src.get_u64_le();
 
-        let node_len = src.get_u16_le() as usize;
-        if src.remaining() < node_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: node_len,
-                got: src.remaining(),
-            });
-        }
-        let node_bytes = src.copy_to_bytes(node_len);
-        let assigned_node = String::from_utf8(node_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
-
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let msg_len = src.get_u16_le() as usize;
-        if src.remaining() < msg_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: msg_len,
-                got: src.remaining(),
-            });
-        }
-        let msg_bytes = src.copy_to_bytes(msg_len);
-        let error_message = String::from_utf8(msg_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let assigned_node = get_u16_str(src, 0)?;
+        let error_message = get_u16_str(src, 0)?;
 
         Ok(Self {
             success,
@@ -1653,33 +1636,8 @@ impl SocialMessagePacket {
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
         let sender_guid = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let sender_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
-
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let content_len = src.get_u16_le() as usize;
-        if src.remaining() < content_len + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: content_len + 8,
-                got: src.remaining(),
-            });
-        }
-        let content_bytes = src.copy_to_bytes(content_len);
-        let content = String::from_utf8(content_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let sender_name = get_u16_str(src, 0)?;
+        let content = get_u16_str(src, 8)?;
         let timestamp = src.get_u64_le();
 
         Ok(Self {
@@ -1717,16 +1675,7 @@ impl SocialSubscribePacket {
         }
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let channel_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let channel_name = get_u16_str(src, 0)?;
         Ok(Self {
             channel_type,
             target_id,
@@ -1759,16 +1708,7 @@ impl SocialUnsubscribePacket {
         }
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let channel_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let channel_name = get_u16_str(src, 0)?;
         Ok(Self {
             channel_type,
             target_id,
@@ -1814,33 +1754,9 @@ impl MarketListingWire {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 8 + 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 10,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 10)?;
         let seller_guid = src.get_u64_le();
-        let iid_len = src.get_u16_le() as usize;
-        if src.remaining() < iid_len + 4 + 8 + 8 + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: iid_len + 28,
-                got: src.remaining(),
-            });
-        }
-        let iid_bytes = src.copy_to_bytes(iid_len);
-        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let item_instance_id = get_u16_str(src, 28)?;
         let item_def_id = src.get_u32_le();
         let price = src.get_u64_le();
         let created_at = src.get_u64_le();
@@ -1878,22 +1794,7 @@ impl MarketListRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let iid_len = src.get_u16_le() as usize;
-        if src.remaining() < iid_len + 28 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: iid_len + 28,
-                got: src.remaining(),
-            });
-        }
-        let iid_bytes = src.copy_to_bytes(iid_len);
-        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let item_instance_id = get_u16_str(src, 28)?;
         let src_container_id = src.get_u64_le();
         let src_slot = src.get_u32_le();
         let price = src.get_u64_le();
@@ -1927,22 +1828,7 @@ impl MarketBuyRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 24 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 24,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 24)?;
         let buyer_container_id = src.get_u64_le();
         let payment_container_id = src.get_u64_le();
         let price = src.get_u64_le();
@@ -1970,22 +1856,7 @@ impl MarketCancelRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 8,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 8)?;
         let dst_container_id = src.get_u64_le();
 
         Ok(Self {
@@ -2069,16 +1940,7 @@ impl MarketResponsePacket {
         let request_type = src.get_u8();
         let success = src.get_u8() != 0;
         let error_code = src.get_u32_le();
-        let msg_len = src.get_u16_le() as usize;
-        if src.remaining() < msg_len + 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: msg_len + 2,
-                got: src.remaining(),
-            });
-        }
-        let msg_bytes = src.copy_to_bytes(msg_len);
-        let error_message = String::from_utf8(msg_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let error_message = get_u16_str(src, 2)?;
 
         let count = src.get_u16_le() as usize;
         const MIN_LISTING_WIRE_SIZE: usize = 40;
@@ -2166,47 +2028,53 @@ impl ClientPacket {
         }
     }
 
+    /// Appends the framed binary packet directly into `buf` without allocating an intermediate payload buffer:
+    /// `[MAGIC (2B) | OPCODE (2B) | PAYLOAD_LEN (4B) | PAYLOAD (NB)]`
+    pub fn encode_into(&self, buf: &mut BytesMut) {
+        let start = buf.len();
+        buf.put_u16_le(PACKET_MAGIC);
+        buf.put_u16_le(self.opcode() as u16);
+        buf.put_u32_le(0);
+
+        match self {
+            ClientPacket::Movement(p) => p.encode(buf),
+            ClientPacket::MovementCorrection(p) => p.encode(buf),
+            ClientPacket::Interaction(p) => p.encode(buf),
+            ClientPacket::InteractionResult(p) => p.encode(buf),
+            ClientPacket::EntityState(p) => p.encode(buf),
+            ClientPacket::EntityDespawn(p) => p.encode(buf),
+            ClientPacket::Ping(p) => p.encode(buf),
+            ClientPacket::Pong(p) => p.encode(buf),
+            ClientPacket::EntityDeltaBatch(p) => p.encode(buf),
+            ClientPacket::ClientAck(p) => p.encode(buf),
+            ClientPacket::WorldObjectSpawn(p) => p.encode(buf),
+            ClientPacket::WorldObjectDelta(p) => p.encode(buf),
+            ClientPacket::WorldObjectDespawn(p) => p.encode(buf),
+            ClientPacket::WorldObjectResync(p) => p.encode(buf),
+            ClientPacket::PlaceObject(p) => p.encode(buf),
+            ClientPacket::InteractObject(p) => p.encode(buf),
+            ClientPacket::AuthRequest(p) => p.encode(buf),
+            ClientPacket::AuthResponse(p) => p.encode(buf),
+            ClientPacket::SocialMessage(p) => p.encode(buf),
+            ClientPacket::SocialSubscribe(p) => p.encode(buf),
+            ClientPacket::SocialUnsubscribe(p) => p.encode(buf),
+            ClientPacket::MarketListRequest(p) => p.encode(buf),
+            ClientPacket::MarketBuyRequest(p) => p.encode(buf),
+            ClientPacket::MarketCancelRequest(p) => p.encode(buf),
+            ClientPacket::MarketQueryRequest(p) => p.encode(buf),
+            ClientPacket::MarketResponse(p) => p.encode(buf),
+        }
+
+        let payload_len = (buf.len() - start - HEADER_SIZE) as u32;
+        buf[start + 4..start + HEADER_SIZE].copy_from_slice(&payload_len.to_le_bytes());
+    }
+
     /// Serializes the packet into a framed binary byte vector:
     /// `[MAGIC (2B) | OPCODE (2B) | PAYLOAD_LEN (4B) | PAYLOAD (NB)]`
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload_buf = BytesMut::new();
-        match self {
-            ClientPacket::Movement(p) => p.encode(&mut payload_buf),
-            ClientPacket::MovementCorrection(p) => p.encode(&mut payload_buf),
-            ClientPacket::Interaction(p) => p.encode(&mut payload_buf),
-            ClientPacket::InteractionResult(p) => p.encode(&mut payload_buf),
-            ClientPacket::EntityState(p) => p.encode(&mut payload_buf),
-            ClientPacket::EntityDespawn(p) => p.encode(&mut payload_buf),
-            ClientPacket::Ping(p) => p.encode(&mut payload_buf),
-            ClientPacket::Pong(p) => p.encode(&mut payload_buf),
-            ClientPacket::EntityDeltaBatch(p) => p.encode(&mut payload_buf),
-            ClientPacket::ClientAck(p) => p.encode(&mut payload_buf),
-            ClientPacket::WorldObjectSpawn(p) => p.encode(&mut payload_buf),
-            ClientPacket::WorldObjectDelta(p) => p.encode(&mut payload_buf),
-            ClientPacket::WorldObjectDespawn(p) => p.encode(&mut payload_buf),
-            ClientPacket::WorldObjectResync(p) => p.encode(&mut payload_buf),
-            ClientPacket::PlaceObject(p) => p.encode(&mut payload_buf),
-            ClientPacket::InteractObject(p) => p.encode(&mut payload_buf),
-            ClientPacket::AuthRequest(p) => p.encode(&mut payload_buf),
-            ClientPacket::AuthResponse(p) => p.encode(&mut payload_buf),
-            ClientPacket::SocialMessage(p) => p.encode(&mut payload_buf),
-            ClientPacket::SocialSubscribe(p) => p.encode(&mut payload_buf),
-            ClientPacket::SocialUnsubscribe(p) => p.encode(&mut payload_buf),
-            ClientPacket::MarketListRequest(p) => p.encode(&mut payload_buf),
-            ClientPacket::MarketBuyRequest(p) => p.encode(&mut payload_buf),
-            ClientPacket::MarketCancelRequest(p) => p.encode(&mut payload_buf),
-            ClientPacket::MarketQueryRequest(p) => p.encode(&mut payload_buf),
-            ClientPacket::MarketResponse(p) => p.encode(&mut payload_buf),
-        }
-
-        let payload_len = payload_buf.len() as u32;
-        let mut frame = BytesMut::with_capacity(HEADER_SIZE + payload_buf.len());
-        frame.put_u16_le(PACKET_MAGIC);
-        frame.put_u16_le(self.opcode() as u16);
-        frame.put_u32_le(payload_len);
-        frame.extend_from_slice(&payload_buf);
-
-        frame.to_vec()
+        let mut buf = BytesMut::with_capacity(64);
+        self.encode_into(&mut buf);
+        buf.to_vec()
     }
 
     /// Deserializes a single framed packet from an owned `Bytes` buffer without payload copying.
@@ -5548,5 +5416,56 @@ mod tests {
         put_property_map(&mut buf, &exact_map);
         let decoded_map = get_property_map(&mut buf.freeze()).expect("exact map limit should pass");
         assert_eq!(decoded_map.len(), MAX_PROPERTIES_PER_MAP);
+    }
+
+    #[test]
+    fn test_client_packet_single_buffer_encode_framing_parity() {
+        let packets = vec![
+            ClientPacket::Ping(PingPacket {
+                timestamp: 123456789,
+            }),
+            ClientPacket::EntityDespawn(EntityDespawnPacket { entity_id: 998877 }),
+            ClientPacket::Movement(MovementPacket {
+                entity_id: 42,
+                position: Vec3::new(1.5, 2.5, -3.5),
+                velocity: Vec3::new(0.1, 0.0, -0.2),
+                yaw: 1.25,
+                pitch: -0.5,
+                timestamp: 987654321,
+                sequence: 77,
+            }),
+        ];
+
+        // Verify single-packet encode() header layout and decode round-trip
+        for pkt in &packets {
+            let encoded = pkt.encode();
+            assert!(encoded.len() >= HEADER_SIZE);
+            assert_eq!(u16::from_le_bytes([encoded[0], encoded[1]]), PACKET_MAGIC);
+            assert_eq!(
+                u16::from_le_bytes([encoded[2], encoded[3]]),
+                pkt.opcode() as u16
+            );
+            let declared_len =
+                u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+            assert_eq!(declared_len, encoded.len() - HEADER_SIZE);
+
+            let decoded = ClientPacket::decode_bytes(Bytes::from(encoded)).unwrap();
+            assert_eq!(&decoded, pkt);
+        }
+
+        // Verify encode_into appends cleanly at non-zero buffer offset
+        let mut combined = BytesMut::new();
+        for pkt in &packets {
+            pkt.encode_into(&mut combined);
+        }
+        let mut cursor = combined.freeze();
+        for expected in &packets {
+            let decoded = ClientPacket::decode_bytes(cursor.clone()).unwrap();
+            assert_eq!(&decoded, expected);
+            let frame_len = HEADER_SIZE
+                + u32::from_le_bytes([cursor[4], cursor[5], cursor[6], cursor[7]]) as usize;
+            cursor.advance(frame_len);
+        }
+        assert_eq!(cursor.remaining(), 0);
     }
 }

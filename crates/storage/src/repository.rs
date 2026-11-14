@@ -1,9 +1,7 @@
 //! Character, Inventory, and Entity repository providing CRUD, inventory management,
 //! ACID player-to-player trading, and snapshot persistence operations.
 
-use crate::db::{
-    compute_free_slots, current_time_ms, current_time_secs, Database, DbBackend, StorageError,
-};
+use crate::db::{compute_free_slots, current_time_ms, current_time_secs, Database, StorageError};
 use crate::models::{
     AccountRecord, CharacterRecord, EntitySnapshot, InventoryRecord, ItemRecord, TradeRecord,
     TradeStatus,
@@ -96,24 +94,14 @@ impl CharacterRepository {
             .db
             .sql("INSERT INTO accounts (account_id, username, created_at) VALUES (?, ?, ?)");
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&query_str)
-                    .bind(account_id)
-                    .bind(username)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&query_str)
-                    .bind(account_id)
-                    .bind(username)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&query_str)
+                .bind(account_id)
+                .bind(username)
+                .bind(now)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(AccountRecord {
             account_id: account_id.to_string(),
@@ -147,52 +135,28 @@ impl CharacterRepository {
             "#,
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&q1)
-                    .bind(guid as i64)
-                    .bind(account_id)
-                    .bind(name)
-                    .bind(1i32)
-                    .bind(pos.0)
-                    .bind(pos.1)
-                    .bind(pos.2)
-                    .bind(0.0f32)
-                    .bind(&empty_json)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&q1)
+                .bind(guid as i64)
+                .bind(account_id)
+                .bind(name)
+                .bind(1i32)
+                .bind(pos.0)
+                .bind(pos.1)
+                .bind(pos.2)
+                .bind(0.0f32)
+                .bind(&empty_json)
+                .bind(now)
+                .execute(pool)
+                .await?;
 
-                sqlx::query(&q2)
-                    .bind(guid as i64)
-                    .bind(30i32)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&q1)
-                    .bind(guid as i64)
-                    .bind(account_id)
-                    .bind(name)
-                    .bind(1i32)
-                    .bind(pos.0)
-                    .bind(pos.1)
-                    .bind(pos.2)
-                    .bind(0.0f32)
-                    .bind(&empty_json)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-
-                sqlx::query(&q2)
-                    .bind(guid as i64)
-                    .bind(30i32)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+            sqlx::query(&q2)
+                .bind(guid as i64)
+                .bind(30i32)
+                .bind(now)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(CharacterRecord {
             guid,
@@ -212,32 +176,17 @@ impl CharacterRepository {
             "SELECT guid, account_id, name, level, pos_x, pos_y, pos_z, rotation, attributes_json, updated_at FROM characters WHERE guid = ?",
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(guid as i64)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&q)
+                .bind(guid as i64)
+                .fetch_optional(pool)
+                .await?;
 
-                if let Some(r) = row {
-                    Ok(Some(parse_character_record!(r)))
-                } else {
-                    Ok(None)
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(guid as i64)
-                    .fetch_optional(pool)
-                    .await?;
-
-                if let Some(r) = row {
-                    Ok(Some(parse_character_record!(r)))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(parse_character_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Updates the persistent coordinates and rotation of a character.
@@ -252,8 +201,8 @@ impl CharacterRepository {
             "UPDATE characters SET pos_x = ?, pos_y = ?, pos_z = ?, rotation = ?, updated_at = ? WHERE guid = ?",
         );
 
-        let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query(&q)
+        let rows_affected = crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&q)
                 .bind(pos.0)
                 .bind(pos.1)
                 .bind(pos.2)
@@ -262,18 +211,8 @@ impl CharacterRepository {
                 .bind(guid as i64)
                 .execute(pool)
                 .await?
-                .rows_affected(),
-            DbBackend::Postgres(pool) => sqlx::query(&q)
-                .bind(pos.0)
-                .bind(pos.1)
-                .bind(pos.2)
-                .bind(rotation)
-                .bind(now)
-                .bind(guid as i64)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
+                .rows_affected()
+        });
 
         Ok(rows_affected > 0)
     }
@@ -356,9 +295,8 @@ impl CharacterRepository {
             "SELECT guid, pos_x, pos_y, pos_z, rotation, attributes_json, state_blob, version, timestamp FROM entity_snapshots WHERE guid = ?",
         );
 
-        let (x, y, z, rotation, attrs_str, state_blob, version, timestamp) = match self.db.backend()
-        {
-            DbBackend::Sqlite(pool) => {
+        let (x, y, z, rotation, attrs_str, state_blob, version, timestamp) =
+            crate::with_dialect_pool!(self.db, |pool| {
                 let row = sqlx::query(&q)
                     .bind(guid as i64)
                     .fetch_optional(pool)
@@ -378,29 +316,7 @@ impl CharacterRepository {
                 } else {
                     return Ok(None);
                 }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(guid as i64)
-                    .fetch_optional(pool)
-                    .await?;
-
-                if let Some(r) = row {
-                    (
-                        r.try_get::<f32, _>("pos_x")?,
-                        r.try_get::<f32, _>("pos_y")?,
-                        r.try_get::<f32, _>("pos_z")?,
-                        r.try_get::<f32, _>("rotation")?,
-                        r.try_get::<String, _>("attributes_json")?,
-                        r.try_get::<Option<Vec<u8>>, _>("state_blob")?,
-                        r.try_get::<i64, _>("version")?,
-                        r.try_get::<i64, _>("timestamp")?,
-                    )
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
+            });
 
         let attributes: serde_json::Value = serde_json::from_str(&attrs_str)?;
 
@@ -429,46 +345,25 @@ impl CharacterRepository {
             "SELECT character_guid, capacity, updated_at FROM inventories WHERE character_guid = ?",
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&q)
+                .bind(character_guid as i64)
+                .fetch_optional(pool)
+                .await?;
 
-                if let Some(r) = row {
-                    let guid: i64 = r.try_get("character_guid")?;
-                    let cap: i32 = r.try_get("capacity")?;
-                    let updated: i64 = r.try_get("updated_at")?;
-                    Ok(Some(InventoryRecord {
-                        character_guid: guid as u64,
-                        capacity: cap as u32,
-                        updated_at: updated,
-                    }))
-                } else {
-                    Ok(None)
-                }
+            if let Some(r) = row {
+                let guid: i64 = r.try_get("character_guid")?;
+                let cap: i32 = r.try_get("capacity")?;
+                let updated: i64 = r.try_get("updated_at")?;
+                Ok(Some(InventoryRecord {
+                    character_guid: guid as u64,
+                    capacity: cap as u32,
+                    updated_at: updated,
+                }))
+            } else {
+                Ok(None)
             }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .fetch_optional(pool)
-                    .await?;
-
-                if let Some(r) = row {
-                    let guid: i64 = r.try_get("character_guid")?;
-                    let cap: i32 = r.try_get("capacity")?;
-                    let updated: i64 = r.try_get("updated_at")?;
-                    Ok(Some(InventoryRecord {
-                        character_guid: guid as u64,
-                        capacity: cap as u32,
-                        updated_at: updated,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        })
     }
 
     /// Sets inventory capacity for a character.
@@ -488,24 +383,14 @@ impl CharacterRepository {
             "#,
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .bind(capacity as i32)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .bind(capacity as i32)
-                    .bind(now)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&q)
+                .bind(character_guid as i64)
+                .bind(capacity as i32)
+                .bind(now)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(())
     }
@@ -525,38 +410,21 @@ impl CharacterRepository {
             "#,
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                sqlx::query(&q)
-                    .bind(&item.item_instance_id)
-                    .bind(item.character_guid as i64)
-                    .bind(container_id as i64)
-                    .bind(item.item_def_id as i32)
-                    .bind(item.slot as i32)
-                    .bind(item.quantity as i32)
-                    .bind(item.durability as i32)
-                    .bind(&attrs_str)
-                    .bind(item.created_at)
-                    .bind(item.updated_at)
-                    .execute(pool)
-                    .await?;
-            }
-            DbBackend::Postgres(pool) => {
-                sqlx::query(&q)
-                    .bind(&item.item_instance_id)
-                    .bind(item.character_guid as i64)
-                    .bind(container_id as i64)
-                    .bind(item.item_def_id as i32)
-                    .bind(item.slot as i32)
-                    .bind(item.quantity as i32)
-                    .bind(item.durability as i32)
-                    .bind(&attrs_str)
-                    .bind(item.created_at)
-                    .bind(item.updated_at)
-                    .execute(pool)
-                    .await?;
-            }
-        }
+        crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&q)
+                .bind(&item.item_instance_id)
+                .bind(item.character_guid as i64)
+                .bind(container_id as i64)
+                .bind(item.item_def_id as i32)
+                .bind(item.slot as i32)
+                .bind(item.quantity as i32)
+                .bind(item.durability as i32)
+                .bind(&attrs_str)
+                .bind(item.created_at)
+                .bind(item.updated_at)
+                .execute(pool)
+                .await?;
+        });
 
         Ok(())
     }
@@ -570,32 +438,17 @@ impl CharacterRepository {
             "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE item_instance_id = ?",
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(item_instance_id)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&q)
+                .bind(item_instance_id)
+                .fetch_optional(pool)
+                .await?;
 
-                if let Some(r) = row {
-                    Ok(Some(parse_item_record!(r)))
-                } else {
-                    Ok(None)
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&q)
-                    .bind(item_instance_id)
-                    .fetch_optional(pool)
-                    .await?;
-
-                if let Some(r) = row {
-                    Ok(Some(parse_item_record!(r)))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(parse_item_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Retrieves all items belonging to a character, ordered by slot index.
@@ -607,50 +460,31 @@ impl CharacterRepository {
             "SELECT item_instance_id, character_guid, container_id, item_def_id, slot, quantity, durability, attributes_json, created_at, updated_at FROM items WHERE character_guid = ? ORDER BY slot ASC",
         );
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let rows = sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .fetch_all(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let rows = sqlx::query(&q)
+                .bind(character_guid as i64)
+                .fetch_all(pool)
+                .await?;
 
-                let mut items = Vec::with_capacity(rows.len());
-                for r in rows {
-                    items.push(parse_item_record!(r));
-                }
-                Ok(items)
+            let mut items = Vec::with_capacity(rows.len());
+            for r in rows {
+                items.push(parse_item_record!(r));
             }
-            DbBackend::Postgres(pool) => {
-                let rows = sqlx::query(&q)
-                    .bind(character_guid as i64)
-                    .fetch_all(pool)
-                    .await?;
-
-                let mut items = Vec::with_capacity(rows.len());
-                for r in rows {
-                    items.push(parse_item_record!(r));
-                }
-                Ok(items)
-            }
-        }
+            Ok(items)
+        })
     }
 
     /// Removes an item instance from inventory.
     pub async fn remove_item(&self, item_instance_id: &str) -> Result<bool, StorageError> {
         let q = self.db.sql("DELETE FROM items WHERE item_instance_id = ?");
 
-        let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query(&q)
+        let rows_affected = crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&q)
                 .bind(item_instance_id)
                 .execute(pool)
                 .await?
-                .rows_affected(),
-            DbBackend::Postgres(pool) => sqlx::query(&q)
-                .bind(item_instance_id)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
+                .rows_affected()
+        });
 
         Ok(rows_affected > 0)
     }

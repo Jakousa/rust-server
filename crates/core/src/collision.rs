@@ -236,6 +236,63 @@ impl AabbCollisionWorld {
         .map(|(dist, normal)| (dist, Vec3::new(normal.0, normal.1, normal.2)))
     }
 
+    /// Helper checking point traversability against a pre-filtered list of obstacle AABBs.
+    fn is_point_traversable_in_boxes(boxes: &[&BoundingBox3D], point: Vec3) -> bool {
+        if !point.is_finite() {
+            return false;
+        }
+        let p_tuple = (point.x, point.y, point.z);
+        !boxes.iter().any(|bounds| bounds.contains(p_tuple))
+    }
+
+    /// Helper checking segment clearance against a pre-filtered list of obstacle AABBs with early exit.
+    fn is_segment_clear_in_boxes(
+        boxes: &[&BoundingBox3D],
+        from: Vec3,
+        to: Vec3,
+        clearance: f32,
+    ) -> bool {
+        let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
+        let dist = diff.length();
+        let Some(norm_dir) = diff.normalized() else {
+            return true;
+        };
+
+        let origin_tuple = (from.x, from.y, from.z);
+        let dir_tuple = (norm_dir.x, norm_dir.y, norm_dir.z);
+
+        for bounds in boxes {
+            if bounds
+                .intersects_ray(origin_tuple, dir_tuple, dist)
+                .is_some()
+            {
+                return false;
+            }
+            if clearance > 0.0 {
+                let expanded_box = BoundingBox3D::new(
+                    (
+                        bounds.min.0 - clearance,
+                        bounds.min.1 - clearance,
+                        bounds.min.2 - clearance,
+                    ),
+                    (
+                        bounds.max.0 + clearance,
+                        bounds.max.1 + clearance,
+                        bounds.max.2 + clearance,
+                    ),
+                );
+                if expanded_box
+                    .intersects_ray(origin_tuple, dir_tuple, dist)
+                    .is_some()
+                {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
     /// Checks whether a linear segment between `from` and `to` is completely unobstructed,
     /// testing both raycast line-of-sight and clearance bounding box sweep.
     pub fn is_segment_clear(&self, from: Vec3, to: Vec3, clearance: f32) -> bool {
@@ -439,6 +496,28 @@ impl CollisionWorld for AabbCollisionWorld {
             return Some(vec![start, end]);
         }
 
+        // Pre-filter candidate obstacles intersecting the padded search bounding box so A*
+        // iterations avoid scanning distant world obstacles.
+        let pad = (dist * 0.5).clamp(64.0, 512.0) + CLEARANCE + STEP;
+        let search_bounds = BoundingBox3D::new(
+            (
+                start.x.min(end.x) - pad,
+                start.y.min(end.y) - pad,
+                start.z.min(end.z) - pad,
+            ),
+            (
+                start.x.max(end.x) + pad,
+                start.y.max(end.y) + pad,
+                start.z.max(end.z) + pad,
+            ),
+        );
+        let candidate_boxes: Vec<&BoundingBox3D> = self
+            .obstacles
+            .values()
+            .filter(|record| record.layer_mask != 0 && record.bounds.intersects(&search_bounds))
+            .map(|record| &record.bounds)
+            .collect();
+
         // Discretized 3D/2.5D A* Lattice Search anchored at `start`
         #[derive(Copy, Clone, PartialEq)]
         struct AStarNode {
@@ -523,7 +602,7 @@ impl CollisionWorld for AabbCollisionWorld {
             let to_end = Vec3::new(end.x - curr_pos.x, end.y - curr_pos.y, end.z - curr_pos.z);
             let dist_to_end = to_end.length();
             if (dist_to_end <= 1.5 * STEP || goal_cell == Some(curr_coord))
-                && self.is_segment_clear(curr_pos, end, CLEARANCE)
+                && Self::is_segment_clear_in_boxes(&candidate_boxes, curr_pos, end, CLEARANCE)
             {
                 reached_goal_coord = Some(curr_coord);
                 break;
@@ -557,10 +636,11 @@ impl CollisionWorld for AabbCollisionWorld {
 
             for &(next_coord, cost) in &neighbors[..neighbor_count] {
                 let next_pos = cell_pos(next_coord);
-                if !self.is_point_traversable(next_pos) {
+                if !Self::is_point_traversable_in_boxes(&candidate_boxes, next_pos) {
                     continue;
                 }
-                if !self.is_segment_clear(curr_pos, next_pos, CLEARANCE) {
+                if !Self::is_segment_clear_in_boxes(&candidate_boxes, curr_pos, next_pos, CLEARANCE)
+                {
                     continue;
                 }
 
@@ -609,7 +689,12 @@ impl CollisionWorld for AabbCollisionWorld {
         while current_idx + 1 < raw.len() {
             let mut furthest_idx = current_idx + 1;
             for candidate_idx in ((current_idx + 2)..raw.len()).rev() {
-                if self.is_segment_clear(raw[current_idx], raw[candidate_idx], CLEARANCE) {
+                if Self::is_segment_clear_in_boxes(
+                    &candidate_boxes,
+                    raw[current_idx],
+                    raw[candidate_idx],
+                    CLEARANCE,
+                ) {
                     furthest_idx = candidate_idx;
                     break;
                 }
@@ -1510,5 +1595,41 @@ mod tests {
         // Should cleanly hit MAX_EXPANDED_NODES and return None without integer or f32 heuristic overflow
         let res = world.find_path(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0e12, 0.0, 0.0));
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_find_path_prefilters_distant_obstacles() {
+        let mut world = AabbCollisionWorld::new();
+        // Local blocking wall at origin
+        world.register_obstacle(
+            Guid(1),
+            create_test_aabb(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 2.0, 3.0)),
+        );
+        // Zero-layer-mask obstacle across the path should not block default queries
+        world.register_obstacle_with_layers(
+            Guid(2),
+            create_test_aabb(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.5, 2.0, 1.0)),
+            0,
+        );
+        // 500 distant obstacles far outside the search bounds
+        for i in 0..500u64 {
+            let offset = 1000.0 + (i as f32) * 10.0;
+            world.register_obstacle(
+                Guid(100 + i),
+                create_test_aabb(Vec3::new(offset, 0.0, offset), Vec3::new(2.0, 2.0, 2.0)),
+            );
+        }
+
+        let start = Vec3::new(-5.0, 0.0, 0.0);
+        let end = Vec3::new(5.0, 0.0, 0.0);
+        let path = world
+            .find_path(start, end)
+            .expect("should find path around local wall despite distant obstacles");
+        assert!(path.len() >= 3);
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+        for i in 0..(path.len() - 1) {
+            assert!(world.is_segment_clear(path[i], path[i + 1], 0.4));
+        }
     }
 }

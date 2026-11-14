@@ -10,9 +10,8 @@ use mmo_core::combat::{CombatEffectOutcome, CombatResolver};
 use mmo_core::entity::state_flags;
 use mmo_core::plugin::EntityIncapacitatedEvent;
 use mmo_core::{
-    canonical_id_for_name, ActionQueue, AttributeId, AttributeSet, DomainEvent, Entity,
-    EntityStore, EventQueue, GameplayPlugin, Guid, InterruptReason, PluginContext, TickContext,
-    TickSystem,
+    ActionQueue, AttributeId, AttributeSet, DomainEvent, Entity, EntityDamagedEvent, EntityStore,
+    EventQueue, GameplayPlugin, Guid, InterruptReason, PluginContext, TickContext, TickSystem,
 };
 
 /// Dynamic component representing an entity's health status.
@@ -250,18 +249,7 @@ impl CombatResolver for RpgCombatResolver {
                 let res = attrs
                     .modify_current("health", -effective_damage)
                     .or_else(|_| {
-                        if let Some(name) = attrs
-                            .attributes
-                            .keys()
-                            .find(|k| {
-                                canonical_id_for_name(k) == Some(AttributeId::PRIMARY_VITALITY)
-                            })
-                            .cloned()
-                        {
-                            attrs.modify_current(&name, -effective_damage)
-                        } else {
-                            Err("no health attribute")
-                        }
+                        attrs.modify_current_by_id(AttributeId::PRIMARY_VITALITY, -effective_damage)
                     });
 
                 if let Ok(new_hp) = res {
@@ -295,6 +283,14 @@ impl CombatResolver for RpgCombatResolver {
                 });
             }
 
+            if effective_damage > 0.0 {
+                event_queue.push(EntityDamagedEvent {
+                    entity: target_guid,
+                    amount: effective_damage,
+                    instigator: caster_guid,
+                });
+            }
+
             // Interrupt active action if configured with cancel_on_damage
             if let Some(queue) = target_ent.components.get_component_mut::<ActionQueue>() {
                 let should_interrupt = queue
@@ -314,18 +310,7 @@ impl CombatResolver for RpgCombatResolver {
                 let res = attrs
                     .modify_current("health", effective_healing)
                     .or_else(|_| {
-                        if let Some(name) = attrs
-                            .attributes
-                            .keys()
-                            .find(|k| {
-                                canonical_id_for_name(k) == Some(AttributeId::PRIMARY_VITALITY)
-                            })
-                            .cloned()
-                        {
-                            attrs.modify_current(&name, effective_healing)
-                        } else {
-                            Err("no health attribute")
-                        }
+                        attrs.modify_current_by_id(AttributeId::PRIMARY_VITALITY, effective_healing)
                     });
 
                 if let Ok(new_hp) = res {
