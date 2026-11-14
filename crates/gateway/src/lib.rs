@@ -13,6 +13,7 @@ pub mod quic;
 pub mod router;
 pub mod server;
 pub mod social;
+pub mod tls;
 pub mod websocket;
 pub mod webtransport;
 
@@ -36,3 +37,4 @@ pub use server::{
     extract_acting_guid, GatewayError, GatewayServer, GatewayServiceImpl, PacketDispatcher,
     RoutedPacket,
 };
+pub use tls::{build_ws_tls_server_config, collect_tls_alt_names, load_pem_certs_and_key};

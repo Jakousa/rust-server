@@ -599,4 +599,134 @@ mod tests {
         assert_send_sync::<Event>();
         assert_send_sync::<EventContext>();
     }
+
+    #[test]
+    fn test_dispatch_with_entities_mutation_arc_and_short_circuit() {
+        use crate::entity::state_flags;
+
+        struct MutatePositionAndMaybeCancel {
+            cancel_action_id: u32,
+        }
+
+        impl HookHandler for MutatePositionAndMaybeCancel {
+            fn handle(&self, _event: &Event, _ctx: &mut EventContext) {}
+
+            fn handle_with_entities(
+                &self,
+                event: &Event,
+                ctx: &mut EventContext,
+                entities: &mut EntityStore,
+            ) {
+                if let Event::BeforeInteract {
+                    initiator,
+                    action_id,
+                    ..
+                } = *event
+                {
+                    if let Some(ent) = entities.get_mut_by_guid(initiator) {
+                        ent.position.0 += 10.0;
+                    }
+                    if action_id == self.cancel_action_id {
+                        ctx.cancel("blocked in entity hook");
+                    }
+                }
+            }
+        }
+
+        struct MarkIncapacitatedHandler;
+        impl HookHandler for MarkIncapacitatedHandler {
+            fn handle(&self, _event: &Event, _ctx: &mut EventContext) {}
+
+            fn handle_with_entities(
+                &self,
+                event: &Event,
+                _ctx: &mut EventContext,
+                entities: &mut EntityStore,
+            ) {
+                if let Some(ent) = entities.get_mut_by_guid(event.entity()) {
+                    ent.state_flags |= state_flags::INCAPACITATED;
+                }
+            }
+        }
+
+        let mut dispatcher = HookDispatcher::new();
+        let closure_calls = Arc::new(AtomicU32::new(0));
+        let closure_calls_ref = Arc::clone(&closure_calls);
+        // Closure handler uses default handle_with_entities -> handle delegation
+        dispatcher.register_fn(move |_event, _ctx| {
+            closure_calls_ref.fetch_add(1, Ordering::SeqCst);
+        });
+        dispatcher.register_arc(Arc::new(MutatePositionAndMaybeCancel {
+            cancel_action_id: 99,
+        }));
+        dispatcher.register_handler(Box::new(MarkIncapacitatedHandler));
+
+        let mut entities = EntityStore::new();
+        let p1 = Guid::new(EntityType::Player, 1, 10);
+        let npc = Guid::new(EntityType::Npc, 1, 20);
+        entities.spawn(p1, (0.0, 0.0, 0.0));
+
+        // Canceled in handler 2 -> handler 3 must NOT mutate state_flags
+        let ctx_canceled = dispatcher.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: p1,
+                target: npc,
+                action_id: 99,
+            },
+            &mut entities,
+        );
+        assert!(ctx_canceled.is_canceled());
+        assert_eq!(ctx_canceled.cancel_reason(), Some("blocked in entity hook"));
+        assert_eq!(closure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(entities.get_by_guid(p1).unwrap().position.0, 10.0);
+        assert!(!entities.get_by_guid(p1).unwrap().is_incapacitated());
+
+        // Allowed -> handler 3 runs and mutates state_flags
+        let ctx_ok = dispatcher.dispatch_with_entities(
+            &Event::BeforeInteract {
+                initiator: p1,
+                target: npc,
+                action_id: 1,
+            },
+            &mut entities,
+        );
+        assert!(!ctx_ok.is_canceled());
+        assert_eq!(closure_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(entities.get_by_guid(p1).unwrap().position.0, 20.0);
+        assert!(entities.get_by_guid(p1).unwrap().is_incapacitated());
+    }
+
+    #[test]
+    fn test_dispatch_tick_and_on_tick_entity() {
+        let mut dispatcher = HookDispatcher::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_ref = Arc::clone(&observed);
+        dispatcher.register_fn(move |event, ctx| {
+            observed_ref.lock().unwrap().push(event.clone());
+            if let Event::OnTick { tick, .. } = event {
+                if *tick == 100 {
+                    ctx.cancel("tick skipped");
+                }
+            }
+        });
+
+        let guid = Guid::new(EntityType::Player, 1, 42);
+        let tick_event = Event::OnTick {
+            entity: guid,
+            tick: 99,
+            dt_sec: 0.05,
+        };
+        assert_eq!(tick_event.entity(), guid);
+
+        let ctx1 = dispatcher.dispatch_tick(guid, 99, 0.05);
+        assert!(!ctx1.is_canceled());
+
+        let ctx2 = dispatcher.dispatch_tick(guid, 100, 0.05);
+        assert!(ctx2.is_canceled());
+        assert_eq!(ctx2.cancel_reason(), Some("tick skipped"));
+
+        let events = observed.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], tick_event);
+    }
 }

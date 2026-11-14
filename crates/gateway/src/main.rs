@@ -327,16 +327,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ws_shutdown_tx = None;
     if let Ok(ws_addr) = ws_bind_addr.parse::<std::net::SocketAddr>() {
         let ws_res = if ws_tls_enabled {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            match mmo_gateway::generate_self_signed_cert(&["localhost", "127.0.0.1"]) {
-                Ok((certs, key)) => match rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                {
-                    Ok(cfg) => server.bind_websocket_tls(ws_addr, Arc::new(cfg)).await,
-                    Err(e) => Err(mmo_gateway::websocket::WebSocketError::Tls(e.to_string())),
-                },
-                Err(e) => Err(mmo_gateway::websocket::WebSocketError::Tls(e.to_string())),
+            match mmo_gateway::build_ws_tls_server_config() {
+                Ok(cfg) => server.bind_websocket_tls(ws_addr, cfg).await,
+                Err(e) => Err(e),
             }
         } else {
             server.bind_websocket(ws_addr).await

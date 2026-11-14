@@ -83,28 +83,9 @@ impl WebTransportServer {
         session_counter: Arc<AtomicU64>,
         packet_tx: Option<mpsc::Sender<RoutedPacket>>,
     ) -> Result<Self, WebTransportError> {
-        let mut alt_names: Vec<String> = vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-        ];
-        for env_key in &["HOST_IP", "PUBLIC_IP"] {
-            if let Ok(val) = std::env::var(env_key) {
-                let ip = val.trim();
-                if !ip.is_empty() && !alt_names.iter().any(|s| s == ip) {
-                    alt_names.push(ip.to_string());
-                }
-            }
-        }
-        if let Ok(extra_names) = std::env::var("WEBTRANSPORT_ALT_NAMES") {
-            for name in extra_names.split(',') {
-                let n = name.trim();
-                if !n.is_empty() && !alt_names.iter().any(|s| s == n) {
-                    alt_names.push(n.to_string());
-                }
-            }
-        }
-        let alt_name_refs: Vec<&str> = alt_names.iter().map(|s| s.as_str()).collect();
+        let alt_names =
+            crate::tls::collect_tls_alt_names(&[crate::tls::ENV_WEBTRANSPORT_ALT_NAMES]);
+        let alt_name_refs: Vec<&str> = alt_names.iter().map(String::as_str).collect();
         let (identity, cert_digest, cert_digest_bytes) =
             generate_self_signed_cert_webtransport(&alt_name_refs, 10)?;
 

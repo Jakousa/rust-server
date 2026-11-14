@@ -822,4 +822,90 @@ mod tests {
         index.remove(id1);
         assert_eq!(index.max_extent(), 2.0);
     }
+
+    #[test]
+    fn test_sector_spatial_index_raycast_closest_hit_and_edge_cases() {
+        let mut index = SectorSpatialIndex::new();
+        let near_id = Guid::new(EntityType::DynamicObject, 1, 10);
+        let far_id = Guid::new(EntityType::DynamicObject, 1, 11);
+        let off_axis_id = Guid::new(EntityType::DynamicObject, 1, 12);
+
+        index.insert(WorldObject::new(
+            near_id,
+            1,
+            Transform3D::from_position((11.0, 0.0, 0.0)),
+            BoundingBox3D::new((10.0, -1.0, -1.0), (12.0, 1.0, 1.0)),
+            ContainerOwner::System("system".into()),
+        ));
+        index.insert(WorldObject::new(
+            far_id,
+            1,
+            Transform3D::from_position((21.0, 0.0, 0.0)),
+            BoundingBox3D::new((20.0, -1.0, -1.0), (22.0, 1.0, 1.0)),
+            ContainerOwner::System("system".into()),
+        ));
+        index.insert(WorldObject::new(
+            off_axis_id,
+            1,
+            Transform3D::from_position((11.0, 0.0, 10.0)),
+            BoundingBox3D::new((10.0, -1.0, 9.0), (12.0, 1.0, 11.0)),
+            ContainerOwner::System("system".into()),
+        ));
+
+        // Non-unit direction should be normalized and hit closest object at t ~= 10.0
+        let (hit_obj, t) = index
+            .raycast((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), 30.0)
+            .expect("should hit near object");
+        assert_eq!(hit_obj.object_id, near_id);
+        assert!((t - 10.0).abs() < 1e-4);
+
+        // Removing near object exposes far object at t ~= 20.0
+        index.remove(near_id);
+        let (hit_far, t_far) = index
+            .raycast((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 30.0)
+            .expect("should hit far object");
+        assert_eq!(hit_far.object_id, far_id);
+        assert!((t_far - 20.0).abs() < 1e-4);
+
+        // Max distance shorter than target returns None
+        assert!(index
+            .raycast((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 15.0)
+            .is_none());
+
+        // Invalid max_dist or degenerate/non-finite direction vectors return None
+        assert!(index
+            .raycast((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.0)
+            .is_none());
+        assert!(index
+            .raycast((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), -5.0)
+            .is_none());
+        assert!(index
+            .raycast((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 30.0)
+            .is_none());
+        assert!(index
+            .raycast((0.0, 0.0, 0.0), (f32::NAN, 0.0, 0.0), 30.0)
+            .is_none());
+
+        // Ray starting inside an object's AABB returns t = 0.0
+        let (inside_hit, t_inside) = index
+            .raycast((21.0, 0.0, 0.0), (1.0, 0.0, 0.0), 10.0)
+            .expect("origin inside box should hit");
+        assert_eq!(inside_hit.object_id, far_id);
+        assert_eq!(t_inside, 0.0);
+
+        // Cross-sector raycast spanning multiple sectors (also tests sparse sector scan path)
+        let distant_id = Guid::new(EntityType::DynamicObject, 1, 99);
+        index.insert(WorldObject::new(
+            distant_id,
+            1,
+            Transform3D::from_position((200.0, 0.0, 0.0)),
+            BoundingBox3D::new((198.0, -2.0, -2.0), (202.0, 2.0, 2.0)),
+            ContainerOwner::System("system".into()),
+        ));
+        let (cross_hit, t_cross) = index
+            .raycast((25.0, 0.0, 0.0), (1.0, 0.0, 0.0), 250.0)
+            .expect("cross-sector raycast should hit distant object");
+        assert_eq!(cross_hit.object_id, distant_id);
+        assert!((t_cross - 173.0).abs() < 1e-4);
+    }
 }

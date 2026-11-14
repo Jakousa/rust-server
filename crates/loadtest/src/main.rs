@@ -61,6 +61,14 @@ struct Cli {
     /// Hotspot radius in meters
     #[arg(long, default_value = "50.0")]
     hotspot_radius: f32,
+
+    /// Optional explicit authentication token sent by loadtest bots
+    #[arg(long, env = "AUTH_TOKEN")]
+    auth_token: Option<String>,
+
+    /// Optional HS256 secret used to sign per-bot JWTs when auth-token is not set
+    #[arg(long, env = "JWT_SECRET")]
+    auth_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -131,6 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile,
         hotspot_center: Vec3::new(cli.hotspot_x, cli.hotspot_y, cli.hotspot_z),
         hotspot_radius: cli.hotspot_radius,
+        auth_token: cli.auth_token,
+        auth_secret: cli.auth_secret,
+        ..Default::default()
     };
 
     let manager = SwarmManager::new(config);
@@ -150,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Snapback Rejections: {}", snapshot.snapbacks);
     println!("Connection Errors  : {}", snapshot.connection_errors);
+    println!("Auth Failures      : {}", snapshot.auth_failures);
     println!("------------------------------------------------------------");
     println!("Latency (RTT):");
     println!("  Min              : {:.2} ms", snapshot.min_rtt_ms);
