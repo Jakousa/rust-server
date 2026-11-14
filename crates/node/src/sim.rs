@@ -61,6 +61,7 @@ pub struct TickSimulation {
     pub script_reloader: Option<Arc<dyn mmo_core::script::ScriptReloadable>>,
     pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
     pub default_spawn_position: (f32, f32, f32),
+    pub default_collider_half_extents: (f32, f32, f32),
 }
 
 /// Lightweight state digest used to skip re-serializing unchanged entities during periodic snapshots.
@@ -172,6 +173,7 @@ impl TickSimulation {
 
         let mut event_queue = EventQueue::new();
         event_queue.register_ephemeral::<mmo_core::ActionProgressEvent>();
+        event_queue.register_ephemeral::<mmo_core::EntityDamagedEvent>();
 
         Self {
             node_id,
@@ -216,6 +218,7 @@ impl TickSimulation {
             script_reloader: None,
             combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
             default_spawn_position: (0.0, 0.0, 0.0),
+            default_collider_half_extents: (0.4, 0.9, 0.4),
         }
     }
 
@@ -267,7 +270,7 @@ impl TickSimulation {
                 mmo_schema::client::ClientPacket::Movement(m)
                     if self.is_spawn_position_traversable(
                         (m.position.x, m.position.y, m.position.z),
-                        (0.4, 0.9, 0.4),
+                        self.default_collider_half_extents,
                     ) =>
                 {
                     Some(mmo_storage::EntitySnapshot {
@@ -540,12 +543,12 @@ impl TickSimulation {
     /// Resolves a traversable spawn position from `candidate`, falling back to
     /// `self.default_spawn_position` or a nearby unobstructed XZ offset if obstructed.
     fn resolve_traversable_spawn_position(&self, candidate: (f32, f32, f32)) -> (f32, f32, f32) {
-        const PLAYER_HALF_EXTENTS: (f32, f32, f32) = (0.4, 0.9, 0.4);
-        if self.is_spawn_position_traversable(candidate, PLAYER_HALF_EXTENTS) {
+        let half_extents = self.default_collider_half_extents;
+        if self.is_spawn_position_traversable(candidate, half_extents) {
             return candidate;
         }
         let base = self.default_spawn_position;
-        if self.is_spawn_position_traversable(base, PLAYER_HALF_EXTENTS) {
+        if self.is_spawn_position_traversable(base, half_extents) {
             return base;
         }
         const RADII: [f32; 4] = [1.5, 3.0, 5.0, 8.0];
@@ -562,7 +565,7 @@ impl TickSimulation {
         for radius in RADII {
             for (dx, dz) in DIRS {
                 let probe = (base.0 + dx * radius, base.1, base.2 + dz * radius);
-                if self.is_spawn_position_traversable(probe, PLAYER_HALF_EXTENTS) {
+                if self.is_spawn_position_traversable(probe, half_extents) {
                     return probe;
                 }
             }

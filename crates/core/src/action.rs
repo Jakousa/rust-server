@@ -153,6 +153,16 @@ pub struct ActionInterruptedEvent {
 }
 impl DomainEvent for ActionInterruptedEvent {}
 
+/// Domain event signaling that an entity received damage/impact during the tick,
+/// triggering `ActionInterruptFlags::cancel_on_damage` in `ActionTickSystem`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDamagedEvent {
+    pub entity: Guid,
+    pub amount: f32,
+    pub instigator: Option<Guid>,
+}
+impl DomainEvent for EntityDamagedEvent {}
+
 /// Entity component managing an entity's current timed action.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActionQueue {
@@ -264,6 +274,7 @@ impl TickSystem for ActionTickSystem {
 
     fn update(&mut self, ctx: &mut TickContext) {
         ctx.events.register_ephemeral::<ActionProgressEvent>();
+        ctx.events.register_ephemeral::<EntityDamagedEvent>();
 
         self.decisions.clear();
 
@@ -303,6 +314,18 @@ impl TickSystem for ActionTickSystem {
                                 }
                             }
                         }
+                    }
+
+                    // 4. cancel_on_damage: entity received damage/impact this tick
+                    if interrupt_reason.is_none()
+                        && action.interrupt_flags.cancel_on_damage
+                        && ctx
+                            .events
+                            .read::<EntityDamagedEvent>()
+                            .iter()
+                            .any(|e| e.entity == entity.guid)
+                    {
+                        interrupt_reason = Some(InterruptReason::Damage);
                     }
 
                     if let Some(reason) = interrupt_reason {
@@ -360,6 +383,7 @@ impl TickSystem for ActionTickSystem {
 /// Component tracking action cooldowns and the shared Global Cooldown (GCD).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CooldownTracker {
+    #[serde(alias = "action_cooldowns")]
     pub ability_cooldowns: HashMap<u32, f32>,
     pub gcd_remaining_sec: f32,
 }
@@ -367,6 +391,11 @@ pub struct CooldownTracker {
 impl CooldownTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a read-only view of per-action remaining cooldowns (in seconds).
+    pub fn action_cooldowns(&self) -> &HashMap<u32, f32> {
+        &self.ability_cooldowns
     }
 
     /// Checks if a specific action or the global cooldown is currently active.
@@ -483,6 +512,7 @@ mod tests {
     use super::*;
     use crate::guid::EntityType;
     use crate::octree::Octree;
+    use crate::{BoundingBox3D, EntityStore};
 
     #[test]
     fn test_instant_action_completes_immediately() {
@@ -793,8 +823,66 @@ mod tests {
         for bad_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             tracker.tick(bad_dt);
             assert!(tracker.is_on_cooldown(10));
-            assert_eq!(tracker.ability_cooldowns.get(&10).copied(), Some(5.0));
+            assert_eq!(tracker.action_cooldowns().get(&10).copied(), Some(5.0));
             assert_eq!(tracker.gcd_remaining_sec, 1.5);
         }
+    }
+
+    #[test]
+    fn test_action_tick_system_cancel_on_damage() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut tick_system = ActionTickSystem::new();
+
+        let caster_guid = Guid::new(EntityType::Player, 1, 77);
+        let attacker_guid = Guid::new(EntityType::Npc, 1, 88);
+        let caster_key = store.spawn(caster_guid, (0.0, 0.0, 0.0));
+        let mut queue = ActionQueue::new();
+        let flags = ActionInterruptFlags {
+            cancel_on_damage: true,
+            ..Default::default()
+        };
+        queue
+            .start_action(
+                caster_guid,
+                TimedAction::new(42, 2.0, flags, None),
+                QueuePolicy::RejectIfBusy,
+                &mut events,
+            )
+            .unwrap();
+        let _ = events.drain::<ActionStartedEvent>();
+        store.get_mut(caster_key).unwrap().add_component(queue);
+
+        events.push(EntityDamagedEvent {
+            entity: caster_guid,
+            amount: 15.0,
+            instigator: Some(attacker_guid),
+        });
+
+        let mut ctx = TickContext {
+            entities: &mut store,
+            octree: &mut octree,
+            events: &mut events,
+            dt_sec: 0.25,
+            tick: 1,
+            collision_world: None,
+        };
+        tick_system.update(&mut ctx);
+
+        let interrupted = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].entity, caster_guid);
+        assert_eq!(interrupted[0].action_id, 42);
+        assert_eq!(interrupted[0].reason, InterruptReason::Damage);
+        assert!(!store
+            .get_by_guid(caster_guid)
+            .unwrap()
+            .get_component::<ActionQueue>()
+            .unwrap()
+            .is_busy());
     }
 }

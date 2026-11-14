@@ -91,6 +91,7 @@ pub struct SectorManager {
     rate_limits: HashMap<Guid, TokenBucket>,
     rate_limit_capacity: f32,
     rate_limit_refill_per_sec: f32,
+    eye_offset_y: f32,
 }
 
 impl Default for SectorManager {
@@ -108,7 +109,19 @@ impl SectorManager {
             rate_limits: HashMap::new(),
             rate_limit_capacity: DEFAULT_RATE_LIMIT_CAPACITY,
             rate_limit_refill_per_sec: DEFAULT_RATE_LIMIT_REFILL_PER_SEC,
+            eye_offset_y: PLAYER_EYE_OFFSET_Y,
         }
+    }
+
+    /// Configures the vertical eye offset used for placement line-of-sight checks.
+    pub fn with_eye_offset_y(mut self, eye_offset_y: f32) -> Self {
+        self.eye_offset_y = eye_offset_y;
+        self
+    }
+
+    /// Updates the vertical eye offset used for placement line-of-sight checks.
+    pub fn set_eye_offset_y(&mut self, eye_offset_y: f32) {
+        self.eye_offset_y = eye_offset_y;
     }
 
     /// Returns the underlying spatial index.
@@ -236,11 +249,7 @@ impl SectorManager {
         }
 
         // 4. Line-of-sight raycast check from eye level
-        let eye_pos = (
-            player_pos.0,
-            player_pos.1 + PLAYER_EYE_OFFSET_Y,
-            player_pos.2,
-        );
+        let eye_pos = (player_pos.0, player_pos.1 + self.eye_offset_y, player_pos.2);
         let ray_dir_unnorm = (
             target_pos.0 - eye_pos.0,
             target_pos.1 - eye_pos.1,

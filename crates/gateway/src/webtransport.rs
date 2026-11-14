@@ -297,28 +297,11 @@ impl WebTransportServer {
                             // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid
                             if let mmo_schema::client::ClientPacket::AuthRequest(_auth_req) = &pkt {
                                 if !has_auth {
-                                    let default_guid = mmo_core::Guid::new(
-                                        mmo_core::EntityType::Player,
-                                        1,
-                                        (session_id & 0xFFFF_FFFF) as u32,
-                                    );
-                                    let assigned_node = default_node_opt
-                                        .clone()
-                                        .unwrap_or_else(|| "127.0.0.1:50052".to_string());
-                                    router_stream.register_session(
+                                    let resp = crate::server::handle_unauthenticated_auth_request(
                                         session_id,
-                                        default_guid,
-                                        assigned_node.clone(),
-                                    );
-                                    let resp = mmo_schema::client::ClientPacket::AuthResponse(
-                                        mmo_schema::client::AuthResponsePacket {
-                                            success: true,
-                                            error_code: 0,
-                                            session_id,
-                                            player_guid: default_guid.raw(),
-                                            assigned_node,
-                                            error_message: String::new(),
-                                        },
+                                        &router_stream,
+                                        default_node_opt.as_deref(),
+                                        intercept_stream.as_ref(),
                                     );
                                     let _ = send_stream.write_all(&resp.encode()).await;
                                     continue;
@@ -326,30 +309,19 @@ impl WebTransportServer {
                             }
 
                             if let mmo_schema::client::ClientPacket::Ping(ref ping) = pkt {
-                                let pong = mmo_schema::client::ClientPacket::Pong(
-                                    mmo_schema::client::PongPacket {
-                                        client_timestamp: ping.timestamp,
-                                        server_timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis()
-                                            as u64,
-                                    },
-                                );
+                                let pong = crate::server::build_pong_packet(ping.timestamp);
                                 let _ = send_stream.write_all(&pong.encode()).await;
                                 continue;
                             }
 
-                            if let Some(ref handler) = intercept_stream {
-                                if handler.handle_packet(session_id, &pkt).await {
-                                    continue;
-                                }
-                            }
-                            if let Ok(routed) = dispatcher.dispatch_packet(session_id, pkt) {
-                                if let Some(ref tx) = packet_tx {
-                                    let _ = tx.send(routed).await;
-                                }
-                            }
+                            let _ = crate::server::process_authenticated_packet(
+                                session_id,
+                                pkt,
+                                &dispatcher,
+                                &packet_tx,
+                                intercept_stream.as_ref(),
+                            )
+                            .await;
                         }
                         Ok(None) => break,
                         Err(_codec_err) => {
@@ -591,6 +563,7 @@ impl WebTransportServer {
         let conn_datagram_in = connection.clone();
         let disp_datagram = dispatcher.clone();
         let ptx_datagram = packet_tx.clone();
+        let intercept_datagram = intercept_handler.clone();
         let datagram_ingress_task = tokio::spawn(async move {
             while let Ok(datagram) = conn_datagram_in.receive_datagram().await {
                 let mut buf = BytesMut::from(&datagram[..]);
@@ -599,25 +572,19 @@ impl WebTransportServer {
                         .increment(1);
 
                     if let mmo_schema::client::ClientPacket::Ping(ref ping) = pkt {
-                        let pong = mmo_schema::client::ClientPacket::Pong(
-                            mmo_schema::client::PongPacket {
-                                client_timestamp: ping.timestamp,
-                                server_timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis()
-                                    as u64,
-                            },
-                        );
+                        let pong = crate::server::build_pong_packet(ping.timestamp);
                         let _ = conn_datagram_in.send_datagram(pong.encode());
                         continue;
                     }
 
-                    if let Ok(routed) = disp_datagram.dispatch_packet(session_id, pkt) {
-                        if let Some(ref tx) = ptx_datagram {
-                            let _ = tx.send(routed).await;
-                        }
-                    }
+                    let _ = crate::server::process_authenticated_packet(
+                        session_id,
+                        pkt,
+                        &disp_datagram,
+                        &ptx_datagram,
+                        intercept_datagram.as_ref(),
+                    )
+                    .await;
                 }
             }
         });

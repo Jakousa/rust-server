@@ -570,28 +570,11 @@ impl WebSocketServer {
                     // Unauthenticated / PoC mode: respond to AuthRequest with assigned player Guid.
                     if let ClientPacket::AuthRequest(_) = &pkt {
                         if !has_authenticator {
-                            let default_guid = mmo_core::Guid::new(
-                                mmo_core::EntityType::Player,
-                                1,
-                                (session_id & 0xFFFF_FFFF) as u32,
-                            );
-                            let assigned_node = default_node_address
-                                .unwrap_or("127.0.0.1:50052")
-                                .to_string();
-                            router.register_session(
+                            let resp = crate::server::handle_unauthenticated_auth_request(
                                 session_id,
-                                default_guid,
-                                assigned_node.clone(),
-                            );
-                            let resp = ClientPacket::AuthResponse(
-                                mmo_schema::client::AuthResponsePacket {
-                                    success: true,
-                                    error_code: 0,
-                                    session_id,
-                                    player_guid: default_guid.raw(),
-                                    assigned_node,
-                                    error_message: String::new(),
-                                },
+                                router,
+                                default_node_address,
+                                intercept_handler,
                             );
                             let _ = sink_entry.stream_tx.try_send(resp.encode().into());
                             continue;
@@ -599,29 +582,20 @@ impl WebSocketServer {
                     }
 
                     if let ClientPacket::Ping(ref ping) = pkt {
-                        let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
-                            client_timestamp: ping.timestamp,
-                            server_timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                        });
+                        let pong = crate::server::build_pong_packet(ping.timestamp);
                         let _ = sink_entry.datagram_tx.try_send(pong.encode().into());
                         continue;
                     }
                     drop(sink_entry);
 
-                    if let Some(handler) = intercept_handler {
-                        if handler.handle_packet(session_id, &pkt).await {
-                            continue;
-                        }
-                    }
-
-                    if let Ok(routed) = dispatcher.dispatch_packet(session_id, pkt) {
-                        if let Some(ref tx) = packet_tx {
-                            let _ = tx.send(routed).await;
-                        }
-                    }
+                    let _ = crate::server::process_authenticated_packet(
+                        session_id,
+                        pkt,
+                        dispatcher,
+                        packet_tx,
+                        intercept_handler,
+                    )
+                    .await;
                 }
                 Ok(None) => return true,
                 Err(_) => {

@@ -529,6 +529,17 @@ impl EventQueue {
         matched
     }
 
+    /// Returns shared references to all queued events of the specified type `E` without draining them.
+    pub fn read<E: DomainEvent>(&self) -> Vec<&E> {
+        let Some(items) = self.queues.get(&TypeId::of::<E>()) else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| item.downcast_ref::<E>())
+            .collect()
+    }
+
     /// Returns `true` if the queue has no events.
     pub fn is_empty(&self) -> bool {
         self.queues.values().all(|v| v.is_empty())
@@ -735,7 +746,6 @@ mod tests {
     #[test]
     fn test_codec_registry_roundtrip() {
         let mut registry = ComponentCodecRegistry::new();
-        println!("Line 316 TypeId: {:?}", TypeId::of::<MockHealth>());
         registry.register::<MockHealth>("mock_health");
 
         let mut store = ComponentStore::new();

@@ -486,9 +486,7 @@ impl Octree {
     /// Queries and returns all entity GUIDs within radial distance from `center`.
     pub fn query_radius(&self, center: (f32, f32, f32), radius: f32) -> Vec<Guid> {
         let mut results = Vec::new();
-        if radius >= 0.0 {
-            self.query_radius_internal(center, radius, radius * radius, &mut results);
-        }
+        self.query_radius_into(center, radius, &mut results);
         results
     }
 
@@ -499,16 +497,16 @@ impl Octree {
         radius: f32,
     ) -> Vec<(Guid, (f32, f32, f32))> {
         let mut results = Vec::new();
-        if radius >= 0.0 {
-            self.query_radius_with_pos_internal(center, radius, radius * radius, &mut results);
-        }
+        self.query_radius_with_pos_into(center, radius, &mut results);
         results
     }
 
     /// Queries all entity GUIDs within radial distance from `center`, appending into `results`.
     pub fn query_radius_into(&self, center: (f32, f32, f32), radius: f32, results: &mut Vec<Guid>) {
         if radius >= 0.0 {
-            self.query_radius_internal(center, radius, radius * radius, results);
+            self.visit_radius(center, radius, radius * radius, &mut |guid, _, _| {
+                results.push(guid);
+            });
         }
     }
 
@@ -520,7 +518,9 @@ impl Octree {
         results: &mut Vec<(Guid, (f32, f32, f32))>,
     ) {
         if radius >= 0.0 {
-            self.query_radius_with_pos_internal(center, radius, radius * radius, results);
+            self.visit_radius(center, radius, radius * radius, &mut |guid, pos, _| {
+                results.push((guid, pos));
+            });
         }
     }
 
@@ -532,7 +532,14 @@ impl Octree {
         results: &mut Vec<(Guid, (f32, f32, f32), f32)>,
     ) {
         if radius >= 0.0 {
-            self.query_radius_with_dist_sq_internal(center, radius, radius * radius, results);
+            self.visit_radius(
+                center,
+                radius,
+                radius * radius,
+                &mut |guid, pos, dist_sq| {
+                    results.push((guid, pos, dist_sq));
+                },
+            );
         }
     }
 
@@ -769,73 +776,10 @@ impl Octree {
 
     // --- Private Helper Methods ---
 
-    fn query_radius_internal(
-        &self,
-        center: (f32, f32, f32),
-        radius: f32,
-        radius_sq: f32,
-        results: &mut Vec<Guid>,
-    ) {
-        if !self.bounds.intersects_sphere(center, radius) {
-            return;
-        }
-
-        match &self.node {
-            OctreeNode::Leaf { entities } => {
-                for &(guid, pos) in entities {
-                    let dx = pos.0 - center.0;
-                    let dy = pos.1 - center.1;
-                    let dz = pos.2 - center.2;
-                    if dx * dx + dy * dy + dz * dz <= radius_sq {
-                        results.push(guid);
-                    }
-                }
-            }
-            OctreeNode::Branch { children } => {
-                for child in children.iter() {
-                    child.query_radius_internal(center, radius, radius_sq, results);
-                }
-            }
-        }
-    }
-
-    fn query_radius_with_pos_internal(
-        &self,
-        center: (f32, f32, f32),
-        radius: f32,
-        radius_sq: f32,
-        results: &mut Vec<(Guid, (f32, f32, f32))>,
-    ) {
-        if !self.bounds.intersects_sphere(center, radius) {
-            return;
-        }
-
-        match &self.node {
-            OctreeNode::Leaf { entities } => {
-                for &(guid, pos) in entities {
-                    let dx = pos.0 - center.0;
-                    let dy = pos.1 - center.1;
-                    let dz = pos.2 - center.2;
-                    if dx * dx + dy * dy + dz * dz <= radius_sq {
-                        results.push((guid, pos));
-                    }
-                }
-            }
-            OctreeNode::Branch { children } => {
-                for child in children.iter() {
-                    child.query_radius_with_pos_internal(center, radius, radius_sq, results);
-                }
-            }
-        }
-    }
-
-    fn query_radius_with_dist_sq_internal(
-        &self,
-        center: (f32, f32, f32),
-        radius: f32,
-        radius_sq: f32,
-        results: &mut Vec<(Guid, (f32, f32, f32), f32)>,
-    ) {
+    fn visit_radius<F>(&self, center: (f32, f32, f32), radius: f32, radius_sq: f32, visitor: &mut F)
+    where
+        F: FnMut(Guid, (f32, f32, f32), f32),
+    {
         if !self.bounds.intersects_sphere(center, radius) {
             return;
         }
@@ -848,13 +792,13 @@ impl Octree {
                     let dz = pos.2 - center.2;
                     let dist_sq = dx * dx + dy * dy + dz * dz;
                     if dist_sq <= radius_sq {
-                        results.push((guid, pos, dist_sq));
+                        visitor(guid, pos, dist_sq);
                     }
                 }
             }
             OctreeNode::Branch { children } => {
                 for child in children.iter() {
-                    child.query_radius_with_dist_sq_internal(center, radius, radius_sq, results);
+                    child.visit_radius(center, radius, radius_sq, visitor);
                 }
             }
         }

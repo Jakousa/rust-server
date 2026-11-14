@@ -1077,6 +1077,29 @@ pub(crate) fn put_u16_str(dst: &mut BytesMut, s: &str) {
     dst.extend_from_slice(bytes);
 }
 
+/// Helper decoding a string with a 16-bit little-endian byte length, ensuring at least `trailing_min_bytes` remain afterward.
+pub(crate) fn get_u16_str(
+    src: &mut impl Buf,
+    trailing_min_bytes: usize,
+) -> Result<String, ClientCodecError> {
+    if src.remaining() < 2 {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: 2,
+            got: src.remaining(),
+        });
+    }
+    let len = src.get_u16_le() as usize;
+    let needed = len + trailing_min_bytes;
+    if src.remaining() < needed {
+        return Err(ClientCodecError::BufferTooShort {
+            expected: needed,
+            got: src.remaining(),
+        });
+    }
+    let bytes = src.copy_to_bytes(len);
+    String::from_utf8(bytes.to_vec()).map_err(|e| ClientCodecError::InvalidData(e.to_string()))
+}
+
 /// Client acknowledgement carrying the latest observed server tick and a 32-tick loss recovery mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientAckPacket {
@@ -1523,22 +1546,7 @@ impl AuthRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let token_len = src.get_u16_le() as usize;
-        if src.remaining() < token_len + 4 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: token_len + 4,
-                got: src.remaining(),
-            });
-        }
-        let token_bytes = src.copy_to_bytes(token_len);
-        let token = String::from_utf8(token_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let token = get_u16_str(src, 4)?;
         let client_version = src.get_u32_le();
         Ok(Self {
             token,
@@ -1582,33 +1590,8 @@ impl AuthResponsePacket {
         let session_id = src.get_u64_le();
         let player_guid = src.get_u64_le();
 
-        let node_len = src.get_u16_le() as usize;
-        if src.remaining() < node_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: node_len,
-                got: src.remaining(),
-            });
-        }
-        let node_bytes = src.copy_to_bytes(node_len);
-        let assigned_node = String::from_utf8(node_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
-
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let msg_len = src.get_u16_le() as usize;
-        if src.remaining() < msg_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: msg_len,
-                got: src.remaining(),
-            });
-        }
-        let msg_bytes = src.copy_to_bytes(msg_len);
-        let error_message = String::from_utf8(msg_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let assigned_node = get_u16_str(src, 0)?;
+        let error_message = get_u16_str(src, 0)?;
 
         Ok(Self {
             success,
@@ -1653,33 +1636,8 @@ impl SocialMessagePacket {
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
         let sender_guid = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let sender_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
-
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let content_len = src.get_u16_le() as usize;
-        if src.remaining() < content_len + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: content_len + 8,
-                got: src.remaining(),
-            });
-        }
-        let content_bytes = src.copy_to_bytes(content_len);
-        let content = String::from_utf8(content_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let sender_name = get_u16_str(src, 0)?;
+        let content = get_u16_str(src, 8)?;
         let timestamp = src.get_u64_le();
 
         Ok(Self {
@@ -1717,16 +1675,7 @@ impl SocialSubscribePacket {
         }
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let channel_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let channel_name = get_u16_str(src, 0)?;
         Ok(Self {
             channel_type,
             target_id,
@@ -1759,16 +1708,7 @@ impl SocialUnsubscribePacket {
         }
         let channel_type = src.get_u8();
         let target_id = src.get_u64_le();
-        let name_len = src.get_u16_le() as usize;
-        if src.remaining() < name_len {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: name_len,
-                got: src.remaining(),
-            });
-        }
-        let name_bytes = src.copy_to_bytes(name_len);
-        let channel_name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let channel_name = get_u16_str(src, 0)?;
         Ok(Self {
             channel_type,
             target_id,
@@ -1814,33 +1754,9 @@ impl MarketListingWire {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 8 + 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 10,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 10)?;
         let seller_guid = src.get_u64_le();
-        let iid_len = src.get_u16_le() as usize;
-        if src.remaining() < iid_len + 4 + 8 + 8 + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: iid_len + 28,
-                got: src.remaining(),
-            });
-        }
-        let iid_bytes = src.copy_to_bytes(iid_len);
-        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let item_instance_id = get_u16_str(src, 28)?;
         let item_def_id = src.get_u32_le();
         let price = src.get_u64_le();
         let created_at = src.get_u64_le();
@@ -1878,22 +1794,7 @@ impl MarketListRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let iid_len = src.get_u16_le() as usize;
-        if src.remaining() < iid_len + 28 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: iid_len + 28,
-                got: src.remaining(),
-            });
-        }
-        let iid_bytes = src.copy_to_bytes(iid_len);
-        let item_instance_id = String::from_utf8(iid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let item_instance_id = get_u16_str(src, 28)?;
         let src_container_id = src.get_u64_le();
         let src_slot = src.get_u32_le();
         let price = src.get_u64_le();
@@ -1927,22 +1828,7 @@ impl MarketBuyRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 24 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 24,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 24)?;
         let buyer_container_id = src.get_u64_le();
         let payment_container_id = src.get_u64_le();
         let price = src.get_u64_le();
@@ -1970,22 +1856,7 @@ impl MarketCancelRequestPacket {
     }
 
     pub fn decode(src: &mut impl Buf) -> Result<Self, ClientCodecError> {
-        if src.remaining() < 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: 2,
-                got: src.remaining(),
-            });
-        }
-        let lid_len = src.get_u16_le() as usize;
-        if src.remaining() < lid_len + 8 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: lid_len + 8,
-                got: src.remaining(),
-            });
-        }
-        let lid_bytes = src.copy_to_bytes(lid_len);
-        let listing_id = String::from_utf8(lid_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let listing_id = get_u16_str(src, 8)?;
         let dst_container_id = src.get_u64_le();
 
         Ok(Self {
@@ -2069,16 +1940,7 @@ impl MarketResponsePacket {
         let request_type = src.get_u8();
         let success = src.get_u8() != 0;
         let error_code = src.get_u32_le();
-        let msg_len = src.get_u16_le() as usize;
-        if src.remaining() < msg_len + 2 {
-            return Err(ClientCodecError::BufferTooShort {
-                expected: msg_len + 2,
-                got: src.remaining(),
-            });
-        }
-        let msg_bytes = src.copy_to_bytes(msg_len);
-        let error_message = String::from_utf8(msg_bytes.to_vec())
-            .map_err(|e| ClientCodecError::InvalidData(e.to_string()))?;
+        let error_message = get_u16_str(src, 2)?;
 
         let count = src.get_u16_le() as usize;
         const MIN_LISTING_WIRE_SIZE: usize = 40;

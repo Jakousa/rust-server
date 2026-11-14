@@ -332,7 +332,7 @@ fn owner_type_code(owner: &mmo_core::container::ContainerOwner) -> u8 {
     use mmo_core::container::ContainerOwner;
     match owner {
         ContainerOwner::Character(_) => 0,
-        ContainerOwner::Guild(_) | ContainerOwner::Group(_) => 1,
+        ContainerOwner::Guild(_) | ContainerOwner::Group(_) | ContainerOwner::Organization(_) => 1,
         ContainerOwner::WorldEntity(_) => 2,
         ContainerOwner::System(_) => 3,
     }

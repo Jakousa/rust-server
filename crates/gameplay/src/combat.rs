@@ -10,8 +10,8 @@ use mmo_core::combat::{CombatEffectOutcome, CombatResolver};
 use mmo_core::entity::state_flags;
 use mmo_core::plugin::EntityIncapacitatedEvent;
 use mmo_core::{
-    ActionQueue, AttributeId, AttributeSet, DomainEvent, Entity, EntityStore, EventQueue,
-    GameplayPlugin, Guid, InterruptReason, PluginContext, TickContext, TickSystem,
+    ActionQueue, AttributeId, AttributeSet, DomainEvent, Entity, EntityDamagedEvent, EntityStore,
+    EventQueue, GameplayPlugin, Guid, InterruptReason, PluginContext, TickContext, TickSystem,
 };
 
 /// Dynamic component representing an entity's health status.
@@ -280,6 +280,14 @@ impl CombatResolver for RpgCombatResolver {
                 event_queue.push(EntityDiedEvent {
                     entity: target_guid,
                     killer: caster_guid,
+                });
+            }
+
+            if effective_damage > 0.0 {
+                event_queue.push(EntityDamagedEvent {
+                    entity: target_guid,
+                    amount: effective_damage,
+                    instigator: caster_guid,
                 });
             }
 

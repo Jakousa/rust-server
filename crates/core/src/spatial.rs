@@ -13,11 +13,15 @@ use crate::octree::{BoundingBox3D, Octree};
 pub use mmo_schema::client::Vec3;
 
 /// Error returned when a spatial query validation fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpatialQueryError {
+    #[error("target out of range: distance {distance} exceeds max range {max_range}")]
     TargetOutOfRange { distance: u32, max_range: u32 },
+    #[error("target lies outside facing cone")]
     TargetOutsideCone,
+    #[error("line of sight is blocked")]
     LineOfSightBlocked,
+    #[error("invalid facing vector")]
     InvalidFacingVector,
 }
 

@@ -327,32 +327,18 @@ impl WorldObjectRepository {
         );
         let query_str = sql_for_dialect(&query, self.db.is_postgres());
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(world_id as i64)
-                    .bind(object_id as i64)
-                    .fetch_optional(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let row = sqlx::query(&query_str)
+                .bind(world_id as i64)
+                .bind(object_id as i64)
+                .fetch_optional(pool)
+                .await?;
 
-                match row {
-                    Some(r) => Ok(Some(parse_world_object_record!(r))),
-                    None => Ok(None),
-                }
-            }
-            DbBackend::Postgres(pool) => {
-                let row = sqlx::query(&query_str)
-                    .bind(world_id as i64)
-                    .bind(object_id as i64)
-                    .fetch_optional(pool)
-                    .await?;
-
-                match row {
-                    Some(r) => Ok(Some(parse_world_object_record!(r))),
-                    None => Ok(None),
-                }
-            }
-        }
+            Ok(match row {
+                Some(r) => Some(parse_world_object_record!(r)),
+                None => None,
+            })
+        })
     }
 
     /// Fetches all world objects located within a discrete 3D spatial sector.
@@ -369,38 +355,21 @@ impl WorldObjectRepository {
         );
         let query_str = sql_for_dialect(&query, self.db.is_postgres());
 
-        match self.db.backend() {
-            DbBackend::Sqlite(pool) => {
-                let rows = sqlx::query(&query_str)
-                    .bind(world_id as i64)
-                    .bind(sector_x)
-                    .bind(sector_y)
-                    .bind(sector_z)
-                    .fetch_all(pool)
-                    .await?;
+        crate::with_dialect_pool!(self.db, |pool| {
+            let rows = sqlx::query(&query_str)
+                .bind(world_id as i64)
+                .bind(sector_x)
+                .bind(sector_y)
+                .bind(sector_z)
+                .fetch_all(pool)
+                .await?;
 
-                let mut objects = Vec::with_capacity(rows.len());
-                for r in rows {
-                    objects.push(parse_world_object_record!(r));
-                }
-                Ok(objects)
+            let mut objects = Vec::with_capacity(rows.len());
+            for r in rows {
+                objects.push(parse_world_object_record!(r));
             }
-            DbBackend::Postgres(pool) => {
-                let rows = sqlx::query(&query_str)
-                    .bind(world_id as i64)
-                    .bind(sector_x)
-                    .bind(sector_y)
-                    .bind(sector_z)
-                    .fetch_all(pool)
-                    .await?;
-
-                let mut objects = Vec::with_capacity(rows.len());
-                for r in rows {
-                    objects.push(parse_world_object_record!(r));
-                }
-                Ok(objects)
-            }
-        }
+            Ok(objects)
+        })
     }
 
     /// Deletes a world object by its primary key `(world_id, object_id)`.
@@ -412,20 +381,14 @@ impl WorldObjectRepository {
         let query = "DELETE FROM world_objects WHERE world_id = ? AND object_id = ?";
         let query_str = sql_for_dialect(query, self.db.is_postgres());
 
-        let rows_affected = match self.db.backend() {
-            DbBackend::Sqlite(pool) => sqlx::query(&query_str)
+        let rows_affected = crate::with_dialect_pool!(self.db, |pool| {
+            sqlx::query(&query_str)
                 .bind(world_id as i64)
                 .bind(object_id as i64)
                 .execute(pool)
                 .await?
-                .rows_affected(),
-            DbBackend::Postgres(pool) => sqlx::query(&query_str)
-                .bind(world_id as i64)
-                .bind(object_id as i64)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
+                .rows_affected()
+        });
 
         Ok(rows_affected > 0)
     }

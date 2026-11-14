@@ -24,11 +24,11 @@ pub use action::{
     resolve_boundary_sphere_aoe, AbilityDefinition, AbilityTickSystem, ActionCompletedEvent,
     ActionCooldownSystem, ActionDefinition, ActionInterruptFlags, ActionInterruptedEvent,
     ActionProgressEvent, ActionQueue, ActionStartedEvent, ActionTickSystem, BoundaryAoeTargeting,
-    CooldownTracker, InterruptReason, QueuePolicy, TimedAction,
+    CooldownTracker, EntityDamagedEvent, InterruptReason, QueuePolicy, TimedAction,
 };
 pub use attribute::{
     canonical_id_for_name, AttributeId, AttributeSet, AttributeTickSystem, AttributeValue,
-    AuraExpiredEvent, ModifierType, TimedModifier,
+    AuraExpiredEvent, ModifierExpiredEvent, ModifierType, TimedModifier,
 };
 pub use container::{
     ContainerAccessPolicy, ContainerError, ContainerId, ContainerOwner, ContainerSlot,

@@ -206,6 +206,9 @@ pub struct AuraExpiredEvent {
 }
 impl DomainEvent for AuraExpiredEvent {}
 
+/// Genre-agnostic alias for [`AuraExpiredEvent`].
+pub type ModifierExpiredEvent = AuraExpiredEvent;
+
 /// Deserializes `AttributeSet::attributes` and backfills missing `canonical_id` caches from the global registry.
 fn deserialize_attributes<'de, D>(
     deserializer: D,
