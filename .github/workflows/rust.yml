@@ -114,6 +114,12 @@ jobs:
           npm test
           npm run build
 
+      - name: Web Frontend E2E Tests (Playwright)
+        working-directory: web
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+
       - name: Supply-Chain and License Audit (cargo-deny)
         run: cargo deny check
 

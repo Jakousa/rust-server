@@ -67,6 +67,7 @@ pub struct WebSocketServer {
     intercept_handler: Option<crate::server::GatewayInterceptHandler>,
     cache: Option<Arc<dyn SessionCacheBackend>>,
     connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    handshake_timeout: Option<Duration>,
 }
 
 impl WebSocketServer {
@@ -94,6 +95,7 @@ impl WebSocketServer {
             intercept_handler: None,
             cache: None,
             connection_semaphore: None,
+            handshake_timeout: None,
         })
     }
 
@@ -142,6 +144,12 @@ impl WebSocketServer {
         self
     }
 
+    /// Configures the timeout applied to TLS acceptance and the WebSocket HTTP upgrade handshake.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
     /// Returns the local bound socket address.
     pub fn local_addr(&self) -> Result<SocketAddr, WebSocketError> {
         self.listener.local_addr().map_err(WebSocketError::Io)
@@ -187,6 +195,7 @@ impl WebSocketServer {
                     let default_node = self.default_node_address.clone();
                     let intercept_handler = self.intercept_handler.clone();
                     let cache = self.cache.clone();
+                    let handshake_timeout = self.handshake_timeout.unwrap_or(WS_HANDSHAKE_TIMEOUT);
 
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -202,6 +211,7 @@ impl WebSocketServer {
                             default_node,
                             intercept_handler,
                             cache,
+                            handshake_timeout,
                         )
                         .await;
                     });
@@ -247,18 +257,18 @@ impl WebSocketServer {
         default_node_address: Option<String>,
         intercept_handler: Option<crate::server::GatewayInterceptHandler>,
         cache: Option<Arc<dyn SessionCacheBackend>>,
+        handshake_timeout: Duration,
     ) {
         let ws_config = Some(Self::ws_config());
 
         if let Some(acceptor) = tls_acceptor {
             let tls_stream =
-                match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream)).await
-                {
+                match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp_stream)).await {
                     Ok(Ok(stream)) => stream,
                     _ => return,
                 };
             let ws_stream = match tokio::time::timeout(
-                WS_HANDSHAKE_TIMEOUT,
+                handshake_timeout,
                 tokio_tungstenite::accept_async_with_config(tls_stream, ws_config),
             )
             .await
@@ -281,7 +291,7 @@ impl WebSocketServer {
             .await;
         } else {
             let ws_stream = match tokio::time::timeout(
-                WS_HANDSHAKE_TIMEOUT,
+                handshake_timeout,
                 tokio_tungstenite::accept_async_with_config(tcp_stream, ws_config),
             )
             .await

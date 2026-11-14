@@ -11,6 +11,7 @@ pub struct MetricsAggregator {
     packets_received: AtomicU64,
     snapbacks: AtomicU64,
     connection_errors: AtomicU64,
+    auth_failures: AtomicU64,
     rtt_histogram_us: Mutex<Histogram<u64>>,
     start_time: Instant,
 }
@@ -25,6 +26,7 @@ pub struct MetricsSnapshot {
     pub recv_rate_pps: f64,
     pub snapbacks: u64,
     pub connection_errors: u64,
+    pub auth_failures: u64,
     pub min_rtt_ms: f64,
     pub p50_rtt_ms: f64,
     pub p95_rtt_ms: f64,
@@ -44,6 +46,7 @@ impl MetricsAggregator {
             packets_received: AtomicU64::new(0),
             snapbacks: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
             rtt_histogram_us: Mutex::new(hist),
             start_time: Instant::now(),
         }
@@ -65,6 +68,10 @@ impl MetricsAggregator {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_auth_failure(&self) {
+        self.auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_rtt_ms(&self, rtt_ms: f64) {
         let us = (rtt_ms * 1000.0).max(1.0) as u64;
         let mut hist = self.rtt_histogram_us.lock().unwrap();
@@ -78,10 +85,22 @@ impl MetricsAggregator {
         let recv = self.packets_received.load(Ordering::Relaxed);
         let snapbacks = self.snapbacks.load(Ordering::Relaxed);
         let errors = self.connection_errors.load(Ordering::Relaxed);
+        let auth_failures = self.auth_failures.load(Ordering::Relaxed);
 
         let hist = self.rtt_histogram_us.lock().unwrap();
 
         let to_ms = |us: u64| us as f64 / 1000.0;
+        let (min_rtt_ms, p50_rtt_ms, p95_rtt_ms, p99_rtt_ms, max_rtt_ms) = if hist.is_empty() {
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            (
+                to_ms(hist.min()),
+                to_ms(hist.value_at_quantile(0.50)),
+                to_ms(hist.value_at_quantile(0.95)),
+                to_ms(hist.value_at_quantile(0.99)),
+                to_ms(hist.max()),
+            )
+        };
 
         MetricsSnapshot {
             duration_secs: duration,
@@ -99,11 +118,12 @@ impl MetricsAggregator {
             },
             snapbacks,
             connection_errors: errors,
-            min_rtt_ms: to_ms(hist.min()),
-            p50_rtt_ms: to_ms(hist.value_at_quantile(0.50)),
-            p95_rtt_ms: to_ms(hist.value_at_quantile(0.95)),
-            p99_rtt_ms: to_ms(hist.value_at_quantile(0.99)),
-            max_rtt_ms: to_ms(hist.max()),
+            auth_failures,
+            min_rtt_ms,
+            p50_rtt_ms,
+            p95_rtt_ms,
+            p99_rtt_ms,
+            max_rtt_ms,
         }
     }
 }
@@ -137,5 +157,18 @@ mod tests {
         assert_eq!(snap.snapbacks, 1);
         assert!(snap.p50_rtt_ms > 0.0);
         assert!(snap.p99_rtt_ms >= snap.p50_rtt_ms);
+    }
+
+    #[test]
+    fn test_empty_metrics_snapshot_returns_zero_rtt() {
+        let metrics = MetricsAggregator::new();
+        metrics.record_auth_failure();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.auth_failures, 1);
+        assert_eq!(snap.min_rtt_ms, 0.0);
+        assert_eq!(snap.p50_rtt_ms, 0.0);
+        assert_eq!(snap.p95_rtt_ms, 0.0);
+        assert_eq!(snap.p99_rtt_ms, 0.0);
+        assert_eq!(snap.max_rtt_ms, 0.0);
     }
 }

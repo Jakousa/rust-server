@@ -989,4 +989,220 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_component_codec_registry_error_and_legacy_value_paths() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct LegacyMultiTypeComponent {
+            flag: bool,
+            signed: i64,
+            unsigned: u64,
+            ratio: f64,
+            label: String,
+            items: Vec<i32>,
+            optional: Option<String>,
+        }
+
+        let mut registry = ComponentCodecRegistry::new();
+        registry.register::<MockHealth>("mock_health");
+        registry.register::<LegacyMultiTypeComponent>("legacy_multi");
+
+        // Non-object JSON input returns Ok(0)
+        let mut store = ComponentStore::new();
+        assert_eq!(
+            registry
+                .deserialize_into(&serde_json::Value::Null, &mut store)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            registry
+                .deserialize_into(&serde_json::json!([1, 2]), &mut store)
+                .unwrap(),
+            0
+        );
+
+        // Unknown component is ignored; invalid schema returns Deserialization error
+        assert_eq!(
+            registry
+                .deserialize_into(&serde_json::json!({"unknown": {"a": 1}}), &mut store)
+                .unwrap(),
+            0
+        );
+        let bad_json = serde_json::json!({"mock_health": {"hp": "not_a_number"}});
+        assert!(matches!(
+            registry.deserialize_into(&bad_json, &mut store),
+            Err(CodecError::Deserialization {
+                type_name: "mock_health",
+                ..
+            })
+        ));
+
+        // Downcast failure in TypedComponentCodec
+        let typed_codec = TypedComponentCodec::<MockHealth>::new("mock_health");
+        let wrong_box: Box<dyn Any + Send + Sync> = Box::new(123u32);
+        assert!(matches!(
+            typed_codec.serialize(wrong_box.as_ref()),
+            Err(CodecError::DowncastFailed("mock_health"))
+        ));
+        let mut bin_out = Vec::new();
+        assert!(matches!(
+            typed_codec.serialize_binary(wrong_box.as_ref(), &mut bin_out),
+            Err(CodecError::DowncastFailed("mock_health"))
+        ));
+
+        // Empty binary blob returns Ok(0)
+        assert_eq!(
+            registry.deserialize_binary_into(&[], &mut store).unwrap(),
+            0
+        );
+
+        // Oversized binary blob returns PayloadTooLarge
+        let oversized = vec![0u8; ComponentCodecRegistry::MAX_STATE_BLOB_SIZE + 1];
+        assert!(matches!(
+            registry.deserialize_binary_into(&oversized, &mut store),
+            Err(CodecError::PayloadTooLarge { .. })
+        ));
+
+        // Unknown key in binary blob is skipped and legacy JSON scalar/seq/null types work
+        let legacy_val = serde_json::json!({
+            "unknown_comp": [1, 2, 3],
+            "legacy_multi": {
+                "flag": true,
+                "signed": -7,
+                "unsigned": 42,
+                "ratio": 1.25,
+                "label": "ok",
+                "items": [10, 20],
+                "optional": null
+            }
+        });
+        let legacy_blob = rmp_serde::to_vec_named(&legacy_val).unwrap();
+        let mut legacy_store = ComponentStore::new();
+        assert_eq!(
+            registry
+                .deserialize_binary_into(&legacy_blob, &mut legacy_store)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            legacy_store.get_component::<LegacyMultiTypeComponent>(),
+            Some(&LegacyMultiTypeComponent {
+                flag: true,
+                signed: -7,
+                unsigned: 42,
+                ratio: 1.25,
+                label: "ok".to_string(),
+                items: vec![10, 20],
+                optional: None,
+            })
+        );
+
+        // Corrupt inner binary payload (0xc1 is never valid MessagePack) for registered component returns error
+        let bad_inner = b"\x81\xabmock_health\xc4\x02\xc1\xc1";
+        assert!(registry
+            .deserialize_binary_into(bad_inner, &mut legacy_store)
+            .is_err());
+    }
+
+    #[test]
+    fn test_event_queue_retain_recent_and_read() {
+        let mut queue = EventQueue::new();
+        let g = Guid::new(EntityType::Player, 1, 1);
+
+        assert!(queue.read::<MockDamageEvent>().is_empty());
+        for amount in 1..=5 {
+            queue.push(MockDamageEvent { target: g, amount });
+        }
+        queue.push(MockHealEvent {
+            target: g,
+            amount: 10,
+        });
+        queue.push(MockHealEvent {
+            target: g,
+            amount: 20,
+        });
+
+        assert_eq!(queue.read::<MockDamageEvent>().len(), 5);
+        queue.retain_recent(2);
+
+        let retained_dmg: Vec<u32> = queue
+            .read::<MockDamageEvent>()
+            .iter()
+            .map(|e| e.amount)
+            .collect();
+        assert_eq!(retained_dmg, vec![4, 5]);
+        assert_eq!(queue.read::<MockHealEvent>().len(), 2);
+
+        queue.retain_recent(0);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_modular_packet_router_dispatch_and_errors() {
+        struct MockModuleHandler;
+        impl ModularPacketHandler for MockModuleHandler {
+            fn handle(
+                &self,
+                entity_guid: Guid,
+                sub_opcode: u16,
+                payload: &[u8],
+                entities: &mut EntityStore,
+            ) -> Result<Option<Vec<u8>>, PacketHandlerError> {
+                if sub_opcode == 99 {
+                    return Err(PacketHandlerError::MalformedPayload {
+                        module_id: 7,
+                        message: "unsupported sub_opcode".to_string(),
+                    });
+                }
+                let ent = entities
+                    .get_mut_by_guid(entity_guid)
+                    .ok_or(PacketHandlerError::EntityNotFound(entity_guid))?;
+                ent.position.0 += 5.0;
+                if sub_opcode == 1 {
+                    Ok(Some(payload.to_vec()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let mut router = ModularPacketRouter::new();
+        assert!(!router.has_module(7));
+        router.register(7, Box::new(MockModuleHandler));
+        assert!(router.has_module(7));
+        assert!(!router.has_module(8));
+
+        let mut entities = EntityStore::new();
+        let guid = Guid::new(EntityType::Player, 1, 55);
+        let missing_guid = Guid::new(EntityType::Player, 1, 56);
+        entities.spawn(guid, (1.0, 0.0, 0.0));
+
+        // Unregistered module returns ModuleNotFound
+        assert_eq!(
+            router.dispatch(8, 1, guid, b"hi", &mut entities),
+            Err(PacketHandlerError::ModuleNotFound(8))
+        );
+
+        // Registered module updates entity and returns response payload
+        let resp = router.dispatch(7, 1, guid, b"ack", &mut entities).unwrap();
+        assert_eq!(resp, Some(b"ack".to_vec()));
+        assert_eq!(entities.get_by_guid(guid).unwrap().position.0, 6.0);
+
+        // Sub-opcode returning Ok(None)
+        assert_eq!(
+            router.dispatch(7, 2, guid, b"", &mut entities).unwrap(),
+            None
+        );
+
+        // Handler error propagation (EntityNotFound & MalformedPayload)
+        assert_eq!(
+            router.dispatch(7, 1, missing_guid, b"", &mut entities),
+            Err(PacketHandlerError::EntityNotFound(missing_guid))
+        );
+        assert!(matches!(
+            router.dispatch(7, 99, guid, b"", &mut entities),
+            Err(PacketHandlerError::MalformedPayload { module_id: 7, .. })
+        ));
+    }
 }

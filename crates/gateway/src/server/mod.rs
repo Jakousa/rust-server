@@ -1003,7 +1003,8 @@ impl GatewayServer {
             self.packet_tx.clone(),
         )
         .await?
-        .with_intercept_handler(self.intercept_handler());
+        .with_intercept_handler(self.intercept_handler())
+        .with_handshake_timeout(self.handshake_timeout());
 
         if let Some(ref auth) = self.authenticator {
             server = server.with_authenticator(auth.clone());

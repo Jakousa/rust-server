@@ -6,7 +6,8 @@
 use bytes::BytesMut;
 use mmo_core::guid::Guid;
 use mmo_schema::client::{
-    delta_flags, ClientAckPacket, ClientCodecError, ClientPacket, MovementPacket, PingPacket, Vec3,
+    delta_flags, AuthRequestPacket, AuthResponsePacket, ClientAckPacket, ClientCodecError,
+    ClientPacket, MovementPacket, PingPacket, Vec3,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -25,6 +26,15 @@ pub enum SessionError {
 
     #[error("Not connected")]
     NotConnected,
+
+    #[error("Authentication rejected (code {error_code}): {error_message}")]
+    AuthRejected {
+        error_code: u32,
+        error_message: String,
+    },
+
+    #[error("Authentication timed out")]
+    AuthTimeout,
 }
 
 /// Active virtual bot session.
@@ -108,15 +118,63 @@ impl BotSession {
         Ok(())
     }
 
-    /// Reads incoming bytes from the gateway socket and parses all completed frames.
+    /// Sends an `AuthRequestPacket` with `token` and awaits the server's `AuthResponsePacket`.
     ///
-    /// Returns decoded packets and any observed ping RTT latency in milliseconds.
-    pub async fn poll_incoming(
+    /// On success, stores the server-assigned `session_id` (and updates `self.guid` when
+    /// `player_guid != 0`). Returns `SessionError::AuthRejected` if the server denies admission
+    /// or `SessionError::AuthTimeout` if no response arrives within `timeout`.
+    pub async fn authenticate(
         &mut self,
-    ) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
-        let stream = self.stream.as_mut().ok_or(SessionError::NotConnected)?;
-        let mut rtt_ms = None;
+        token: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Result<AuthResponsePacket, SessionError> {
+        if !self.is_connected() {
+            return Err(SessionError::NotConnected);
+        }
+        let auth_packet = ClientPacket::AuthRequest(AuthRequestPacket {
+            token: token.into(),
+            client_version: 1,
+        });
+        self.send_packet(&auth_packet).await?;
 
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Decode one frame at a time so any trailing frames coalesced behind AuthResponse
+            // remain intact in `self.read_buf` for subsequent tick polling.
+            while let Some(pkt) = ClientPacket::decode_frame(&mut self.read_buf)? {
+                let _ = self.handle_decoded_packet(&pkt);
+                if let ClientPacket::AuthResponse(resp) = pkt {
+                    return if resp.success {
+                        Ok(resp)
+                    } else {
+                        Err(SessionError::AuthRejected {
+                            error_code: resp.error_code,
+                            error_message: resp.error_message,
+                        })
+                    };
+                }
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(SessionError::AuthTimeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, self.read_more_bytes()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(SessionError::AuthTimeout),
+            }
+        }
+    }
+
+    /// Consumes the session and returns its active `TcpStream` and unparsed read buffer.
+    pub fn into_parts(self) -> Option<(TcpStream, BytesMut)> {
+        self.stream.map(|stream| (stream, self.read_buf))
+    }
+
+    async fn read_more_bytes(&mut self) -> Result<usize, SessionError> {
+        let stream = self.stream.as_mut().ok_or(SessionError::NotConnected)?;
         let bytes_read = stream.read_buf(&mut self.read_buf).await?;
         if bytes_read == 0 {
             self.stream = None;
@@ -126,60 +184,92 @@ impl BotSession {
             )));
         }
         self.total_bytes_received += bytes_read as u64;
+        Ok(bytes_read)
+    }
 
+    fn handle_decoded_packet(&mut self, packet: &ClientPacket) -> Option<f64> {
+        let mut rtt_ms = None;
+        match packet {
+            ClientPacket::AuthResponse(resp) => {
+                if resp.success {
+                    self.session_id = resp.session_id;
+                    if resp.player_guid != 0 {
+                        self.guid = Guid::from_raw(resp.player_guid);
+                    }
+                }
+            }
+            ClientPacket::Pong(pong) => {
+                if let Some((ts, sent_time)) = self.last_ping_sent {
+                    if ts == pong.client_timestamp {
+                        let elapsed = sent_time.elapsed().as_secs_f64() * 1000.0;
+                        rtt_ms = Some(elapsed);
+                        self.last_ping_sent = None;
+                    }
+                }
+            }
+            ClientPacket::MovementCorrection(corr) if corr.entity_id == self.guid.raw() => {
+                self.snapback_count += 1;
+                self.current_position = corr.corrected_position;
+                self.current_velocity = Vec3::ZERO;
+            }
+            ClientPacket::EntityDeltaBatch(batch) => {
+                self.last_observed_tick = self.last_observed_tick.max(batch.server_tick);
+                for &despawn_id in &batch.despawns {
+                    self.known_entities.remove(&despawn_id);
+                }
+                for delta in &batch.deltas {
+                    if delta.field_mask & delta_flags::MASK_KEYFRAME != 0 {
+                        self.known_entities.insert(
+                            delta.entity_id,
+                            Vec3::new(delta.position.0, delta.position.1, delta.position.2),
+                        );
+                    } else if let Some(ent) = self.known_entities.get_mut(&delta.entity_id) {
+                        if delta.field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
+                            ent.x += delta.position.0;
+                        }
+                        if delta.field_mask & delta_flags::MASK_DELTA_POS_Y != 0 {
+                            ent.y += delta.position.1;
+                        }
+                        if delta.field_mask & delta_flags::MASK_DELTA_POS_Z != 0 {
+                            ent.z += delta.position.2;
+                        }
+                    }
+                }
+            }
+            ClientPacket::EntityState(state) => {
+                self.known_entities.insert(state.entity_id, state.position);
+            }
+            ClientPacket::EntityDespawn(despawn) => {
+                self.known_entities.remove(&despawn.entity_id);
+            }
+            _ => {}
+        }
+        rtt_ms
+    }
+
+    fn decode_buffered_packets(
+        &mut self,
+    ) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
+        let mut rtt_ms = None;
         let mut packets = Vec::new();
         while let Some(packet) = ClientPacket::decode_frame(&mut self.read_buf)? {
-            match &packet {
-                ClientPacket::Pong(pong) => {
-                    if let Some((ts, sent_time)) = self.last_ping_sent {
-                        if ts == pong.client_timestamp {
-                            let elapsed = sent_time.elapsed().as_secs_f64() * 1000.0;
-                            rtt_ms = Some(elapsed);
-                            self.last_ping_sent = None;
-                        }
-                    }
-                }
-                ClientPacket::MovementCorrection(corr) if corr.entity_id == self.guid.raw() => {
-                    self.snapback_count += 1;
-                    self.current_position = corr.corrected_position;
-                    self.current_velocity = Vec3::ZERO;
-                }
-                ClientPacket::EntityDeltaBatch(batch) => {
-                    self.last_observed_tick = self.last_observed_tick.max(batch.server_tick);
-                    for &despawn_id in &batch.despawns {
-                        self.known_entities.remove(&despawn_id);
-                    }
-                    for delta in &batch.deltas {
-                        if delta.field_mask & delta_flags::MASK_KEYFRAME != 0 {
-                            self.known_entities.insert(
-                                delta.entity_id,
-                                Vec3::new(delta.position.0, delta.position.1, delta.position.2),
-                            );
-                        } else if let Some(ent) = self.known_entities.get_mut(&delta.entity_id) {
-                            if delta.field_mask & delta_flags::MASK_DELTA_POS_X != 0 {
-                                ent.x += delta.position.0;
-                            }
-                            if delta.field_mask & delta_flags::MASK_DELTA_POS_Y != 0 {
-                                ent.y += delta.position.1;
-                            }
-                            if delta.field_mask & delta_flags::MASK_DELTA_POS_Z != 0 {
-                                ent.z += delta.position.2;
-                            }
-                        }
-                    }
-                }
-                ClientPacket::EntityState(state) => {
-                    self.known_entities.insert(state.entity_id, state.position);
-                }
-                ClientPacket::EntityDespawn(despawn) => {
-                    self.known_entities.remove(&despawn.entity_id);
-                }
-                _ => {}
+            if let Some(rtt) = self.handle_decoded_packet(&packet) {
+                rtt_ms = Some(rtt);
             }
             packets.push(packet);
         }
 
         Ok((packets, rtt_ms))
+    }
+
+    /// Reads incoming bytes from the gateway socket and parses all completed frames.
+    ///
+    /// Returns decoded packets and any observed ping RTT latency in milliseconds.
+    pub async fn poll_incoming(
+        &mut self,
+    ) -> Result<(Vec<ClientPacket>, Option<f64>), SessionError> {
+        self.read_more_bytes().await?;
+        self.decode_buffered_packets()
     }
 
     /// Dispatches a baseline acknowledgement confirming the latest observed tick.
@@ -254,5 +344,123 @@ mod tests {
         assert!(rtt.unwrap() >= 0.0);
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bot_session_authenticate_success_and_poll_incoming() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let assigned_guid = Guid::new(EntityType::Player, 1, 9001);
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::with_capacity(1024);
+            socket.read_buf(&mut buf).await.unwrap();
+            let pkt = ClientPacket::decode_frame(&mut buf).unwrap().unwrap();
+            match pkt {
+                ClientPacket::AuthRequest(req) => {
+                    assert_eq!(req.token, "valid-token");
+                    let resp = ClientPacket::AuthResponse(AuthResponsePacket {
+                        success: true,
+                        error_code: 0,
+                        session_id: 777,
+                        player_guid: assigned_guid.raw(),
+                        assigned_node: "127.0.0.1:50052".to_string(),
+                        error_message: String::new(),
+                    });
+                    socket.write_all(&resp.encode()).await.unwrap();
+                }
+                other => panic!("Expected AuthRequest, got {other:?}"),
+            }
+        });
+
+        let initial_guid = Guid::new(EntityType::Player, 1, 1);
+        let mut session = BotSession::new(initial_guid, Vec3::ZERO);
+        session.connect(&local_addr.to_string()).await.unwrap();
+        let resp = session
+            .authenticate("valid-token", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(resp.success);
+        assert_eq!(session.session_id, 777);
+        assert_eq!(session.guid, assigned_guid);
+        server_task.await.unwrap();
+
+        // Also verify poll_incoming updates session_id on AuthResponse directly
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr2 = listener2.local_addr().unwrap();
+        let server_task2 = tokio::spawn(async move {
+            let (mut socket, _) = listener2.accept().await.unwrap();
+            let resp = ClientPacket::AuthResponse(AuthResponsePacket {
+                success: true,
+                error_code: 0,
+                session_id: 888,
+                player_guid: 0,
+                assigned_node: "127.0.0.1:50052".to_string(),
+                error_message: String::new(),
+            });
+            socket.write_all(&resp.encode()).await.unwrap();
+        });
+        let mut session2 = BotSession::new(initial_guid, Vec3::ZERO);
+        session2.connect(&local_addr2.to_string()).await.unwrap();
+        let (pkts, _) = session2
+            .poll_incoming_timeout(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(session2.session_id, 888);
+        assert_eq!(session2.guid, initial_guid);
+        server_task2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bot_session_authenticate_rejected_and_timeout() {
+        // Rejection path
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::with_capacity(1024);
+            socket.read_buf(&mut buf).await.unwrap();
+            let _ = ClientPacket::decode_frame(&mut buf).unwrap().unwrap();
+            let resp = ClientPacket::AuthResponse(AuthResponsePacket {
+                success: false,
+                error_code: 3,
+                session_id: 0,
+                player_guid: 0,
+                assigned_node: String::new(),
+                error_message: "invalid signature".to_string(),
+            });
+            socket.write_all(&resp.encode()).await.unwrap();
+        });
+
+        let mut session = BotSession::new(Guid::new(EntityType::Player, 1, 2), Vec3::ZERO);
+        session.connect(&local_addr.to_string()).await.unwrap();
+        let err = session
+            .authenticate("bad-token", Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::AuthRejected { error_code: 3, .. }
+        ));
+        assert_eq!(session.session_id, 0);
+        server_task.await.unwrap();
+
+        // Timeout path
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr2 = listener2.local_addr().unwrap();
+        let _hold_server = tokio::spawn(async move {
+            let (_socket, _) = listener2.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let mut session2 = BotSession::new(Guid::new(EntityType::Player, 1, 3), Vec3::ZERO);
+        session2.connect(&local_addr2.to_string()).await.unwrap();
+        let err2 = session2
+            .authenticate("any-token", Duration::from_millis(40))
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, SessionError::AuthTimeout));
     }
 }

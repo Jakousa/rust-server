@@ -2039,6 +2039,7 @@ dependencies = [
  "bytes",
  "clap",
  "hdrhistogram",
+ "jsonwebtoken",
  "mmo-core",
  "mmo-gateway",
  "mmo-node",

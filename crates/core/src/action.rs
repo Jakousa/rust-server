@@ -885,4 +885,229 @@ mod tests {
             .unwrap()
             .is_busy());
     }
+
+    #[test]
+    fn test_cooldown_tracker_lifecycle_gcd_and_resets() {
+        let mut tracker = CooldownTracker::new();
+        assert!(tracker.action_cooldowns().is_empty());
+        assert!(!tracker.is_on_cooldown(1));
+        assert!(!tracker.is_on_cooldown(2));
+
+        // Starting action 1 puts action 1 on 3.0s CD and triggers 1.5s shared GCD
+        tracker.start_cooldown(1, 3.0, 1.5);
+        assert!(tracker.is_on_cooldown(1));
+        assert!(tracker.is_on_cooldown(2));
+        assert_eq!(tracker.gcd_remaining_sec, 1.5);
+        assert_eq!(tracker.action_cooldowns().get(&1).copied(), Some(3.0));
+
+        // Zero/negative durations do not insert entries or shrink active GCD
+        tracker.start_cooldown(3, 0.0, 0.5);
+        assert!(!tracker.action_cooldowns().contains_key(&3));
+        assert_eq!(tracker.gcd_remaining_sec, 1.5);
+
+        // Advance 1.0s: both GCD and ability 1 remain active
+        tracker.tick(1.0);
+        assert!((tracker.gcd_remaining_sec - 0.5).abs() < 1e-5);
+        assert!(tracker.is_on_cooldown(1));
+        assert!(tracker.is_on_cooldown(2));
+
+        // Advance 0.5s: GCD expires, unrelated ability 2 is ready, ability 1 still on 1.5s CD
+        tracker.tick(0.5);
+        assert_eq!(tracker.gcd_remaining_sec, 0.0);
+        assert!(!tracker.is_on_cooldown(2));
+        assert!(tracker.is_on_cooldown(1));
+
+        // Reset specific cooldown
+        tracker.reset_cooldown(1);
+        assert!(!tracker.is_on_cooldown(1));
+        assert!(tracker.action_cooldowns().is_empty());
+
+        // Reset GCD independently of per-action cooldown
+        tracker.start_cooldown(4, 2.0, 1.0);
+        tracker.reset_gcd();
+        assert_eq!(tracker.gcd_remaining_sec, 0.0);
+        assert!(!tracker.is_on_cooldown(5));
+        assert!(tracker.is_on_cooldown(4));
+
+        // Tick past ability 4's remaining cooldown prunes map entry
+        tracker.tick(2.0);
+        assert!(!tracker.is_on_cooldown(4));
+        assert!(tracker.action_cooldowns().is_empty());
+    }
+
+    #[test]
+    fn test_action_cooldown_system_advances_entity_cooldowns() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut system = ActionCooldownSystem;
+        assert_eq!(system.name(), "ActionCooldownSystem");
+
+        let player_guid = Guid::new(EntityType::Player, 1, 10);
+        let idle_guid = Guid::new(EntityType::Npc, 1, 11);
+        let player_key = store.spawn(player_guid, (0.0, 0.0, 0.0));
+        let _idle_key = store.spawn(idle_guid, (5.0, 0.0, 0.0));
+
+        let mut tracker = CooldownTracker::new();
+        tracker.start_cooldown(10, 1.0, 0.4);
+        store.get_mut(player_key).unwrap().add_component(tracker);
+
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.5,
+                tick: 1,
+                collision_world: None,
+            };
+            system.update(&mut ctx);
+        }
+
+        let cd = store
+            .get_by_guid(player_guid)
+            .unwrap()
+            .get_component::<CooldownTracker>()
+            .unwrap();
+        assert_eq!(cd.gcd_remaining_sec, 0.0);
+        assert!(cd.is_on_cooldown(10));
+        assert!(!cd.is_on_cooldown(99));
+
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.5,
+                tick: 2,
+                collision_world: None,
+            };
+            system.update(&mut ctx);
+        }
+
+        let cd = store
+            .get_by_guid(player_guid)
+            .unwrap()
+            .get_component::<CooldownTracker>()
+            .unwrap();
+        assert!(!cd.is_on_cooldown(10));
+        assert!(cd.action_cooldowns().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_boundary_sphere_aoe_partitioning_and_filters() {
+        let g_local = Guid::new(EntityType::Npc, 1, 1);
+        let g_remote2_alive = Guid::new(EntityType::Npc, 1, 2);
+        let g_remote2_dead = Guid::new(EntityType::Npc, 1, 3);
+        let g_remote3_near = Guid::new(EntityType::Npc, 1, 4);
+        let g_remote3_far = Guid::new(EntityType::Npc, 1, 5);
+
+        let candidates = vec![
+            SpatialTargetCandidate::new(g_local, 1, Vec3::new(2.0, 0.0, 0.0), true, false),
+            SpatialTargetCandidate::new(g_remote2_alive, 2, Vec3::new(3.0, 0.0, 0.0), true, false),
+            SpatialTargetCandidate::new(g_remote2_dead, 2, Vec3::new(1.0, 0.0, 0.0), false, false),
+            SpatialTargetCandidate::new(g_remote3_near, 3, Vec3::new(4.0, 0.0, 0.0), true, false),
+            SpatialTargetCandidate::new(g_remote3_far, 3, Vec3::new(50.0, 0.0, 0.0), true, false),
+        ];
+
+        // require_alive = true, max_targets = 2 -> picks g_local (dist 2) and g_remote2_alive (dist 3)
+        let res = resolve_boundary_sphere_aoe(&candidates, Vec3::ZERO, 10.0, 2, true, 1);
+        assert_eq!(res.local_targets.len(), 1);
+        assert_eq!(res.local_targets[0].guid, g_local);
+        assert_eq!(res.remote_batches.len(), 1);
+        assert_eq!(res.remote_batches[&2].len(), 1);
+        assert_eq!(res.remote_batches[&2][0].guid, g_remote2_alive);
+
+        // require_alive = false, max_targets = 10 -> includes dead candidate and node 3 near target
+        let res_all = resolve_boundary_sphere_aoe(&candidates, Vec3::ZERO, 10.0, 10, false, 1);
+        assert_eq!(res_all.local_targets.len(), 1);
+        assert_eq!(res_all.remote_batches[&2].len(), 2);
+        assert_eq!(res_all.remote_batches[&3].len(), 1);
+        assert_eq!(res_all.remote_batches[&3][0].guid, g_remote3_near);
+    }
+
+    #[test]
+    fn test_action_queue_edge_cases_and_target_despawn() {
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(BoundingBox3D::new(
+            (-100.0, -100.0, -100.0),
+            (100.0, 100.0, 100.0),
+        ));
+        let mut events = EventQueue::new();
+        let mut tick_system = ActionTickSystem::new();
+        assert_eq!(tick_system.name(), "ActionTickSystem");
+
+        let caster_guid = Guid::new(EntityType::Player, 1, 90);
+        let target_guid = Guid::new(EntityType::Npc, 1, 91);
+        let caster_key = store.spawn(caster_guid, (0.0, 0.0, 0.0));
+        store.spawn(target_guid, (5.0, 0.0, 0.0));
+
+        let mut queue = ActionQueue::new();
+        // Interrupt on idle queue returns None without emitting event
+        assert!(queue
+            .interrupt(caster_guid, InterruptReason::Manual, &mut events)
+            .is_none());
+        assert!(events.drain::<ActionInterruptedEvent>().is_empty());
+
+        // cancel_on_movement = false allows movement and preserves extra_data on completion
+        let flags = ActionInterruptFlags {
+            cancel_on_movement: false,
+            ..Default::default()
+        };
+        let action = TimedAction::new(55, 0.5, flags, Some(target_guid))
+            .with_extra_data(serde_json::json!({"rank": 3}));
+        queue
+            .start_action(caster_guid, action, QueuePolicy::RejectIfBusy, &mut events)
+            .unwrap();
+        queue.current_mut().unwrap().elapsed_sec = 0.25;
+        store.get_mut(caster_key).unwrap().velocity = (2.0, 0.0, 0.0);
+        store.get_mut(caster_key).unwrap().add_component(queue);
+
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.25,
+                tick: 1,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let completed = events.drain::<ActionCompletedEvent>();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].extra_data,
+            Some(serde_json::json!({"rank": 3}))
+        );
+
+        // Start another targeted action, then despawn target -> InterruptReason::TargetLost
+        let action2 = TimedAction::new(56, 1.0, flags, Some(target_guid));
+        store
+            .get_mut(caster_key)
+            .unwrap()
+            .get_component_mut::<ActionQueue>()
+            .unwrap()
+            .start_action(caster_guid, action2, QueuePolicy::Replace, &mut events)
+            .unwrap();
+        store.despawn_by_guid(target_guid);
+
+        {
+            let mut ctx = TickContext {
+                entities: &mut store,
+                octree: &mut octree,
+                events: &mut events,
+                dt_sec: 0.1,
+                tick: 2,
+                collision_world: None,
+            };
+            tick_system.update(&mut ctx);
+        }
+        let interrupted = events.drain::<ActionInterruptedEvent>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].reason, InterruptReason::TargetLost);
+    }
 }

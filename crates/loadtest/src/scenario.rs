@@ -14,6 +14,7 @@ use mmo_schema::client::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::metrics::MetricsAggregator;
 use crate::session::{BotSession, SessionError};
 
 /// High-level declarative scenario specification.
@@ -123,7 +124,7 @@ impl ScenarioRunner {
     pub async fn run(manifest: &ScenarioManifest) -> Result<ScenarioReport, ScenarioError> {
         let start_time = Instant::now();
         let mut sessions: HashMap<u32, BotSession> = HashMap::new();
-        let mut rtt_samples: Vec<f64> = Vec::new();
+        let metrics = MetricsAggregator::new();
         let mut steps_executed = 0;
 
         for step in &manifest.steps {
@@ -158,7 +159,7 @@ impl ScenarioRunner {
                         {
                             Ok((packets, rtt)) => {
                                 if let Some(val) = rtt {
-                                    rtt_samples.push(val);
+                                    metrics.record_rtt_ms(val);
                                 }
                                 for pkt in packets {
                                     if let ClientPacket::AuthResponse(resp) = pkt {
@@ -234,7 +235,7 @@ impl ScenarioRunner {
                         .poll_incoming_timeout(Duration::from_millis(10))
                         .await
                     {
-                        rtt_samples.push(rtt);
+                        metrics.record_rtt_ms(rtt);
                     }
                 }
                 ScenarioStep::Ping { bot_id } => {
@@ -253,7 +254,7 @@ impl ScenarioRunner {
                             .poll_incoming_timeout(Duration::from_millis(50))
                             .await?;
                         if let Some(val) = rtt {
-                            rtt_samples.push(val);
+                            metrics.record_rtt_ms(val);
                             break;
                         }
                     }
@@ -271,7 +272,7 @@ impl ScenarioRunner {
                                     .poll_incoming_timeout(Duration::from_millis(2))
                                     .await
                                 {
-                                    rtt_samples.push(rtt);
+                                    metrics.record_rtt_ms(rtt);
                                 }
                             }
                         }
@@ -357,14 +358,9 @@ impl ScenarioRunner {
         }
 
         let total_duration_ms = start_time.elapsed().as_millis() as u64;
-        let (p50_rtt_ms, p99_rtt_ms) = if rtt_samples.is_empty() {
-            (0.0, 0.0)
-        } else {
-            rtt_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let p50_idx = ((rtt_samples.len() as f64) * 0.50) as usize;
-            let p99_idx = (((rtt_samples.len() as f64) * 0.99) as usize).min(rtt_samples.len() - 1);
-            (rtt_samples[p50_idx], rtt_samples[p99_idx])
-        };
+        let snapshot = metrics.snapshot();
+        let p50_rtt_ms = snapshot.p50_rtt_ms;
+        let p99_rtt_ms = snapshot.p99_rtt_ms;
 
         if let Some(max_p99) = manifest.max_p99_rtt_ms {
             if p99_rtt_ms > max_p99 {
@@ -458,5 +454,63 @@ mod tests {
         assert_eq!(deserialized.scenario_name, "bench_run");
         assert_eq!(deserialized.steps_executed, 10);
         assert_eq!(deserialized.errors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_runner_metrics_aggregator_rtt_and_sla() {
+        use bytes::BytesMut;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = listener.local_addr().unwrap().to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::with_capacity(1024);
+            while let Ok(n) = socket.read_buf(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                while let Ok(Some(pkt)) = ClientPacket::decode_frame(&mut buf) {
+                    if let ClientPacket::Ping(ping) = pkt {
+                        tokio::time::sleep(Duration::from_millis(12)).await;
+                        let pong = ClientPacket::Pong(mmo_schema::client::PongPacket {
+                            client_timestamp: ping.timestamp,
+                            server_timestamp: 5000,
+                        });
+                        let _ = socket.write_all(&pong.encode()).await;
+                    }
+                }
+            }
+        });
+
+        let manifest = ScenarioManifest {
+            name: "rtt_aggregator_check".to_string(),
+            gateway_addr: gateway_addr.clone(),
+            max_p99_rtt_ms: Some(1000.0),
+            steps: vec![
+                ScenarioStep::Connect { bot_id: 1 },
+                ScenarioStep::Ping { bot_id: 1 },
+                ScenarioStep::Ping { bot_id: 1 },
+                ScenarioStep::Disconnect { bot_id: 1 },
+            ],
+        };
+
+        let report = ScenarioRunner::run(&manifest).await.unwrap();
+        assert!(report.p50_rtt_ms >= 5.0);
+        assert!(report.p99_rtt_ms >= report.p50_rtt_ms);
+        server_task.await.unwrap();
+
+        // Empty RTT samples yields 0.0 percentiles
+        let empty_manifest = ScenarioManifest {
+            name: "no_rtt".to_string(),
+            gateway_addr,
+            max_p99_rtt_ms: None,
+            steps: vec![],
+        };
+        let empty_report = ScenarioRunner::run(&empty_manifest).await.unwrap();
+        assert_eq!(empty_report.p50_rtt_ms, 0.0);
+        assert_eq!(empty_report.p99_rtt_ms, 0.0);
     }
 }
