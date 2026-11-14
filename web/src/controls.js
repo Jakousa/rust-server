@@ -79,29 +79,19 @@ export class PlayerControls {
     if (this.keys.a || this.keys.arrowLeft) this.yaw += this.turnSpeed * dt;
     if (this.keys.d || this.keys.arrowRight) this.yaw -= this.turnSpeed * dt;
 
-    // Movement relative to facing direction
+    // Movement relative to facing direction (matches Three.js rotation.y = yaw with +Z nose)
     let moveForward = 0.0;
-    let moveStrafe = 0.0;
 
     if (this.keys.w || this.keys.arrowUp) moveForward += 1.0;
     if (this.keys.s || this.keys.arrowDown) moveForward -= 1.0;
-    if (this.keys.d) moveStrafe += 1.0;
-    if (this.keys.a) moveStrafe -= 1.0;
 
-    if (moveForward !== 0.0 || moveStrafe !== 0.0) {
-      const len = Math.hypot(moveForward, moveStrafe);
-      moveForward /= len;
-      moveStrafe /= len;
-
+    if (moveForward !== 0.0) {
       const cos = Math.cos(this.yaw);
       const sin = Math.sin(this.yaw);
 
-      // Forward vector: (-sin, cos) in XZ plane
-      const dx = (-sin * moveForward + cos * moveStrafe) * this.speed * dt;
-      const dz = (cos * moveForward + sin * moveStrafe) * this.speed * dt;
-
-      this.position.x += dx;
-      this.position.z += dz;
+      // Forward vector: (+sin, +cos) in XZ plane matches group.rotation.y = yaw with nose at +Z
+      this.position.x += sin * moveForward * this.speed * dt;
+      this.position.z += cos * moveForward * this.speed * dt;
     }
   }
 

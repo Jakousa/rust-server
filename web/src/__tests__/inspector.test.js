@@ -258,6 +258,42 @@ describe("PlayerControls", () => {
     expect(controls.speed).toBeLessThan(10.0);
     expect(controls.speed).toBe(7.5);
   });
+
+  it("turns in place with A/D without drifting position and moves forward along (sin(yaw), cos(yaw))", () => {
+    const controls = new PlayerControls();
+    const dt = 0.2;
+
+    // Pressing A or D alone rotates yaw without translating X/Z
+    controls.keys.a = true;
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(controls.turnSpeed * dt, 5);
+    expect(controls.position.x).toBeCloseTo(0.0, 5);
+    expect(controls.position.z).toBeCloseTo(5.0, 5);
+    controls.keys.a = false;
+
+    controls.keys.d = true;
+    controls.update(dt);
+    expect(controls.yaw).toBeCloseTo(0.0, 5);
+    expect(controls.position.x).toBeCloseTo(0.0, 5);
+    expect(controls.position.z).toBeCloseTo(5.0, 5);
+    controls.keys.d = false;
+
+    // At yaw = +PI/2 (matching Three.js rotation.y = +PI/2 where +Z nose points to +X), W moves +X
+    controls.yaw = Math.PI / 2;
+    controls.keys.w = true;
+    controls.update(dt);
+    expect(controls.position.x).toBeCloseTo(controls.speed * dt, 5);
+    expect(controls.position.z).toBeCloseTo(5.0, 5);
+    controls.keys.w = false;
+
+    // At yaw = -PI/2 (nose points to -X), W moves -X
+    controls.setPosition(0.0, 0.0, 5.0);
+    controls.yaw = -Math.PI / 2;
+    controls.keys.w = true;
+    controls.update(dt);
+    expect(controls.position.x).toBeCloseTo(-controls.speed * dt, 5);
+    expect(controls.position.z).toBeCloseTo(5.0, 5);
+  });
 });
 
 describe("WorldObjectRenderer", () => {
