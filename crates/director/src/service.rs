@@ -14,10 +14,10 @@ use mmo_schema::cluster::{
     DeregisterGatewayResponse, DeregisterNodeRequest, DeregisterNodeResponse,
     GatewayHeartbeatRequest, GatewayHeartbeatResponse, HeartbeatRequest, HeartbeatResponse,
     InstanceHeartbeatRequest, InstanceHeartbeatResponse, IssueRealmTransferClaimRequest,
-    IssueRealmTransferClaimResponse, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterNodeRequest, RegisterNodeResponse, SplitReportRequest, SplitReportResponse,
-    TerminateInstanceRequest, TerminateInstanceResponse, Vector3, VerifyRealmTransferClaimRequest,
-    VerifyRealmTransferClaimResponse,
+    IssueRealmTransferClaimResponse, PartitionAssignment, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse, SplitReportRequest,
+    SplitReportResponse, TerminateInstanceRequest, TerminateInstanceResponse, Vector3,
+    VerifyRealmTransferClaimRequest, VerifyRealmTransferClaimResponse,
 };
 
 use crate::coordinator::GlobalOctreeCoordinator;
@@ -61,6 +61,21 @@ pub fn bounding_box_3d_to_proto(bbox: &BoundingBox3D) -> BoundingBox {
             z: bbox.max.2,
         }),
     }
+}
+
+fn partitions_to_proto(
+    coord: &GlobalOctreeCoordinator,
+    reg: &NodeRegistry,
+) -> Vec<PartitionAssignment> {
+    coord
+        .collect_partitions(reg)
+        .into_iter()
+        .map(|(bounds, node_id, node_address)| PartitionAssignment {
+            bounds: Some(bounding_box_3d_to_proto(&bounds)),
+            node_id,
+            node_address,
+        })
+        .collect()
 }
 
 /// Implementation of the `DirectorService` gRPC interface.
@@ -400,10 +415,12 @@ impl DirectorService for DirectorServiceImpl {
         if acknowledged {
             let should_split =
                 coord.evaluate_heartbeat(req.node_id, req.entity_count, req.tick_duration_ms);
+            let partitions = partitions_to_proto(&coord, &reg);
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: true,
                 should_split,
                 topology_epoch,
+                partitions,
             }))
         } else if reg.is_evicted(req.node_id) {
             metrics::counter!("mmo_director_node_fenced_total").increment(1);
@@ -417,6 +434,7 @@ impl DirectorService for DirectorServiceImpl {
                 acknowledged: false,
                 should_split: false,
                 topology_epoch,
+                partitions: Vec::new(),
             }))
         }
     }
@@ -456,6 +474,16 @@ impl DirectorService for DirectorServiceImpl {
 
         let assigned_node_ids =
             coord.handle_split(req.node_id, original_bounds, child_bounds, &mut reg);
+        let assigned_node_addresses: Vec<String> = assigned_node_ids
+            .iter()
+            .map(|&id| {
+                crate::coordinator::fallback_node_addr(
+                    id,
+                    reg.get_node(id).map(|n| n.listen_addr.as_str()),
+                )
+            })
+            .collect();
+        let partitions = partitions_to_proto(&coord, &reg);
         let topology_epoch = coord.topology_epoch();
 
         metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
@@ -464,6 +492,8 @@ impl DirectorService for DirectorServiceImpl {
             acknowledged: true,
             assigned_node_ids,
             topology_epoch,
+            assigned_node_addresses,
+            partitions,
         }))
     }
 
@@ -501,18 +531,30 @@ impl DirectorService for DirectorServiceImpl {
         request: Request<GatewayHeartbeatRequest>,
     ) -> Result<Response<GatewayHeartbeatResponse>, Status> {
         let req = request.into_inner();
-        let mut reg = self.gateway_registry.write().await;
-        let acknowledged = reg.update_heartbeat(
-            &req.gateway_id,
-            req.active_sessions,
-            req.cpu_percent,
-            req.memory_percent,
-        );
-        metrics::gauge!("mmo_director_active_gateways").set(reg.get_active_gateways().len() as f64);
+        let acknowledged = {
+            let mut reg = self.gateway_registry.write().await;
+            let ack = reg.update_heartbeat(
+                &req.gateway_id,
+                req.active_sessions,
+                req.cpu_percent,
+                req.memory_percent,
+            );
+            metrics::gauge!("mmo_director_active_gateways")
+                .set(reg.get_active_gateways().len() as f64);
+            ack
+        };
+
+        // Enforce strict lock acquisition order: registry -> coordinator
+        let reg = self.registry.read().await;
+        let coord = self.coordinator.read().await;
+        let topology_epoch = coord.topology_epoch();
+        let partitions = partitions_to_proto(&coord, &reg);
 
         Ok(Response::new(GatewayHeartbeatResponse {
             acknowledged,
             should_drain: false,
+            topology_epoch,
+            partitions,
         }))
     }
 
@@ -1794,5 +1836,155 @@ mod tests {
             .into_inner();
         assert!(split_resp.acknowledged);
         assert_eq!(split_resp.assigned_node_ids.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_service_partitions_and_normalized_addresses_across_rpcs() {
+        let world_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let service = DirectorServiceImpl::new(
+            Arc::new(RwLock::new(NodeRegistry::new())),
+            Arc::new(RwLock::new(GlobalOctreeCoordinator::new(world_bounds))),
+        );
+
+        // Register node 1 and standby node 2 both reporting unspecified listen addresses + world bounds
+        let r1 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 1,
+                listen_addr: "0.0.0.0:50052".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&world_bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r1.success);
+        assert_eq!(r1.topology_epoch, 1);
+
+        let r2 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 2,
+                listen_addr: "[::]:50052".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&world_bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r2.success);
+        assert_eq!(r2.topology_epoch, 1);
+
+        // Standby node 2 has no assigned bounds and must not be told to split
+        let hb2 = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 2,
+                tick_rate: 20.0,
+                entity_count: 100,
+                cpu_percent: 50.0,
+                memory_bytes: 1024,
+                timestamp: 1000,
+                tick_duration_ms: 45.0,
+                entity_centroid: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hb2.acknowledged);
+        assert!(!hb2.should_split);
+        assert_eq!(hb2.partitions.len(), 1);
+        assert_eq!(hb2.partitions[0].node_id, 1);
+        assert_eq!(hb2.partitions[0].node_address, "mmo-node-0.mmo-node:50052");
+
+        // Unacknowledged heartbeat for unknown node returns empty partitions
+        let hb_unknown = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 999,
+                tick_rate: 20.0,
+                entity_count: 10,
+                cpu_percent: 5.0,
+                memory_bytes: 1024,
+                timestamp: 1500,
+                tick_duration_ms: 5.0,
+                entity_centroid: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!hb_unknown.acknowledged);
+        assert!(hb_unknown.partitions.is_empty());
+
+        // Active node 1 triggers split and report_split returns balanced IDs, normalized addresses, and partitions
+        let hb1 = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 1,
+                tick_rate: 20.0,
+                entity_count: 100,
+                cpu_percent: 50.0,
+                memory_bytes: 1024,
+                timestamp: 2000,
+                tick_duration_ms: 45.0,
+                entity_centroid: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hb1.acknowledged);
+        assert!(hb1.should_split);
+
+        let split_resp = service
+            .report_split(Request::new(SplitReportRequest {
+                node_id: 1,
+                original_bounds: Some(bounding_box_3d_to_proto(&world_bounds)),
+                child_bounds: vec![],
+                total_entities: 100,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(split_resp.acknowledged);
+        assert_eq!(split_resp.topology_epoch, 2);
+        assert_eq!(split_resp.assigned_node_ids, vec![1, 2, 1, 2, 1, 2, 1, 2]);
+        assert_eq!(
+            split_resp.assigned_node_addresses,
+            vec![
+                "mmo-node-0.mmo-node:50052",
+                "mmo-node-1.mmo-node:50052",
+                "mmo-node-0.mmo-node:50052",
+                "mmo-node-1.mmo-node:50052",
+                "mmo-node-0.mmo-node:50052",
+                "mmo-node-1.mmo-node:50052",
+                "mmo-node-0.mmo-node:50052",
+                "mmo-node-1.mmo-node:50052",
+            ]
+        );
+        assert_eq!(split_resp.partitions.len(), 8);
+
+        // Register gateway and verify gateway_heartbeat returns topology_epoch and all 8 partitions
+        service
+            .register_gateway(Request::new(RegisterGatewayRequest {
+                gateway_id: "gw-part-test".to_string(),
+                region: "us-east".to_string(),
+                listen_addr: "127.0.0.1:8080".to_string(),
+                grpc_addr: "127.0.0.1:50050".to_string(),
+                probe_addr: "127.0.0.1:8081".to_string(),
+                capacity: 1000,
+            }))
+            .await
+            .unwrap();
+
+        let gw_hb = service
+            .gateway_heartbeat(Request::new(GatewayHeartbeatRequest {
+                gateway_id: "gw-part-test".to_string(),
+                active_sessions: 10,
+                cpu_percent: 12.0,
+                memory_percent: 20.0,
+                timestamp_ms: 3000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(gw_hb.acknowledged);
+        assert_eq!(gw_hb.topology_epoch, 2);
+        assert_eq!(gw_hb.partitions.len(), 8);
+        assert!(gw_hb.partitions.iter().all(|p| p.bounds.is_some()
+            && (p.node_address == "mmo-node-0.mmo-node:50052"
+                || p.node_address == "mmo-node-1.mmo-node:50052")));
     }
 }

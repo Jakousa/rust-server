@@ -47,12 +47,8 @@ spec:
                 echo "Applying startup delay of ${STARTUP_DELAY_SECS}s..."
                 sleep "${STARTUP_DELAY_SECS}"
               fi
-              if [ "${NODE_ID}" -eq 1 ]; then
-                echo "Starting authoritative village simulation node (mmo-village-node)..."
-                exec mmo-village-node
-              else
-                exec mmo-node
-              fi
+              echo "Starting village simulation node (mmo-village-node)..."
+              exec mmo-village-node
           env:
             - name: STARTUP_DELAY_SECS
               value: "4"

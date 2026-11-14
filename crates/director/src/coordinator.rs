@@ -19,6 +19,9 @@ pub const DEFAULT_TICK_SATURATION_MS: f32 = 35.0;
 /// Default cooldown duration between splits on a partition.
 pub const DEFAULT_SPLIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Minimum dimensional extent (in world units) along every axis required for a partition to split.
+pub const MIN_SPLIT_EXTENT: f32 = 25.0;
+
 /// Default global bounding box covering the entire world.
 pub const DEFAULT_WORLD_BOUNDS: BoundingBox3D = BoundingBox3D {
     min: (-1000.0, -1000.0, -1000.0),
@@ -48,6 +51,26 @@ fn bounds_contains_box(outer: &BoundingBox3D, inner: &BoundingBox3D) -> bool {
         && inner.max.0 <= outer.max.0 + BOUNDS_EPSILON
         && inner.max.1 <= outer.max.1 + BOUNDS_EPSILON
         && inner.max.2 <= outer.max.2 + BOUNDS_EPSILON
+}
+
+fn meets_min_split_extent(bounds: &BoundingBox3D) -> bool {
+    let (dx, dy, dz) = bounds.dimensions();
+    dx >= MIN_SPLIT_EXTENT && dy >= MIN_SPLIT_EXTENT && dz >= MIN_SPLIT_EXTENT
+}
+
+fn strip_http_scheme(s: &str) -> &str {
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        &s[7..]
+    } else if s
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        &s[8..]
+    } else {
+        s
+    }
 }
 
 fn is_octree_descendant(outer: &BoundingBox3D, target: &BoundingBox3D, depth_left: usize) -> bool {
@@ -102,16 +125,67 @@ pub fn union_bounds(a: &BoundingBox3D, b: &BoundingBox3D) -> BoundingBox3D {
     )
 }
 
-/// Resolves a node's network listen address from registry metadata, falling back to the Kubernetes
-/// StatefulSet DNS convention `mmo-node-{id-1}.mmo-node:50052` when empty or unregistered.
+/// Resolves a node's network listen address from registry metadata, normalizing empty,
+/// missing, or unspecified bind addresses (`0.0.0.0`, `::`, `[::]`) to the Kubernetes
+/// StatefulSet DNS convention `mmo-node-{id-1}.mmo-node:{port}` (defaulting port to `50052`).
 pub fn fallback_node_addr(node_id: u32, registered: Option<&str>) -> String {
-    if let Some(addr) = registered {
-        let trimmed = addr.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+    let default_addr =
+        |port: u16| -> String { format!("mmo-node-{}.mmo-node:{port}", node_id.saturating_sub(1)) };
+
+    let Some(raw) = registered else {
+        return default_addr(50052);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_addr(50052);
+    }
+
+    let without_scheme = strip_http_scheme(trimmed);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if authority.is_empty() {
+        return default_addr(50052);
+    }
+
+    if let Ok(sock) = authority.parse::<std::net::SocketAddr>() {
+        if sock.ip().is_unspecified() {
+            let port = if sock.port() == 0 { 50052 } else { sock.port() };
+            return default_addr(port);
+        }
+        return trimmed.to_string();
+    }
+
+    let bare = authority
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(authority);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip.is_unspecified() {
+            return default_addr(50052);
+        }
+        return trimmed.to_string();
+    }
+
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        let host_bare = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if host_bare == "0.0.0.0"
+            || host_bare == "::"
+            || host_bare
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_unspecified())
+        {
+            let port = port_str
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
+                .unwrap_or(50052);
+            return default_addr(port);
         }
     }
-    format!("mmo-node-{}.mmo-node:50052", node_id.saturating_sub(1))
+
+    trimmed.to_string()
 }
 
 /// Node representation in the global octree topology hierarchy.
@@ -216,7 +290,7 @@ impl GlobalOctreeNode {
     ) -> bool {
         match self {
             GlobalOctreeNode::Leaf { bounds, .. } => {
-                if bounds == target_bounds {
+                if bounds_approx_eq(bounds, target_bounds) {
                     let children_vec: Vec<GlobalOctreeNode> = assignments
                         .iter()
                         .map(|(cb, nid)| GlobalOctreeNode::Leaf {
@@ -233,7 +307,7 @@ impl GlobalOctreeNode {
                         };
 
                     *self = GlobalOctreeNode::Branch {
-                        bounds: *target_bounds,
+                        bounds: *bounds,
                         children,
                     };
                     true
@@ -246,11 +320,57 @@ impl GlobalOctreeNode {
                     return false;
                 }
                 for child in children.iter_mut() {
-                    if child.split_at(target_bounds, assignments) {
+                    if !is_empty_slot(child) && child.split_at(target_bounds, assignments) {
                         return true;
                     }
                 }
                 false
+            }
+        }
+    }
+
+    fn first_assigned_node(&self) -> Option<u32> {
+        match self {
+            GlobalOctreeNode::Leaf {
+                assigned_node_id, ..
+            } => *assigned_node_id,
+            GlobalOctreeNode::Branch { children, .. } => children
+                .iter()
+                .filter(|c| !is_empty_slot(c))
+                .find_map(|c| c.first_assigned_node()),
+        }
+    }
+
+    fn find_split_assignments(&self, target: &BoundingBox3D) -> Option<Vec<u32>> {
+        match self {
+            GlobalOctreeNode::Leaf { .. } => None,
+            GlobalOctreeNode::Branch { bounds, children } => {
+                if bounds_approx_eq(bounds, target) {
+                    let non_empty_count = children.iter().filter(|c| !is_empty_slot(c)).count();
+                    if non_empty_count == 8 {
+                        let ids = children
+                            .iter()
+                            .map(|c| match c {
+                                GlobalOctreeNode::Leaf {
+                                    assigned_node_id, ..
+                                } => assigned_node_id.unwrap_or(0),
+                                GlobalOctreeNode::Branch { .. } => {
+                                    c.first_assigned_node().unwrap_or(0)
+                                }
+                            })
+                            .collect();
+                        return Some(ids);
+                    }
+                    return None;
+                }
+                for child in children.iter() {
+                    if !is_empty_slot(child) && bounds_contains_box(child.bounds(), target) {
+                        if let Some(ids) = child.find_split_assignments(target) {
+                            return Some(ids);
+                        }
+                    }
+                }
+                None
             }
         }
     }
@@ -408,12 +528,19 @@ impl GlobalOctreeNode {
                 ..
             } => {
                 if bounds_approx_eq(bounds, &target) {
-                    let changed = *assigned_node_id != Some(node_id);
                     if let (Some(prev), Some(reg)) = (*assigned_node_id, registry.as_deref_mut()) {
+                        if prev != node_id && reg.get_node(prev).is_some() {
+                            if let Some(node) = reg.get_node_mut(node_id) {
+                                node.assigned_bounds
+                                    .retain(|b| !bounds_approx_eq(b, &target));
+                            }
+                            return (true, false);
+                        }
                         if prev != node_id {
                             reg.remove_assigned_bounds(prev, bounds);
                         }
                     }
+                    let changed = *assigned_node_id != Some(node_id);
                     *assigned_node_id = Some(node_id);
                     (true, changed)
                 } else if bounds_contains_box(bounds, &target)
@@ -471,6 +598,22 @@ impl GlobalOctreeNode {
                 }
             }
             GlobalOctreeNode::Branch { bounds, children } => {
+                if bounds_approx_eq(bounds, &target) {
+                    if let Some(reg) = registry.as_deref_mut() {
+                        let mut owned_leaves = Vec::new();
+                        for child in children.iter() {
+                            child.collect_assigned_bounds(node_id, &mut owned_leaves);
+                        }
+                        if let Some(node) = reg.get_node_mut(node_id) {
+                            node.assigned_bounds
+                                .retain(|b| !bounds_approx_eq(b, &target));
+                            if node.assigned_bounds.is_empty() {
+                                node.assigned_bounds.extend(owned_leaves);
+                            }
+                        }
+                    }
+                    return (true, false);
+                }
                 for child in children.iter_mut() {
                     if !is_empty_slot(child) && bounds_contains_box(child.bounds(), &target) {
                         let (mapped, changed) = child.map_bounds(node_id, target, registry);
@@ -623,7 +766,8 @@ impl GlobalOctreeCoordinator {
         entity_count >= self.split_threshold
     }
 
-    /// Returns `true` if a node should split based on entity count or tick duration, respecting the split cooldown.
+    /// Returns `true` if a node should split based on entity count or tick duration,
+    /// respecting the split cooldown and minimum partition extent (`MIN_SPLIT_EXTENT`).
     pub fn should_split_node(
         &self,
         node_id: u32,
@@ -635,7 +779,17 @@ impl GlobalOctreeCoordinator {
                 return false;
             }
         }
-        entity_count >= self.split_threshold || tick_duration_ms >= self.tick_saturation_ms
+        if entity_count < self.split_threshold && tick_duration_ms < self.tick_saturation_ms {
+            return false;
+        }
+        let leaves = self.leaf_octants();
+        if leaves.iter().any(|(_, owner)| owner.is_some()) {
+            leaves
+                .iter()
+                .any(|(bounds, owner)| *owner == Some(node_id) && meets_min_split_extent(bounds))
+        } else {
+            meets_min_split_extent(self.root.bounds())
+        }
     }
 
     /// Returns `true` if an octant's entity count drops to or below `merge_threshold`.
@@ -742,6 +896,34 @@ impl GlobalOctreeCoordinator {
         leaves.into_iter().map(|(b, nid)| (*b, nid)).collect()
     }
 
+    /// Returns the existing 8 direct child node IDs if `target` is already split into 8 children.
+    pub fn find_split_assignments(&self, target: &BoundingBox3D) -> Option<Vec<u32>> {
+        self.root.find_split_assignments(target)
+    }
+
+    /// Collects all non-empty leaf octants with an assigned owner as `(bounds, node_id, resolved_addr)`.
+    pub fn collect_partitions(&self, registry: &NodeRegistry) -> Vec<(BoundingBox3D, u32, String)> {
+        let mut leaves = Vec::new();
+        self.root.collect_leaves(&mut leaves);
+        leaves
+            .into_iter()
+            .filter_map(|(bounds, owner)| {
+                let node_id = owner?;
+                if bounds.min.0 >= bounds.max.0
+                    || bounds.min.1 >= bounds.max.1
+                    || bounds.min.2 >= bounds.max.2
+                {
+                    return None;
+                }
+                let addr = fallback_node_addr(
+                    node_id,
+                    registry.get_node(node_id).map(|n| n.listen_addr.as_str()),
+                );
+                Some((*bounds, node_id, addr))
+            })
+            .collect()
+    }
+
     /// Evaluates whether an incoming heartbeat triggers a split recommendation.
     pub fn evaluate_heartbeat(
         &self,
@@ -764,6 +946,38 @@ impl GlobalOctreeCoordinator {
         child_bounds: Vec<BoundingBox3D>,
         registry: &mut NodeRegistry,
     ) -> Vec<u32> {
+        if !meets_min_split_extent(&original_bounds) {
+            return Vec::new();
+        }
+
+        if let Some(existing_ids) = self.root.find_split_assignments(&original_bounds) {
+            let mut leaves = Vec::new();
+            self.root.collect_leaves(&mut leaves);
+            let mut nodes_to_sync: Vec<u32> =
+                existing_ids.iter().copied().filter(|&id| id != 0).collect();
+            if reporting_node_id != 0 && !nodes_to_sync.contains(&reporting_node_id) {
+                nodes_to_sync.push(reporting_node_id);
+            }
+            for nid in nodes_to_sync {
+                if let Some(reg_node) = registry.get_node_mut(nid) {
+                    reg_node
+                        .assigned_bounds
+                        .retain(|b| !bounds_approx_eq(b, &original_bounds));
+                    for &(leaf_bounds, owner) in &leaves {
+                        if owner == Some(nid)
+                            && !reg_node
+                                .assigned_bounds
+                                .iter()
+                                .any(|b| bounds_approx_eq(b, leaf_bounds))
+                        {
+                            reg_node.assigned_bounds.push(*leaf_bounds);
+                        }
+                    }
+                }
+            }
+            return existing_ids;
+        }
+
         // 1. Determine child bounds (subdivide if not provided or incomplete)
         let sub_bounds: [BoundingBox3D; 8] = if child_bounds.len() == 8 {
             child_bounds
@@ -788,7 +1002,7 @@ impl GlobalOctreeCoordinator {
                 assigned_node_ids.push(target_node);
             }
         } else {
-            // Distribute across nodes balancing load
+            // Distribute evenly across all active nodes including reporting_node_id
             let mut other_nodes: Vec<u32> = active_nodes
                 .iter()
                 .copied()
@@ -809,33 +1023,86 @@ impl GlobalOctreeCoordinator {
                 }
             });
 
-            for (i, _) in sub_bounds.iter().enumerate() {
-                if i == 0 {
+            let effective_partition_count =
+                |id: u32, newly_assigned: &std::collections::HashMap<u32, usize>| -> usize {
+                    let existing = registry
+                        .get_node(id)
+                        .map(|n| {
+                            n.assigned_bounds
+                                .iter()
+                                .filter(|b| {
+                                    !(id == reporting_node_id
+                                        && bounds_approx_eq(b, &original_bounds))
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    existing + newly_assigned.get(&id).copied().unwrap_or(0)
+                };
+
+            let effective_load_score =
+                |id: u32, newly_assigned: &std::collections::HashMap<u32, usize>| -> f32 {
+                    let new_count = newly_assigned.get(&id).copied().unwrap_or(0) as f32;
+                    let base = registry
+                        .get_node(id)
+                        .map(|n| {
+                            let removed_orig = if id == reporting_node_id {
+                                n.assigned_bounds
+                                    .iter()
+                                    .filter(|b| bounds_approx_eq(b, &original_bounds))
+                                    .count() as f32
+                            } else {
+                                0.0
+                            };
+                            (n.load_score() - removed_orig * 10.0).max(0.0)
+                        })
+                        .unwrap_or(0.0);
+                    base + new_count * 10.0
+                };
+
+            let mut newly_assigned: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+
+            for i in 0..8 {
+                let chosen = if i == 0 {
                     // Retain reporting node on child 0 for spatial continuity
-                    assigned_node_ids.push(reporting_node_id);
-                } else if !other_nodes.is_empty() {
-                    // Round-robin over other available least-loaded nodes
-                    let chosen = other_nodes[(i - 1) % other_nodes.len()];
-                    assigned_node_ids.push(chosen);
+                    reporting_node_id
+                } else if i == 1 {
+                    other_nodes.first().copied().unwrap_or(reporting_node_id)
                 } else {
-                    assigned_node_ids.push(reporting_node_id);
-                }
+                    active_nodes
+                        .iter()
+                        .copied()
+                        .min_by(|&a, &b| {
+                            effective_partition_count(a, &newly_assigned)
+                                .cmp(&effective_partition_count(b, &newly_assigned))
+                                .then_with(|| {
+                                    effective_load_score(a, &newly_assigned)
+                                        .partial_cmp(&effective_load_score(b, &newly_assigned))
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .then_with(|| a.cmp(&b))
+                        })
+                        .unwrap_or(reporting_node_id)
+                };
+                *newly_assigned.entry(chosen).or_insert(0) += 1;
+                assigned_node_ids.push(chosen);
             }
         }
 
         // 3. Update coordinator topology tree first. If split fails (octant not found),
         // abort without corrupting registry or topology epoch.
-        let mut assignments_arr: [(BoundingBox3D, u32); 8] =
-            [(original_bounds, reporting_node_id); 8];
-        for i in 0..8 {
-            assignments_arr[i] = (sub_bounds[i], assigned_node_ids[i]);
-        }
+        let assignments_arr: [(BoundingBox3D, u32); 8] =
+            std::array::from_fn(|i| (sub_bounds[i], assigned_node_ids[i]));
         if !self.root.split_at(&original_bounds, &assignments_arr) {
             return Vec::new();
         }
 
         // 4. Update NodeRegistry assigned bounds on successful split
-        registry.remove_assigned_bounds(reporting_node_id, &original_bounds);
+        if let Some(node) = registry.get_node_mut(reporting_node_id) {
+            node.assigned_bounds
+                .retain(|b| !bounds_approx_eq(b, &original_bounds));
+        }
         for (&child, &assigned_id) in sub_bounds.iter().zip(assigned_node_ids.iter()) {
             registry.add_assigned_bounds(assigned_id, child);
         }
@@ -1697,5 +1964,271 @@ mod tests {
         );
         assert_eq!(registry.get_node(node2).unwrap().assigned_bounds.len(), 4);
         assert_eq!(registry.get_node(node3).unwrap().assigned_bounds.len(), 4);
+    }
+
+    #[test]
+    fn test_fallback_node_addr_normalization() {
+        assert_eq!(
+            fallback_node_addr(1, Some("0.0.0.0:50052")),
+            "mmo-node-0.mmo-node:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(2, Some("0.0.0.0:50053")),
+            "mmo-node-1.mmo-node:50053"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("[::]:50052")),
+            "mmo-node-0.mmo-node:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(3, Some("[::]:50060")),
+            "mmo-node-2.mmo-node:50060"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("::")),
+            "mmo-node-0.mmo-node:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("[::]")),
+            "mmo-node-0.mmo-node:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("0.0.0.0")),
+            "mmo-node-0.mmo-node:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("http://0.0.0.0:50054")),
+            "mmo-node-0.mmo-node:50054"
+        );
+        assert_eq!(
+            fallback_node_addr(2, Some("https://[::]:50055")),
+            "mmo-node-1.mmo-node:50055"
+        );
+        assert_eq!(fallback_node_addr(1, Some("")), "mmo-node-0.mmo-node:50052");
+        assert_eq!(
+            fallback_node_addr(2, Some("   ")),
+            "mmo-node-1.mmo-node:50052"
+        );
+        assert_eq!(fallback_node_addr(1, None), "mmo-node-0.mmo-node:50052");
+        assert_eq!(
+            fallback_node_addr(1, Some("127.0.0.1:50051")),
+            "127.0.0.1:50051"
+        );
+        assert_eq!(
+            fallback_node_addr(2, Some("10.0.1.5:50052")),
+            "10.0.1.5:50052"
+        );
+        assert_eq!(
+            fallback_node_addr(1, Some("mmo-node-0.mmo-node:50052")),
+            "mmo-node-0.mmo-node:50052"
+        );
+    }
+
+    #[test]
+    fn test_standby_node_does_not_steal_active_root_partition() {
+        let world_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(world_bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 =
+            registry.register_node_with_id(1, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            node1,
+            world_bounds,
+            Some(&mut registry)
+        ));
+        assert_eq!(coord.topology_epoch(), 1);
+        assert_eq!(coord.find_node_for_point((0.0, 0.0, 0.0)), Some(node1));
+
+        // Standby node 2 registers with the same default world bounds while node 1 is active
+        let node2 = registry.register_node_with_id(2, "[::]:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            node2,
+            world_bounds,
+            Some(&mut registry)
+        ));
+
+        // Node 1 must retain ownership, epoch must not bump, and node 2 must have empty bounds
+        assert_eq!(coord.find_node_for_point((0.0, 0.0, 0.0)), Some(node1));
+        assert_eq!(coord.topology_epoch(), 1);
+        assert!(registry.get_node(node2).unwrap().assigned_bounds.is_empty());
+        assert_eq!(
+            registry.get_node(node1).unwrap().assigned_bounds,
+            vec![world_bounds]
+        );
+
+        // Also test when coordinator uses DEFAULT_WORLD_BOUNDS and nodes register (-100..100)^3
+        let mut default_coord = GlobalOctreeCoordinator::default();
+        let mut default_reg = NodeRegistry::new();
+        let n1 =
+            default_reg.register_node_with_id(1, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(default_coord.assign_or_map_node_bounds_with_registry(
+            n1,
+            world_bounds,
+            Some(&mut default_reg)
+        ));
+        let epoch_before = default_coord.topology_epoch();
+        let n2 =
+            default_reg.register_node_with_id(2, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(default_coord.assign_or_map_node_bounds_with_registry(
+            n2,
+            world_bounds,
+            Some(&mut default_reg)
+        ));
+        assert_eq!(default_coord.find_node_for_point((0.0, 0.0, 0.0)), Some(n1));
+        assert_eq!(default_coord.topology_epoch(), epoch_before);
+        assert!(default_reg.get_node(n2).unwrap().assigned_bounds.is_empty());
+
+        // If node 1 is no longer active in registry, node 2 CAN take over on re-registration
+        default_reg.deregister_node(n1);
+        let n2_takeover =
+            default_reg.register_node_with_id(2, "10.0.0.2:50052".to_string(), vec![world_bounds]);
+        assert!(default_coord.assign_or_map_node_bounds_with_registry(
+            n2_takeover,
+            world_bounds,
+            Some(&mut default_reg)
+        ));
+        assert_eq!(
+            default_coord.find_node_for_point((0.0, 0.0, 0.0)),
+            Some(n2_takeover)
+        );
+    }
+
+    #[test]
+    fn test_repeated_register_on_already_split_bounds_preserves_branch() {
+        let world_bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(world_bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 =
+            registry.register_node_with_id(1, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            node1,
+            world_bounds,
+            Some(&mut registry)
+        ));
+        let node2 =
+            registry.register_node_with_id(2, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            node2,
+            world_bounds,
+            Some(&mut registry)
+        ));
+
+        let assigned = coord.handle_split(node1, world_bounds, vec![], &mut registry);
+        assert_eq!(assigned, vec![1, 2, 1, 2, 1, 2, 1, 2]);
+        let epoch_after_split = coord.topology_epoch();
+        assert_eq!(epoch_after_split, 2);
+
+        // Node 1 restarts and re-registers with world_bounds: branch must NOT flatten or duplicate
+        registry.register_node_with_id(1, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            1,
+            world_bounds,
+            Some(&mut registry)
+        ));
+        assert!(matches!(coord.root, GlobalOctreeNode::Branch { .. }));
+        assert_eq!(coord.leaf_octants().len(), 8);
+        assert_eq!(coord.topology_epoch(), epoch_after_split);
+
+        let reg_n1_bounds = &registry.get_node(1).unwrap().assigned_bounds;
+        assert_eq!(reg_n1_bounds.len(), 4);
+        assert!(!reg_n1_bounds.contains(&world_bounds));
+
+        // New standby node 3 registers with world_bounds: gets empty assigned_bounds
+        let node3 =
+            registry.register_node_with_id(3, "0.0.0.0:50052".to_string(), vec![world_bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(
+            node3,
+            world_bounds,
+            Some(&mut registry)
+        ));
+        assert_eq!(coord.leaf_octants().len(), 8);
+        assert_eq!(coord.topology_epoch(), epoch_after_split);
+        assert!(registry.get_node(node3).unwrap().assigned_bounds.is_empty());
+    }
+
+    #[test]
+    fn test_should_split_node_rejects_standby_and_sub_minimum_bounds() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 = registry.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(node1, bounds, Some(&mut registry)));
+        let node2 = registry.register_node_with_id(2, "127.0.0.1:50052".to_string(), vec![bounds]);
+        assert!(coord.assign_or_map_node_bounds_with_registry(node2, bounds, Some(&mut registry)));
+
+        // Standby node 2 owns no leaves -> should_split_node must return false
+        assert!(!coord.should_split_node(node2, 1000, 100.0));
+        // Active node 1 owns 100^3 >= MIN_SPLIT_EXTENT (25.0) -> true
+        assert!(coord.should_split_node(node1, 100, 10.0));
+
+        // 25^3 meets MIN_SPLIT_EXTENT and can split into 12.5^3
+        let min_splittable = BoundingBox3D::new((0.0, 0.0, 0.0), (25.0, 25.0, 25.0));
+        let mut min_coord = GlobalOctreeCoordinator::new(min_splittable);
+        let mut min_reg = NodeRegistry::new();
+        let mn =
+            min_reg.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![min_splittable]);
+        min_coord.assign_initial_node(mn);
+        assert!(min_coord.should_split_node(mn, 100, 10.0));
+        let sub_assigned = min_coord.handle_split(mn, min_splittable, vec![], &mut min_reg);
+        assert_eq!(sub_assigned.len(), 8);
+
+        // After splitting 25^3 -> 12.5^3, all owned leaves are < MIN_SPLIT_EXTENT
+        min_coord.last_split_times.clear();
+        assert!(!min_coord.should_split_node(mn, 1000, 100.0));
+        let sub_leaf = BoundingBox3D::new((0.0, 0.0, 0.0), (12.5, 12.5, 12.5));
+        assert!(min_coord
+            .handle_split(mn, sub_leaf, vec![], &mut min_reg)
+            .is_empty());
+
+        // Asymmetric box with one axis < MIN_SPLIT_EXTENT (24.0 < 25.0) must also be rejected
+        let thin_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 24.0));
+        let mut thin_coord = GlobalOctreeCoordinator::new(thin_bounds);
+        let mut thin_reg = NodeRegistry::new();
+        let tn =
+            thin_reg.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![thin_bounds]);
+        thin_coord.assign_initial_node(tn);
+        assert!(!thin_coord.should_split_node(tn, 1000, 100.0));
+        assert!(thin_coord
+            .handle_split(tn, thin_bounds, vec![], &mut thin_reg)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_handle_split_balanced_and_idempotent() {
+        let bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(bounds);
+        let mut registry = NodeRegistry::new();
+
+        let node1 = registry.register_node_with_id(1, "0.0.0.0:50052".to_string(), vec![bounds]);
+        let node2 = registry.register_node_with_id(2, "0.0.0.0:50052".to_string(), vec![]);
+        coord.assign_initial_node(node1);
+
+        let first = coord.handle_split(node1, bounds, vec![], &mut registry);
+        assert_eq!(first, vec![1, 2, 1, 2, 1, 2, 1, 2]);
+        assert_eq!(coord.topology_epoch(), 2);
+        assert_eq!(registry.get_node(node1).unwrap().assigned_bounds.len(), 4);
+        assert_eq!(registry.get_node(node2).unwrap().assigned_bounds.len(), 4);
+
+        // Second split call on already-split branch must be idempotent and not bump epoch
+        let second = coord.handle_split(node1, bounds, vec![], &mut registry);
+        assert_eq!(second, vec![1, 2, 1, 2, 1, 2, 1, 2]);
+        assert_eq!(coord.topology_epoch(), 2);
+        assert_eq!(registry.get_node(node1).unwrap().assigned_bounds.len(), 4);
+        assert_eq!(registry.get_node(node2).unwrap().assigned_bounds.len(), 4);
+
+        // Even if registry lost sync, idempotent handle_split restores leaf bounds without bumping epoch
+        registry.get_node_mut(node1).unwrap().assigned_bounds = vec![bounds];
+        let third = coord.handle_split(node1, bounds, vec![], &mut registry);
+        assert_eq!(third, vec![1, 2, 1, 2, 1, 2, 1, 2]);
+        assert_eq!(coord.topology_epoch(), 2);
+        assert_eq!(registry.get_node(node1).unwrap().assigned_bounds.len(), 4);
+        assert!(!registry
+            .get_node(node1)
+            .unwrap()
+            .assigned_bounds
+            .contains(&bounds));
     }
 }

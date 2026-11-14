@@ -210,5 +210,51 @@ mod tests {
         };
         assert!(batch_route_resp.success);
         assert_eq!(batch_route_resp.updated_count, 1);
+
+        let assignment = PartitionAssignment {
+            bounds: Some(BoundingBox {
+                min: Some(Vector3 {
+                    x: -100.0,
+                    y: -100.0,
+                    z: -100.0,
+                }),
+                max: Some(Vector3 {
+                    x: 100.0,
+                    y: 100.0,
+                    z: 100.0,
+                }),
+            }),
+            node_id: 1,
+            node_address: "mmo-node-0.mmo-node:50052".to_string(),
+        };
+
+        let hb_resp = HeartbeatResponse {
+            acknowledged: true,
+            should_split: false,
+            topology_epoch: 2,
+            partitions: vec![assignment.clone()],
+        };
+        assert_eq!(hb_resp.partitions.len(), 1);
+
+        let split_resp = SplitReportResponse {
+            acknowledged: true,
+            assigned_node_ids: vec![1, 2],
+            topology_epoch: 2,
+            assigned_node_addresses: vec![
+                "mmo-node-0.mmo-node:50052".to_string(),
+                "mmo-node-1.mmo-node:50052".to_string(),
+            ],
+            partitions: vec![assignment.clone()],
+        };
+        assert_eq!(split_resp.assigned_node_addresses.len(), 2);
+
+        let gw_hb_resp = GatewayHeartbeatResponse {
+            acknowledged: true,
+            should_drain: false,
+            topology_epoch: 2,
+            partitions: vec![assignment],
+        };
+        assert_eq!(gw_hb_resp.topology_epoch, 2);
+        assert_eq!(gw_hb_resp.partitions.len(), 1);
     }
 }

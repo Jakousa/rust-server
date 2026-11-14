@@ -3,7 +3,7 @@
 //! Drives the fixed-frequency (20 Hz / 50ms) simulation game loop, entity iteration,
 //! hook dispatches, and authoritative client movement validation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -62,6 +62,10 @@ pub struct TickSimulation {
     pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
     pub default_spawn_position: (f32, f32, f32),
     pub default_collider_half_extents: (f32, f32, f32),
+    pub owned_bounds: Vec<BoundingBox3D>,
+    pub peer_partitions: Vec<(BoundingBox3D, u32, String)>,
+    pub pending_migrations: Vec<Guid>,
+    pub gateway_grpc_addr: String,
 }
 
 /// Lightweight state digest used to skip re-serializing unchanged entities during periodic snapshots.
@@ -140,6 +144,10 @@ impl TickSimulation {
     pub const MAX_PLACE_OBJECT_KEY_LEN: usize = 256;
     /// Maximum byte length allowed for a `PlaceObjectPacket` property value.
     pub const MAX_PLACE_OBJECT_VALUE_LEN: usize = 1024;
+    /// Default hysteresis margin (world units) beyond owned bounds before boundary migration triggers.
+    pub const DEFAULT_BOUNDARY_HYSTERESIS_MARGIN: f32 = 1.0;
+    /// Default cooldown period (ticks) between migrations for the same entity.
+    pub const DEFAULT_MIGRATION_COOLDOWN_TICKS: u64 = 20;
 
     /// Creates a new `TickSimulation` instance with default kinematic validation.
     pub fn new(node_id: u16, bounds: BoundingBox3D) -> Self {
@@ -219,6 +227,11 @@ impl TickSimulation {
             combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
             default_spawn_position: (0.0, 0.0, 0.0),
             default_collider_half_extents: (0.4, 0.9, 0.4),
+            owned_bounds: vec![bounds],
+            peer_partitions: Vec::new(),
+            pending_migrations: Vec::new(),
+            gateway_grpc_addr: std::env::var("GATEWAY_GRPC_ADDR")
+                .unwrap_or_else(|_| "http://127.0.0.1:50050".to_string()),
         }
     }
 
@@ -741,9 +754,38 @@ impl TickSimulation {
         }
     }
 
+    /// Returns `true` if `pos` falls inside any spatial partition currently owned by this node.
+    ///
+    /// Standby nodes (empty `owned_bounds` with non-empty `peer_partitions`) own no positions.
+    /// Unconfigured standalone simulations (both `owned_bounds` and `peer_partitions` empty)
+    /// fall back to `self.octree.bounds.contains(pos)`.
+    pub fn owns_position(&self, pos: (f32, f32, f32)) -> bool {
+        if !self.owned_bounds.is_empty() {
+            self.owned_bounds.iter().any(|b| b.contains(pos))
+        } else if !self.peer_partitions.is_empty() {
+            false
+        } else {
+            self.octree.bounds.contains(pos)
+        }
+    }
+
+    /// Computes the minimum Euclidean distance from `pos` to this node's owned bounds.
+    ///
+    /// Returns `0.0` when `pos` lies inside or on the boundary of any owned partition.
+    pub fn distance_to_owned_bounds(&self, pos: (f32, f32, f32)) -> f32 {
+        if self.owned_bounds.is_empty() {
+            self.octree.bounds.distance_to_point(pos)
+        } else {
+            self.owned_bounds
+                .iter()
+                .map(|b| b.distance_to_point(pos))
+                .fold(f32::INFINITY, f32::min)
+        }
+    }
+
     /// Evaluates whether a proposed movement qualifies for boundary migration across partitions.
     ///
-    /// Returns `true` if `new_pos` is outside local bounds by at least `margin` world units,
+    /// Returns `true` if `new_pos` is outside local owned bounds by at least `margin` world units,
     /// the entity is not currently migrating, and migration cooldown has elapsed.
     pub fn check_boundary_migration(
         &self,
@@ -761,7 +803,148 @@ impl TickSimulation {
         if self.is_migrating(guid) || self.is_in_migration_cooldown(guid, cooldown_ticks) {
             return false;
         }
-        self.octree.bounds.distance_to_point(new_pos) >= margin
+        self.distance_to_owned_bounds(new_pos) >= margin
+    }
+
+    /// Finds the peer node `(node_id, node_address)` responsible for `pos`.
+    ///
+    /// Prefers the first peer partition whose bounding box strictly contains `pos`, falling back
+    /// to the nearest peer partition with a non-empty dialable address.
+    pub fn find_peer_for_position(&self, pos: (f32, f32, f32)) -> Option<(u32, String)> {
+        if let Some((_bounds, node_id, addr)) = self
+            .peer_partitions
+            .iter()
+            .find(|(b, _nid, addr)| b.contains(pos) && !addr.trim().is_empty())
+        {
+            return Some((*node_id, addr.trim().to_string()));
+        }
+
+        self.peer_partitions
+            .iter()
+            .filter(|(_b, _nid, addr)| !addr.trim().is_empty())
+            .min_by(|a, b| {
+                a.0.distance_to_point(pos)
+                    .total_cmp(&b.0.distance_to_point(pos))
+            })
+            .map(|(_b, node_id, addr)| (*node_id, addr.trim().to_string()))
+    }
+
+    /// Applies an authoritative topology partition layout received from the Director.
+    ///
+    /// Updates `owned_bounds` and `peer_partitions`, and expands `self.octree.bounds` (rebuilding
+    /// the octree from `entity_store`) whenever any partition extends beyond current octree bounds.
+    pub fn apply_topology_partitions(&mut self, partitions: &[(BoundingBox3D, u32, String)]) {
+        if partitions.is_empty() {
+            return;
+        }
+
+        let self_node_id = u32::from(self.node_id);
+        let mut next_owned = Vec::new();
+        let mut next_peers = Vec::new();
+        let mut min = self.octree.bounds.min;
+        let mut max = self.octree.bounds.max;
+
+        for (bounds, nid, addr) in partitions {
+            min.0 = min.0.min(bounds.min.0);
+            min.1 = min.1.min(bounds.min.1);
+            min.2 = min.2.min(bounds.min.2);
+            max.0 = max.0.max(bounds.max.0);
+            max.1 = max.1.max(bounds.max.1);
+            max.2 = max.2.max(bounds.max.2);
+
+            if *nid == self_node_id {
+                next_owned.push(*bounds);
+            } else if !addr.trim().is_empty() {
+                next_peers.push((*bounds, *nid, addr.trim().to_string()));
+            }
+        }
+
+        self.owned_bounds = next_owned;
+        self.peer_partitions = next_peers;
+
+        let expanded_bounds = BoundingBox3D::new(min, max);
+        if expanded_bounds != self.octree.bounds {
+            let mut rebuilt = Octree::with_config(
+                expanded_bounds,
+                self.octree.max_entities_per_leaf,
+                self.octree.min_entities_to_merge,
+            );
+            for (_key, entity) in self.entity_store.iter() {
+                rebuilt.insert(entity.guid, entity.position);
+            }
+            self.octree = rebuilt;
+        }
+    }
+
+    /// Counts entities currently residing within this node's owned partitions.
+    pub fn owned_entity_count(&self) -> u32 {
+        if self.owned_bounds.is_empty() && !self.peer_partitions.is_empty() {
+            return 0;
+        }
+        self.entity_store
+            .iter()
+            .filter(|(_key, entity)| self.owns_position(entity.position))
+            .count() as u32
+    }
+
+    fn append_entity_migration_batch(
+        &self,
+        root_guid: Guid,
+        seen_guids: &mut HashSet<Guid>,
+        batches: &mut HashMap<(u32, String), Vec<Guid>>,
+    ) {
+        let Some(entity) = self.entity_store.get_by_guid(root_guid) else {
+            return;
+        };
+        if entity.parent_guid.is_some()
+            || self.sectors.get_object(root_guid).is_some()
+            || self.is_migrating(root_guid)
+            || self.tombstoned_entities.contains_key(&root_guid)
+            || self.owns_position(entity.position)
+        {
+            return;
+        }
+        let Some(peer) = self.find_peer_for_position(entity.position) else {
+            return;
+        };
+
+        let group: Vec<Guid> = self
+            .collect_migration_group(root_guid)
+            .into_iter()
+            .filter(|guid| {
+                !self.is_migrating(*guid)
+                    && !self.tombstoned_entities.contains_key(guid)
+                    && self.sectors.get_object(*guid).is_none()
+                    && seen_guids.insert(*guid)
+            })
+            .collect();
+
+        if !group.is_empty() {
+            batches.entry(peer).or_default().extend(group);
+        }
+    }
+
+    /// Collects all movable root entities (plus attached hierarchy descendants) currently outside
+    /// `owned_bounds`, grouped by destination peer `(node_id, node_address)`.
+    pub fn collect_entities_for_peer_partitions(&self) -> HashMap<(u32, String), Vec<Guid>> {
+        let mut batches = HashMap::new();
+        let mut seen_guids = HashSet::new();
+        for (_key, entity) in self.entity_store.iter() {
+            self.append_entity_migration_batch(entity.guid, &mut seen_guids, &mut batches);
+        }
+        batches
+    }
+
+    /// Drains queued boundary-crossing entity GUIDs and groups deduplicated migration hierarchies
+    /// by destination peer `(node_id, node_address)`.
+    pub fn drain_boundary_migrations_by_peer(&mut self) -> HashMap<(u32, String), Vec<Guid>> {
+        let pending = std::mem::take(&mut self.pending_migrations);
+        let mut batches = HashMap::new();
+        let mut seen_guids = HashSet::new();
+        for root_guid in pending {
+            self.append_entity_migration_batch(root_guid, &mut seen_guids, &mut batches);
+        }
+        batches
     }
 
     /// Collects an entity and all its transitive hierarchy descendants as an atomic migration group.
@@ -1418,6 +1601,32 @@ impl TickSimulation {
             }
         }
         self.event_queue.clear_ephemeral();
+
+        // 3.8. Detect entities that crossed partition boundaries beyond hysteresis margin
+        if !self.peer_partitions.is_empty() {
+            let candidates: Vec<Guid> = self
+                .entity_store
+                .iter()
+                .filter_map(|(_key, entity)| {
+                    if entity.parent_guid.is_none()
+                        && self.sectors.get_object(entity.guid).is_none()
+                        && !self.tombstoned_entities.contains_key(&entity.guid)
+                        && self.check_boundary_migration(
+                            entity.guid,
+                            entity.position,
+                            Self::DEFAULT_BOUNDARY_HYSTERESIS_MARGIN,
+                            Self::DEFAULT_MIGRATION_COOLDOWN_TICKS,
+                        )
+                        && !self.pending_migrations.contains(&entity.guid)
+                    {
+                        Some(entity.guid)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.pending_migrations.extend(candidates);
+        }
 
         // 4. Record simulation loop metrics
         let duration = start.elapsed();
@@ -3404,5 +3613,153 @@ mod tests {
             properties: boundary,
         };
         assert!(sim.handle_place_object(player, &pkt_boundary).is_ok());
+    }
+
+    #[test]
+    fn test_topology_partitions_ownership_and_octree_expansion() {
+        let initial = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, initial);
+        assert!(sim.owns_position((0.0, 0.0, 0.0)));
+        assert_eq!(sim.distance_to_owned_bounds((0.0, 0.0, 0.0)), 0.0);
+
+        let e_left = Guid::new(EntityType::Player, 1, 1);
+        let e_right = Guid::new(EntityType::Npc, 1, 2);
+        assert!(sim.spawn_entity(e_left, (-25.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(e_right, (25.0, 0.0, 0.0)));
+        assert_eq!(sim.owned_entity_count(), 2);
+
+        let p1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let p2 = BoundingBox3D::new((0.0, -100.0, -100.0), (150.0, 100.0, 100.0));
+        sim.apply_topology_partitions(&[
+            (p1, 1, "mmo-node-0.mmo-node:50052".to_string()),
+            (p2, 2, "mmo-node-1.mmo-node:50052".to_string()),
+        ]);
+
+        assert_eq!(sim.owned_bounds, vec![p1]);
+        assert_eq!(sim.peer_partitions.len(), 1);
+        assert_eq!(
+            sim.octree.bounds,
+            BoundingBox3D::new((-100.0, -100.0, -100.0), (150.0, 100.0, 100.0))
+        );
+        assert!(sim.owns_position((-25.0, 0.0, 0.0)));
+        assert!(!sim.owns_position((25.0, 0.0, 0.0)));
+        assert_eq!(sim.owned_entity_count(), 1);
+        assert!((sim.distance_to_owned_bounds((5.0, 0.0, 0.0)) - 5.0).abs() < 1e-4);
+        assert_eq!(
+            sim.find_peer_for_position((25.0, 0.0, 0.0)),
+            Some((2, "mmo-node-1.mmo-node:50052".to_string()))
+        );
+        // Nearest peer fallback when outside both boxes on Y axis
+        assert_eq!(
+            sim.find_peer_for_position((25.0, 120.0, 0.0)),
+            Some((2, "mmo-node-1.mmo-node:50052".to_string()))
+        );
+        // Octree rebuilt with existing entities intact
+        assert_eq!(sim.octree.query_range(&sim.octree.bounds).len(), 2);
+
+        // Standby node configuration (0 owned partitions, non-empty peer partitions)
+        let mut standby = TickSimulation::new(3, initial);
+        assert!(standby.spawn_entity(Guid::new(EntityType::Player, 3, 1), (25.0, 0.0, 0.0)));
+        standby.apply_topology_partitions(&[
+            (p1, 1, "mmo-node-0.mmo-node:50052".to_string()),
+            (p2, 2, "mmo-node-1.mmo-node:50052".to_string()),
+        ]);
+        assert!(standby.owned_bounds.is_empty());
+        assert!(!standby.owns_position((-25.0, 0.0, 0.0)));
+        assert!(!standby.owns_position((25.0, 0.0, 0.0)));
+        assert_eq!(standby.owned_entity_count(), 0);
+        let standby_batches = standby.collect_entities_for_peer_partitions();
+        assert_eq!(
+            standby_batches
+                .get(&(2, "mmo-node-1.mmo-node:50052".to_string()))
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_collect_entities_for_peer_partitions_hierarchy_and_dedup() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let p1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let p2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let owned_player = Guid::new(EntityType::Player, 1, 1);
+        let ship_guid = Guid::new(EntityType::DynamicObject, 1, 2);
+        let passenger_guid = Guid::new(EntityType::Player, 1, 3);
+        assert!(sim.spawn_entity(owned_player, (-10.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(ship_guid, (20.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(passenger_guid, (21.0, 1.0, 0.0)));
+        assert!(sim
+            .entity_store
+            .attach_child(passenger_guid, ship_guid, (1.0, 1.0, 0.0), 0.0));
+
+        // Static WorldObject in sectors should never be included even if its GUID appears in entity_store
+        let static_obj_guid = Guid::new(EntityType::DynamicObject, 1, 99);
+        let world_obj = mmo_core::WorldObject::new(
+            static_obj_guid,
+            7,
+            mmo_core::Transform3D::new((25.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),
+            BoundingBox3D::new((24.0, -1.0, -1.0), (26.0, 1.0, 1.0)),
+            mmo_core::ContainerOwner::System("test".to_string()),
+        );
+        sim.insert_world_object(world_obj);
+        assert!(sim.spawn_entity(static_obj_guid, (25.0, 0.0, 0.0)));
+
+        sim.apply_topology_partitions(&[
+            (p1, 1, "127.0.0.1:50051".to_string()),
+            (p2, 2, "127.0.0.1:50052".to_string()),
+        ]);
+
+        let batches = sim.collect_entities_for_peer_partitions();
+        assert_eq!(batches.len(), 1);
+        let guids = batches
+            .get(&(2, "127.0.0.1:50052".to_string()))
+            .expect("peer batch present");
+        assert_eq!(guids.len(), 2);
+        assert!(guids.contains(&ship_guid));
+        assert!(guids.contains(&passenger_guid));
+        assert!(!guids.contains(&owned_player));
+        assert!(!guids.contains(&static_obj_guid));
+    }
+
+    #[test]
+    fn test_step_detects_boundary_crossing_and_drain_respects_hysteresis_and_cooldown() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        let p1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let p2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        sim.apply_topology_partitions(&[
+            (p1, 1, "127.0.0.1:50051".to_string()),
+            (p2, 2, "127.0.0.1:50052".to_string()),
+        ]);
+
+        let runner = Guid::new(EntityType::Player, 1, 1);
+        // Inside hysteresis zone (0.5 < 1.0)
+        assert!(sim.spawn_entity(runner, (0.5, 0.0, 0.0)));
+        // Advance past initial cooldown window
+        sim.tick_counter = TickSimulation::DEFAULT_MIGRATION_COOLDOWN_TICKS + 1;
+        sim.step_tick();
+        assert!(sim.pending_migrations.is_empty());
+
+        // Move past hysteresis margin (1.5 >= 1.0)
+        if let Some(ent) = sim.entity_store.get_mut_by_guid(runner) {
+            ent.position = (1.5, 0.0, 0.0);
+        }
+        sim.step_tick();
+        assert_eq!(sim.pending_migrations, vec![runner]);
+
+        // Cooldown prevents re-queueing immediately if recently migrated
+        let drained = sim.drain_boundary_migrations_by_peer();
+        assert!(sim.pending_migrations.is_empty());
+        assert_eq!(
+            drained.get(&(2, "127.0.0.1:50052".to_string())),
+            Some(&vec![runner])
+        );
+
+        sim.set_last_migration_tick(runner, sim.tick_counter);
+        sim.step_tick();
+        assert!(sim.pending_migrations.is_empty());
     }
 }

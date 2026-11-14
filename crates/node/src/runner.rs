@@ -8,7 +8,9 @@ use mmo_core::BoundingBox3D;
 use mmo_schema::cluster::director_service_client::DirectorServiceClient;
 use mmo_schema::cluster::gateway_service_client::GatewayServiceClient;
 use mmo_schema::cluster::node_service_server::NodeServiceServer;
-use mmo_schema::cluster::{BoundingBox, HeartbeatRequest, RegisterNodeRequest, Vector3};
+use mmo_schema::cluster::{
+    BoundingBox, HeartbeatRequest, PartitionAssignment, RegisterNodeRequest, Vector3,
+};
 use mmo_storage::db::Database;
 use mmo_storage::repository::CharacterRepository;
 
@@ -84,9 +86,21 @@ pub async fn run_node_daemon_with_sim(
         (None, None)
     };
 
+    tick_sim.gateway_grpc_addr = gateway_grpc_addr.clone();
     let input_tx = tick_sim.input_sender();
     let ghost_store = tick_sim.ghost_store.clone();
     let sim = Arc::new(RwLock::new(tick_sim));
+
+    let (migration_tx, mut migration_rx) = tokio::sync::mpsc::channel::<()>(16);
+    let migration_sim = Arc::clone(&sim);
+    let migration_handle = tokio::spawn(async move {
+        let pool = crate::network::GrpcClientPool::new();
+        let self_node_id = u32::from(node_id);
+        while migration_rx.recv().await.is_some() {
+            while migration_rx.try_recv().is_ok() {}
+            flush_pending_boundary_migrations(self_node_id, &migration_sim, &pool).await;
+        }
+    });
 
     // 1. Start gRPC NodeService server with graceful shutdown support
     let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -228,9 +242,13 @@ pub async fn run_node_daemon_with_sim(
         }
 
         let mut catchup = 0;
+        let mut notify_migration = false;
         while tokio::time::Instant::now() >= next_tick && catchup < MAX_CATCHUP_TICKS {
             let mut sim_guard = sim.write().await;
             sim_guard.step_tick();
+            if !sim_guard.pending_migrations.is_empty() {
+                notify_migration = true;
+            }
             let jobs = sim_guard.drain_broadcast_jobs();
             if !jobs.is_empty() {
                 if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
@@ -242,6 +260,9 @@ pub async fn run_node_daemon_with_sim(
             catchup += 1;
             next_tick += tick_duration;
         }
+        if notify_migration {
+            let _ = migration_tx.try_send(());
+        }
 
         // Clamp residual lag to prevent spiral of death
         let now_after = tokio::time::Instant::now();
@@ -251,7 +272,9 @@ pub async fn run_node_daemon_with_sim(
     }
 
     drop(broadcast_tx);
+    drop(migration_tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), broadcast_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), migration_handle).await;
 
     drain_and_shutdown_node(
         node_id,
@@ -288,6 +311,185 @@ fn normalize_endpoint(endpoint: &str) -> String {
     } else {
         format!("http://{endpoint}")
     }
+}
+
+/// Resolves the dialable gRPC node address advertised to the Director during registration.
+///
+/// Honors explicit `ADVERTISE_ADDR` overrides, derives Kubernetes StatefulSet DNS names from
+/// `HOSTNAME` (`<hostname>.mmo-node:<port>`) when bound to an unspecified address (`0.0.0.0`/`::`),
+/// and otherwise returns `listen_addr` verbatim.
+pub fn resolve_advertise_addr(listen_addr: SocketAddr) -> String {
+    let advertise_addr = std::env::var("ADVERTISE_ADDR").ok();
+    let hostname = std::env::var("HOSTNAME").ok();
+    resolve_advertise_addr_with(listen_addr, advertise_addr.as_deref(), hostname.as_deref())
+}
+
+fn resolve_advertise_addr_with(
+    listen_addr: SocketAddr,
+    advertise_addr: Option<&str>,
+    hostname: Option<&str>,
+) -> String {
+    if let Some(addr) = advertise_addr.map(str::trim).filter(|s| !s.is_empty()) {
+        return addr.to_string();
+    }
+    if listen_addr.ip().is_unspecified() {
+        if let Some(host) = hostname.map(str::trim).filter(|h| !h.is_empty()) {
+            if host.starts_with("mmo-node-") {
+                return format!("{host}.mmo-node:{}", listen_addr.port());
+            }
+        }
+    }
+    listen_addr.to_string()
+}
+
+fn proto_bbox_to_bounding_box_3d(bbox: &BoundingBox) -> Option<BoundingBox3D> {
+    let min = bbox.min.as_ref()?;
+    let max = bbox.max.as_ref()?;
+    if !(min.x.is_finite()
+        && min.y.is_finite()
+        && min.z.is_finite()
+        && max.x.is_finite()
+        && max.y.is_finite()
+        && max.z.is_finite())
+    {
+        return None;
+    }
+    if min.x > max.x || min.y > max.y || min.z > max.z {
+        return None;
+    }
+    Some(BoundingBox3D::new(
+        (min.x, min.y, min.z),
+        (max.x, max.y, max.z),
+    ))
+}
+
+fn parse_partitions(assignments: &[PartitionAssignment]) -> Vec<(BoundingBox3D, u32, String)> {
+    assignments
+        .iter()
+        .filter_map(|p| {
+            let bounds = p.bounds.as_ref().and_then(proto_bbox_to_bounding_box_3d)?;
+            Some((bounds, p.node_id, p.node_address.trim().to_string()))
+        })
+        .collect()
+}
+
+fn build_split_partitions(
+    split_inner: &mmo_schema::cluster::SplitReportResponse,
+    current_bounds: &BoundingBox3D,
+) -> Vec<(BoundingBox3D, u32, String)> {
+    let parsed = parse_partitions(&split_inner.partitions);
+    if !parsed.is_empty() {
+        return parsed;
+    }
+
+    let children = current_bounds.subdivide();
+    children
+        .into_iter()
+        .zip(split_inner.assigned_node_ids.iter().copied())
+        .enumerate()
+        .map(|(idx, (bounds, nid))| {
+            let addr = split_inner
+                .assigned_node_addresses
+                .get(idx)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            (bounds, nid, addr)
+        })
+        .collect()
+}
+
+const MAX_ENTITIES_PER_MIGRATION_RPC: usize = 500;
+
+async fn dispatch_migration_batches(
+    self_node_id: u32,
+    batches: std::collections::HashMap<(u32, String), Vec<mmo_core::Guid>>,
+    gateway_addr: String,
+    sim: &Arc<RwLock<TickSimulation>>,
+    pool: &crate::network::GrpcClientPool,
+) {
+    let normalized_gw =
+        (!gateway_addr.trim().is_empty()).then(|| normalize_endpoint(gateway_addr.trim()));
+    let gw_ref = normalized_gw.as_deref();
+
+    for ((target_node_id, target_addr), guids) in batches {
+        let trimmed_addr = target_addr.trim();
+        if target_node_id == self_node_id || trimmed_addr.is_empty() || guids.is_empty() {
+            continue;
+        }
+
+        for chunk in guids.chunks(MAX_ENTITIES_PER_MIGRATION_RPC) {
+            match crate::network::execute_batch_entity_migration_pooled(
+                pool,
+                Arc::clone(sim),
+                chunk,
+                target_node_id,
+                trimmed_addr,
+                gw_ref,
+            )
+            .await
+            {
+                Ok(report) => {
+                    println!(
+                        "[Node {self_node_id}] Migrated {}/{} entities to node {target_node_id} ({trimmed_addr}) [success={}]",
+                        report.migrated_count,
+                        report.total_requested,
+                        report.success
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[Node {self_node_id}] Migration batch ({} entities) to node {target_node_id} ({trimmed_addr}) failed: {err}",
+                        chunk.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn apply_partitions_and_migrate(
+    self_node_id: u32,
+    partitions: &[(BoundingBox3D, u32, String)],
+    sim: &Arc<RwLock<TickSimulation>>,
+    pool: &crate::network::GrpcClientPool,
+    current_bounds: &mut BoundingBox3D,
+) {
+    if partitions.is_empty() {
+        return;
+    }
+
+    let (batches, gateway_addr) = {
+        let mut s = sim.write().await;
+        s.apply_topology_partitions(partitions);
+        if let Some(&first_owned) = s.owned_bounds.first() {
+            *current_bounds = first_owned;
+        }
+        (
+            s.collect_entities_for_peer_partitions(),
+            s.gateway_grpc_addr.clone(),
+        )
+    };
+
+    dispatch_migration_batches(self_node_id, batches, gateway_addr, sim, pool).await;
+}
+
+async fn flush_pending_boundary_migrations(
+    self_node_id: u32,
+    sim: &Arc<RwLock<TickSimulation>>,
+    pool: &crate::network::GrpcClientPool,
+) {
+    let (batches, gateway_addr) = {
+        let mut s = sim.write().await;
+        if s.pending_migrations.is_empty() {
+            return;
+        }
+        (
+            s.drain_boundary_migrations_by_peer(),
+            s.gateway_grpc_addr.clone(),
+        )
+    };
+
+    dispatch_migration_batches(self_node_id, batches, gateway_addr, sim, pool).await;
 }
 
 fn build_bounds_proto(bounds: &BoundingBox3D) -> Option<BoundingBox> {
@@ -440,9 +642,10 @@ pub async fn run_director_registration_and_heartbeat_loop(
     println!("[Node {node_id}] Attempting connection to Director at {endpoint}...");
 
     let mut current_bounds = config.bounds;
+    let advertise_addr = resolve_advertise_addr(config.listen_addr);
     let initial_reg_req = RegisterNodeRequest {
         node_id: u32::from(node_id),
-        listen_addr: config.listen_addr.to_string(),
+        listen_addr: advertise_addr.clone(),
         bounds: build_bounds_proto(&current_bounds),
     };
 
@@ -461,6 +664,8 @@ pub async fn run_director_registration_and_heartbeat_loop(
     let mut prev_tick_counter = sim.read().await.tick_counter;
     let mut prev_hb_at = std::time::Instant::now();
     let mut rolling_tick_rate: Option<f32> = None;
+    let migration_pool = crate::network::GrpcClientPool::new();
+    let mut last_applied_partitions: Vec<(BoundingBox3D, u32, String)> = Vec::new();
 
     let mut hb_interval = tokio::time::interval(config.heartbeat_interval);
     hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -500,7 +705,7 @@ pub async fn run_director_registration_and_heartbeat_loop(
 
         let (entity_count, tick_duration_ms, entity_centroid, curr_tick_counter, active_instances) = {
             let s = sim.read().await;
-            let count = s.entity_store.count() as u32;
+            let count = s.owned_entity_count();
             let dur = s.last_tick_duration_ms();
             let centroid = if count > 0 {
                 let c = s.compute_clamped_centroid(&current_bounds);
@@ -570,7 +775,7 @@ pub async fn run_director_registration_and_heartbeat_loop(
                     );
                     let rereg_req = RegisterNodeRequest {
                         node_id: u32::from(node_id),
-                        listen_addr: config.listen_addr.to_string(),
+                        listen_addr: advertise_addr.clone(),
                         bounds: build_bounds_proto(&current_bounds),
                     };
                     match register_until_acknowledged(
@@ -601,6 +806,28 @@ pub async fn run_director_registration_and_heartbeat_loop(
                 }
 
                 last_ack = std::time::Instant::now();
+
+                if !inner.partitions.is_empty() {
+                    let incoming_partitions = parse_partitions(&inner.partitions);
+                    if !incoming_partitions.is_empty() {
+                        let should_apply = {
+                            let s = sim.read().await;
+                            incoming_partitions != last_applied_partitions
+                                || !s.collect_entities_for_peer_partitions().is_empty()
+                        };
+                        if should_apply {
+                            apply_partitions_and_migrate(
+                                u32::from(node_id),
+                                &incoming_partitions,
+                                &sim,
+                                &migration_pool,
+                                &mut current_bounds,
+                            )
+                            .await;
+                            last_applied_partitions = incoming_partitions;
+                        }
+                    }
+                }
 
                 for (instance_id, player_count, total_entity_count, is_idle) in active_instances {
                     let inst_hb = mmo_schema::cluster::InstanceHeartbeatRequest {
@@ -636,20 +863,27 @@ pub async fn run_director_registration_and_heartbeat_loop(
                             "[Node {node_id}] Split reported, assigned nodes: {:?}",
                             split_inner.assigned_node_ids
                         );
-                        if split_inner.acknowledged && !split_inner.assigned_node_ids.is_empty() {
-                            let children = current_bounds.subdivide();
-                            let self_id = u32::from(node_id);
-                            if let Some(idx) = split_inner
-                                .assigned_node_ids
-                                .iter()
-                                .position(|&assigned| assigned == self_id)
-                            {
-                                if let Some(&next_bounds) = children.get(idx) {
-                                    current_bounds = next_bounds;
-                                }
+                        if split_inner.acknowledged {
+                            let split_partitions =
+                                build_split_partitions(&split_inner, &current_bounds);
+                            if !split_partitions.is_empty() {
+                                apply_partitions_and_migrate(
+                                    u32::from(node_id),
+                                    &split_partitions,
+                                    &sim,
+                                    &migration_pool,
+                                    &mut current_bounds,
+                                )
+                                .await;
+                                last_applied_partitions = split_partitions;
                             }
                         }
                     }
+                }
+
+                if !sim.read().await.pending_migrations.is_empty() {
+                    flush_pending_boundary_migrations(u32::from(node_id), &sim, &migration_pool)
+                        .await;
                 }
             }
             Ok(Err(e)) => {
@@ -671,5 +905,98 @@ pub async fn run_director_registration_and_heartbeat_loop(
                 client = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_advertise_addr_with_env_and_statefulset_hostname() {
+        let wildcard: SocketAddr = "0.0.0.0:50052".parse().expect("valid wildcard addr");
+        let explicit: SocketAddr = "10.1.2.3:50052".parse().expect("valid explicit addr");
+
+        // Explicit ADVERTISE_ADDR wins over everything
+        assert_eq!(
+            resolve_advertise_addr_with(wildcard, Some("  custom-node:6000  "), Some("mmo-node-0")),
+            "custom-node:6000"
+        );
+        // Wildcard listen_addr with StatefulSet hostname synthesizes headless DNS name
+        assert_eq!(
+            resolve_advertise_addr_with(wildcard, Some("   "), Some("mmo-node-1")),
+            "mmo-node-1.mmo-node:50052"
+        );
+        // Wildcard listen_addr with non-statefulset hostname falls back to listen_addr
+        assert_eq!(
+            resolve_advertise_addr_with(wildcard, None, Some("dev-laptop")),
+            "0.0.0.0:50052"
+        );
+        // Non-unspecified listen_addr ignores StatefulSet hostname
+        assert_eq!(
+            resolve_advertise_addr_with(explicit, None, Some("mmo-node-0")),
+            "10.1.2.3:50052"
+        );
+    }
+
+    #[test]
+    fn test_parse_partitions_and_build_split_partitions_fallback() {
+        let b1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let b2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let proto = vec![
+            PartitionAssignment {
+                bounds: build_bounds_proto(&b1),
+                node_id: 1,
+                node_address: " mmo-node-0.mmo-node:50052 ".to_string(),
+            },
+            PartitionAssignment {
+                bounds: Some(BoundingBox {
+                    min: Some(Vector3 {
+                        x: f32::NAN,
+                        y: 0.0,
+                        z: 0.0,
+                    }),
+                    max: Some(Vector3 {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    }),
+                }),
+                node_id: 99,
+                node_address: "invalid".to_string(),
+            },
+            PartitionAssignment {
+                bounds: build_bounds_proto(&b2),
+                node_id: 2,
+                node_address: "mmo-node-1.mmo-node:50052".to_string(),
+            },
+        ];
+        let parsed = parse_partitions(&proto);
+        assert_eq!(
+            parsed,
+            vec![
+                (b1, 1, "mmo-node-0.mmo-node:50052".to_string()),
+                (b2, 2, "mmo-node-1.mmo-node:50052".to_string()),
+            ]
+        );
+
+        let full = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let fallback_resp = mmo_schema::cluster::SplitReportResponse {
+            acknowledged: true,
+            assigned_node_ids: vec![1, 2],
+            topology_epoch: 1,
+            assigned_node_addresses: vec![
+                "127.0.0.1:50051".to_string(),
+                "127.0.0.1:50052".to_string(),
+            ],
+            partitions: vec![],
+        };
+        let built = build_split_partitions(&fallback_resp, &full);
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].1, 1);
+        assert_eq!(built[0].2, "127.0.0.1:50051");
+        assert_eq!(built[1].1, 2);
+        assert_eq!(built[1].2, "127.0.0.1:50052");
     }
 }

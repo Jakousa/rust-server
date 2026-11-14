@@ -40,8 +40,44 @@ use crate::backhaul::BackhaulPool;
 use crate::interceptor::EdgePacketInterceptor;
 use crate::marketplace::GatewayMarketplaceService;
 use crate::quic::{create_quic_server, generate_self_signed_cert, QuicTransportError};
-use crate::router::SessionRouter;
+use crate::router::{PartitionRoute, SessionRouter};
 use crate::social::GatewaySubscriptionManager;
+
+/// Converts protobuf partition assignments from Director into validated `PartitionRoute` entries,
+/// skipping assignments with missing/non-finite/inverted bounds or empty node addresses.
+fn parse_proto_partitions(
+    proto_partitions: &[mmo_schema::cluster::PartitionAssignment],
+) -> Vec<PartitionRoute> {
+    proto_partitions
+        .iter()
+        .filter_map(|p| {
+            let bbox = p.bounds.as_ref()?;
+            let min = bbox.min.as_ref()?;
+            let max = bbox.max.as_ref()?;
+            if !min.x.is_finite()
+                || !min.y.is_finite()
+                || !min.z.is_finite()
+                || !max.x.is_finite()
+                || !max.y.is_finite()
+                || !max.z.is_finite()
+                || min.x > max.x
+                || min.y > max.y
+                || min.z > max.z
+            {
+                return None;
+            }
+            let trimmed = p.node_address.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(PartitionRoute {
+                bounds: mmo_core::BoundingBox3D::new((min.x, min.y, min.z), (max.x, max.y, max.z)),
+                node_id: p.node_id,
+                node_address: trimmed.to_string(),
+            })
+        })
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -338,11 +374,45 @@ impl GatewayServer {
         capacity: u32,
         session_sinks: Arc<DashMap<u64, SessionSink>>,
     ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_heartbeat_loop_with_router(
+            director_addr,
+            gateway_id,
+            region,
+            listen_addr,
+            grpc_addr,
+            probe_addr,
+            capacity,
+            session_sinks,
+            None,
+        )
+    }
+
+    /// Spawns a background task registering this gateway with the Director, emitting periodic
+    /// heartbeats, and synchronizing cluster topology partitions into `router` when provided.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_heartbeat_loop_with_router(
+        director_addr: String,
+        gateway_id: String,
+        region: String,
+        listen_addr: String,
+        grpc_addr: String,
+        probe_addr: String,
+        capacity: u32,
+        session_sinks: Arc<DashMap<u64, SessionSink>>,
+        router: Option<Arc<SessionRouter>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let director_endpoint =
+                if director_addr.starts_with("http://") || director_addr.starts_with("https://") {
+                    director_addr
+                } else {
+                    format!("http://{director_addr}")
+                };
+
             let mut client = None;
             let mut attempts = 0;
             while client.is_none() && attempts < 10 {
-                match DirectorServiceClient::connect(director_addr.clone()).await {
+                match DirectorServiceClient::connect(director_endpoint.clone()).await {
                     Ok(c) => client = Some(c),
                     Err(_) => {
                         attempts += 1;
@@ -354,7 +424,7 @@ impl GatewayServer {
             let mut client = match client {
                 Some(c) => c,
                 None => {
-                    eprintln!("[Gateway] Failed to connect to Director at {director_addr}");
+                    eprintln!("[Gateway] Failed to connect to Director at {director_endpoint}");
                     return;
                 }
             };
@@ -369,12 +439,16 @@ impl GatewayServer {
             };
 
             let mut interval_ms = 1000;
-            if let Ok(res) = client.register_gateway(reg_req).await {
+            if let Ok(res) = client.register_gateway(reg_req.clone()).await {
                 interval_ms = res.into_inner().heartbeat_interval_ms.max(200);
             }
 
+            let mut hb_interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
+            hb_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                hb_interval.tick().await;
                 let active = session_sinks.len() as u32;
                 let hb = GatewayHeartbeatRequest {
                     gateway_id: gateway_id.clone(),
@@ -386,10 +460,40 @@ impl GatewayServer {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0),
                 };
-                if client.gateway_heartbeat(hb).await.is_err() {
-                    // Try reconnecting next loop
-                    if let Ok(c) = DirectorServiceClient::connect(director_addr.clone()).await {
-                        client = c;
+                match client.gateway_heartbeat(hb).await {
+                    Ok(resp) => {
+                        let inner = resp.into_inner();
+                        if !inner.acknowledged {
+                            if let Ok(res) = client.register_gateway(reg_req.clone()).await {
+                                let next_ms = res.into_inner().heartbeat_interval_ms.max(200);
+                                if next_ms != interval_ms {
+                                    interval_ms = next_ms;
+                                    hb_interval = tokio::time::interval(
+                                        tokio::time::Duration::from_millis(interval_ms),
+                                    );
+                                    hb_interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Delay,
+                                    );
+                                    hb_interval.tick().await;
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(ref r) = router {
+                            let routes = parse_proto_partitions(&inner.partitions);
+                            if !routes.is_empty() || inner.partitions.is_empty() {
+                                r.update_topology_partitions(inner.topology_epoch, routes);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Try reconnecting next loop
+                        if let Ok(mut c) =
+                            DirectorServiceClient::connect(director_endpoint.clone()).await
+                        {
+                            let _ = c.register_gateway(reg_req.clone()).await;
+                            client = c;
+                        }
                     }
                 }
             }
@@ -2400,5 +2504,223 @@ mod tests {
         assert_eq!(server.active_sink_count().unwrap(), 0);
         // Sink sender was dropped, so receiver closes
         assert!(srx.recv().await.is_none());
+    }
+
+    #[test]
+    fn test_parse_proto_partitions_filters_invalid_entries_and_trims_addresses() {
+        use mmo_schema::cluster::{BoundingBox, PartitionAssignment, Vector3};
+
+        let proto = vec![
+            PartitionAssignment {
+                bounds: Some(BoundingBox {
+                    min: Some(Vector3 {
+                        x: -10.0,
+                        y: -10.0,
+                        z: -10.0,
+                    }),
+                    max: Some(Vector3 {
+                        x: 10.0,
+                        y: 10.0,
+                        z: 10.0,
+                    }),
+                }),
+                node_id: 1,
+                node_address: "  127.0.0.1:50051  ".to_string(),
+            },
+            // Missing bounds
+            PartitionAssignment {
+                bounds: None,
+                node_id: 2,
+                node_address: "127.0.0.1:50052".to_string(),
+            },
+            // Empty address
+            PartitionAssignment {
+                bounds: Some(BoundingBox {
+                    min: Some(Vector3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    }),
+                    max: Some(Vector3 {
+                        x: 5.0,
+                        y: 5.0,
+                        z: 5.0,
+                    }),
+                }),
+                node_id: 3,
+                node_address: "   ".to_string(),
+            },
+            // Non-finite coordinates
+            PartitionAssignment {
+                bounds: Some(BoundingBox {
+                    min: Some(Vector3 {
+                        x: f32::NAN,
+                        y: 0.0,
+                        z: 0.0,
+                    }),
+                    max: Some(Vector3 {
+                        x: 5.0,
+                        y: 5.0,
+                        z: 5.0,
+                    }),
+                }),
+                node_id: 4,
+                node_address: "127.0.0.1:50054".to_string(),
+            },
+            // Inverted bounds (min.x > max.x)
+            PartitionAssignment {
+                bounds: Some(BoundingBox {
+                    min: Some(Vector3 {
+                        x: 20.0,
+                        y: 0.0,
+                        z: 0.0,
+                    }),
+                    max: Some(Vector3 {
+                        x: 10.0,
+                        y: 5.0,
+                        z: 5.0,
+                    }),
+                }),
+                node_id: 5,
+                node_address: "127.0.0.1:50055".to_string(),
+            },
+        ];
+
+        let parsed = parse_proto_partitions(&proto);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].node_id, 1);
+        assert_eq!(parsed[0].node_address, "127.0.0.1:50051");
+        assert_eq!(
+            parsed[0].bounds,
+            mmo_core::BoundingBox3D::new((-10.0, -10.0, -10.0), (10.0, 10.0, 10.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_heartbeat_syncs_topology_and_resolve_initial_node_balances_across_nodes()
+    {
+        use mmo_core::BoundingBox3D;
+        use mmo_director::coordinator::GlobalOctreeCoordinator;
+        use mmo_director::registry::NodeRegistry;
+        use mmo_director::service::{bounding_box_3d_to_proto, DirectorServiceImpl};
+        use mmo_schema::cluster::director_service_server::{
+            DirectorService, DirectorServiceServer,
+        };
+        use mmo_schema::cluster::{RegisterNodeRequest, SplitReportRequest};
+
+        let world = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let registry = Arc::new(tokio::sync::RwLock::new(NodeRegistry::new()));
+        let coordinator = Arc::new(tokio::sync::RwLock::new(GlobalOctreeCoordinator::new(
+            world,
+        )));
+        let director = DirectorServiceImpl::new(registry, coordinator);
+
+        // Register two nodes and split world into 8 octants across them
+        director
+            .register_node(tonic::Request::new(RegisterNodeRequest {
+                node_id: 1,
+                listen_addr: "127.0.0.1:51001".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&world)),
+            }))
+            .await
+            .unwrap();
+        director
+            .register_node(tonic::Request::new(RegisterNodeRequest {
+                node_id: 2,
+                listen_addr: "127.0.0.1:51002".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&world)),
+            }))
+            .await
+            .unwrap();
+        let split_resp = director
+            .report_split(tonic::Request::new(SplitReportRequest {
+                node_id: 1,
+                original_bounds: Some(bounding_box_3d_to_proto(&world)),
+                child_bounds: vec![],
+                total_entities: 80,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(split_resp.acknowledged);
+        assert_eq!(split_resp.topology_epoch, 2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let director_addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let dir_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(DirectorServiceServer::new(director))
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let router = Arc::new(SessionRouter::new());
+        let server =
+            GatewayServer::new(Arc::clone(&router)).with_default_node_address("127.0.0.1:59999");
+
+        // Before heartbeat sync, resolve_initial_node falls back to default_node
+        let g0 = Guid::new(EntityType::Player, 1, 1);
+        assert_eq!(
+            server.resolve_initial_node(g0).await.unwrap(),
+            "127.0.0.1:59999"
+        );
+
+        let hb_handle = GatewayServer::spawn_heartbeat_loop_with_router(
+            format!("http://{director_addr}"),
+            "gw-topo-test".to_string(),
+            "us-east".to_string(),
+            "127.0.0.1:8080".to_string(),
+            "127.0.0.1:50050".to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+            server.session_sinks(),
+            Some(Arc::clone(&router)),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while router.topology_epoch() < 2 || router.get_topology_partitions().len() != 8 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gateway heartbeat did not sync topology partitions in time"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(router.topology_epoch(), 2);
+        assert_eq!(router.get_topology_partitions().len(), 8);
+
+        // New player sessions at default spawn (0, 0, 5) now balance across both nodes
+        let pick1 = server
+            .resolve_initial_node(Guid::new(EntityType::Player, 1, 10))
+            .await
+            .unwrap();
+        let pick2 = server
+            .resolve_initial_node(Guid::new(EntityType::Player, 1, 11))
+            .await
+            .unwrap();
+        let picks: std::collections::HashSet<String> = [pick1, pick2].into_iter().collect();
+        assert_eq!(
+            picks,
+            ["127.0.0.1:51001".to_string(), "127.0.0.1:51002".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        // Existing GUID route still takes precedence over topology selection
+        let existing_guid = Guid::new(EntityType::Player, 1, 42);
+        router.register_session(42, existing_guid, "127.0.0.1:51002".to_string());
+        assert_eq!(
+            server.resolve_initial_node(existing_guid).await.unwrap(),
+            "127.0.0.1:51002"
+        );
+
+        hb_handle.abort();
+        let _ = shutdown_tx.send(());
+        let _ = dir_handle.await;
     }
 }

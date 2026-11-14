@@ -289,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Spawn Director Gateway Heartbeat Loop
-    let heartbeat_handle = GatewayServer::spawn_heartbeat_loop(
+    let heartbeat_handle = GatewayServer::spawn_heartbeat_loop_with_router(
         director_addr.clone(),
         gateway_id.clone(),
         region,
@@ -298,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         probe_addr,
         capacity,
         server.session_sinks(),
+        Some(Arc::clone(server.router())),
     );
 
     // Bind and launch WebTransport HTTP/3 listener (with self-signed cert discovery)
@@ -380,7 +381,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let session_id = server.next_session_id();
                         let server_clone = Arc::clone(&server);
-                        let target_node = default_node_addr.clone();
+                        let target_node = server_clone
+                            .router()
+                            .select_node_for_new_session(
+                                Some((0.0, 0.0, 5.0)),
+                                Some(&default_node_addr),
+                            )
+                            .unwrap_or_else(|| default_node_addr.clone());
 
                         // Register initial session routing to default node
                         let _ = server_clone.register_session_fallback(session_id, target_node);

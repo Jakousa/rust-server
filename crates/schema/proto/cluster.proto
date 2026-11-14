@@ -38,10 +38,17 @@ message HeartbeatRequest {
   Vector3 entity_centroid = 8;
 }
 
+message PartitionAssignment {
+  BoundingBox bounds = 1;
+  uint32 node_id = 2;
+  string node_address = 3;
+}
+
 message HeartbeatResponse {
   bool acknowledged = 1;
   bool should_split = 2;
   uint64 topology_epoch = 3;
+  repeated PartitionAssignment partitions = 4;
 }
 
 message SplitReportRequest {
@@ -55,6 +62,8 @@ message SplitReportResponse {
   bool acknowledged = 1;
   repeated uint32 assigned_node_ids = 2;
   uint64 topology_epoch = 3;
+  repeated string assigned_node_addresses = 4;
+  repeated PartitionAssignment partitions = 5;
 }
 
 message DeregisterNodeRequest {
@@ -293,6 +302,8 @@ message GatewayHeartbeatRequest {
 message GatewayHeartbeatResponse {
   bool acknowledged = 1;
   bool should_drain = 2;
+  uint64 topology_epoch = 3;
+  repeated PartitionAssignment partitions = 4;
 }
 
 message DeregisterGatewayRequest {
