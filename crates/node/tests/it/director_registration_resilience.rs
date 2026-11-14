@@ -7,10 +7,14 @@ use tokio::sync::{oneshot, RwLock};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
+use mmo_core::guid::{EntityType, Guid};
 use mmo_core::{BoundingBox3D, TelemetryServer};
 use mmo_director::coordinator::GlobalOctreeCoordinator;
 use mmo_director::registry::NodeRegistry;
 use mmo_director::service::DirectorServiceImpl;
+use mmo_gateway::router::SessionRouter;
+use mmo_gateway::server::{GatewayServer, GatewayServiceServer};
+use mmo_node::network::NodeServiceImpl;
 use mmo_node::runner::{run_director_registration_and_heartbeat_loop, DirectorHeartbeatConfig};
 use mmo_node::sim::TickSimulation;
 use mmo_schema::cluster::director_service_server::DirectorServiceServer;
@@ -328,6 +332,7 @@ impl mmo_schema::cluster::director_service_server::DirectorService for Telemetry
                 acknowledged: true,
                 should_split,
                 topology_epoch: 1,
+                partitions: Vec::new(),
             },
         ))
     }
@@ -344,6 +349,8 @@ impl mmo_schema::cluster::director_service_server::DirectorService for Telemetry
                 acknowledged: true,
                 assigned_node_ids: vec![nid, 99, 99, 99, 99, 99, 99, 99],
                 topology_epoch: 2,
+                assigned_node_addresses: Vec::new(),
+                partitions: Vec::new(),
             },
         ))
     }
@@ -536,4 +543,506 @@ async fn test_heartbeat_reports_real_telemetry_and_updates_current_bounds_on_spl
     node_handle.abort();
     let _ = shutdown_tx.send(());
     let _ = dir_handle.await;
+}
+
+async fn spawn_node_grpc_on(
+    node_id: u16,
+    bounds: BoundingBox3D,
+    gateway_grpc_addr: SocketAddr,
+) -> (
+    Arc<RwLock<TickSimulation>>,
+    SocketAddr,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut tick_sim = TickSimulation::new(node_id, bounds);
+    tick_sim.gateway_grpc_addr = format!("http://{gateway_grpc_addr}");
+    let input_tx = tick_sim.input_sender();
+    let ghost_store = tick_sim.ghost_store.clone();
+    let sim = Arc::new(RwLock::new(tick_sim));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = NodeServiceImpl::new(Arc::clone(&sim), input_tx, ghost_store);
+    let incoming = TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(service.into_server())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    (sim, addr, handle)
+}
+
+struct SplitClusterFixture {
+    registry: Arc<RwLock<NodeRegistry>>,
+    director_service: DirectorServiceImpl,
+    router: Arc<SessionRouter>,
+    gateway_server: Arc<GatewayServer>,
+    node1_sim: Arc<RwLock<TickSimulation>>,
+    node2_sim: Arc<RwLock<TickSimulation>>,
+    node1_addr: SocketAddr,
+    node2_addr: SocketAddr,
+    spawned_players: Vec<(Guid, u64, (f32, f32, f32))>,
+    dir_shutdown_tx: oneshot::Sender<()>,
+    dir_handle: tokio::task::JoinHandle<()>,
+    gw_grpc_handle: tokio::task::JoinHandle<()>,
+    gw_hb_handle: tokio::task::JoinHandle<()>,
+    node1_grpc_handle: tokio::task::JoinHandle<()>,
+    node2_grpc_handle: tokio::task::JoinHandle<()>,
+    node1_hb_handle: tokio::task::JoinHandle<()>,
+    node2_hb_handle: tokio::task::JoinHandle<()>,
+}
+
+impl SplitClusterFixture {
+    async fn start_and_split() -> Self {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        // 1. Start real DirectorServiceImpl on ephemeral port
+        let dir_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let director_addr = dir_listener.local_addr().unwrap();
+        let (registry, director_service, dir_shutdown_tx, dir_handle) =
+            spawn_director_on(dir_listener, bounds).await;
+
+        // 2. Start real GatewayServer gRPC service & heartbeat loop
+        let router = Arc::new(SessionRouter::new());
+        let gateway_server = Arc::new(
+            GatewayServer::new(Arc::clone(&router)).with_default_node_address("127.0.0.1:59999"),
+        );
+        let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_grpc_addr = gw_listener.local_addr().unwrap();
+        let gw_service = gateway_server.create_service();
+        let gw_incoming = TcpListenerStream::new(gw_listener);
+        let gw_grpc_handle = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(GatewayServiceServer::new(gw_service))
+                .serve_with_incoming(gw_incoming)
+                .await;
+        });
+
+        let gw_hb_handle = GatewayServer::spawn_heartbeat_loop_with_router(
+            format!("http://{director_addr}"),
+            "gw-e2e-split".to_string(),
+            "us-east".to_string(),
+            "127.0.0.1:8080".to_string(),
+            gw_grpc_addr.to_string(),
+            "127.0.0.1:8081".to_string(),
+            1000,
+            gateway_server.session_sinks(),
+            Some(Arc::clone(&router)),
+        );
+
+        // 3. Start Node 1 and Node 2 gRPC servers
+        let (node1_sim, node1_addr, node1_grpc_handle) =
+            spawn_node_grpc_on(1, bounds, gw_grpc_addr).await;
+        let (node2_sim, node2_addr, node2_grpc_handle) =
+            spawn_node_grpc_on(2, bounds, gw_grpc_addr).await;
+
+        // 4. Register Node 1 first and wait until it owns the root partition
+        let telemetry1 = TelemetryServer::init().unwrap();
+        let (fenced_tx1, _fenced_rx1) = tokio::sync::mpsc::channel::<String>(1);
+        let cfg1 = DirectorHeartbeatConfig {
+            node_id: 1,
+            listen_addr: node1_addr,
+            bounds,
+            director_endpoint: format!("http://{director_addr}"),
+            retry_interval: Duration::from_millis(30),
+            heartbeat_interval: Duration::from_millis(40),
+            rpc_timeout: Duration::from_millis(500),
+            lease_timeout: None,
+        };
+        let node1_hb_handle = tokio::spawn(run_director_registration_and_heartbeat_loop(
+            cfg1,
+            Arc::clone(&node1_sim),
+            telemetry1,
+            fenced_tx1,
+        ));
+
+        let reg_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while registry.read().await.get_node(1).is_none() {
+            assert!(
+                tokio::time::Instant::now() < reg_deadline,
+                "Node 1 failed to register with Director"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            director_service
+                .coordinator
+                .read()
+                .await
+                .get_assigned_bounds_for_node(1),
+            vec![bounds]
+        );
+
+        // 5. Start Node 2 with identical world bounds and assert Node 1 retains root ownership
+        let telemetry2 = TelemetryServer::init().unwrap();
+        let (fenced_tx2, _fenced_rx2) = tokio::sync::mpsc::channel::<String>(1);
+        let cfg2 = DirectorHeartbeatConfig {
+            node_id: 2,
+            listen_addr: node2_addr,
+            bounds,
+            director_endpoint: format!("http://{director_addr}"),
+            retry_interval: Duration::from_millis(30),
+            heartbeat_interval: Duration::from_millis(40),
+            rpc_timeout: Duration::from_millis(500),
+            lease_timeout: None,
+        };
+        let node2_hb_handle = tokio::spawn(run_director_registration_and_heartbeat_loop(
+            cfg2,
+            Arc::clone(&node2_sim),
+            telemetry2,
+            fenced_tx2,
+        ));
+
+        let reg2_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while registry.read().await.get_node(2).is_none() {
+            assert!(
+                tokio::time::Instant::now() < reg2_deadline,
+                "Node 2 failed to register with Director"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        {
+            let coord = director_service.coordinator.read().await;
+            assert_eq!(coord.topology_epoch(), 1);
+            assert_eq!(coord.get_assigned_bounds_for_node(1), vec![bounds]);
+            assert!(coord.get_assigned_bounds_for_node(2).is_empty());
+        }
+
+        // 6. Spawn 64 movable player entities across all 8 octant centers on Node 1
+        let octants = bounds.subdivide();
+        let mut spawned_players = Vec::with_capacity(64);
+        {
+            let mut sim1 = node1_sim.write().await;
+            for (octant_idx, octant_bounds) in octants.iter().enumerate() {
+                let center = octant_bounds.center();
+                for k in 0..8usize {
+                    let idx = (octant_idx * 8 + k) as u32;
+                    let guid = Guid::new(EntityType::Player, 1, idx + 1);
+                    let session_id = 1000 + u64::from(idx);
+                    assert!(sim1.spawn_entity(guid, center));
+                    sim1.register_aoi_observer(session_id, guid, Default::default());
+                    router.register_session(session_id, guid, node1_addr.to_string());
+                    spawned_players.push((guid, session_id, center));
+                }
+            }
+        }
+
+        // 7. Wait for split (epoch == 2), batch migration, partition sync on both nodes, and gateway routes
+        let split_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let epoch = director_service.coordinator.read().await.topology_epoch();
+            let (n1_cnt, n1_owned, n1_peers) = {
+                let s = node1_sim.read().await;
+                (
+                    s.entity_store.count(),
+                    s.owned_bounds.len(),
+                    s.peer_partitions.len(),
+                )
+            };
+            let (n2_cnt, n2_owned, n2_peers) = {
+                let s = node2_sim.read().await;
+                (
+                    s.entity_store.count(),
+                    s.owned_bounds.len(),
+                    s.peer_partitions.len(),
+                )
+            };
+            let routes_settled = {
+                let reg = registry.read().await;
+                let coord = director_service.coordinator.read().await;
+                let parts = coord.collect_partitions(&reg);
+                parts.len() == 8
+                    && spawned_players.iter().all(|(guid, _, pos)| {
+                        parts
+                            .iter()
+                            .find(|(b, _, _)| b.contains(*pos))
+                            .and_then(|(_, nid, _)| {
+                                let expected = if *nid == 1 {
+                                    node1_addr.to_string()
+                                } else {
+                                    node2_addr.to_string()
+                                };
+                                router.get_route_by_guid(*guid).map(|r| r == expected)
+                            })
+                            .unwrap_or(false)
+                    })
+            };
+
+            if epoch == 2
+                && n1_cnt == 32
+                && n2_cnt == 32
+                && n1_owned == 4
+                && n1_peers == 4
+                && n2_owned == 4
+                && n2_peers == 4
+                && routes_settled
+            {
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < split_deadline,
+                "timed out waiting for split and migration to settle: epoch={epoch}, n1=({n1_cnt},{n1_owned},{n1_peers}), n2=({n2_cnt},{n2_owned},{n2_peers}), routes_settled={routes_settled}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        Self {
+            registry,
+            director_service,
+            router,
+            gateway_server,
+            node1_sim,
+            node2_sim,
+            node1_addr,
+            node2_addr,
+            spawned_players,
+            dir_shutdown_tx,
+            dir_handle,
+            gw_grpc_handle,
+            gw_hb_handle,
+            node1_grpc_handle,
+            node2_grpc_handle,
+            node1_hb_handle,
+            node2_hb_handle,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.node1_hb_handle.abort();
+        self.node2_hb_handle.abort();
+        self.gw_hb_handle.abort();
+        self.node1_grpc_handle.abort();
+        self.node2_grpc_handle.abort();
+        self.gw_grpc_handle.abort();
+        let _ = self.dir_shutdown_tx.send(());
+        let _ = self.dir_handle.await;
+    }
+}
+
+#[tokio::test]
+async fn test_multi_node_split_migrates_entities_and_prevents_split_loop() {
+    let fixture = SplitClusterFixture::start_and_split().await;
+    let node1_str = fixture.node1_addr.to_string();
+    let node2_str = fixture.node2_addr.to_string();
+
+    let partitions = {
+        let reg = fixture.registry.read().await;
+        let coord = fixture.director_service.coordinator.read().await;
+        assert_eq!(coord.topology_epoch(), 2);
+        coord.collect_partitions(&reg)
+    };
+    assert_eq!(partitions.len(), 8);
+    assert_eq!(partitions.iter().filter(|(_, nid, _)| *nid == 1).count(), 4);
+    assert_eq!(partitions.iter().filter(|(_, nid, _)| *nid == 2).count(), 4);
+
+    // Verify exact entity ownership and Gateway routes with zero duplicates or losses
+    let s1 = fixture.node1_sim.read().await;
+    let s2 = fixture.node2_sim.read().await;
+    assert_eq!(s1.entity_store.count(), 32);
+    assert_eq!(s2.entity_store.count(), 32);
+
+    let mut migrated_count = 0usize;
+    let mut retained_count = 0usize;
+    for (guid, session_id, pos) in &fixture.spawned_players {
+        let (_, owner_id, _) = partitions
+            .iter()
+            .find(|(b, _, _)| b.contains(*pos))
+            .expect("spawned entity position covered by partition");
+        if *owner_id == 2 {
+            migrated_count += 1;
+            assert!(
+                s2.entity_store.contains_guid(*guid),
+                "migrated entity {guid:?} missing from Node 2"
+            );
+            assert!(
+                !s1.entity_store.contains_guid(*guid),
+                "migrated entity {guid:?} still present on Node 1"
+            );
+            assert_eq!(s2.aoi.get_session_by_guid(*guid), Some(*session_id));
+            assert_eq!(
+                fixture.router.get_route_by_guid(*guid).as_deref(),
+                Some(node2_str.as_str())
+            );
+            assert_eq!(
+                fixture.router.get_route_by_session(*session_id).as_deref(),
+                Some(node2_str.as_str())
+            );
+        } else {
+            retained_count += 1;
+            assert_eq!(*owner_id, 1);
+            assert!(
+                s1.entity_store.contains_guid(*guid),
+                "retained entity {guid:?} missing from Node 1"
+            );
+            assert!(
+                !s2.entity_store.contains_guid(*guid),
+                "retained entity {guid:?} duplicated on Node 2"
+            );
+            assert_eq!(s1.aoi.get_session_by_guid(*guid), Some(*session_id));
+            assert_eq!(
+                fixture.router.get_route_by_guid(*guid).as_deref(),
+                Some(node1_str.as_str())
+            );
+            assert_eq!(
+                fixture.router.get_route_by_session(*session_id).as_deref(),
+                Some(node1_str.as_str())
+            );
+        }
+    }
+    assert_eq!(migrated_count, 32);
+    assert_eq!(retained_count, 32);
+    drop(s1);
+    drop(s2);
+
+    // Continue heartbeating for > 5 more intervals (40ms each) and verify no split loop
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        fixture
+            .director_service
+            .coordinator
+            .read()
+            .await
+            .topology_epoch(),
+        2
+    );
+    assert_eq!(fixture.node1_sim.read().await.entity_store.count(), 32);
+    assert_eq!(fixture.node2_sim.read().await.entity_store.count(), 32);
+
+    // Verify Gateway heartbeat syncs topology_epoch == 2 and all 8 partitions,
+    // and resolve_initial_node balances new sessions across Node 1 and Node 2
+    let gw_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while fixture.router.topology_epoch() < 2 || fixture.router.get_topology_partitions().len() != 8
+    {
+        assert!(
+            tokio::time::Instant::now() < gw_deadline,
+            "Gateway heartbeat did not receive split topology partitions in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let p1 = fixture
+        .gateway_server
+        .resolve_initial_node(Guid::new(EntityType::Player, 1, 9001))
+        .await
+        .unwrap();
+    let p2 = fixture
+        .gateway_server
+        .resolve_initial_node(Guid::new(EntityType::Player, 1, 9002))
+        .await
+        .unwrap();
+    let picks: std::collections::HashSet<String> = [p1, p2].into_iter().collect();
+    assert_eq!(picks, [node1_str, node2_str].into_iter().collect());
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_boundary_crossing_after_split_migrates_entity() {
+    let fixture = SplitClusterFixture::start_and_split().await;
+    let node2_str = fixture.node2_addr.to_string();
+
+    // Octant 0 is always retained by Node 1 (x in -100..0), and Octant 1 is assigned to Node 2 (x in 0..100).
+    let (mover_guid, mover_session, _) = fixture.spawned_players[0];
+    assert!(fixture
+        .node1_sim
+        .read()
+        .await
+        .entity_store
+        .contains_guid(mover_guid));
+
+    // 1. Move just across X=0 within hysteresis margin (0.5 < 1.0) -> stays on Node 1
+    {
+        let mut s1 = fixture.node1_sim.write().await;
+        let old_pos = s1.entity_store.get_by_guid(mover_guid).unwrap().position;
+        let within_margin = (0.5, -50.0, -50.0);
+        s1.entity_store
+            .get_mut_by_guid(mover_guid)
+            .unwrap()
+            .position = within_margin;
+        s1.octree.remove(mover_guid, old_pos);
+        s1.octree.insert(mover_guid, within_margin);
+        s1.step_tick();
+        assert!(
+            !s1.pending_migrations.contains(&mover_guid),
+            "entity inside hysteresis margin must not trigger boundary migration"
+        );
+    }
+
+    // 2. Move beyond hysteresis margin into Node 2's Octant 1 (1.5 >= 1.0) and step tick
+    let across_boundary = (1.5, -50.0, -50.0);
+    {
+        let mut s1 = fixture.node1_sim.write().await;
+        let old_pos = s1.entity_store.get_by_guid(mover_guid).unwrap().position;
+        s1.entity_store
+            .get_mut_by_guid(mover_guid)
+            .unwrap()
+            .position = across_boundary;
+        s1.octree.remove(mover_guid, old_pos);
+        s1.octree.insert(mover_guid, across_boundary);
+        s1.step_tick();
+        assert!(
+            s1.pending_migrations.contains(&mover_guid),
+            "entity crossing boundary beyond hysteresis margin must queue for migration"
+        );
+    }
+
+    // 3. Wait for Node 1 heartbeat loop to flush pending boundary migration to Node 2 and Gateway
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let on_node2 = fixture
+            .node2_sim
+            .read()
+            .await
+            .entity_store
+            .contains_guid(mover_guid);
+        let off_node1 = !fixture
+            .node1_sim
+            .read()
+            .await
+            .entity_store
+            .contains_guid(mover_guid);
+        let gw_updated =
+            fixture.router.get_route_by_guid(mover_guid).as_deref() == Some(node2_str.as_str());
+        if on_node2 && off_node1 && gw_updated {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for boundary crossing migration (on_node2={on_node2}, off_node1={off_node1}, gw_updated={gw_updated})"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    {
+        let s1 = fixture.node1_sim.read().await;
+        let s2 = fixture.node2_sim.read().await;
+        assert_eq!(s1.entity_store.count(), 31);
+        assert_eq!(s2.entity_store.count(), 33);
+        assert_eq!(
+            s2.entity_store.get_by_guid(mover_guid).unwrap().position,
+            across_boundary
+        );
+        assert_eq!(s2.aoi.get_session_by_guid(mover_guid), Some(mover_session));
+    }
+    assert_eq!(
+        fixture
+            .router
+            .get_route_by_session(mover_session)
+            .as_deref(),
+        Some(node2_str.as_str())
+    );
+    assert_eq!(
+        fixture
+            .director_service
+            .coordinator
+            .read()
+            .await
+            .topology_epoch(),
+        2
+    );
+
+    fixture.shutdown().await;
 }

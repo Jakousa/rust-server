@@ -32,7 +32,7 @@ pub use quic::{
     create_quic_server, generate_self_signed_cert, make_insecure_client_config, make_server_config,
     QuicClientSession, QuicTransportError,
 };
-pub use router::SessionRouter;
+pub use router::{PartitionRoute, SessionRouter};
 pub use server::{
     extract_acting_guid, GatewayError, GatewayServer, GatewayServiceImpl, PacketDispatcher,
     RoutedPacket,

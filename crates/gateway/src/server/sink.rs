@@ -100,9 +100,10 @@ pub fn handle_unauthenticated_auth_request(
     intercept_handler: Option<&GatewayInterceptHandler>,
 ) -> ClientPacket {
     let default_guid = Guid::new(EntityType::Player, 1, (session_id & 0xFFFF_FFFF) as u32);
-    let assigned_node = default_node_address
-        .unwrap_or("127.0.0.1:50052")
-        .to_string();
+    let assigned_node = router
+        .get_route_by_session(session_id)
+        .or_else(|| router.select_node_for_new_session(Some((0.0, 0.0, 5.0)), default_node_address))
+        .unwrap_or_else(|| "127.0.0.1:50052".to_string());
     router.register_session(session_id, default_guid, assigned_node.clone());
     if let Some(handler) = intercept_handler {
         let _ = handler

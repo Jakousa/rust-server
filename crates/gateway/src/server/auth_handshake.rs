@@ -44,8 +44,8 @@ pub async fn resolve_initial_node(
         }
     }
 
-    if let Some(default_addr) = default_node {
-        return Ok(default_addr.to_string());
+    if let Some(addr) = router.select_node_for_new_session(Some((0.0, 0.0, 5.0)), default_node) {
+        return Ok(addr);
     }
 
     Err(GatewayError::NoRouteFound {

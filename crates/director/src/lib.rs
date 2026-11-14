@@ -10,8 +10,9 @@ pub mod registry;
 pub mod service;
 
 pub use coordinator::{
-    subdivide_bounds, GlobalOctreeCoordinator, GlobalOctreeNode, NodeSmoothingContext,
-    PartitionRecoveryEvent, DEFAULT_MERGE_THRESHOLD, DEFAULT_SPLIT_THRESHOLD, DEFAULT_WORLD_BOUNDS,
+    fallback_node_addr, subdivide_bounds, GlobalOctreeCoordinator, GlobalOctreeNode,
+    NodeSmoothingContext, PartitionRecoveryEvent, DEFAULT_MERGE_THRESHOLD, DEFAULT_SPLIT_THRESHOLD,
+    DEFAULT_WORLD_BOUNDS, MIN_SPLIT_EXTENT,
 };
 pub use federation::{FederationError, RealmFederationAuthority, RealmTransferClaim};
 pub use instance::{validate_instance_bounds, InstanceDescriptor, InstanceError, InstanceRegistry};

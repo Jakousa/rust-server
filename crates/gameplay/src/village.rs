@@ -772,8 +772,9 @@ impl GameplayPlugin for VillagePlugin {
     }
 }
 
-/// Bootstraps the village world by installing plugins and placing structures and NPCs.
-pub fn bootstrap_village_world(sim: &mut mmo_node::TickSimulation) {
+/// Installs village gameplay plugins, default spawn position, and static/interactive structures
+/// without spawning the singleton villager NPCs (which originate on node 1 and migrate dynamically).
+pub fn bootstrap_village_plugins_and_structures(sim: &mut mmo_node::TickSimulation) {
     // Place default player spawn in the open cobblestone plaza south of the Village Well
     sim.set_default_spawn_position((0.0, 0.0, 5.0));
 
@@ -837,6 +838,11 @@ pub fn bootstrap_village_world(sim: &mut mmo_node::TickSimulation) {
         );
         sim.insert_world_object(obj);
     }
+}
+
+/// Bootstraps the full village world by installing plugins, structures, and spawning villager NPCs.
+pub fn bootstrap_village_world(sim: &mut mmo_node::TickSimulation) {
+    bootstrap_village_plugins_and_structures(sim);
 
     // 3. Spawn Villager NPCs
     // NPC 1: Blacksmith Ilmari (Guid::new(EntityType::Npc, sim.node_id, 1)) at (-9.0, 0.0, -6.0)
@@ -1661,5 +1667,26 @@ mod tests {
             .handle(p1, 3, &far_trade, &mut sim.entity_store)
             .unwrap_err();
         assert!(matches!(err, PacketHandlerError::Custom(msg) if msg.contains("far apart")));
+    }
+
+    #[test]
+    fn test_bootstrap_village_plugins_and_structures_vs_full_world() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let mut secondary = TickSimulation::new(2, bounds);
+        bootstrap_village_plugins_and_structures(&mut secondary);
+        assert_eq!(secondary.default_spawn_position, (0.0, 0.0, 5.0));
+        assert_eq!(secondary.entity_store.count(), 0);
+        assert!(!secondary.sectors.query_aabb(&bounds).is_empty());
+        assert!(!secondary.tick_systems.is_empty());
+
+        let mut primary = TickSimulation::new(1, bounds);
+        bootstrap_village_world(&mut primary);
+        assert_eq!(primary.default_spawn_position, (0.0, 0.0, 5.0));
+        assert_eq!(primary.entity_store.count(), 3);
+        assert_eq!(
+            primary.sectors.query_aabb(&bounds).len(),
+            secondary.sectors.query_aabb(&bounds).len()
+        );
     }
 }

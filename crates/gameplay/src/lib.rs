@@ -62,8 +62,8 @@ pub use spawner::{
 pub use threat::{ThreatEntry, ThreatPlugin, ThreatSystem, ThreatTableComponent};
 pub use trade::{TradeCompletedEvent, TradeManager, TradeOffer, TradePlugin, TradeSession};
 pub use village::{
-    bootstrap_village_world, build_state_response, build_trade_session_view, BarterRecipe,
-    InspectRequest, NpcBarterRequest, PlayerStarterKitHook, PlayerTradeOfferRequest,
-    PlayerTradeSessionRequest, PlayerTradeStartRequest, TradeSessionView, VillagePlugin,
-    VillageTradePacketHandler, VillageTradeStateResponse, VillagerMerchantComponent,
+    bootstrap_village_plugins_and_structures, bootstrap_village_world, build_state_response,
+    build_trade_session_view, BarterRecipe, InspectRequest, NpcBarterRequest, PlayerStarterKitHook,
+    PlayerTradeOfferRequest, PlayerTradeSessionRequest, PlayerTradeStartRequest, TradeSessionView,
+    VillagePlugin, VillageTradePacketHandler, VillageTradeStateResponse, VillagerMerchantComponent,
 };

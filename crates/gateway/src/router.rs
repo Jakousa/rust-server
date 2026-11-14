@@ -4,8 +4,33 @@
 //! to authoritative simulation node network addresses (`String`), facilitating
 //! dynamic, seamless packet forwarding and boundary handovers with lock-free sharded concurrency.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::RwLock;
+
 use dashmap::DashMap;
 use mmo_core::guid::Guid;
+use mmo_core::BoundingBox3D;
+
+/// Spatial partition route mapping a 3D bounding box to an authoritative simulation node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionRoute {
+    pub bounds: BoundingBox3D,
+    pub node_id: u32,
+    pub node_address: String,
+}
+
+fn collect_unique_addresses<'a>(
+    partitions: impl Iterator<Item = &'a PartitionRoute>,
+) -> Vec<String> {
+    let mut unique = Vec::new();
+    for partition in partitions {
+        let trimmed = partition.node_address.trim();
+        if !trimmed.is_empty() && !unique.iter().any(|addr: &String| addr == trimmed) {
+            unique.push(trimmed.to_string());
+        }
+    }
+    unique
+}
 
 /// Concurrent session routing table mapping sessions and player GUIDs to authoritative node addresses.
 ///
@@ -23,6 +48,12 @@ pub struct SessionRouter {
     session_to_node: DashMap<u64, String>,
     /// Maps client session ID to authoritative session epoch.
     session_to_epoch: DashMap<u64, u64>,
+    /// Authoritative cluster spatial partitions synchronized from the Director.
+    partitions: RwLock<Vec<PartitionRoute>>,
+    /// Latest topology epoch observed from the Director.
+    topology_epoch: AtomicU64,
+    /// Round-robin cursor across active/boundary-sharing simulation nodes.
+    next_node_rr: AtomicUsize,
 }
 
 impl Clone for SessionRouter {
@@ -47,6 +78,19 @@ impl Clone for SessionRouter {
         for item in self.session_to_epoch.iter() {
             router.session_to_epoch.insert(*item.key(), *item.value());
         }
+        let partitions = self
+            .partitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *router.partitions.write().unwrap_or_else(|e| e.into_inner()) = partitions;
+        router.topology_epoch.store(
+            self.topology_epoch.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        router
+            .next_node_rr
+            .store(self.next_node_rr.load(Ordering::Relaxed), Ordering::Relaxed);
         router
     }
 }
@@ -56,12 +100,19 @@ impl PartialEq for SessionRouter {
         if self.session_count() != other.session_count() {
             return false;
         }
+        if self.topology_epoch.load(Ordering::Relaxed)
+            != other.topology_epoch.load(Ordering::Relaxed)
+        {
+            return false;
+        }
         for item in self.session_to_guid.iter() {
             if other.session_to_guid.get(item.key()).map(|r| *r.value()) != Some(*item.value()) {
                 return false;
             }
         }
-        true
+        let self_parts = self.partitions.read().unwrap_or_else(|e| e.into_inner());
+        let other_parts = other.partitions.read().unwrap_or_else(|e| e.into_inner());
+        *self_parts == *other_parts
     }
 }
 
@@ -274,6 +325,81 @@ impl SessionRouter {
         self.session_to_guid.clear();
         self.guid_to_session.clear();
         self.session_to_epoch.clear();
+    }
+
+    /// Replaces the cached spatial partition map and updates the observed topology epoch.
+    ///
+    /// Updates unconditionally to support Director restarts where `topology_epoch` may reset.
+    pub fn update_topology_partitions(&self, epoch: u64, partitions: Vec<PartitionRoute>) {
+        let mut guard = self.partitions.write().unwrap_or_else(|e| e.into_inner());
+        if *guard != partitions {
+            *guard = partitions;
+        }
+        self.topology_epoch.store(epoch, Ordering::Release);
+    }
+
+    /// Returns a snapshot of the cached spatial partition routes.
+    pub fn get_topology_partitions(&self) -> Vec<PartitionRoute> {
+        self.partitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Returns the latest topology epoch synchronized from the Director.
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Acquire)
+    }
+
+    /// Resolves the first non-empty node address whose partition bounding box contains `pos`.
+    pub fn resolve_node_for_position(&self, pos: (f32, f32, f32)) -> Option<String> {
+        let partitions = self.partitions.read().unwrap_or_else(|e| e.into_inner());
+        partitions.iter().find_map(|p| {
+            if p.bounds.contains(pos) {
+                let trimmed = p.node_address.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            None
+        })
+    }
+
+    /// Selects an authoritative node address for a new client session.
+    ///
+    /// - When `spawn_pos` falls inside one or more partitions: returns the sole owning node
+    ///   deterministically, or round-robins across unique owning nodes when `spawn_pos` lies on
+    ///   a shared boundary seam.
+    /// - Otherwise, round-robins across all unique active partition nodes if any exist.
+    /// - Falls back to `default_node` when no valid partition routes are cached.
+    pub fn select_node_for_new_session(
+        &self,
+        spawn_pos: Option<(f32, f32, f32)>,
+        default_node: Option<&str>,
+    ) -> Option<String> {
+        let partitions = self.partitions.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = spawn_pos {
+            let matching =
+                collect_unique_addresses(partitions.iter().filter(|p| p.bounds.contains(pos)));
+            if matching.len() == 1 {
+                return matching.into_iter().next();
+            }
+            if !matching.is_empty() {
+                let idx = self.next_node_rr.fetch_add(1, Ordering::Relaxed) % matching.len();
+                return Some(matching[idx].clone());
+            }
+        }
+
+        let unique = collect_unique_addresses(partitions.iter());
+        if unique.len() == 1 {
+            return unique.into_iter().next();
+        }
+        if !unique.is_empty() {
+            let idx = self.next_node_rr.fetch_add(1, Ordering::Relaxed) % unique.len();
+            return Some(unique[idx].clone());
+        }
+
+        default_node.map(str::to_string)
     }
 }
 
@@ -518,5 +644,175 @@ mod tests {
         // Old guid2 no longer points to session 40
         assert_eq!(router.get_session_by_guid(guid2), None);
         assert_eq!(router.get_route_by_guid(guid2), None);
+    }
+
+    #[test]
+    fn test_topology_partition_update_and_position_lookup() {
+        let router = SessionRouter::new();
+        assert_eq!(router.topology_epoch(), 0);
+        assert!(router.get_topology_partitions().is_empty());
+        assert_eq!(router.resolve_node_for_position((0.0, 0.0, 0.0)), None);
+
+        let world = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let octants = world.subdivide();
+        let partitions: Vec<PartitionRoute> = octants
+            .into_iter()
+            .enumerate()
+            .map(|(idx, bounds)| {
+                let (node_id, node_address) = if idx % 2 == 0 {
+                    (1, " 127.0.0.1:50051 ".to_string())
+                } else {
+                    (2, "127.0.0.1:50052".to_string())
+                };
+                PartitionRoute {
+                    bounds,
+                    node_id,
+                    node_address,
+                }
+            })
+            .collect();
+
+        router.update_topology_partitions(2, partitions.clone());
+        assert_eq!(router.topology_epoch(), 2);
+        assert_eq!(router.get_topology_partitions(), partitions);
+
+        // Octant 0 interior -> Node 1 (trimmed)
+        assert_eq!(
+            router.resolve_node_for_position((-50.0, -50.0, -50.0)),
+            Some("127.0.0.1:50051".to_string())
+        );
+        // Octant 1 interior -> Node 2
+        assert_eq!(
+            router.resolve_node_for_position((50.0, -50.0, -50.0)),
+            Some("127.0.0.1:50052".to_string())
+        );
+        // Outside world bounds -> None
+        assert_eq!(router.resolve_node_for_position((250.0, 0.0, 0.0)), None);
+
+        // Epoch reset (e.g. Director restart) updates cleanly
+        router.update_topology_partitions(
+            1,
+            vec![PartitionRoute {
+                bounds: world,
+                node_id: 3,
+                node_address: "127.0.0.1:50053".to_string(),
+            }],
+        );
+        assert_eq!(router.topology_epoch(), 1);
+        assert_eq!(
+            router.resolve_node_for_position((50.0, -50.0, -50.0)),
+            Some("127.0.0.1:50053".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_node_for_new_session_fallback_seam_and_round_robin() {
+        let router = SessionRouter::new();
+
+        // 1. Empty partitions -> falls back to default_node
+        assert_eq!(
+            router.select_node_for_new_session(Some((0.0, 0.0, 5.0)), Some("default:50052")),
+            Some("default:50052".to_string())
+        );
+        assert_eq!(
+            router.select_node_for_new_session(Some((0.0, 0.0, 5.0)), None),
+            None
+        );
+
+        // 2. Populated octants: octants 0,2,4,6 -> node1, octants 1,3,5,7 -> node2
+        let world = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let partitions: Vec<PartitionRoute> = world
+            .subdivide()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, bounds)| PartitionRoute {
+                bounds,
+                node_id: if idx % 2 == 0 { 1 } else { 2 },
+                node_address: if idx % 2 == 0 {
+                    "node1:50051".to_string()
+                } else {
+                    "node2:50052".to_string()
+                },
+            })
+            .collect();
+        router.update_topology_partitions(2, partitions);
+
+        // Interior points deterministically select their exact owner
+        for _ in 0..4 {
+            assert_eq!(
+                router.select_node_for_new_session(
+                    Some((-50.0, -50.0, -50.0)),
+                    Some("default:50052")
+                ),
+                Some("node1:50051".to_string())
+            );
+            assert_eq!(
+                router
+                    .select_node_for_new_session(Some((50.0, -50.0, -50.0)), Some("default:50052")),
+                Some("node2:50052".to_string())
+            );
+        }
+
+        // Octant boundary seam (0.0, 0.0, 5.0) is shared by octants 4,5,6,7 (both node1 and node2)
+        let seam_picks: Vec<Option<String>> = (0..4)
+            .map(|_| {
+                router.select_node_for_new_session(Some((0.0, 0.0, 5.0)), Some("default:50052"))
+            })
+            .collect();
+        assert_eq!(
+            seam_picks,
+            vec![
+                Some("node1:50051".to_string()),
+                Some("node2:50052".to_string()),
+                Some("node1:50051".to_string()),
+                Some("node2:50052".to_string()),
+            ]
+        );
+
+        // None spawn_pos (and out-of-bounds spawn_pos) round-robins across unique active nodes
+        let rr_none: Vec<Option<String>> = (0..4)
+            .map(|_| router.select_node_for_new_session(None, Some("default:50052")))
+            .collect();
+        assert_eq!(
+            rr_none,
+            vec![
+                Some("node1:50051".to_string()),
+                Some("node2:50052".to_string()),
+                Some("node1:50051".to_string()),
+                Some("node2:50052".to_string()),
+            ]
+        );
+
+        let rr_oob = router.select_node_for_new_session(Some((999.0, 0.0, 0.0)), None);
+        assert_eq!(rr_oob, Some("node1:50051".to_string()));
+        let rr_oob2 = router.select_node_for_new_session(Some((999.0, 0.0, 0.0)), None);
+        assert_eq!(rr_oob2, Some("node2:50052".to_string()));
+    }
+
+    #[test]
+    fn test_router_clone_eq_and_clear_preserves_topology() {
+        let router = SessionRouter::new();
+        let guid = Guid::new(EntityType::Player, 1, 77);
+        router.register_session(10, guid, "node1:50051".to_string());
+        router.update_topology_partitions(
+            3,
+            vec![PartitionRoute {
+                bounds: BoundingBox3D::new((-10.0, -10.0, -10.0), (10.0, 10.0, 10.0)),
+                node_id: 1,
+                node_address: "node1:50051".to_string(),
+            }],
+        );
+
+        let cloned = router.clone();
+        assert_eq!(router, cloned);
+        assert_eq!(cloned.topology_epoch(), 3);
+        assert_eq!(cloned.get_topology_partitions().len(), 1);
+
+        // clear() wipes session mappings while leaving topology partitions intact
+        cloned.clear();
+        assert!(cloned.is_empty());
+        assert_eq!(cloned.topology_epoch(), 3);
+        assert_eq!(cloned.get_topology_partitions().len(), 1);
+        assert_ne!(router, cloned);
     }
 }
