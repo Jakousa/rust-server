@@ -41,3 +41,11 @@ The Edge Gateway SHALL utilize RAII cleanup guards for client connection tasks t
 #### Scenario: Client task cancellation cleanup
 - **WHEN** a client transport task is cancelled or terminates due to error
 - **THEN** the gateway's session drop guard SHALL automatically unregister the session from the routing table and downstream channel registry
+
+### Requirement: Topology-Aware Partition Session Selection
+The Edge Gateway SHALL synchronize spatial partition assignments from `mmo-director` heartbeats and select initial target simulation nodes using active partition topology when available.
+
+#### Scenario: Gateway synchronizes partition assignments from Director heartbeat
+- **GIVEN** `mmo-gateway` is connected to `mmo-director`
+- **WHEN** `GatewayHeartbeatResponse` includes updated `topology_epoch` and `partitions`
+- **THEN** `SessionRouter` SHALL update its internal partition table and route new sessions according to the active partition topology rather than pinning all sessions to a single static default node.
