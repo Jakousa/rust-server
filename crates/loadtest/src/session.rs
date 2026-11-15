@@ -37,6 +37,26 @@ pub enum SessionError {
     AuthTimeout,
 }
 
+/// Maximum tolerable server tick jitter/reordering before treating a backward jump as a route handover.
+pub(crate) const TICK_HANDOVER_JITTER_TOLERANCE: u64 = 4;
+
+/// Updates `last_observed_tick` from an incoming `EntityDeltaBatch.server_tick`.
+///
+/// Returns `true` when a backward tick reset exceeds [`TICK_HANDOVER_JITTER_TOLERANCE`]
+/// (indicating the session migrated to a different simulation node), resetting the cursor to
+/// `server_tick` so subsequent ticks on the destination node do not double-count.
+pub(crate) fn observe_server_tick(last_observed_tick: &mut u64, server_tick: u64) -> bool {
+    if *last_observed_tick > 0
+        && server_tick.saturating_add(TICK_HANDOVER_JITTER_TOLERANCE) < *last_observed_tick
+    {
+        *last_observed_tick = server_tick;
+        true
+    } else {
+        *last_observed_tick = (*last_observed_tick).max(server_tick);
+        false
+    }
+}
+
 /// Active virtual bot session.
 pub struct BotSession {
     pub guid: Guid,
@@ -50,6 +70,8 @@ pub struct BotSession {
     pub snapback_count: u64,
     pub last_observed_tick: u64,
     pub total_bytes_received: u64,
+    pub entity_deltas_received: u64,
+    pub route_handovers_observed: u64,
     pub known_entities: HashMap<u64, Vec3>,
 }
 
@@ -68,6 +90,8 @@ impl BotSession {
             snapback_count: 0,
             last_observed_tick: 0,
             total_bytes_received: 0,
+            entity_deltas_received: 0,
+            route_handovers_observed: 0,
             known_entities: HashMap::new(),
         }
     }
@@ -213,7 +237,10 @@ impl BotSession {
                 self.current_velocity = Vec3::ZERO;
             }
             ClientPacket::EntityDeltaBatch(batch) => {
-                self.last_observed_tick = self.last_observed_tick.max(batch.server_tick);
+                if observe_server_tick(&mut self.last_observed_tick, batch.server_tick) {
+                    self.route_handovers_observed += 1;
+                }
+                self.entity_deltas_received += batch.deltas.len() as u64;
                 for &despawn_id in &batch.despawns {
                     self.known_entities.remove(&despawn_id);
                 }
@@ -462,5 +489,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err2, SessionError::AuthTimeout));
+    }
+
+    #[test]
+    fn test_observe_server_tick_detects_handover_and_ignores_minor_jitter() {
+        let mut cursor = 0;
+        assert!(!observe_server_tick(&mut cursor, 500));
+        assert_eq!(cursor, 500);
+
+        // Minor out-of-order jitter within tolerance (500 -> 496, 496 + 4 == 500) must NOT fire
+        assert!(!observe_server_tick(&mut cursor, 496));
+        assert_eq!(cursor, 500);
+
+        // Significant backward reset (500 -> 120, 120 + 4 < 500) fires once and resets cursor
+        assert!(observe_server_tick(&mut cursor, 120));
+        assert_eq!(cursor, 120);
+
+        // Subsequent ticks on destination node must NOT re-trigger
+        assert!(!observe_server_tick(&mut cursor, 121));
+        assert_eq!(cursor, 121);
     }
 }

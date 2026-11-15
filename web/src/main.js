@@ -259,8 +259,19 @@ export class ClientWorldBridge {
         const baseRes = readVarintU64(view, offset);
         offset += baseRes.bytesRead;
 
-        this.latestServerTick = Number(tickRes.value);
-        this.latestBaselineTick = Number(baseRes.value);
+        const nextServerTick = Number(tickRes.value);
+        const nextBaselineTick = Number(baseRes.value);
+        if (
+          this.latestServerTick > 0 &&
+          nextServerTick > 0 &&
+          (nextServerTick + 4 < this.latestServerTick ||
+            (nextServerTick < this.latestServerTick && nextBaselineTick === 0))
+        ) {
+          this.interpHistory.clear();
+        }
+
+        this.latestServerTick = nextServerTick;
+        this.latestBaselineTick = nextBaselineTick;
 
         if (this.onServerTickCallback) {
           this.onServerTickCallback({
@@ -663,21 +674,27 @@ export class ClientWorldBridge {
       const back = queue[queue.length - 1];
       if (tick > 0 && back.tick > 0) {
         if (tick < back.tick) {
-          const frontTick = queue[0].tick;
-          if (tick <= frontTick || queue.some((s) => s.tick === tick)) {
+          if (back.tick - tick > 4) {
+            const prevBackTs = back.timestampSec;
+            queue.length = 0;
+            effectiveTs = Math.max(timestampSec, prevBackTs + 0.05);
+          } else {
+            const frontTick = queue[0].tick;
+            if (tick <= frontTick || queue.some((s) => s.tick === tick)) {
+              return;
+            }
+            const insertIdx = queue.findIndex((s) => s.tick > tick);
+            const idx = insertIdx === -1 ? queue.length : insertIdx;
+            const prevS = queue[idx - 1];
+            const nextS = queue[idx];
+            const frac = (tick - prevS.tick) / (nextS.tick - prevS.tick);
+            const ts = prevS.timestampSec + frac * (nextS.timestampSec - prevS.timestampSec);
+            queue.splice(idx, 0, { tick, timestampSec: ts, x, y, z, vx, vy, vz, yaw });
+            while (queue.length > this.maxInterpHistory) {
+              queue.shift();
+            }
             return;
           }
-          const insertIdx = queue.findIndex((s) => s.tick > tick);
-          const idx = insertIdx === -1 ? queue.length : insertIdx;
-          const prevS = queue[idx - 1];
-          const nextS = queue[idx];
-          const frac = (tick - prevS.tick) / (nextS.tick - prevS.tick);
-          const ts = prevS.timestampSec + frac * (nextS.timestampSec - prevS.timestampSec);
-          queue.splice(idx, 0, { tick, timestampSec: ts, x, y, z, vx, vy, vz, yaw });
-          while (queue.length > this.maxInterpHistory) {
-            queue.shift();
-          }
-          return;
         } else if (tick === back.tick) {
           return;
         } else {
@@ -1032,7 +1049,12 @@ if (typeof window !== "undefined") {
     hasSyncedInitialPosition = false;
   });
   world.onLocalPlayerKeyframe((state) => {
-    if (!hasSyncedInitialPosition) {
+    const snapError = Math.hypot(
+      controls.position.x - state.x,
+      controls.position.y - state.y,
+      controls.position.z - state.z
+    );
+    if (!hasSyncedInitialPosition || snapError > 10.0) {
       controls.setPosition(state.x, state.y, state.z);
       hasSyncedInitialPosition = true;
     }

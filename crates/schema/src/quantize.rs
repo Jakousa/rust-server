@@ -3,6 +3,17 @@
 //! Provides deterministic mapping between 32-bit floating-point coordinates,
 //! velocities, and Euler rotations to compact discrete integers with sub-centimeter
 //! and sub-degree accuracy.
+//!
+//! # Quantization Scales & Representable Ranges
+//!
+//! | Quantity | Wire Type | Scale / Formula | Resolution | Range / Fallback |
+//! |---|---|---|---|---|
+//! | Position delta (`X/Y/Z`) | `i16` LE | `val * 128.0` ([`DELTA_POS_SCALE`]) | `1/128` m (`≈ 7.8125 mm`) | `[-255.0, +255.0]` m safe ([`MAX_DELTA_POS`]); larger/non-finite deltas trigger keyframe (`MASK_KEYFRAME`) via [`is_teleport_delta`] |
+//! | Velocity (`vx/vy/vz`) | `i16` LE | `val * 100.0` ([`VELOCITY_SCALE`]) | `0.01 m/s` (`1 cm/s`) | `[-327.68, +327.67] m/s` (saturated) |
+//! | Yaw angle (radians) | `u8` | `yaw.rem_euclid(2π) * (256 / 2π)` | `2π / 256` (`≈ 1.406°`) | `[0, 2π)` radians |
+//! | Pitch angle (radians) | `i8` | `pitch.clamp(-π/2, π/2) * (127 / (π/2))` | `π / 254` (`≈ 0.709°`) | `[-π/2, +π/2]` radians |
+//!
+//! All quantizers return `0` defensively if given `NaN` or `±Infinity`.
 
 use std::f32::consts::PI;
 

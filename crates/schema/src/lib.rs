@@ -10,6 +10,11 @@ pub mod bitpack;
 pub mod client;
 pub mod quantize;
 
+pub use client::{
+    ClientCodecError, ClientPacket, Opcode, HEADER_SIZE, MAX_PACKET_PAYLOAD_SIZE, PACKET_MAGIC,
+    PROTOCOL_VERSION,
+};
+
 #[cfg(all(test, feature = "grpc"))]
 mod tests {
     use super::cluster::*;

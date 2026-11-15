@@ -1,8 +1,29 @@
 //! Client-facing protocol packet definitions and binary codecs.
 //!
 //! Provides compact binary framing and serialization for high-frequency
-//! client-gateway and gateway-node communications (movement, entity state sync,
-//! and interaction actions).
+//! client-gateway and gateway-node communications (authentication, movement,
+//! entity state sync, world objects, social messaging, marketplace, and
+//! interaction actions).
+//!
+//! # Wire Frame Layout (`0x4D4D`)
+//!
+//! All client-facing messages across TCP, QUIC, WebTransport, and WebSocket share
+//! an identical 8-byte little-endian envelope ([`HEADER_SIZE`] = 8 bytes):
+//!
+//! ```text
+//! +----------------+----------------+------------------------+-----------------------+
+//! | magic (2B LE)  | opcode (2B LE) | payload_len (4B LE)    | payload (N bytes)     |
+//! | 0x4D, 0x4D     | 0x0001..0x001A | 0..=65536 (64 KiB)     | opcode-specific bytes |
+//! +----------------+----------------+------------------------+-----------------------+
+//! ```
+//!
+//! * **Byte order**: All fixed-width integers and IEEE-754 `f32` values are little-endian.
+//! * **Payload cap**: [`MAX_PACKET_PAYLOAD_SIZE`] is `65536` bytes (64 KiB). Frames exceeding
+//!   this cap fail decoding with [`ClientCodecError::PacketTooLarge`].
+//! * **Protocol version**: [`PROTOCOL_VERSION`] (`1`) is sent in [`AuthRequestPacket::client_version`].
+//! * **Delta compression & ACKs**: [`EntityDeltaBatchPacket`] (`0x0009`) compresses AoI state using
+//!   [`crate::bitpack`] LEB128 varints, [`crate::quantize`] fixed-point kinematics, and
+//!   [`delta_flags`] bitmasks; clients confirm observed server ticks via [`ClientAckPacket`] (`0x000A`).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -23,6 +44,13 @@ pub const HEADER_SIZE: usize = 8;
 
 /// Maximum allowed packet payload size in bytes (64 KiB) to prevent memory exhaustion attacks.
 pub const MAX_PACKET_PAYLOAD_SIZE: usize = 64 * 1024;
+
+/// Stabilized client-gateway binary wire protocol version (`1`).
+///
+/// Sent by clients in [`AuthRequestPacket::client_version`] during the initial
+/// gateway handshake (`0x0011`) to signal compatibility with the `0x4D4D` framing,
+/// opcodes `0x0001..=0x001A`, and delta/quantization encodings.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Errors that can occur during packet framing, encoding, or decoding.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -47,6 +75,17 @@ pub enum ClientCodecError {
 }
 
 /// Operation codes distinguishing packet types on the wire.
+///
+/// Serialized in bytes `2..4` of every 8-byte `0x4D4D` header as an unsigned
+/// 16-bit little-endian discriminant.
+///
+/// * **Ephemeral (datagram-eligible on QUIC/WebTransport)**: `Movement` (`0x0001`),
+///   `MovementCorrection` (`0x0002`), `EntityState` (`0x0005`), `EntityDespawn` (`0x0006`),
+///   `Ping` (`0x0007`), `Pong` (`0x0008`), `EntityDeltaBatch` (`0x0009`).
+/// * **Reliable (stream-routed on QUIC/WebTransport)**: `Interaction` (`0x0003`),
+///   `InteractionResult` (`0x0004`), `ClientAck` (`0x000A`), `WorldObject*` (`0x000B..=0x000E`),
+///   `PlaceObject` (`0x000F`), `InteractObject` (`0x0010`), `AuthRequest` (`0x0011`),
+///   `AuthResponse` (`0x0012`), `Social*` (`0x0013..=0x0015`), `Market*` (`0x0016..=0x001A`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Opcode {
@@ -738,7 +777,25 @@ impl PongPacket {
     }
 }
 
-/// Field mask flags indicating which entity attributes are present in an `EntityDeltaState`.
+/// Field mask flags indicating which entity attributes are present in an [`EntityDeltaState`].
+///
+/// Serialized immediately after `entity_id` (`varint_u64`) as a 16-bit little-endian integer.
+/// Encoded fields appear in strict ascending bit order:
+///
+/// 1. [`MASK_KEYFRAME`](delta_flags::MASK_KEYFRAME) (`1 << 0`) -> `3 × f32` LE absolute position
+///    *(mutually exclusive with `MASK_DELTA_POS_{X,Y,Z}`)*
+/// 2. [`MASK_DELTA_POS_X`](delta_flags::MASK_DELTA_POS_X) (`1 << 1`) -> `i16` LE quantized delta X (`1/128 m`)
+/// 3. [`MASK_DELTA_POS_Y`](delta_flags::MASK_DELTA_POS_Y) (`1 << 2`) -> `i16` LE quantized delta Y (`1/128 m`)
+/// 4. [`MASK_DELTA_POS_Z`](delta_flags::MASK_DELTA_POS_Z) (`1 << 3`) -> `i16` LE quantized delta Z (`1/128 m`)
+/// 5. [`MASK_VELOCITY`](delta_flags::MASK_VELOCITY) (`1 << 4`) -> `3 × i16` LE quantized velocity (`0.01 m/s`)
+/// 6. [`MASK_YAW`](delta_flags::MASK_YAW) (`1 << 5`) -> `u8` quantized yaw (`[0, 2π)` in `256` steps)
+/// 7. [`MASK_PITCH`](delta_flags::MASK_PITCH) (`1 << 6`) -> `i8` quantized pitch (`[-π/2, π/2]` in `[-127, 127]`)
+/// 8. [`MASK_HEALTH`](delta_flags::MASK_HEALTH) (`1 << 7`) -> `varint_u32` health
+/// 9. [`MASK_MAX_HEALTH`](delta_flags::MASK_MAX_HEALTH) (`1 << 8`) -> `varint_u32` max health
+/// 10. [`MASK_STATE_FLAGS`](delta_flags::MASK_STATE_FLAGS) (`1 << 9`) -> `varint_u32` bitmask flags
+/// 11. [`MASK_ACTION_ID`](delta_flags::MASK_ACTION_ID) (`1 << 10`) -> `varint_u32` active action ID
+/// 12. [`MASK_ATTRIBUTES`](delta_flags::MASK_ATTRIBUTES) (`1 << 11`) -> `varint_u32` count (`<= 256`) followed by
+///     `(attribute_id: varint_u32 <= u16::MAX, value: varint_u32)` pairs
 pub mod delta_flags {
     /// Full keyframe: absolute position coordinates are sent as 3x f32.
     pub const MASK_KEYFRAME: u16 = 1;
@@ -1009,12 +1066,23 @@ impl EntityDeltaState {
     }
 }
 
-/// Server broadcast containing batched entity delta states.
+/// Server broadcast (`0x0009`) containing batched entity delta states relative to `baseline_tick`.
+///
+/// Wire layout:
+/// `server_tick (varint_u64) | baseline_tick (varint_u64) | despawn_count (varint_u32) |`
+/// `despawns ([varint_u64]) | delta_count (varint_u32) | deltas ([EntityDeltaState])`.
+///
+/// When `baseline_tick == 0` or an entity enters AoI / teleports beyond
+/// [`crate::quantize::MAX_DELTA_POS`], the entity's delta carries [`delta_flags::MASK_KEYFRAME`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityDeltaBatchPacket {
+    /// Authoritative simulation tick at which this batch was generated (20 Hz default).
     pub server_tick: u64,
+    /// Client-acknowledged baseline tick this batch is diffed against (`0` for unacknowledged full keyframes).
     pub baseline_tick: u64,
+    /// Entity GUIDs leaving the observer's Area of Interest on `server_tick`.
     pub despawns: Vec<u64>,
+    /// Per-entity delta/keyframe updates in the observer's Area of Interest.
     pub deltas: Vec<EntityDeltaState>,
 }
 
@@ -1100,11 +1168,20 @@ pub(crate) fn get_u16_str(
     String::from_utf8(bytes.to_vec()).map_err(|e| ClientCodecError::InvalidData(e.to_string()))
 }
 
-/// Client acknowledgement carrying the latest observed server tick and a 32-tick loss recovery mask.
+/// Client acknowledgement (`0x000A`) carrying the latest observed server tick and a 32-tick loss recovery mask.
+///
+/// Sent reliably over stream transport after processing [`EntityDeltaBatchPacket`] frames so the
+/// node's `BaselineTracker` advances the session's delta compression baseline (`<= current_tick`
+/// enforced server-side).
+///
+/// Wire layout: `session_id (varint_u64) | observed_tick (varint_u64) | ack_mask (u32 LE)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientAckPacket {
+    /// Server-assigned session identifier returned in [`AuthResponsePacket::session_id`] (or connection session ID).
     pub session_id: u64,
+    /// Latest server tick processed cleanly by the client.
     pub observed_tick: u64,
+    /// Bitmask reserved for 32-tick loss recovery preceding `observed_tick` (clients may send `0` when tracking solely by `observed_tick`).
     pub ack_mask: u32,
 }
 
@@ -1532,10 +1609,18 @@ pub mod auth_error_codes {
     pub const IDENTITY_MISMATCH: u32 = 9;
 }
 
-/// Client-originated authentication request containing a cryptographic token (e.g. JWT or HandoverTicket).
+/// Client-originated authentication request (`0x0011`) containing a cryptographic token
+/// (e.g. JWT or `HandoverTicket`) and [`PROTOCOL_VERSION`].
+///
+/// Must be sent as the first reliable packet when gateway `EdgeAuthenticator` is active
+/// (bounded by gateway `auth_timeout`, default 5 s).
+///
+/// Wire layout: `token_len (u16 LE) | token_utf8 ([u8; token_len]) | client_version (u32 LE)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRequestPacket {
+    /// Bearer JWT or base64 handover ticket authenticating the player GUID.
     pub token: String,
+    /// Client wire protocol version (set to [`PROTOCOL_VERSION`]).
     pub client_version: u32,
 }
 
@@ -1555,14 +1640,24 @@ impl AuthRequestPacket {
     }
 }
 
-/// Server-originated authentication response granting or denying session admission.
+/// Server-originated authentication response (`0x0012`) granting or denying session admission.
+///
+/// Wire layout:
+/// `success (u8) | error_code (u32 LE) | session_id (u64 LE) | player_guid (u64 LE) |`
+/// `assigned_node (u16 LE len + UTF-8) | error_message (u16 LE len + UTF-8)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthResponsePacket {
+    /// `true` (`0x01`) if session admission succeeded; `false` (`0x00`) otherwise.
     pub success: bool,
+    /// Numeric status from [`auth_error_codes`] (`0` on success).
     pub error_code: u32,
+    /// Gateway session identifier to include in [`ClientAckPacket::session_id`].
     pub session_id: u64,
+    /// Authoritative 64-bit entity GUID assigned to the player character.
     pub player_guid: u64,
+    /// Routed simulation node address or cluster ID handling this session.
     pub assigned_node: String,
+    /// Human-readable error detail when `success == false` (empty string on success).
     pub error_message: String,
 }
 
@@ -5467,5 +5562,214 @@ mod tests {
             cursor.advance(frame_len);
         }
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn test_wire_contract_golden_vectors_and_roundtrips() {
+        // 1. AuthRequest (0x0011): token = "dev-jwt" (u16 LE len + UTF-8), client_version = PROTOCOL_VERSION (1)
+        let auth_req = ClientPacket::AuthRequest(AuthRequestPacket {
+            token: "dev-jwt".to_string(),
+            client_version: PROTOCOL_VERSION,
+        });
+        #[rustfmt::skip]
+        let expected_auth_req: [u8; 21] = [
+            0x4D, 0x4D,             // magic 0x4D4D LE
+            0x11, 0x00,             // opcode AuthRequest (0x0011) LE
+            0x0D, 0x00, 0x00, 0x00, // payload_len = 13 LE
+            0x07, 0x00,             // token len = 7 LE
+            b'd', b'e', b'v', b'-', b'j', b'w', b't',
+            0x01, 0x00, 0x00, 0x00, // client_version = 1 LE
+        ];
+        assert_eq!(auth_req.encode(), expected_auth_req);
+        assert_eq!(ClientPacket::decode(&expected_auth_req).unwrap(), auth_req);
+
+        // 2. AuthResponse (0x0012)
+        let auth_resp = ClientPacket::AuthResponse(AuthResponsePacket {
+            success: true,
+            error_code: auth_error_codes::SUCCESS,
+            session_id: 0x0102_0304_0506_0708,
+            player_guid: 0x1122_3344_5566_7788,
+            assigned_node: "node-1".to_string(),
+            error_message: String::new(),
+        });
+        #[rustfmt::skip]
+        let expected_auth_resp: [u8; 39] = [
+            0x4D, 0x4D,                                     // magic
+            0x12, 0x00,                                     // opcode AuthResponse (0x0012)
+            0x1F, 0x00, 0x00, 0x00,                         // payload_len = 31 LE
+            0x01,                                           // success = true
+            0x00, 0x00, 0x00, 0x00,                         // error_code = SUCCESS (0)
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // session_id LE
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // player_guid LE
+            0x06, 0x00, b'n', b'o', b'd', b'e', b'-', b'1', // assigned_node
+            0x00, 0x00,                                     // error_message = ""
+        ];
+        assert_eq!(auth_resp.encode(), expected_auth_resp);
+        assert_eq!(
+            ClientPacket::decode(&expected_auth_resp).unwrap(),
+            auth_resp
+        );
+
+        // 3. Movement (0x0001): fixed 52-byte payload
+        let movement = ClientPacket::Movement(MovementPacket {
+            entity_id: 0x0102_0304_0506_0708,
+            position: Vec3::new(1.0, -2.5, 4.0),
+            velocity: Vec3::new(0.5, 0.0, -1.25),
+            yaw: 1.5,
+            pitch: -0.5,
+            timestamp: 0x1020_3040_5060_7080,
+            sequence: 0xAABB_CCDD,
+        });
+        #[rustfmt::skip]
+        let expected_movement: [u8; 60] = [
+            0x4D, 0x4D,                                     // magic
+            0x01, 0x00,                                     // opcode Movement (0x0001)
+            0x34, 0x00, 0x00, 0x00,                         // payload_len = 52 LE
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // entity_id LE
+            0x00, 0x00, 0x80, 0x3F,                         // pos.x = 1.0f32 LE
+            0x00, 0x00, 0x20, 0xC0,                         // pos.y = -2.5f32 LE
+            0x00, 0x00, 0x80, 0x40,                         // pos.z = 4.0f32 LE
+            0x00, 0x00, 0x00, 0x3F,                         // vel.x = 0.5f32 LE
+            0x00, 0x00, 0x00, 0x00,                         // vel.y = 0.0f32 LE
+            0x00, 0x00, 0xA0, 0xBF,                         // vel.z = -1.25f32 LE
+            0x00, 0x00, 0xC0, 0x3F,                         // yaw = 1.5f32 LE
+            0x00, 0x00, 0x00, 0xBF,                         // pitch = -0.5f32 LE
+            0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, // timestamp LE
+            0xDD, 0xCC, 0xBB, 0xAA,                         // sequence LE
+        ];
+        assert_eq!(movement.encode(), expected_movement);
+        assert_eq!(ClientPacket::decode(&expected_movement).unwrap(), movement);
+
+        // 4. Interaction (0x0003)
+        let interaction = ClientPacket::Interaction(InteractionPacket {
+            source_guid: 0x0001_0000_0000_002A,
+            target_guid: 0x0002_0000_0000_0007,
+            interaction_type: InteractionType::Attack,
+            action_id: 0x0000_0400,
+            payload: Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
+        });
+        #[rustfmt::skip]
+        let expected_interaction: [u8; 37] = [
+            0x4D, 0x4D,                                     // magic
+            0x03, 0x00,                                     // opcode Interaction (0x0003)
+            0x1D, 0x00, 0x00, 0x00,                         // payload_len = 29 LE
+            0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, // source_guid LE
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, // target_guid LE
+            0x01,                                           // interaction_type = Attack (1)
+            0x00, 0x04, 0x00, 0x00,                         // action_id = 0x400 LE
+            0x04, 0x00, 0x00, 0x00,                         // payload_len = 4 LE
+            0xDE, 0xAD, 0xBE, 0xEF,                         // payload
+        ];
+        assert_eq!(interaction.encode(), expected_interaction);
+        assert_eq!(
+            ClientPacket::decode(&expected_interaction).unwrap(),
+            interaction
+        );
+
+        // 5. EntityDeltaBatch (0x0009): quantized delta fields + despawn list
+        let delta_mask = delta_flags::MASK_DELTA_POS_X
+            | delta_flags::MASK_VELOCITY
+            | delta_flags::MASK_YAW
+            | delta_flags::MASK_HEALTH
+            | delta_flags::MASK_ATTRIBUTES;
+        let delta_batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 150,
+            baseline_tick: 140,
+            despawns: vec![129],
+            deltas: vec![EntityDeltaState {
+                entity_id: 42,
+                field_mask: delta_mask,
+                position: (0.5, 0.0, 0.0),
+                velocity: (1.0, -0.5, 0.25),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 75,
+                max_health: 0,
+                state_flags: 0,
+                action_id: 0,
+                attributes: vec![ScalarAttributeDelta {
+                    attribute_id: 3,
+                    value: 300,
+                }],
+            }],
+        });
+        #[rustfmt::skip]
+        let expected_delta_batch: [u8; 33] = [
+            0x4D, 0x4D,             // magic
+            0x09, 0x00,             // opcode EntityDeltaBatch (0x0009)
+            0x19, 0x00, 0x00, 0x00, // payload_len = 25 LE
+            0x96, 0x01,             // server_tick = 150 (LEB128)
+            0x8C, 0x01,             // baseline_tick = 140 (LEB128)
+            0x01,                   // despawns.len() = 1
+            0x81, 0x01,             // despawns[0] = 129 (LEB128)
+            0x01,                   // deltas.len() = 1
+            0x2A,                   // entity_id = 42 (LEB128)
+            0xB2, 0x08,             // field_mask = 0x08B2 LE
+            0x40, 0x00,             // delta_pos.x = 0.5 * 128 = 64i16 LE
+            0x64, 0x00,             // vel.x = 1.0 * 100 = 100i16 LE
+            0xCE, 0xFF,             // vel.y = -0.5 * 100 = -50i16 LE
+            0x19, 0x00,             // vel.z = 0.25 * 100 = 25i16 LE
+            0x00,                   // yaw = 0u8
+            0x4B,                   // health = 75 (LEB128)
+            0x01,                   // attributes.len() = 1
+            0x03,                   // attribute_id = 3
+            0xAC, 0x02,             // value = 300 (LEB128)
+        ];
+        assert_eq!(delta_batch.encode(), expected_delta_batch);
+        assert_eq!(
+            ClientPacket::decode(&expected_delta_batch).unwrap(),
+            delta_batch
+        );
+
+        // 5b. EntityDeltaBatch with MASK_KEYFRAME absolute position (0x0009)
+        let keyframe_batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 1,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: 7,
+                field_mask: delta_flags::MASK_KEYFRAME,
+                position: (1.0, 2.0, -4.0),
+                ..Default::default()
+            }],
+        });
+        #[rustfmt::skip]
+        let expected_keyframe_batch: [u8; 27] = [
+            0x4D, 0x4D,
+            0x09, 0x00,
+            0x13, 0x00, 0x00, 0x00, // payload_len = 19 LE
+            0x01,                   // server_tick = 1
+            0x00,                   // baseline_tick = 0
+            0x00,                   // despawns.len() = 0
+            0x01,                   // deltas.len() = 1
+            0x07,                   // entity_id = 7
+            0x01, 0x00,             // field_mask = MASK_KEYFRAME (0x0001)
+            0x00, 0x00, 0x80, 0x3F, // pos.x = 1.0f32 LE
+            0x00, 0x00, 0x00, 0x40, // pos.y = 2.0f32 LE
+            0x00, 0x00, 0x80, 0xC0, // pos.z = -4.0f32 LE
+        ];
+        assert_eq!(keyframe_batch.encode(), expected_keyframe_batch);
+        assert_eq!(
+            ClientPacket::decode(&expected_keyframe_batch).unwrap(),
+            keyframe_batch
+        );
+
+        // 6. ClientAck (0x000A)
+        let ack = ClientPacket::ClientAck(ClientAckPacket {
+            session_id: 300,
+            observed_tick: 150,
+            ack_mask: 0x0000_000F,
+        });
+        #[rustfmt::skip]
+        let expected_ack: [u8; 16] = [
+            0x4D, 0x4D,             // magic
+            0x0A, 0x00,             // opcode ClientAck (0x000A)
+            0x08, 0x00, 0x00, 0x00, // payload_len = 8 LE
+            0xAC, 0x02,             // session_id = 300 (LEB128)
+            0x96, 0x01,             // observed_tick = 150 (LEB128)
+            0x0F, 0x00, 0x00, 0x00, // ack_mask = 0x0F LE
+        ];
+        assert_eq!(ack.encode(), expected_ack);
+        assert_eq!(ClientPacket::decode(&expected_ack).unwrap(), ack);
     }
 }

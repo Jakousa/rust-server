@@ -92,7 +92,7 @@ rust-server/
 │   └── client-wasm/     # Pure Rust WebAssembly leaf crate: zero-copy Float32Array render buffer, delta & voxel decoding
 ├── web/                 # Interactive 3D Web Visual Inspector (Vite + Three.js), HUD, Vitest + Playwright E2E suites
 ├── k8s/                 # Kubernetes manifests (base, local k3d overlay, cloud overlay, and Flux v2 GitOps system)
-├── docs/                # Cloud PoC deployment & server sizing guides and historical architecture audits
+├── docs/                # Cloud PoC deployment, wire protocol SDK, Godot client integration, and architecture audits
 ├── openspec/            # OpenSpec 2.0 capability specifications (openspec/specs/) and archived change history
 └── scripts/             # Cluster lifecycle, chaos failover testing, and deployment automation scripts
 ```
@@ -113,11 +113,99 @@ rust-server/
 
 ---
 
+## Playable Village & Barter Showcase
+
+The repository ships an interactive **Village & Barter Vertical Slice** powered by [`mmo-village-node`](crates/gameplay/src/bin/mmo_village_node.rs), `mmo-gateway`, and the Three.js browser client in [`web/`](web/):
+
+- **Auto-Discovery & Transport Fallback**: On load, the Web Visual Inspector resolves the gateway host, fetches `/cert-hash`, and connects over **HTTP/3 WebTransport** (`:4433/udp`), automatically falling back to **WebSocket** (`ws://`/`wss://` on `:8443/tcp`) when UDP is restricted. Live connection state (`Disconnected`, `Connecting...`, `Connected`) and active protocol (`HTTP/3`, `WebSocket`, `Offline`) appear in the **Edge Gateway** HUD header.
+- **Controls & Multi-Tab Playtesting**:
+  - `WASD` / `Arrow` keys: Move and turn (`Space` to trigger action/cast; keyboard movement is automatically ignored while typing into HUD inputs).
+  - `Mouse Drag` / `Scroll Wheel`: Orbit pitch/yaw and zoom the 3D camera around your character.
+  - `E` (within `5m`): Open the NPC Barter modal with village artisans (*Blacksmith Ilmari*, *Herbalist Aino*, *Elder Väinö*) or initiate atomic two-player gold/item trading with another browser tab (each tab receives an isolated `sessionStorage` guest identity).
+
+---
+
 ## Quickstart & Local Development
 
-### 1. Rust Workspace Build, Lint & Test
+### 1. Single-Command Docker Compose Stack (Fastest Local Demo)
+Launch the full distributed showcase (`director`, `node-1` running `mmo-village-node`, `node-2` running `mmo-node`, `gateway`, and `web` Nginx frontend) from [`docker-compose.yml`](docker-compose.yml):
+
 ```bash
-# Check formatting and strict linter
+docker compose up -d
+```
+
+- **Web Visual Inspector**: [http://localhost:3000](http://localhost:3000)
+- **Gateway Endpoints**: `4433/udp` (HTTP/3 WebTransport), `8080/tcp` (framed TCP), `9091/tcp` (admin `/cert-hash`, `/healthz`, `/ready`, `/metrics`)
+- **Director gRPC**: `50051/tcp`
+- **Optional Compose Profiles**:
+  ```bash
+  # Include PostgreSQL (:5432) and Redis (:6379)
+  docker compose --profile storage up -d
+
+  # Run the synthetic bot load generator against gateway:8080
+  docker compose --profile loadtest up
+  ```
+
+### 2. Web Visual Inspector & Vite Dev Server (`web/`)
+Run the frontend locally with hot module replacement (HMR) against either Docker Compose or native Rust daemons:
+
+```bash
+# Install dependencies (first time only)
+npm --prefix web install
+
+# Start Vite dev server at http://localhost:3000
+npm --prefix web run dev
+
+# Run Vitest unit tests and Vite production bundle build
+npm --prefix web test -- --run
+npm --prefix web run build
+
+# Run headless WebGL Playwright E2E browser tests
+npm --prefix web run test:e2e
+```
+
+To run the native Rust cluster locally alongside `npm --prefix web run dev` (in separate terminals):
+```bash
+cargo run -p mmo-director
+cargo run -p mmo-gameplay --bin mmo-village-node
+cargo run -p mmo-gateway
+```
+
+### 3. Local Kubernetes Cluster (`k3d`)
+Cluster lifecycle, image builds, load testing, and chaos failover are automated via [`scripts/cluster.sh`](scripts/cluster.sh) using [`k8s/k3d.yaml`](k8s/k3d.yaml) and `k8s/overlays/local/`:
+
+```bash
+# Provision local k3d cluster, build mmo-server:local, import image, and deploy
+./scripts/cluster.sh all
+
+# Inspect pods, services, and statefulsets in the mmo namespace
+./scripts/cluster.sh status
+
+# Run bot swarm load test (1,000 bots, 10s duration, hotspot behavior)
+./scripts/cluster.sh loadtest 1000 10 hotspot
+
+# Run end-to-end chaos failover & recovery test
+./scripts/cluster.sh chaos
+
+# Fast iteration: rebuild image, re-import into k3d, and rolling restart
+./scripts/cluster.sh reload
+```
+
+Local `k3d` forwards ports `4433/udp` (WebTransport), `8080/tcp+udp` (TCP/QUIC), `9091` (Gateway admin & `/cert-hash`), `50051` (Director), `9090` (Prometheus), and `3000` (Grafana, `admin`/`admin`).
+
+### 4. Cloud PoC Deployment & GitOps
+For public cloud VM sizing, firewall rules (`UDP 4433` WebTransport, `TCP 8443` WebSocket fallback, `TCP 8080` TCP ingress, `TCP 80/443/3000` web + `/cert-hash`), kernel UDP buffer tuning, `k8s/overlays/cloud/`, and Flux v2 GitOps (`k8s/flux-system/`), see:
+- [`docs/CLOUD_POC_DEPLOYMENT.md`](docs/CLOUD_POC_DEPLOYMENT.md)
+
+### 5. External Client SDK & Godot Integration
+Build external native or engine clients using the shared `0x4D4D` binary wire protocol, LEB128 varint delta decoding, and WebAssembly/SDK bindings:
+- **Wire Protocol & Client SDK Guide**: [`docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md`](docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md)
+- **Godot Client Integration Guide**: [`docs/GODOT_CLIENT_INTEGRATION.md`](docs/GODOT_CLIENT_INTEGRATION.md)
+- **Browser WebAssembly Adapter**: [`crates/client-wasm`](crates/client-wasm)
+
+### 6. Rust Workspace Build, Lint & Quality Gates
+```bash
+# Check formatting and strict linter (zero warnings allowed)
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -126,52 +214,6 @@ cargo test --workspace
 
 # Validate all OpenSpec 2.0 capability specifications
 openspec validate --all
-```
-
-### 2. Launching & Testing the Web Visual Inspector Frontend
-```bash
-# Install dependencies (first time only)
-npm --prefix web install
-
-# Run Vite development server (hot-reloading at http://localhost:3000)
-npm --prefix web run dev
-
-# Run unit tests (Vitest) and production bundle build
-npm --prefix web test -- --run
-npm --prefix web run build
-
-# Run headless WebGL Playwright E2E browser tests
-npx --prefix web playwright test
-```
-
-### 3. Single-Command Docker Compose Stack
-```bash
-# Launch Postgres, Director, Village Simulation Node, Gateway, and Web Client
-docker compose up -d
-```
-See [`docs/CLOUD_POC_DEPLOYMENT.md`](docs/CLOUD_POC_DEPLOYMENT.md) for cloud VM sizing, firewall ports, and k3s/Flux GitOps deployment instructions.
-
-### 4. Cluster Operations via Kubernetes (`k3d`)
-Cluster lifecycle and chaos testing are abstracted into single-step commands via [`scripts/cluster.sh`](scripts/cluster.sh):
-
-```bash
-# 1. Provision local Kubernetes cluster (k3d) via declarative config (k8s/k3d.yaml)
-./scripts/cluster.sh up
-
-# 2. Build images and deploy cluster (Director, Gateway, Nodes, Postgres, Grafana)
-./scripts/cluster.sh all
-
-# 3. Check cluster status and node health
-./scripts/cluster.sh status
-
-# 4. Run bot swarm load test (e.g. 1,000 bots, 10s duration, hotspot behavior)
-./scripts/cluster.sh loadtest 1000 10 hotspot
-
-# 5. Run end-to-end chaos failover & recovery test
-./scripts/cluster.sh chaos
-
-# 6. Fast iteration: rebuild code, re-import image, and rolling restart
-./scripts/cluster.sh reload
 ```
 
 ---

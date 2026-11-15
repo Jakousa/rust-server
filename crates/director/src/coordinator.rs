@@ -383,7 +383,7 @@ impl GlobalOctreeNode {
         match self {
             GlobalOctreeNode::Leaf { .. } => None,
             GlobalOctreeNode::Branch { bounds, children } => {
-                if bounds == parent_bounds {
+                if bounds_approx_eq(bounds, parent_bounds) {
                     let mut leaves = Vec::new();
                     for child in children.iter() {
                         child.collect_leaves(&mut leaves);
@@ -401,12 +401,37 @@ impl GlobalOctreeNode {
         }
     }
 
+    /// Finds all branches whose 8 direct children are all non-empty leaf partitions.
+    pub fn find_collapsible_branches(&self, out: &mut Vec<(BoundingBox3D, Vec<Option<u32>>)>) {
+        if let GlobalOctreeNode::Branch { bounds, children } = self {
+            let all_non_empty_leaves = children.iter().all(|child| {
+                !is_empty_slot(child) && matches!(child, GlobalOctreeNode::Leaf { .. })
+            });
+            if all_non_empty_leaves {
+                let owners = children
+                    .iter()
+                    .filter_map(|child| match child {
+                        GlobalOctreeNode::Leaf {
+                            assigned_node_id, ..
+                        } => Some(*assigned_node_id),
+                        GlobalOctreeNode::Branch { .. } => None,
+                    })
+                    .collect();
+                out.push((*bounds, owners));
+            } else {
+                for child in children.iter() {
+                    child.find_collapsible_branches(out);
+                }
+            }
+        }
+    }
+
     /// Collapses the branch matching `parent_bounds` into a single leaf assigned to `new_node_id`.
     pub fn merge_at(&mut self, parent_bounds: &BoundingBox3D, new_node_id: u32) -> bool {
         match self {
             GlobalOctreeNode::Leaf { .. } => false,
             GlobalOctreeNode::Branch { bounds, children } => {
-                if bounds == parent_bounds {
+                if bounds_approx_eq(bounds, parent_bounds) {
                     *self = GlobalOctreeNode::Leaf {
                         bounds: *parent_bounds,
                         assigned_node_id: Some(new_node_id),
@@ -457,13 +482,16 @@ impl GlobalOctreeNode {
         target_bounds: &BoundingBox3D,
         new_node_id: Option<u32>,
     ) -> bool {
+        if is_empty_slot(self) {
+            return false;
+        }
         match self {
             GlobalOctreeNode::Leaf {
                 bounds,
                 assigned_node_id,
                 ..
             } => {
-                if bounds == target_bounds {
+                if bounds_approx_eq(bounds, target_bounds) {
                     *assigned_node_id = new_node_id;
                     true
                 } else {
@@ -471,7 +499,7 @@ impl GlobalOctreeNode {
                 }
             }
             GlobalOctreeNode::Branch { bounds, children } => {
-                if !bounds.intersects(target_bounds) {
+                if !bounds.expanded(BOUNDS_EPSILON).intersects(target_bounds) {
                     return false;
                 }
                 for child in children.iter_mut() {
@@ -490,9 +518,12 @@ impl GlobalOctreeNode {
         old_bounds: &BoundingBox3D,
         new_bounds: BoundingBox3D,
     ) -> bool {
+        if is_empty_slot(self) {
+            return false;
+        }
         match self {
             GlobalOctreeNode::Leaf { bounds, .. } => {
-                if bounds == old_bounds {
+                if bounds_approx_eq(bounds, old_bounds) {
                     *bounds = new_bounds;
                     true
                 } else {
@@ -1107,8 +1138,11 @@ impl GlobalOctreeCoordinator {
             registry.add_assigned_bounds(assigned_id, child);
         }
 
-        self.last_split_times
-            .insert(reporting_node_id, std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.last_split_times.insert(reporting_node_id, now);
+        for &assigned_id in &assigned_node_ids {
+            self.last_split_times.insert(assigned_id, now);
+        }
         self.topology_epoch += 1;
 
         assigned_node_ids
@@ -1324,6 +1358,84 @@ impl GlobalOctreeCoordinator {
 
         if merged {
             self.topology_epoch += 1;
+        }
+
+        merged
+    }
+
+    /// Evaluates collapsible branches and merges underloaded sibling octants back into a single partition.
+    ///
+    /// Returns a list of `(merged_branch_bounds, target_node_id)` for each merge performed.
+    pub fn evaluate_and_merge_underloaded(
+        &mut self,
+        registry: &mut NodeRegistry,
+    ) -> Vec<(BoundingBox3D, u32)> {
+        let mut collapsible = Vec::new();
+        self.root.find_collapsible_branches(&mut collapsible);
+
+        let mut merged = Vec::new();
+        for (branch_bounds, child_owners) in collapsible {
+            let mut unique_owners: Vec<u32> = child_owners.into_iter().flatten().collect();
+            unique_owners.sort_unstable();
+            unique_owners.dedup();
+            if unique_owners.is_empty() {
+                continue;
+            }
+
+            if unique_owners.iter().any(|id| {
+                self.last_split_times
+                    .get(id)
+                    .is_some_and(|t| t.elapsed() < self.split_cooldown)
+            }) {
+                continue;
+            }
+
+            let mut saturated = false;
+            let mut total_entities: u32 = 0;
+            let mut best_active_owner: Option<(f32, u32)> = None;
+
+            for &owner_id in &unique_owners {
+                if let Some(node) = registry.get_node(owner_id) {
+                    if node.tick_duration_ms >= self.tick_saturation_ms {
+                        saturated = true;
+                        break;
+                    }
+                    total_entities = total_entities.saturating_add(node.entity_count);
+                    let score = node.load_score();
+                    let replace = match best_active_owner {
+                        None => true,
+                        Some((best_score, best_id)) => match score
+                            .partial_cmp(&best_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                        {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Equal => owner_id < best_id,
+                            std::cmp::Ordering::Greater => false,
+                        },
+                    };
+                    if replace {
+                        best_active_owner = Some((score, owner_id));
+                    }
+                }
+            }
+
+            if saturated || !self.should_merge(total_entities) {
+                continue;
+            }
+
+            let Some(target_node_id) = best_active_owner
+                .map(|(_, id)| id)
+                .or_else(|| registry.find_least_loaded_node(&[]))
+            else {
+                continue;
+            };
+
+            if self.handle_merge(branch_bounds, target_node_id, registry) {
+                self.last_split_times
+                    .insert(target_node_id, std::time::Instant::now());
+                metrics::counter!("mmo_director_partition_merges_total").increment(1);
+                merged.push((branch_bounds, target_node_id));
+            }
         }
 
         merged
@@ -2230,5 +2342,153 @@ mod tests {
             .unwrap()
             .assigned_bounds
             .contains(&bounds));
+    }
+
+    #[test]
+    fn test_bounds_approx_eq_in_tree_mutators() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let mut coord = GlobalOctreeCoordinator::new(root_bounds);
+        let mut registry = NodeRegistry::new();
+        let node1 =
+            registry.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![root_bounds]);
+        let node2 = registry.register_node_with_id(2, "127.0.0.1:50052".to_string(), vec![]);
+        coord.assign_initial_node(node1);
+
+        let _ = coord.handle_split(node1, root_bounds, vec![], &mut registry);
+
+        let perturbed_root = BoundingBox3D::new((0.0001, -0.0001, 0.0), (99.9999, 100.0001, 100.0));
+        let leaves = coord.root.find_branch_leaves(&perturbed_root).unwrap();
+        assert_eq!(leaves.len(), 8);
+
+        let first_leaf = leaves[0].0;
+        let perturbed_leaf = BoundingBox3D::new(
+            (
+                first_leaf.min.0 + 0.0002,
+                first_leaf.min.1 - 0.0002,
+                first_leaf.min.2,
+            ),
+            (
+                first_leaf.max.0 - 0.0002,
+                first_leaf.max.1 + 0.0002,
+                first_leaf.max.2,
+            ),
+        );
+        assert!(coord.root.assign_leaf_node(&perturbed_leaf, Some(node2)));
+        assert_eq!(coord.find_node_for_point((1.0, 1.0, 1.0)), Some(node2));
+
+        let shifted_leaf = BoundingBox3D::new((0.0, 0.0, 0.0), (55.0, 50.0, 50.0));
+        assert!(coord.root.update_leaf_bounds(&perturbed_leaf, shifted_leaf));
+        assert!(coord
+            .leaf_octants()
+            .into_iter()
+            .any(|(b, _)| b == shifted_leaf));
+
+        assert!(coord.root.merge_at(&perturbed_root, node1));
+        assert_eq!(coord.leaf_octants().len(), 1);
+        assert_eq!(coord.find_node_for_point((75.0, 75.0, 75.0)), Some(node1));
+    }
+
+    #[test]
+    fn test_find_collapsible_branches_and_evaluate_merge() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (200.0, 200.0, 200.0));
+        let mut coord = GlobalOctreeCoordinator::with_full_thresholds(
+            root_bounds,
+            100,
+            20,
+            35.0,
+            std::time::Duration::ZERO,
+        );
+        let mut registry = NodeRegistry::new();
+        let node1 =
+            registry.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![root_bounds]);
+        let node2 = registry.register_node_with_id(2, "127.0.0.1:50052".to_string(), vec![]);
+        coord.assign_initial_node(node1);
+
+        // Split level 1: 8 children under (0..200)^3
+        let _ = coord.handle_split(node1, root_bounds, vec![], &mut registry);
+        // Split level 2 on child (0..100)^3 assigned to node 1
+        let sub_branch = BoundingBox3D::new((0.0, 0.0, 0.0), (100.0, 100.0, 100.0));
+        let _ = coord.handle_split(node1, sub_branch, vec![], &mut registry);
+
+        // Only the deeper sub_branch has 8 non-empty Leaf children
+        let mut collapsible = Vec::new();
+        coord.root.find_collapsible_branches(&mut collapsible);
+        assert_eq!(collapsible.len(), 1);
+        assert_eq!(collapsible[0].0, sub_branch);
+
+        // High combined entity count prevents merge
+        registry.record_heartbeat(&mmo_schema::cluster::HeartbeatRequest {
+            node_id: node1,
+            entity_count: 15,
+            tick_duration_ms: 5.0,
+            ..Default::default()
+        });
+        registry.record_heartbeat(&mmo_schema::cluster::HeartbeatRequest {
+            node_id: node2,
+            entity_count: 10,
+            tick_duration_ms: 5.0,
+            ..Default::default()
+        });
+        assert!(coord
+            .evaluate_and_merge_underloaded(&mut registry)
+            .is_empty());
+
+        // Under threshold (15 <= 20) but one owner is saturated -> blocked
+        for _ in 0..12 {
+            registry.record_heartbeat(&mmo_schema::cluster::HeartbeatRequest {
+                node_id: node1,
+                entity_count: 5,
+                tick_duration_ms: 40.0,
+                ..Default::default()
+            });
+        }
+        assert!(registry.get_node(node1).unwrap().tick_duration_ms >= 35.0);
+        assert!(coord
+            .evaluate_and_merge_underloaded(&mut registry)
+            .is_empty());
+
+        // Normal tick time + total entities <= 20 -> merges into lower-load owner (tie-broken by smaller node_id or lowest load_score)
+        for _ in 0..12 {
+            registry.record_heartbeat(&mmo_schema::cluster::HeartbeatRequest {
+                node_id: node1,
+                entity_count: 12,
+                tick_duration_ms: 5.0,
+                ..Default::default()
+            });
+        }
+        registry.record_heartbeat(&mmo_schema::cluster::HeartbeatRequest {
+            node_id: node2,
+            entity_count: 6,
+            tick_duration_ms: 5.0,
+            ..Default::default()
+        });
+        let epoch_before = coord.topology_epoch();
+        let merged = coord.evaluate_and_merge_underloaded(&mut registry);
+        assert_eq!(merged, vec![(sub_branch, node2)]);
+        assert_eq!(coord.topology_epoch(), epoch_before + 1);
+        assert_eq!(coord.leaf_octants().len(), 8);
+
+        // Now root branch has 8 non-empty leaves; merge it back to 1 partition
+        let merged_root = coord.evaluate_and_merge_underloaded(&mut registry);
+        assert_eq!(merged_root.len(), 1);
+        assert_eq!(merged_root[0].0, root_bounds);
+        assert_eq!(coord.leaf_octants().len(), 1);
+
+        // Cooldown prevents premature merge right after split
+        let mut cooldown_coord = GlobalOctreeCoordinator::with_full_thresholds(
+            root_bounds,
+            100,
+            20,
+            35.0,
+            std::time::Duration::from_secs(60),
+        );
+        let mut cd_reg = NodeRegistry::new();
+        let cn1 = cd_reg.register_node_with_id(1, "127.0.0.1:50051".to_string(), vec![root_bounds]);
+        let _cn2 = cd_reg.register_node_with_id(2, "127.0.0.1:50052".to_string(), vec![]);
+        cooldown_coord.assign_initial_node(cn1);
+        let _ = cooldown_coord.handle_split(cn1, root_bounds, vec![], &mut cd_reg);
+        assert!(cooldown_coord
+            .evaluate_and_merge_underloaded(&mut cd_reg)
+            .is_empty());
     }
 }

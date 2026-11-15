@@ -135,6 +135,20 @@ impl ClientEntityReplica {
             1.0
         }
     }
+
+    /// Returns health normalized to `0.0..=1.0`, or `0.0` when `max_health == 0`.
+    pub fn health_fraction(&self) -> f32 {
+        if self.max_health > 0 {
+            (self.health as f32 / self.max_health as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Returns `true` if `flag` is non-zero and all bits in `flag` are set in `state_flags`.
+    pub fn has_state_flag(&self, flag: u32) -> bool {
+        flag != 0 && (self.state_flags & flag) == flag
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +219,37 @@ mod tests {
         assert_eq!(replica.get_attribute(0), Some(75));
         assert_eq!(replica.get_attribute(10), Some(999));
         assert_eq!(replica.get_attribute(99), None);
+    }
+
+    #[test]
+    fn test_replica_health_fraction_and_state_flags() {
+        let mut replica = ClientEntityReplica::new(100);
+        assert_eq!(replica.health_fraction(), 1.0);
+
+        // Zero max_health returns 0.0 safely without NaN/Inf
+        replica.max_health = 0;
+        assert_eq!(replica.health_fraction(), 0.0);
+        replica.health = 50;
+        assert_eq!(replica.health_fraction(), 0.0);
+
+        // Partial, full, and clamped health ratios
+        replica.max_health = 200;
+        assert!((replica.health_fraction() - 0.25).abs() < 1e-6);
+        replica.health = 250;
+        assert_eq!(replica.health_fraction(), 1.0);
+        replica.health = 0;
+        assert_eq!(replica.health_fraction(), 0.0);
+
+        // Bitmask queries for empty, single, and composite flag masks
+        assert!(!replica.has_state_flag(0));
+        assert!(!replica.has_state_flag(1 << 0));
+
+        replica.state_flags = (1 << 0) | (1 << 3) | (1 << 7);
+        assert!(!replica.has_state_flag(0));
+        assert!(replica.has_state_flag(1 << 0));
+        assert!(replica.has_state_flag(1 << 3));
+        assert!(replica.has_state_flag((1 << 0) | (1 << 7)));
+        assert!(!replica.has_state_flag(1 << 1));
+        assert!(!replica.has_state_flag((1 << 0) | (1 << 1)));
     }
 }

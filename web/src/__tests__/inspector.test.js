@@ -1511,6 +1511,75 @@ describe("EntityDeltaBatch and Protocol Extensions", () => {
     expect(keyframe.y).toBeCloseTo(0.0, 4);
     expect(keyframe.z).toBeCloseTo(5.0, 4);
   });
+
+  it("rebases interpolation history on cross-node tick rollover in _pushInterpSnapshot and EntityDeltaBatch", () => {
+    const bridge = new ClientWorldBridge();
+    const remoteGuid = (1n << 48n) | 501n;
+    const remoteKey = Number(remoteGuid);
+
+    // 1. Direct _pushInterpSnapshot unit check: back.tick - tick > 4 resets queue
+    bridge._pushInterpSnapshot(remoteKey, 5000, 100.0, 10.0, 0.0, 5.0, 1.0, 0.0, 0.0, 0.0);
+    bridge._pushInterpSnapshot(remoteKey, 5001, 100.05, 11.0, 0.0, 5.0, 1.0, 0.0, 0.0, 0.0);
+    expect(bridge.interpHistory.get(remoteKey)).toHaveLength(2);
+
+    // Rollover from tick 5001 to tick 12 (diff > 4): should rebase cleanly instead of dropping
+    bridge._pushInterpSnapshot(remoteKey, 12, 90.0, 12.0, 0.0, 5.0, 1.0, 0.0, 0.0, 0.0);
+    const rebased = bridge.interpHistory.get(remoteKey);
+    expect(rebased).toHaveLength(1);
+    expect(rebased[0].tick).toBe(12);
+    expect(rebased[0].timestampSec).toBeCloseTo(100.1, 4);
+
+    // 2. EntityDeltaBatch rollover clears stale interpHistory and re-populates on the new timeline
+    const buildDeltaBatch = (serverTick, baselineTick, xVal) => {
+      const payload = [];
+      const pushVarint = (val) => {
+        let v = BigInt(val);
+        while (v >= 0x80n) {
+          payload.push(Number((v & 0x7fn) | 0x80n));
+          v >>= 7n;
+        }
+        payload.push(Number(v));
+      };
+      pushVarint(serverTick);
+      pushVarint(baselineTick);
+      pushVarint(0); // despawns
+      pushVarint(1); // deltas
+      pushVarint(remoteGuid);
+      payload.push(DELTA_FLAGS.MASK_KEYFRAME & 0xff, (DELTA_FLAGS.MASK_KEYFRAME >> 8) & 0xff);
+      const f32Buf = new ArrayBuffer(12);
+      const f32View = new DataView(f32Buf);
+      f32View.setFloat32(0, xVal, true);
+      f32View.setFloat32(4, 0.0, true);
+      f32View.setFloat32(8, 5.0, true);
+      new Uint8Array(f32Buf).forEach((b) => payload.push(b));
+
+      const frame = new Uint8Array(8 + payload.length);
+      const view = new DataView(frame.buffer);
+      frame[0] = 0x4d;
+      frame[1] = 0x4d;
+      view.setUint16(2, OPCODES.ENTITY_DELTA_BATCH, true);
+      view.setUint32(4, payload.length, true);
+      frame.set(payload, 8);
+      return frame;
+    };
+
+    const otherKey = Number((1n << 48n) | 502n);
+    bridge.latestServerTick = 0;
+    bridge.interpHistory.clear();
+    bridge._pushInterpSnapshot(otherKey, 5000, 100.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    bridge.processPacket(buildDeltaBatch(5000, 4999, 14.0));
+    expect(bridge.interpHistory.has(otherKey)).toBe(true);
+    expect(bridge.interpHistory.get(remoteKey).at(-1).tick).toBe(5000);
+
+    // Transition to target node at lower tick (12, baseline 0) -> clears stale queues & adds tick 12
+    bridge.processPacket(buildDeltaBatch(12, 0, 15.0));
+    expect(bridge.latestServerTick).toBe(12);
+    expect(bridge.interpHistory.has(otherKey)).toBe(false);
+    const afterBatch = bridge.interpHistory.get(remoteKey);
+    expect(afterBatch).toHaveLength(1);
+    expect(afterBatch[0].tick).toBe(12);
+    expect(afterBatch[0].x).toBeCloseTo(15.0, 4);
+  });
 });
 
 describe("Session Token & Multi-Session Isolation", () => {

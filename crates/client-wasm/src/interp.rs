@@ -69,38 +69,45 @@ impl InterpolationBuffer {
         let effective_ts = if let Some(back) = queue.back() {
             if tick > 0 && back.tick > 0 {
                 if tick < back.tick {
-                    // Out-of-order tick arrival
-                    let front_tick = queue.front().map(|f| f.tick).unwrap_or(0);
-                    if tick <= front_tick || queue.iter().any(|s| s.tick == tick) {
-                        // Older than retained history or duplicate
+                    if back.tick - tick > 4 {
+                        // Cross-node handover reset authoritative tick counter: rebase cleanly.
+                        let prev_back_ts = back.timestamp_sec;
+                        queue.clear();
+                        timestamp_sec.max(prev_back_ts + 0.05)
+                    } else {
+                        // Minor out-of-order tick arrival
+                        let front_tick = queue.front().map(|f| f.tick).unwrap_or(0);
+                        if tick <= front_tick || queue.iter().any(|s| s.tick == tick) {
+                            // Older than retained history or duplicate
+                            return;
+                        }
+
+                        // Insert at sorted index
+                        let insert_idx = queue
+                            .iter()
+                            .position(|s| s.tick > tick)
+                            .unwrap_or(queue.len());
+                        let prev_s = &queue[insert_idx - 1];
+                        let next_s = &queue[insert_idx];
+                        let frac = (tick - prev_s.tick) as f64 / (next_s.tick - prev_s.tick) as f64;
+                        let ts = prev_s.timestamp_sec
+                            + frac * (next_s.timestamp_sec - prev_s.timestamp_sec);
+
+                        queue.insert(
+                            insert_idx,
+                            EntitySnapshot {
+                                tick,
+                                timestamp_sec: ts,
+                                position,
+                                velocity,
+                                yaw,
+                            },
+                        );
+                        while queue.len() > self.max_history {
+                            queue.pop_front();
+                        }
                         return;
                     }
-
-                    // Insert at sorted index
-                    let insert_idx = queue
-                        .iter()
-                        .position(|s| s.tick > tick)
-                        .unwrap_or(queue.len());
-                    let prev_s = &queue[insert_idx - 1];
-                    let next_s = &queue[insert_idx];
-                    let frac = (tick - prev_s.tick) as f64 / (next_s.tick - prev_s.tick) as f64;
-                    let ts =
-                        prev_s.timestamp_sec + frac * (next_s.timestamp_sec - prev_s.timestamp_sec);
-
-                    queue.insert(
-                        insert_idx,
-                        EntitySnapshot {
-                            tick,
-                            timestamp_sec: ts,
-                            position,
-                            velocity,
-                            yaw,
-                        },
-                    );
-                    while queue.len() > self.max_history {
-                        queue.pop_front();
-                    }
-                    return;
                 } else if tick == back.tick {
                     // Duplicate tick in same or subsequent packet: drop duplicate
                     return;
@@ -390,5 +397,44 @@ mod tests {
             .expect("must interpolate after tick 0 rebase");
         assert!((pos.0 - 7.5).abs() < 1e-3);
         assert!((yaw - 0.75).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_cross_node_tick_rollover_rebases_snapshot_queue() {
+        let mut buffer = InterpolationBuffer::new(0.10);
+        let entity_id = 777;
+
+        buffer.push_snapshot(
+            entity_id,
+            100,
+            1.00,
+            (10.0, 0.0, 0.0),
+            (20.0, 0.0, 0.0),
+            0.0,
+        );
+        buffer.push_snapshot(
+            entity_id,
+            101,
+            1.05,
+            (12.0, 0.0, 0.0),
+            (20.0, 0.0, 0.0),
+            0.0,
+        );
+
+        // Handover to a peer node whose server_tick starts at 1 (>4 tick drop)
+        buffer.push_snapshot(entity_id, 1, 1.08, (14.0, 0.0, 0.0), (20.0, 0.0, 0.0), 0.0);
+        buffer.push_snapshot(entity_id, 2, 1.13, (16.0, 0.0, 0.0), (20.0, 0.0, 0.0), 0.0);
+
+        let queue = buffer.history.get(&entity_id).expect("must have history");
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].tick, 1);
+        assert!((queue[0].timestamp_sec - 1.10).abs() < 1e-6);
+        assert_eq!(queue[1].tick, 2);
+        assert!((queue[1].timestamp_sec - 1.15).abs() < 1e-6);
+
+        let (pos, _) = buffer
+            .sample(entity_id, 1.225)
+            .expect("must interpolate cleanly");
+        assert!((pos.0 - 15.0).abs() < 1e-3);
     }
 }

@@ -1,0 +1,20 @@
+# Design: Live Cloud Validation & Multi-Client Load/Soak Testing
+
+## 1. Extended Soak Telemetry (`crates/loadtest/src/metrics.rs`, `swarm.rs`, `session.rs`, `main.rs`)
+- `MetricsAggregator` adds lock-free `AtomicU64` counters:
+  - `authenticated_sessions` (via `record_authenticated_session()`): measures admission throughput `auth_throughput_sps = authenticated_sessions as f64 / duration_secs`.
+  - `entity_deltas_received` (via `record_entity_deltas(count: u64)`): counts individual `EntityDeltaState` updates received inside `EntityDeltaBatchPacket`.
+  - `route_handovers_observed` (via `record_route_handover()`): detects when a bot's stream transitions to a different authoritative node whose `server_tick` timeline sits behind the previously observed tick (`last_observed_tick > 0 && batch.server_tick.saturating_add(4) < last_observed_tick`). On detection, `last_observed_tick` resets to `batch.server_tick` so subsequent ticks on the new node do not re-trigger the detector; minor reordering within 4 ticks keeps `last_observed_tick` monotonic via `.max(batch.server_tick)` without false positives.
+  - `total_bytes_received` (via `record_bytes_received(bytes: u64)`): tracks raw TCP payload bytes read across both the authentication handshake (`BotSession::total_bytes_received`) and the steady-state reader loop (`reader.read_buf`), reporting `recv_bandwidth_kbps = (total_bytes_received as f64 * 8.0 / 1000.0) / duration_secs` (kilobits/sec, SI `1000` bits/kbit).
+- `BotSession` mirrors per-session `entity_deltas_received` and `route_handovers_observed` in `handle_decoded_packet` so `ScenarioRunner` and direct session tests share identical handover and delta semantics.
+
+## 2. Multi-Node Split, Migration, Failover & Persistence Soak Test (`crates/loadtest/tests/cloud_soak_validation.rs`)
+- Preserves server-authoritative anti-cheat invariants and lock-ordering discipline (`TickSimulation` never performs blocking DB I/O inside `step_tick`; persistence uses `WriteBehindSnapshotter`'s non-blocking dirty queue):
+  1. **Swarm Auth & 20 Hz Movement**: Spawns a `GatewayServer` with `EdgeAuthenticator` (HS256 JWTs) and `GatewayServiceImpl` (gRPC on an ephemeral port), routing packets to two independent `NodeServiceImpl` + `TickSimulation` nodes (`Node 1` owning `x < 0` and `Node 2` owning `x >= 0`). A `SwarmManager` bot swarm authenticates concurrently and streams 20 Hz movement.
+  2. **Live Batch Entity Migration & Route Handover**: While bots actively stream movement and receive `EntityDeltaBatch` frames (with `Node 1` at a higher `tick_counter` than `Node 2`), entities crossing into `Node 2`'s domain are migrated via `mmo_node::network::execute_batch_entity_migration` with `gateway_addr` updating `SessionRouter` over gRPC (`UpdateBatchRoutes`). Bots observe route handover without disconnecting and continue routing movement to `Node 2`.
+  3. **Node Failover Route Reassignment**: Simulates `Node 2` loss and invokes `GatewayService::reassign_node_routes` over gRPC to evacuate remaining `Node 2` routes to surviving `Node 1`, verifying `SessionRouter` entries and RPC reassignment counts reflect zero blackholed routes.
+  4. **Write-Behind SQLite Snapshot Integrity**: Configures `WriteBehindSnapshotter` backed by `CharacterRepository` on `Database::connect("sqlite::memory:")`, flushes queued player movement snapshots across sustained ticks, and queries `CharacterRepository::get_snapshot` to confirm persisted coordinates and version numbers match authoritative simulation state.
+
+## 3. Live Cloud Validation (`docs/CLOUD_POC_DEPLOYMENT.md`)
+- Uses read-only Kubernetes inspection (`kubectl get`, `kubectl logs`, Prometheus HTTP API) plus external client connections (`mmo-loadtest` against LoadBalancer TCP `:8080`, HTTPS `/cert-hash`, UDP `:4433`, and TCP `:8443` diagnostics) to avoid mutating cluster workloads while measuring real cluster behavior under load.
+- Documents exact observed metrics (bot count, duration, PPS, auth throughput, bandwidth kbps, RTT percentiles, Prometheus tick duration/active entities, and cluster split/migration events) in `docs/CLOUD_POC_DEPLOYMENT.md`.

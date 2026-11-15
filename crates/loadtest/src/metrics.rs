@@ -9,6 +9,10 @@ use std::time::Instant;
 pub struct MetricsAggregator {
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
+    authenticated_sessions: AtomicU64,
+    entity_deltas_received: AtomicU64,
+    route_handovers_observed: AtomicU64,
+    total_bytes_received: AtomicU64,
     snapbacks: AtomicU64,
     connection_errors: AtomicU64,
     auth_failures: AtomicU64,
@@ -24,6 +28,14 @@ pub struct MetricsSnapshot {
     pub total_packets_received: u64,
     pub send_rate_pps: f64,
     pub recv_rate_pps: f64,
+    pub authenticated_sessions: u64,
+    /// Authenticated session admission throughput in sessions per second.
+    pub auth_throughput_sps: f64,
+    pub entity_deltas_received: u64,
+    pub route_handovers_observed: u64,
+    pub total_bytes_received: u64,
+    /// Downstream wire receive bandwidth in kilobits per second (SI `1000` bits/kbit).
+    pub recv_bandwidth_kbps: f64,
     pub snapbacks: u64,
     pub connection_errors: u64,
     pub auth_failures: u64,
@@ -44,6 +56,10 @@ impl MetricsAggregator {
         Self {
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
+            authenticated_sessions: AtomicU64::new(0),
+            entity_deltas_received: AtomicU64::new(0),
+            route_handovers_observed: AtomicU64::new(0),
+            total_bytes_received: AtomicU64::new(0),
             snapbacks: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
@@ -58,6 +74,25 @@ impl MetricsAggregator {
 
     pub fn record_packet_received(&self) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_authenticated_session(&self) {
+        self.authenticated_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_entity_deltas(&self, count: u64) {
+        self.entity_deltas_received
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_route_handover(&self) {
+        self.route_handovers_observed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_bytes_received(&self, bytes: u64) {
+        self.total_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn record_snapback(&self) {
@@ -80,9 +115,16 @@ impl MetricsAggregator {
 
     /// Generates a summary snapshot.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let duration = self.start_time.elapsed().as_secs_f64();
+        self.snapshot_for_duration(self.start_time.elapsed().as_secs_f64())
+    }
+
+    fn snapshot_for_duration(&self, duration: f64) -> MetricsSnapshot {
         let sent = self.packets_sent.load(Ordering::Relaxed);
         let recv = self.packets_received.load(Ordering::Relaxed);
+        let authenticated_sessions = self.authenticated_sessions.load(Ordering::Relaxed);
+        let entity_deltas_received = self.entity_deltas_received.load(Ordering::Relaxed);
+        let route_handovers_observed = self.route_handovers_observed.load(Ordering::Relaxed);
+        let total_bytes_received = self.total_bytes_received.load(Ordering::Relaxed);
         let snapbacks = self.snapbacks.load(Ordering::Relaxed);
         let errors = self.connection_errors.load(Ordering::Relaxed);
         let auth_failures = self.auth_failures.load(Ordering::Relaxed);
@@ -102,20 +144,26 @@ impl MetricsAggregator {
             )
         };
 
+        let per_sec = |count: f64| {
+            if duration > 0.0 {
+                count / duration
+            } else {
+                0.0
+            }
+        };
+
         MetricsSnapshot {
             duration_secs: duration,
             total_packets_sent: sent,
             total_packets_received: recv,
-            send_rate_pps: if duration > 0.0 {
-                sent as f64 / duration
-            } else {
-                0.0
-            },
-            recv_rate_pps: if duration > 0.0 {
-                recv as f64 / duration
-            } else {
-                0.0
-            },
+            send_rate_pps: per_sec(sent as f64),
+            recv_rate_pps: per_sec(recv as f64),
+            authenticated_sessions,
+            auth_throughput_sps: per_sec(authenticated_sessions as f64),
+            entity_deltas_received,
+            route_handovers_observed,
+            total_bytes_received,
+            recv_bandwidth_kbps: per_sec(total_bytes_received as f64 * 8.0 / 1000.0),
             snapbacks,
             connection_errors: errors,
             auth_failures,
@@ -165,10 +213,43 @@ mod tests {
         metrics.record_auth_failure();
         let snap = metrics.snapshot();
         assert_eq!(snap.auth_failures, 1);
+        assert_eq!(snap.authenticated_sessions, 0);
+        assert_eq!(snap.auth_throughput_sps, 0.0);
+        assert_eq!(snap.entity_deltas_received, 0);
+        assert_eq!(snap.route_handovers_observed, 0);
+        assert_eq!(snap.total_bytes_received, 0);
+        assert_eq!(snap.recv_bandwidth_kbps, 0.0);
         assert_eq!(snap.min_rtt_ms, 0.0);
         assert_eq!(snap.p50_rtt_ms, 0.0);
         assert_eq!(snap.p95_rtt_ms, 0.0);
         assert_eq!(snap.p99_rtt_ms, 0.0);
         assert_eq!(snap.max_rtt_ms, 0.0);
+    }
+
+    #[test]
+    fn test_extended_soak_telemetry_counters_and_rates() {
+        let metrics = MetricsAggregator::new();
+        for _ in 0..25 {
+            metrics.record_authenticated_session();
+        }
+        metrics.record_entity_deltas(120);
+        metrics.record_entity_deltas(30);
+        metrics.record_route_handover();
+        metrics.record_route_handover();
+        metrics.record_bytes_received(50_000);
+        metrics.record_bytes_received(25_000);
+
+        let snap = metrics.snapshot_for_duration(2.5);
+        assert_eq!(snap.authenticated_sessions, 25);
+        assert!((snap.auth_throughput_sps - 10.0).abs() < 1e-6);
+        assert_eq!(snap.entity_deltas_received, 150);
+        assert_eq!(snap.route_handovers_observed, 2);
+        assert_eq!(snap.total_bytes_received, 75_000);
+        // 75,000 bytes * 8 bits / 1000 / 2.5s = 240.0 kbps
+        assert!((snap.recv_bandwidth_kbps - 240.0).abs() < 1e-6);
+
+        let zero_dur = metrics.snapshot_for_duration(0.0);
+        assert_eq!(zero_dur.auth_throughput_sps, 0.0);
+        assert_eq!(zero_dur.recv_bandwidth_kbps, 0.0);
     }
 }

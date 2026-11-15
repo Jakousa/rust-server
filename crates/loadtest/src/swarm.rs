@@ -1,5 +1,5 @@
 use crate::metrics::{MetricsAggregator, MetricsSnapshot};
-use crate::session::{BotSession, SessionError};
+use crate::session::{observe_server_tick, BotSession, SessionError};
 use crate::trajectory::{BehaviorProfile, TrajectoryController, WorldBounds};
 use bytes::BytesMut;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -119,34 +119,45 @@ impl SwarmConfig {
     }
 }
 
+struct BotFrameContext<'a> {
+    session_id: u64,
+    guid: Guid,
+    traj: &'a mut TrajectoryController,
+    last_ping: &'a mut Option<(u64, Instant)>,
+    last_observed_tick: &'a mut u64,
+}
+
 async fn process_bot_frames(
     read_buf: &mut BytesMut,
     writer: &mut OwnedWriteHalf,
     metrics: &MetricsAggregator,
-    session_id: u64,
-    guid: Guid,
-    traj: &mut TrajectoryController,
-    last_ping: &mut Option<(u64, Instant)>,
+    ctx: &mut BotFrameContext<'_>,
 ) {
     while let Ok(Some(packet)) = ClientPacket::decode_frame(read_buf) {
         metrics.record_packet_received();
         match packet {
             ClientPacket::Pong(pong) => {
-                if let Some((ts, sent_time)) = *last_ping {
+                if let Some((ts, sent_time)) = *ctx.last_ping {
                     if ts == pong.client_timestamp {
                         metrics.record_rtt_ms(sent_time.elapsed().as_secs_f64() * 1000.0);
-                        *last_ping = None;
+                        *ctx.last_ping = None;
                     }
                 }
             }
-            ClientPacket::MovementCorrection(corr) if corr.entity_id == guid.raw() => {
+            ClientPacket::MovementCorrection(corr) if corr.entity_id == ctx.guid.raw() => {
                 metrics.record_snapback();
-                traj.position = corr.corrected_position;
-                traj.velocity = Vec3::ZERO;
+                ctx.traj.position = corr.corrected_position;
+                ctx.traj.velocity = Vec3::ZERO;
             }
             ClientPacket::EntityDeltaBatch(batch) => {
+                if !batch.deltas.is_empty() {
+                    metrics.record_entity_deltas(batch.deltas.len() as u64);
+                }
+                if observe_server_tick(ctx.last_observed_tick, batch.server_tick) {
+                    metrics.record_route_handover();
+                }
                 let ack_pkt = ClientPacket::ClientAck(ClientAckPacket {
-                    session_id,
+                    session_id: ctx.session_id,
                     observed_tick: batch.server_tick,
                     ack_mask: 0,
                 });
@@ -231,8 +242,15 @@ impl SwarmManager {
                     Ok(_) => {
                         metrics.record_packet_sent();
                         metrics.record_packet_received();
+                        metrics.record_authenticated_session();
+                        if session.total_bytes_received > 0 {
+                            metrics.record_bytes_received(session.total_bytes_received);
+                        }
                     }
                     Err(e) => {
+                        if session.total_bytes_received > 0 {
+                            metrics.record_bytes_received(session.total_bytes_received);
+                        }
                         match &e {
                             SessionError::AuthRejected { .. } => {
                                 metrics.record_packet_sent();
@@ -252,6 +270,7 @@ impl SwarmManager {
 
                 let session_id = session.session_id;
                 let guid = session.guid;
+                let mut last_observed_tick = session.last_observed_tick;
                 let Some((stream, mut read_buf)) = session.into_parts() else {
                     metrics.record_connection_error();
                     return;
@@ -267,16 +286,14 @@ impl SwarmManager {
                 let mut seq: u32 = 0;
 
                 if !read_buf.is_empty() {
-                    process_bot_frames(
-                        &mut read_buf,
-                        &mut writer,
-                        &metrics,
+                    let mut ctx = BotFrameContext {
                         session_id,
                         guid,
-                        &mut traj,
-                        &mut last_ping,
-                    )
-                    .await;
+                        traj: &mut traj,
+                        last_ping: &mut last_ping,
+                        last_observed_tick: &mut last_observed_tick,
+                    };
+                    process_bot_frames(&mut read_buf, &mut writer, &metrics, &mut ctx).await;
                 }
 
                 loop {
@@ -290,15 +307,20 @@ impl SwarmManager {
                                     metrics.record_connection_error();
                                     break;
                                 }
-                                Ok(_) => {
+                                Ok(bytes_read) => {
+                                    metrics.record_bytes_received(bytes_read as u64);
+                                    let mut ctx = BotFrameContext {
+                                        session_id,
+                                        guid,
+                                        traj: &mut traj,
+                                        last_ping: &mut last_ping,
+                                        last_observed_tick: &mut last_observed_tick,
+                                    };
                                     process_bot_frames(
                                         &mut read_buf,
                                         &mut writer,
                                         &metrics,
-                                        session_id,
-                                        guid,
-                                        &mut traj,
-                                        &mut last_ping,
+                                        &mut ctx,
                                     )
                                     .await;
                                 }
@@ -621,6 +643,7 @@ mod tests {
         let snapshot = manager.run().await;
 
         assert_eq!(snapshot.auth_failures, 3);
+        assert_eq!(snapshot.authenticated_sessions, 0);
         assert_eq!(snapshot.connection_errors, 3);
         assert_eq!(router.session_count(), 0);
         assert!(
@@ -628,5 +651,80 @@ mod tests {
             "Rejected bots must not forward gameplay packets"
         );
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_swarm_manager_records_extended_telemetry_and_handover() {
+        use mmo_schema::client::EntityDeltaState;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = listener.local_addr().unwrap().to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::with_capacity(1024);
+            let _ = s.read_buf(&mut buf).await.unwrap();
+            let _ = ClientPacket::decode_frame(&mut buf).unwrap().unwrap();
+
+            let guid = Guid::new(EntityType::Player, 1, 77);
+            let resp = ClientPacket::AuthResponse(AuthResponsePacket {
+                success: true,
+                error_code: 0,
+                session_id: 501,
+                player_guid: guid.raw(),
+                assigned_node: "127.0.0.1:50052".to_string(),
+                error_message: String::new(),
+            });
+            s.write_all(&resp.encode()).await.unwrap();
+
+            let delta_sample = EntityDeltaState {
+                entity_id: guid.raw(),
+                field_mask: 0x01,
+                position: (1.0, 0.0, 1.0),
+                health: 100,
+                max_health: 100,
+                ..Default::default()
+            };
+
+            // Send tick 200 (2 deltas), tick 197 (jitter within 4 -> no handover),
+            // tick 40 (backward reset -> 1 handover, 1 delta), tick 41 (normal -> no handover).
+            for (tick, deltas) in [
+                (200u64, vec![delta_sample.clone(), delta_sample.clone()]),
+                (197u64, vec![delta_sample.clone()]),
+                (40u64, vec![delta_sample]),
+                (41u64, Vec::new()),
+            ] {
+                let batch = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+                    server_tick: tick,
+                    baseline_tick: tick.saturating_sub(1),
+                    despawns: Vec::new(),
+                    deltas,
+                });
+                s.write_all(&batch.encode()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        });
+
+        let config = SwarmConfig {
+            gateway_addr,
+            bot_count: 1,
+            duration: Duration::from_millis(250),
+            tick_rate_hz: 20,
+            ping_interval: Duration::from_millis(100),
+            stagger_delay: Duration::from_millis(0),
+            ..Default::default()
+        };
+
+        let manager = SwarmManager::new(config);
+        let snapshot = manager.run().await;
+        server_task.await.unwrap();
+
+        assert_eq!(snapshot.authenticated_sessions, 1);
+        assert!(snapshot.auth_throughput_sps > 0.0);
+        assert_eq!(snapshot.entity_deltas_received, 4);
+        assert_eq!(snapshot.route_handovers_observed, 1);
+        assert!(snapshot.total_bytes_received > 0);
+        assert!(snapshot.recv_bandwidth_kbps > 0.0);
     }
 }

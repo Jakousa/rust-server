@@ -116,11 +116,13 @@ sequenceDiagram
 
 ## 4. Network Wire Protocol & Compression
 
-The network protocol operates across four transport mechanisms sharing the same `0x4D4D` binary framing:
-1. **HTTP/3 WebTransport (Browser Primary)**: Multiplexes unreliable datagrams (movement, deltas) and reliable streams (actions, trades).
-2. **WebSocket / TLS over TCP (`ws://` / `wss://` Browser Fallback)**: Automatic fallback for restricted networks blocking UDP/HTTP/3, multiplexing biased `SessionSink` channels over binary WebSocket frames.
-3. **Native QUIC UDP (Client)**: TLS 1.3 encryption with sub-millisecond datagram delivery.
-4. **Framed TCP (Bot Swarm & Legacy Fallback)**: 8-byte header (`[0x4D, 0x4D]`, opcode `u16`, length `u32`).
+The network protocol operates across four transport mechanisms sharing the same `0x4D4D` binary framing (documented in [`docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md`](docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md)):
+1. **HTTP/3 WebTransport (Browser Primary, `4433/udp`)**: Multiplexes unreliable datagrams (movement, deltas) and reliable streams (actions, trades) with SHA-256 certificate digest pinning via `/cert-hash`.
+2. **WebSocket / TLS over TCP (`ws://` / `wss://` Browser & Engine Fallback, `8443/tcp`)**: Automatic fallback for restricted networks blocking UDP/HTTP/3, multiplexing biased `SessionSink` channels over binary WebSocket frames.
+3. **Native QUIC UDP (Client, `8080/udp`)**: TLS 1.3 encryption with sub-millisecond datagram delivery.
+4. **Framed TCP (Bot Swarm & External Clients, `8080/tcp`)**: 8-byte header (`[0x4D, 0x4D]`, opcode `u16` LE, payload length `u32` LE).
+
+For connecting third-party engines such as Godot 4, see [`docs/GODOT_CLIENT_INTEGRATION.md`](docs/GODOT_CLIENT_INTEGRATION.md).
 
 ### Bit-Packing & Quantization
 To minimize network egress bandwidth:
@@ -154,3 +156,15 @@ The storage tier separates high-frequency simulation state updates from relation
 - **Write-Behind Coalesced Snapshotting**: Dirty entity and world-object state changes are coalesced in memory during the tick and flushed asynchronously in batches using parameterized multi-row `INSERT ... ON CONFLICT DO UPDATE` queries.
 - **Atomic Two-Player Item Trading & 2PC Containers**: Player-to-player item exchanges and cross-container 2PC transfers execute under strict ascending GUID-ordered row locking (`SELECT ... FOR UPDATE`), preventing deadlocks and guaranteeing zero item duplication even under network drops.
 - **Session Caching**: Dynamic gateway route lookups fall back to a distributed cache layer with automatic TTL-based expiration.
+
+---
+
+## 7. Deployment Topologies & Operational Guides
+
+| Environment | Entry Point | Topology & Services | Reference |
+| :--- | :--- | :--- | :--- |
+| **Local Single-Command Demo** | `docker compose up -d` | `director`, `node-1` (`mmo-village-node`), `node-2` (`mmo-node`), `gateway`, `web` (`:3000`), optional `storage` & `loadtest` profiles | [`docker-compose.yml`](docker-compose.yml) |
+| **Frontend Dev Server** | `npm --prefix web run dev` | Vite HMR dev server (`:3000`) connecting to local/Compose/k3d `mmo-gateway` | [`web/vite.config.js`](web/vite.config.js) |
+| **Local Kubernetes (`k3d`)** | `./scripts/cluster.sh all` | `k8s/k3d.yaml` + `k8s/overlays/local/` (`mmo-director`, `mmo-gateway`, `mmo-node` StatefulSet, `postgres`, Prometheus `:9090`, Grafana `:3000`) | [`scripts/cluster.sh`](scripts/cluster.sh) |
+| **Cloud PoC & Flux GitOps** | `kubectl apply -k k8s/overlays/cloud` | `k8s/overlays/cloud/` + `k8s/flux-system/` with Let's Encrypt HTTPS ingress, `/cert-hash` routing, UDP `:4433`, WSS `:8443` | [`docs/CLOUD_POC_DEPLOYMENT.md`](docs/CLOUD_POC_DEPLOYMENT.md) |
+| **External Client & Godot SDKs** | `0x4D4D` Binary Framing | Custom native/Godot client connectivity, auth handshake, and `EntityDeltaBatch` decoding | [`docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md`](docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md), [`docs/GODOT_CLIENT_INTEGRATION.md`](docs/GODOT_CLIENT_INTEGRATION.md) |

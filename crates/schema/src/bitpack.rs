@@ -1,7 +1,33 @@
-//! Bit-level serialization utilities and variable-length integer codecs.
+//! Bit-level serialization utilities and unsigned LEB128 variable-length integer codecs.
 //!
-//! Provides zero-allocation streaming bit reading and writing for compact
-//! delta state replication, and unsigned LEB128 variable-length integer encoding.
+//! Provides zero-allocation streaming bit reading/writing ([`BitWriter`], [`BitReader`]),
+//! declarative bit-packed delta structs ([`crate::bitpack_delta!`]), and canonical unsigned
+//! LEB128 variable-length integer encoding/decoding ([`put_varint_u64`], [`get_varint_u64`],
+//! [`put_varint_u32`], [`get_varint_u32`]).
+//!
+//! # Unsigned LEB128 Wire Format
+//!
+//! Each byte contributes 7 payload bits (least-significant group first); bit 7 (`0x80`)
+//! is the continuation flag (`1` if more bytes follow, `0` on the final byte):
+//!
+//! * **32-bit (`u32`)**: `1..=5` bytes ([`MAX_VARINT_U32_BYTES`] = 5). Byte 5 may only populate
+//!   its lower 4 bits (`byte & 0xF0 == 0`); overflow or >5 bytes returns
+//!   [`ClientCodecError::InvalidData`].
+//! * **64-bit (`u64`)**: `1..=10` bytes ([`MAX_VARINT_U64_BYTES`] = 10). Byte 10 may only
+//!   populate bit 0 (`byte & 0x7E == 0`, no continuation bit); overflow or >10 bytes returns
+//!   [`ClientCodecError::InvalidData`].
+//!
+//! # Bitstream Packing (`BitWriter` / `BitReader`)
+//!
+//! * Bits are packed **LSB-first** (`bit_offset` runs `0..8` from least-significant bit
+//!   upward within each byte).
+//! * [`BitWriter::put_varint_u32`], [`BitWriter::put_varint_u64`], [`BitWriter::write_bytes`],
+//!   and their [`BitReader`] counterparts automatically flush/align to the next whole byte
+//!   boundary (`zero`-padded on write) before reading or writing byte-aligned values.
+//! * Note that top-level [`crate::client::EntityDeltaBatchPacket`] (`0x0009`) uses byte-aligned
+//!   LEB128 varints, `u16` little-endian bitmasks, and quantized little-endian integers for
+//!   cross-language ergonomics, whereas [`BitWriter`]/[`BitReader`] serve sub-byte custom payloads
+//!   and [`crate::bitpack_delta!`] models.
 
 use bytes::{Buf, BufMut, BytesMut};
 

@@ -19,7 +19,11 @@ use mmo_schema::client::{
 };
 use mmo_schema::quantize::is_teleport_delta;
 
+use crate::network::ghost::{GhostRecord, GhostStore};
 use crate::sector::SectorManager;
+
+/// Boundary margin in meters around partition seams used for cross-node ghost replication.
+pub const AOI_BOUNDARY_MARGIN: f32 = 100.0;
 
 /// Configuration parameters for an Area-of-Interest observer.
 #[derive(Debug, Clone, PartialEq)]
@@ -550,6 +554,49 @@ pub struct AoiManager {
     scratch_session_ids: Vec<u64>,
     scratch_exited_guids: Vec<Guid>,
     scratch_baseline_upserts: Vec<(Guid, CachedEntityState)>,
+    scratch_ghosts: HashMap<Guid, GhostRecord>,
+}
+
+type ExtractedEntityFields = (
+    u32,
+    u32,
+    u32,
+    Vec<ScalarAttributeDelta>,
+    f32,
+    f32,
+    (f32, f32, f32),
+);
+
+fn extract_visible_entity_fields(
+    visible_guid: Guid,
+    entity_store: &EntityStore,
+    ghosts: &HashMap<Guid, GhostRecord>,
+    extractor: &dyn AoiAttributeExtractor,
+) -> Option<ExtractedEntityFields> {
+    if let Some(ent) = entity_store.get_by_guid(visible_guid) {
+        let (health, max_health, state_flags, attrs) = extractor.extract(ent);
+        Some((
+            health,
+            max_health,
+            state_flags,
+            attrs,
+            ent.rotation,
+            0.0,
+            (0.0, 0.0, 0.0),
+        ))
+    } else {
+        ghosts.get(&visible_guid).map(|ghost| {
+            (
+                100,
+                100,
+                0,
+                Vec::new(),
+                ghost.yaw,
+                ghost.pitch,
+                ghost.velocity,
+            )
+        })
+    }
 }
 
 impl Default for AoiManager {
@@ -570,6 +617,7 @@ impl AoiManager {
             scratch_session_ids: Vec::with_capacity(64),
             scratch_exited_guids: Vec::with_capacity(128),
             scratch_baseline_upserts: Vec::with_capacity(128),
+            scratch_ghosts: HashMap::with_capacity(64),
         }
     }
 
@@ -676,6 +724,19 @@ impl AoiManager {
         current_tick: u64,
         timestamp_ms: u64,
     ) -> Vec<AoiBroadcastJob> {
+        self.update_observers_with_ghosts(entity_store, octree, None, current_tick, timestamp_ms)
+    }
+
+    /// Evaluates AoI visibility for all observers, optionally merging nearby cross-partition
+    /// entities from `ghost_store`, and generates broadcast jobs.
+    pub fn update_observers_with_ghosts(
+        &mut self,
+        entity_store: &EntityStore,
+        octree: &Octree,
+        ghost_store: Option<&GhostStore>,
+        current_tick: u64,
+        timestamp_ms: u64,
+    ) -> Vec<AoiBroadcastJob> {
         let mut jobs = Vec::new();
 
         self.scratch_session_ids.clear();
@@ -698,6 +759,7 @@ impl AoiManager {
 
             // 2. Perform zero-allocation query into scratch buffer
             self.scratch_query.clear();
+            self.scratch_ghosts.clear();
             octree.query_radius_with_dist_sq_into(
                 observer_pos,
                 observer.effective_radius,
@@ -719,6 +781,27 @@ impl AoiManager {
                         false
                     }
                 });
+            }
+
+            // 2.3 Include boundary ghosts from neighboring nodes when not present locally
+            if let Some(gs) = ghost_store {
+                if !gs.is_empty() {
+                    for ghost in gs.query_radius(observer_pos, observer.effective_radius) {
+                        if (!observer.config.include_self && ghost.guid == observer.player_guid)
+                            || entity_store.get_by_guid(ghost.guid).is_some()
+                        {
+                            continue;
+                        }
+                        let dx = ghost.position.0 - observer_pos.0;
+                        let dy = ghost.position.1 - observer_pos.1;
+                        let dz = ghost.position.2 - observer_pos.2;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        let gpos = ghost.position;
+                        let gguid = ghost.guid;
+                        self.scratch_ghosts.insert(gguid, ghost);
+                        self.scratch_query.push((gguid, gpos, dist_sq));
+                    }
+                }
             }
 
             // 2.5 Frustum Culling (if enabled)
@@ -799,17 +882,16 @@ impl AoiManager {
                 let tracker_was_empty = observer.baseline_tracker.is_empty();
 
                 for &(visible_guid, pos, _) in &self.scratch_query {
-                    let ent = match entity_store.get_by_guid(visible_guid) {
-                        Some(e) => e,
-                        None => continue,
+                    let Some((health, max_health, state_flags, attrs, yaw, pitch, velocity)) =
+                        extract_visible_entity_fields(
+                            visible_guid,
+                            entity_store,
+                            &self.scratch_ghosts,
+                            self.attribute_extractor.as_ref(),
+                        )
+                    else {
+                        continue;
                     };
-
-                    let (health, max_health, state_flags, attrs) =
-                        self.attribute_extractor.extract(ent);
-
-                    let yaw = ent.rotation;
-                    let pitch = 0.0;
-                    let velocity = (0.0, 0.0, 0.0);
 
                     let mut delta_entry = None;
 
@@ -1013,17 +1095,16 @@ impl AoiManager {
                 }
 
                 for &(visible_guid, pos, _) in &self.scratch_query {
-                    let ent = match entity_store.get_by_guid(visible_guid) {
-                        Some(e) => e,
-                        None => continue,
+                    let Some((health, max_health, state_flags, attrs, yaw, pitch, velocity)) =
+                        extract_visible_entity_fields(
+                            visible_guid,
+                            entity_store,
+                            &self.scratch_ghosts,
+                            self.attribute_extractor.as_ref(),
+                        )
+                    else {
+                        continue;
                     };
-
-                    let (health, max_health, state_flags, attrs) =
-                        self.attribute_extractor.extract(ent);
-
-                    let yaw = ent.rotation;
-                    let pitch = 0.0;
-                    let velocity = (0.0, 0.0, 0.0);
 
                     if let Some(cached) = observer.observed_entities.get_mut(&visible_guid) {
                         let dx = pos.0 - cached.position.0;
@@ -2378,5 +2459,95 @@ mod tests {
             obs3.last_center_sector,
             Some(SectorCoord3D::from_world_pos((200.0, 10.0, 0.0)))
         );
+    }
+
+    #[test]
+    fn test_update_observers_with_ghosts_visibility_and_deduplication() {
+        use mmo_core::guid::EntityType;
+        use mmo_core::BoundingBox3D;
+
+        let bounds = BoundingBox3D::new((0.0, -50.0, -50.0), (200.0, 50.0, 50.0));
+        let mut store = EntityStore::new();
+        let mut octree = Octree::new(bounds);
+        let ghost_store = GhostStore::new();
+
+        let obs_guid = Guid::new(EntityType::Player, 1, 1);
+        let ghost_guid = Guid::new(EntityType::Player, 2, 2);
+        let far_ghost_guid = Guid::new(EntityType::Player, 2, 3);
+
+        store.spawn(obs_guid, (95.0, 0.0, 0.0));
+        octree.insert(obs_guid, (95.0, 0.0, 0.0));
+
+        ghost_store.insert_or_update(GhostRecord::new(
+            ghost_guid,
+            (105.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            0.5,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        ));
+        ghost_store.insert_or_update(GhostRecord::new(
+            far_ghost_guid,
+            (190.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        ));
+        // Duplicate self record inside ghost_store must still respect include_self = false
+        ghost_store.insert_or_update(GhostRecord::new(
+            obs_guid,
+            (95.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            Vec::new(),
+            1,
+            2,
+        ));
+
+        let mut aoi = AoiManager::new();
+        aoi.register_observer(
+            10,
+            obs_guid,
+            ObserverConfig {
+                base_radius: 25.0,
+                include_self: false,
+                enable_delta_compression: true,
+                ..Default::default()
+            },
+        );
+
+        let jobs1 = aoi.update_observers_with_ghosts(&store, &octree, Some(&ghost_store), 1, 1000);
+        assert_eq!(jobs1.len(), 1);
+        match &jobs1[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert!(batch.despawns.is_empty());
+                assert_eq!(batch.deltas.len(), 1);
+                assert_eq!(batch.deltas[0].entity_id, ghost_guid.raw());
+                assert_eq!(batch.deltas[0].position, (105.0, 0.0, 0.0));
+                assert_eq!(batch.deltas[0].health, 100);
+            }
+            other => panic!("Expected EntityDeltaBatch, got {other:?}"),
+        }
+
+        // Migrate ghost_guid into local store while still present in ghost_store -> no despawn & no duplicate
+        store.spawn(ghost_guid, (106.0, 0.0, 0.0));
+        octree.insert(ghost_guid, (106.0, 0.0, 0.0));
+        let jobs2 = aoi.update_observers_with_ghosts(&store, &octree, Some(&ghost_store), 2, 1050);
+        assert_eq!(jobs2.len(), 1);
+        match &jobs2[0].packets[0] {
+            ClientPacket::EntityDeltaBatch(batch) => {
+                assert!(batch.despawns.is_empty());
+                assert_eq!(batch.deltas.len(), 1);
+                assert_eq!(batch.deltas[0].entity_id, ghost_guid.raw());
+                assert_eq!(batch.deltas[0].position, (106.0, 0.0, 0.0));
+            }
+            other => panic!("Expected EntityDeltaBatch, got {other:?}"),
+        }
     }
 }

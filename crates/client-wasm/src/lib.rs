@@ -128,6 +128,16 @@ impl WasmClientWorld {
     fn handle_parsed_packet(&mut self, packet: ClientPacket) {
         match packet {
             ClientPacket::EntityDeltaBatch(batch) => {
+                if self.latest_server_tick > 0
+                    && batch.server_tick > 0
+                    && (batch.server_tick + 4 < self.latest_server_tick
+                        || (batch.server_tick < self.latest_server_tick
+                            && batch.baseline_tick == 0))
+                {
+                    self.interp_buffer.clear();
+                    self.pending_acks.clear();
+                }
+
                 self.latest_server_tick = batch.server_tick;
                 self.latest_baseline_tick = batch.baseline_tick;
 
@@ -1313,6 +1323,79 @@ mod tests {
         let pos_after_update = world.get_entity_position(local_id).unwrap();
         assert!((pos_after_update.1 - 2.5).abs() < 0.05);
         assert!((pos_after_update.2 + 3.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_entity_delta_batch_tick_discontinuity_clears_interp_and_acks() {
+        let mut world = WasmClientWorld::new();
+        let eid = 42u64;
+
+        let batch1 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 100,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: eid,
+                field_mask: delta_flags::MASK_KEYFRAME,
+                position: (10.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch1.encode()).unwrap();
+
+        let batch2 = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 101,
+            baseline_tick: 100,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: eid,
+                field_mask: delta_flags::MASK_KEYFRAME,
+                position: (12.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch2.encode()).unwrap();
+        assert_eq!(world.pending_acks.len(), 2);
+
+        // Peer node begins streaming from tick 2 -> clears stale acks & interpolation queues
+        let batch_handover = ClientPacket::EntityDeltaBatch(EntityDeltaBatchPacket {
+            server_tick: 2,
+            baseline_tick: 0,
+            despawns: Vec::new(),
+            deltas: vec![EntityDeltaState {
+                entity_id: eid,
+                field_mask: delta_flags::MASK_KEYFRAME,
+                position: (14.0, 0.0, 0.0),
+                velocity: (0.0, 0.0, 0.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                health: 100,
+                max_health: 100,
+                state_flags: 0,
+                action_id: 0,
+                attributes: Vec::new(),
+            }],
+        });
+        world.process_packet(&batch_handover.encode()).unwrap();
+
+        assert_eq!(world.latest_server_tick, 2);
+        assert_eq!(world.pending_acks, std::collections::VecDeque::from([2]));
+        let pos = world.get_entity_position(eid).unwrap();
+        assert!((pos.0 - 14.0).abs() < 1e-3);
     }
 
     proptest! {
