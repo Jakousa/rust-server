@@ -86,6 +86,7 @@ export class WebTransportClient {
       await this.disconnect();
     }
 
+    this.transportMode = null;
     this.notifyStatus("connecting");
 
     try {
@@ -528,7 +529,12 @@ export class WebTransportClient {
 
   notifyStatus(status, error = null) {
     if (this.onStatusCallback) {
-      this.onStatusCallback({ status, error, mode: this.transportMode });
+      this.onStatusCallback({
+        status,
+        error,
+        mode: this.transportMode,
+        transportMode: this.transportMode,
+      });
     }
   }
 

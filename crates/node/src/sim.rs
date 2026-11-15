@@ -66,6 +66,7 @@ pub struct TickSimulation {
     pub peer_partitions: Vec<(BoundingBox3D, u32, String)>,
     pub pending_migrations: Vec<Guid>,
     pub gateway_grpc_addr: String,
+    pub is_draining: bool,
 }
 
 /// Lightweight state digest used to skip re-serializing unchanged entities during periodic snapshots.
@@ -232,6 +233,7 @@ impl TickSimulation {
             pending_migrations: Vec::new(),
             gateway_grpc_addr: std::env::var("GATEWAY_GRPC_ADDR")
                 .unwrap_or_else(|_| "http://127.0.0.1:50050".to_string()),
+            is_draining: false,
         }
     }
 
@@ -890,6 +892,7 @@ impl TickSimulation {
     fn append_entity_migration_batch(
         &self,
         root_guid: Guid,
+        include_owned: bool,
         seen_guids: &mut HashSet<Guid>,
         batches: &mut HashMap<(u32, String), Vec<Guid>>,
     ) {
@@ -900,7 +903,7 @@ impl TickSimulation {
             || self.sectors.get_object(root_guid).is_some()
             || self.is_migrating(root_guid)
             || self.tombstoned_entities.contains_key(&root_guid)
-            || self.owns_position(entity.position)
+            || (!include_owned && self.owns_position(entity.position))
         {
             return;
         }
@@ -930,7 +933,18 @@ impl TickSimulation {
         let mut batches = HashMap::new();
         let mut seen_guids = HashSet::new();
         for (_key, entity) in self.entity_store.iter() {
-            self.append_entity_migration_batch(entity.guid, &mut seen_guids, &mut batches);
+            self.append_entity_migration_batch(entity.guid, false, &mut seen_guids, &mut batches);
+        }
+        batches
+    }
+
+    /// Collects all movable root entities (including those still within `owned_bounds`) plus their
+    /// attached hierarchy descendants for graceful node drain, grouped by destination peer.
+    pub fn collect_all_entities_for_drain(&self) -> HashMap<(u32, String), Vec<Guid>> {
+        let mut batches = HashMap::new();
+        let mut seen_guids = HashSet::new();
+        for (_key, entity) in self.entity_store.iter() {
+            self.append_entity_migration_batch(entity.guid, true, &mut seen_guids, &mut batches);
         }
         batches
     }
@@ -942,7 +956,7 @@ impl TickSimulation {
         let mut batches = HashMap::new();
         let mut seen_guids = HashSet::new();
         for root_guid in pending {
-            self.append_entity_migration_batch(root_guid, &mut seen_guids, &mut batches);
+            self.append_entity_migration_batch(root_guid, false, &mut seen_guids, &mut batches);
         }
         batches
     }
@@ -1478,9 +1492,13 @@ impl TickSimulation {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut aoi_jobs =
-            self.aoi
-                .update_observers(&self.entity_store, &self.octree, self.tick_counter, now_ms);
+        let mut aoi_jobs = self.aoi.update_observers_with_ghosts(
+            &self.entity_store,
+            &self.octree,
+            Some(&self.ghost_store),
+            self.tick_counter,
+            now_ms,
+        );
         self.pending_broadcast_jobs.append(&mut aoi_jobs);
 
         let mut world_obj_jobs = self
@@ -3761,5 +3779,53 @@ mod tests {
         sim.set_last_migration_tick(runner, sim.tick_counter);
         sim.step_tick();
         assert!(sim.pending_migrations.is_empty());
+    }
+
+    #[test]
+    fn test_collect_all_entities_for_drain_includes_owned_hierarchies_and_skips_static_objects() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+
+        let p1 = BoundingBox3D::new((-100.0, -100.0, -100.0), (0.0, 100.0, 100.0));
+        let p2 = BoundingBox3D::new((0.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+
+        let owned_ship = Guid::new(EntityType::DynamicObject, 1, 10);
+        let passenger = Guid::new(EntityType::Player, 1, 11);
+        let static_obj = Guid::new(EntityType::DynamicObject, 1, 12);
+        let tombstoned = Guid::new(EntityType::Player, 1, 13);
+
+        assert!(sim.spawn_entity(owned_ship, (-20.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(passenger, (-20.0, 1.0, 0.0)));
+        assert!(sim
+            .entity_store
+            .attach_child(passenger, owned_ship, (0.0, 1.0, 0.0), 0.0));
+        assert!(sim.spawn_entity(static_obj, (-10.0, 0.0, 0.0)));
+        assert!(sim.spawn_entity(tombstoned, (-30.0, 0.0, 0.0)));
+        sim.tombstoned_entities
+            .insert(tombstoned, std::time::Instant::now());
+
+        let obj = mmo_core::WorldObject::new(
+            static_obj,
+            1,
+            mmo_core::Transform3D::new((-10.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),
+            BoundingBox3D::new((-11.0, -1.0, -1.0), (-9.0, 1.0, 1.0)),
+            mmo_core::ContainerOwner::System("test".to_string()),
+        );
+        sim.insert_world_object(obj);
+
+        sim.apply_topology_partitions(&[
+            (p1, 1, "127.0.0.1:50051".to_string()),
+            (p2, 2, "127.0.0.1:50052".to_string()),
+        ]);
+
+        let batches = sim.collect_all_entities_for_drain();
+        assert_eq!(batches.len(), 1);
+        let guids = batches
+            .get(&(2, "127.0.0.1:50052".to_string()))
+            .expect("peer 2 batch must exist");
+        assert!(guids.contains(&owned_ship));
+        assert!(guids.contains(&passenger));
+        assert!(!guids.contains(&static_obj));
+        assert!(!guids.contains(&tombstoned));
     }
 }

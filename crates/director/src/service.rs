@@ -406,15 +406,26 @@ impl DirectorService for DirectorServiceImpl {
         let mut reg = self.registry.write().await;
         let acknowledged = reg.record_heartbeat(&req);
 
-        let coord = self.coordinator.read().await;
-        let topology_epoch = coord.topology_epoch();
+        let mut coord = self.coordinator.write().await;
 
         metrics::gauge!("mmo_director_active_nodes").set(reg.len() as f64);
-        metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
 
         if acknowledged {
             let should_split =
                 coord.evaluate_heartbeat(req.node_id, req.entity_count, req.tick_duration_ms);
+            if !should_split {
+                let merged = coord.evaluate_and_merge_underloaded(&mut reg);
+                for (bounds, target_node_id) in merged {
+                    println!(
+                        "[Director] Auto-merged underloaded branch {:?} onto node {} (epoch={})",
+                        bounds,
+                        target_node_id,
+                        coord.topology_epoch()
+                    );
+                }
+            }
+            let topology_epoch = coord.topology_epoch();
+            metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
             let partitions = partitions_to_proto(&coord, &reg);
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: true,
@@ -423,12 +434,16 @@ impl DirectorService for DirectorServiceImpl {
                 partitions,
             }))
         } else if reg.is_evicted(req.node_id) {
+            let topology_epoch = coord.topology_epoch();
+            metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
             metrics::counter!("mmo_director_node_fenced_total").increment(1);
             Err(Status::failed_precondition(format!(
                 "Node {} is evicted from director topology (node fenced to prevent split-brain simulation)",
                 req.node_id
             )))
         } else {
+            let topology_epoch = coord.topology_epoch();
+            metrics::gauge!("mmo_director_topology_epoch").set(topology_epoch as f64);
             metrics::counter!("mmo_director_node_reregister_required_total").increment(1);
             Ok(Response::new(HeartbeatResponse {
                 acknowledged: false,
@@ -1986,5 +2001,86 @@ mod tests {
         assert!(gw_hb.partitions.iter().all(|p| p.bounds.is_some()
             && (p.node_address == "mmo-node-0.mmo-node:50052"
                 || p.node_address == "mmo-node-1.mmo-node:50052")));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_triggers_automatic_partition_merge_when_underloaded() {
+        let root_bounds = BoundingBox3D::new((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0));
+        let mut coord_inner = GlobalOctreeCoordinator::with_full_thresholds(
+            root_bounds,
+            100,
+            20,
+            35.0,
+            std::time::Duration::ZERO,
+        );
+        coord_inner.assign_initial_node(1);
+        let coordinator = Arc::new(RwLock::new(coord_inner));
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let service = DirectorServiceImpl::new(registry, coordinator);
+
+        let r1 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 1,
+                listen_addr: "127.0.0.1:50051".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&root_bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r1.success);
+
+        let r2 = service
+            .register_node(Request::new(RegisterNodeRequest {
+                node_id: 2,
+                listen_addr: "127.0.0.1:50052".to_string(),
+                bounds: Some(bounding_box_3d_to_proto(&root_bounds)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r2.success);
+
+        let split_resp = service
+            .report_split(Request::new(SplitReportRequest {
+                node_id: 1,
+                original_bounds: Some(bounding_box_3d_to_proto(&root_bounds)),
+                child_bounds: Vec::new(),
+                total_entities: 100,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(split_resp.acknowledged);
+        assert_eq!(split_resp.topology_epoch, 2);
+        assert_eq!(split_resp.partitions.len(), 8);
+
+        // Node 1 reports low entities, node 2 also reports low entities -> combined 10 <= 20 triggers merge
+        let hb1 = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 1,
+                entity_count: 6,
+                tick_duration_ms: 4.0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hb1.acknowledged);
+        assert!(!hb1.should_split);
+
+        let hb2 = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                node_id: 2,
+                entity_count: 4,
+                tick_duration_ms: 4.0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hb2.acknowledged);
+        assert!(!hb2.should_split);
+        assert_eq!(hb2.topology_epoch, 3);
+        assert_eq!(hb2.partitions.len(), 1);
     }
 }

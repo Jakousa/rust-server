@@ -47,12 +47,19 @@ export class PlayerControls {
   }
 
   setKeyState(e, pressed) {
-    const key = typeof e.key === "string" ? e.key.toLowerCase() : "";
-    const bound = KEY_BINDINGS[key] || CODE_BINDINGS[e.code];
+    const tag = typeof e?.target?.tagName === "string" ? e.target.tagName.toUpperCase() : "";
+    if (
+      pressed &&
+      (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e?.target?.isContentEditable)
+    ) {
+      return;
+    }
+    const key = typeof e?.key === "string" ? e.key.toLowerCase() : "";
+    const bound = KEY_BINDINGS[key] || CODE_BINDINGS[e?.code];
     if (bound) {
       this.keys[bound] = pressed;
     }
-    if (pressed && e.code === "Space" && this.onCastCallback) {
+    if (pressed && e?.code === "Space" && this.onCastCallback) {
       this.onCastCallback();
     }
   }

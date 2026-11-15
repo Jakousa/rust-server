@@ -83,6 +83,19 @@ impl PredictionBuffer {
         self.unacknowledged_inputs.len()
     }
 
+    /// Returns the most recently recorded unacknowledged input sequence number, if any.
+    pub fn latest_sequence(&self) -> Option<u32> {
+        self.unacknowledged_inputs.back().map(|i| i.sequence)
+    }
+
+    /// Computes the Euclidean distance between the current predicted position and `server_pos`.
+    pub fn error_distance(&self, server_pos: (f32, f32, f32)) -> f32 {
+        let dx = self.current_sim_pos.0 - server_pos.0;
+        let dy = self.current_sim_pos.1 - server_pos.1;
+        let dz = self.current_sim_pos.2 - server_pos.2;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
     /// Reconciles the client's predicted position against an authoritative server state update
     /// acknowledging `ack_sequence`.
     ///
@@ -315,5 +328,33 @@ mod tests {
         assert_eq!(pos_extreme, (12.0, 0.0, 0.0));
         assert_eq!(buffer.unacknowledged_inputs.len(), 3);
         assert_eq!(buffer.unacknowledged_inputs[0].sequence, 10);
+    }
+
+    #[test]
+    fn test_prediction_helpers_error_distance_and_latest_sequence() {
+        let mut buffer = PredictionBuffer::new();
+
+        // Empty buffer edge cases
+        assert_eq!(buffer.latest_sequence(), None);
+        assert!((buffer.error_distance((0.0, 0.0, 0.0))).abs() < 1e-6);
+        assert!((buffer.error_distance((3.0, 4.0, 0.0)) - 5.0).abs() < 1e-5);
+
+        // Non-empty queue tracks most recently pushed sequence and predicted position distance
+        buffer.push_input(10, (1.0, 2.0, 2.0), (1.0, 0.0, 0.0), 0.05, 0.5);
+        buffer.push_input(11, (4.0, 6.0, 2.0), (1.0, 0.0, 0.0), 0.05, 0.55);
+        assert_eq!(buffer.latest_sequence(), Some(11));
+        assert!((buffer.error_distance((1.0, 2.0, 2.0)) - 5.0).abs() < 1e-5);
+
+        // After full ACK drains queue, latest_sequence returns None while error_distance compares against sim pos
+        buffer.reconcile(11, (4.0, 6.0, 2.0));
+        assert_eq!(buffer.latest_sequence(), None);
+        assert!(buffer.error_distance((4.0, 6.0, 2.0)).abs() < 1e-6);
+
+        // Reset clears sequence queue and sets predicted position
+        buffer.push_input(12, (7.0, 6.0, 2.0), (1.0, 0.0, 0.0), 0.05, 0.6);
+        assert_eq!(buffer.latest_sequence(), Some(12));
+        buffer.reset((0.0, 0.0, 0.0));
+        assert_eq!(buffer.latest_sequence(), None);
+        assert!((buffer.error_distance((0.0, 3.0, 4.0)) - 5.0).abs() < 1e-5);
     }
 }

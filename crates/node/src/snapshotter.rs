@@ -416,34 +416,8 @@ impl WriteBehindSnapshotter {
     }
 }
 
-/// Executes the orderly node draining sequence upon receiving a termination signal:
-/// 1. Marks telemetry readiness probe unready (`telemetry.mark_unready()`).
-/// 2. Aborts the background Director heartbeat task to prevent re-registration races.
-/// 3. Signals the `WriteBehindSnapshotter` to shut down, awaits its worker handle with a 5-second timeout,
-///    and performs a final `flush_batch()` to persist any remaining dirty snapshots.
-/// 4. Invokes Director's `DeregisterNode` RPC with a bounded 2-second timeout.
-/// 5. Signals the gRPC `NodeServiceServer` to shut down cleanly.
-pub async fn drain_and_shutdown_node(
-    node_id: u16,
-    telemetry: &mmo_core::TelemetryServer,
-    heartbeat_handle: tokio::task::JoinHandle<()>,
-    snapshotter: Option<Arc<WriteBehindSnapshotter>>,
-    snapshot_worker_handle: Option<tokio::task::JoinHandle<()>>,
-    director_addr: &str,
-    grpc_shutdown_tx: tokio::sync::oneshot::Sender<()>,
-) -> usize {
-    telemetry.mark_unready();
-    heartbeat_handle.abort();
-
-    let mut total_flushed = 0;
-    if let Some(snap) = snapshotter {
-        snap.shutdown();
-        if let Some(worker) = snapshot_worker_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
-        }
-        total_flushed += snap.flush_batch().await;
-    }
-
+/// Best-effort deregistration of this simulation node from the Director within a 2-second timeout.
+pub(crate) async fn deregister_node_from_director(node_id: u16, director_addr: &str) {
     let endpoint = if director_addr.starts_with("http://") || director_addr.starts_with("https://")
     {
         director_addr.to_string()
@@ -486,6 +460,46 @@ pub async fn drain_and_shutdown_node(
             );
         }
     }
+}
+
+/// Signals the `WriteBehindSnapshotter` worker to shut down, awaits it with a 5-second timeout,
+/// and performs a synchronous final batch flush.
+pub(crate) async fn flush_snapshotter_on_shutdown(
+    snapshotter: Option<Arc<WriteBehindSnapshotter>>,
+    snapshot_worker_handle: Option<tokio::task::JoinHandle<()>>,
+) -> usize {
+    let mut total_flushed = 0;
+    if let Some(snap) = snapshotter {
+        snap.shutdown();
+        if let Some(worker) = snapshot_worker_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+        }
+        total_flushed += snap.flush_batch().await;
+    }
+    total_flushed
+}
+
+/// Executes the orderly node draining sequence upon receiving a termination signal:
+/// 1. Marks telemetry readiness probe unready (`telemetry.mark_unready()`).
+/// 2. Aborts the background Director heartbeat task to prevent re-registration races.
+/// 3. Signals the `WriteBehindSnapshotter` to shut down, awaits its worker handle with a 5-second timeout,
+///    and performs a final `flush_batch()` to persist any remaining dirty snapshots.
+/// 4. Invokes Director's `DeregisterNode` RPC with a bounded 2-second timeout.
+/// 5. Signals the gRPC `NodeServiceServer` to shut down cleanly.
+pub async fn drain_and_shutdown_node(
+    node_id: u16,
+    telemetry: &mmo_core::TelemetryServer,
+    heartbeat_handle: tokio::task::JoinHandle<()>,
+    snapshotter: Option<Arc<WriteBehindSnapshotter>>,
+    snapshot_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    director_addr: &str,
+    grpc_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+) -> usize {
+    telemetry.mark_unready();
+    heartbeat_handle.abort();
+
+    let total_flushed = flush_snapshotter_on_shutdown(snapshotter, snapshot_worker_handle).await;
+    deregister_node_from_director(node_id, director_addr).await;
 
     let _ = grpc_shutdown_tx.send(());
     total_flushed

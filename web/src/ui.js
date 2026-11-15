@@ -4,6 +4,11 @@
 export class UIController {
   constructor() {
     this.statusDot = document.getElementById("status-dot");
+    this.statusText = document.getElementById("status-text");
+    this.transportBadge = document.getElementById("transport-badge");
+    this.hudToast = document.getElementById("hud-toast");
+    this._toastTimer = null;
+    this._lastTransportMode = null;
     this.gatewayUrlInput = document.getElementById("gateway-url");
     this.certHashInput = document.getElementById("cert-hash");
     this.btnConnect = document.getElementById("btn-connect");
@@ -286,33 +291,141 @@ export class UIController {
     }
   }
 
-  setConnectionState(state, text = "", errorMessage = "") {
+  setConnectionState(state, text = "", errorMessage = "", transportMode = "") {
+    const normalizedState =
+      state === "connected" || state === "connecting" || state === "disconnected"
+        ? state
+        : "disconnected";
+
+    const defaultStatusLabel =
+      normalizedState === "connected"
+        ? "Connected"
+        : normalizedState === "connecting"
+        ? "Connecting..."
+        : "Disconnected";
+    const resolvedStatusText =
+      typeof text === "string" && text.trim().length > 0 ? text.trim() : defaultStatusLabel;
+
     if (this.statusDot) {
-      this.statusDot.className = `status-indicator ${state}`;
-      if (text) {
-        this.statusDot.title = text;
+      this.statusDot.className = `status-indicator ${normalizedState}`;
+      this.statusDot.title = resolvedStatusText;
+    }
+
+    if (this.statusText) {
+      this.statusText.textContent = resolvedStatusText;
+      this.statusText.className = `status-badge ${normalizedState}`;
+    }
+
+    if (this.transportBadge) {
+      const normalizedMode =
+        typeof transportMode === "string" ? transportMode.trim().toLowerCase() : "";
+
+      if (
+        normalizedMode === "webtransport" ||
+        normalizedMode === "http3" ||
+        normalizedMode === "http/3"
+      ) {
+        this._lastTransportMode = "webtransport";
+      } else if (
+        normalizedMode === "websocket" ||
+        normalizedMode === "ws" ||
+        normalizedMode === "wss"
+      ) {
+        this._lastTransportMode = "websocket";
+      } else if (normalizedState !== "connected") {
+        this._lastTransportMode = null;
+      }
+
+      if (normalizedState === "disconnected") {
+        this._lastTransportMode = null;
+        this.transportBadge.textContent = "Offline";
+        this.transportBadge.className = "transport-badge offline";
+      } else if (this._lastTransportMode === "webtransport") {
+        this.transportBadge.textContent = "HTTP/3";
+        this.transportBadge.className = "transport-badge webtransport";
+      } else if (this._lastTransportMode === "websocket") {
+        this.transportBadge.textContent = "WebSocket";
+        this.transportBadge.className = "transport-badge websocket";
+      } else if (normalizedState === "connecting") {
+        this.transportBadge.textContent = "Negotiating";
+        this.transportBadge.className = "transport-badge connecting";
+      } else {
+        this.transportBadge.textContent = "Online";
+        this.transportBadge.className = "transport-badge online";
       }
     }
-    if (state === "connected") {
+
+    if (normalizedState === "connected") {
       if (this.btnConnect) this.btnConnect.disabled = true;
       if (this.btnDisconnect) this.btnDisconnect.disabled = false;
-    } else if (state === "disconnected") {
+    } else if (normalizedState === "disconnected") {
       if (this.btnConnect) this.btnConnect.disabled = false;
       if (this.btnDisconnect) this.btnDisconnect.disabled = true;
-    } else if (state === "connecting") {
+    } else if (normalizedState === "connecting") {
       if (this.btnConnect) this.btnConnect.disabled = true;
       if (this.btnDisconnect) this.btnDisconnect.disabled = false;
     }
 
     if (this.connectionError) {
       const normalizedError = typeof errorMessage === "string" ? errorMessage.trim() : "";
-      if (state !== "connected" && state !== "connecting" && normalizedError.length > 0) {
+      if (
+        normalizedState !== "connected" &&
+        normalizedState !== "connecting" &&
+        normalizedError.length > 0
+      ) {
         this.connectionError.textContent = normalizedError;
         this._setElementHidden(this.connectionError, false);
       } else {
         this.connectionError.textContent = "";
         this._setElementHidden(this.connectionError, true);
       }
+    }
+  }
+
+  /**
+   * Displays a timed, non-intrusive toast notification in #hud-toast.
+   */
+  showToast(message, variant = "info", durationMs = 3000) {
+    if (!this.hudToast) return;
+
+    if (this._toastTimer !== null) {
+      clearTimeout(this._toastTimer);
+      this._toastTimer = null;
+    }
+
+    const text = typeof message === "string" ? message.trim() : String(message ?? "").trim();
+    if (!text) {
+      this._setElementHidden(this.hudToast, true);
+      return;
+    }
+
+    const allowedVariants = new Set(["info", "success", "warning", "error"]);
+    const normalizedVariant =
+      typeof variant === "string" ? variant.trim().toLowerCase() : "info";
+    const safeVariant = allowedVariants.has(normalizedVariant) ? normalizedVariant : "info";
+
+    this.hudToast.textContent = text;
+    this.hudToast.className = `hud-toast toast-${safeVariant}`;
+    this._setElementHidden(this.hudToast, false);
+
+    if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
+      this._toastTimer = setTimeout(() => {
+        this._toastTimer = null;
+        this.hideToast();
+      }, durationMs);
+    }
+  }
+
+  /**
+   * Hides the #hud-toast notification banner and clears any pending dismiss timer.
+   */
+  hideToast() {
+    if (this._toastTimer !== null) {
+      clearTimeout(this._toastTimer);
+      this._toastTimer = null;
+    }
+    if (this.hudToast) {
+      this._setElementHidden(this.hudToast, true);
     }
   }
 
@@ -373,7 +486,9 @@ export class UIController {
     const now = performance.now();
     if (now - this.lastFpsUpdate >= 1000) {
       const fps = Math.round((this.frameCount * 1000) / (now - this.lastFpsUpdate));
-      this.fpsCounter.textContent = `${fps} FPS`;
+      if (this.fpsCounter) {
+        this.fpsCounter.textContent = `${fps} FPS`;
+      }
       this.frameCount = 0;
       this.lastFpsUpdate = now;
     }

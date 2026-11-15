@@ -534,9 +534,37 @@ impl GhostBroadcaster {
         self.build_sync_request(tick, ghosts)
     }
 
+    /// Finds all entities near authoritative sub-partition seams (`owned_bounds` / `peer_partitions`),
+    /// falling back to `octree` boundary faces when partition metadata is empty.
+    pub fn find_boundary_entities_for_sim(&self, sim: &TickSimulation) -> Vec<GhostEntity> {
+        if self.boundary_margin <= 0.0 || sim.entity_store.count() == 0 {
+            return Vec::new();
+        }
+        if sim.owned_bounds.is_empty() && sim.peer_partitions.is_empty() {
+            return self.find_boundary_entities(&sim.octree, &sim.entity_store, sim.tick_counter);
+        }
+
+        let mut ghosts = Vec::new();
+        for (_key, entity) in sim.entity_store.iter() {
+            let near_owned = sim.owned_bounds.iter().any(|b| {
+                b.distance_to_point(entity.position) <= self.boundary_margin
+                    && Self::distance_to_bounds(b, entity.position) <= self.boundary_margin
+            });
+            let near_peer = sim
+                .peer_partitions
+                .iter()
+                .any(|(b, _, _)| b.distance_to_point(entity.position) <= self.boundary_margin);
+            if near_owned || near_peer {
+                ghosts.push(Self::build_ghost_entity(entity, sim.tick_counter));
+            }
+        }
+        ghosts
+    }
+
     /// Collects boundary entities directly from a [`TickSimulation`].
     pub fn collect_sync_from_sim(&self, sim: &TickSimulation) -> GhostSyncRequest {
-        self.collect_sync_request(&sim.octree, &sim.entity_store, sim.tick_counter)
+        let ghosts = self.find_boundary_entities_for_sim(sim);
+        self.build_sync_request(sim.tick_counter, ghosts)
     }
 
     /// Prepares broadcast jobs for all registered neighbor endpoints using entities from octree and entity store.
@@ -559,7 +587,15 @@ impl GhostBroadcaster {
 
     /// Prepares broadcast jobs directly from a [`TickSimulation`].
     pub fn prepare_broadcast_from_sim(&self, sim: &TickSimulation) -> Vec<BroadcastJob> {
-        self.prepare_broadcast(&sim.octree, &sim.entity_store, sim.tick_counter)
+        let req = self.collect_sync_from_sim(sim);
+        self.neighbor_endpoints
+            .iter()
+            .map(|(&target_node_id, endpoint)| BroadcastJob {
+                target_node_id,
+                endpoint: endpoint.clone(),
+                request: req.clone(),
+            })
+            .collect()
     }
 
     /// Sends a [`GhostSyncRequest`] using an established Tonic client channel.
@@ -1002,5 +1038,27 @@ mod tests {
             .collect();
         found.sort_unstable();
         assert_eq!(found, expected_boundary);
+    }
+
+    #[test]
+    fn test_ghost_broadcaster_find_boundary_entities_for_sim_expanded_octree_seam() {
+        let owned = BoundingBox3D::new((0.0, 0.0, 0.0), (500.0, 500.0, 500.0));
+        let peer = BoundingBox3D::new((500.0, 0.0, 0.0), (1000.0, 500.0, 500.0));
+        let mut sim = TickSimulation::new(1, owned);
+        sim.apply_topology_partitions(&[
+            (owned, 1, "127.0.0.1:50051".to_string()),
+            (peer, 2, "127.0.0.1:50052".to_string()),
+        ]);
+
+        let seam_guid = Guid::new(mmo_core::guid::EntityType::Player, 1, 1);
+        let interior_guid = Guid::new(mmo_core::guid::EntityType::Player, 1, 2);
+        // Near x=500 sub-partition seam, even though expanded octree goes from 0..1000
+        assert!(sim.spawn_entity(seam_guid, (460.0, 250.0, 250.0)));
+        assert!(sim.spawn_entity(interior_guid, (250.0, 250.0, 250.0)));
+
+        let broadcaster = GhostBroadcaster::new(1, 50.0);
+        let req = broadcaster.collect_sync_from_sim(&sim);
+        assert_eq!(req.ghosts.len(), 1);
+        assert_eq!(req.ghosts[0].guid, seam_guid.raw());
     }
 }

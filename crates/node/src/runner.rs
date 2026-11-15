@@ -150,6 +150,57 @@ pub async fn run_node_daemon_with_sim(
         .await;
     });
 
+    // 2.5. Periodic 10 Hz cross-partition boundary ghost replication
+    let ghost_sim = Arc::clone(&sim);
+    let ghost_handle = tokio::spawn(async move {
+        let pool = crate::network::GrpcClientPool::new();
+        let broadcaster = crate::network::ghost::GhostBroadcaster::new(
+            u32::from(node_id),
+            crate::aoi::AOI_BOUNDARY_MARGIN,
+        );
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let (sync_req, endpoints) = {
+                let guard = ghost_sim.read().await;
+                if guard.peer_partitions.is_empty() || guard.is_draining {
+                    continue;
+                }
+                let mut seen_peers = std::collections::HashSet::new();
+                let peers: Vec<(u32, String)> = guard
+                    .peer_partitions
+                    .iter()
+                    .filter(|(_, peer_id, addr)| {
+                        *peer_id != u32::from(node_id)
+                            && !addr.trim().is_empty()
+                            && seen_peers.insert(*peer_id)
+                    })
+                    .map(|(_, peer_id, addr)| (*peer_id, addr.trim().to_string()))
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                (broadcaster.collect_sync_from_sim(&guard), peers)
+            };
+
+            let mut join_set = tokio::task::JoinSet::new();
+            for (_peer_id, endpoint) in endpoints {
+                let pool_clone = pool.clone();
+                let req_clone = sync_req.clone();
+                join_set.spawn(async move {
+                    let _ = crate::network::ghost::GhostBroadcaster::send_sync_to_endpoint_pooled(
+                        &pool_clone,
+                        &endpoint,
+                        req_clone,
+                    )
+                    .await;
+                });
+            }
+            while join_set.join_next().await.is_some() {}
+        }
+    });
+
     // 3. AoI Broadcast Delivery Decoupler & Gateway Worker
     let (broadcast_tx, mut broadcast_rx) =
         tokio::sync::mpsc::channel::<Vec<crate::aoi::AoiBroadcastJob>>(128);
@@ -211,6 +262,7 @@ pub async fn run_node_daemon_with_sim(
     let mut next_tick = tokio::time::Instant::now() + tick_duration;
     let shutdown_fut = mmo_core::shutdown_signal();
     tokio::pin!(shutdown_fut);
+    let mut was_fenced = false;
 
     loop {
         let now = tokio::time::Instant::now();
@@ -222,6 +274,7 @@ pub async fn run_node_daemon_with_sim(
                 }
                 reason = fenced_rx.recv() => {
                     println!("[Node {node_id}] Simulation halted due to node fencing: {:?}", reason);
+                    was_fenced = true;
                     break;
                 }
                 _ = tokio::time::sleep_until(next_tick) => {}
@@ -235,6 +288,7 @@ pub async fn run_node_daemon_with_sim(
                 }
                 reason = fenced_rx.recv() => {
                     println!("[Node {node_id}] Simulation halted due to node fencing: {:?}", reason);
+                    was_fenced = true;
                     break;
                 }
                 _ = std::future::ready(()) => {}
@@ -271,21 +325,52 @@ pub async fn run_node_daemon_with_sim(
         }
     }
 
+    ghost_handle.abort();
     drop(broadcast_tx);
     drop(migration_tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), broadcast_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), migration_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), ghost_handle).await;
 
-    drain_and_shutdown_node(
-        node_id,
-        &telemetry,
-        heartbeat_handle,
-        snapshotter,
-        snapshot_worker_handle,
-        &director_addr,
-        grpc_shutdown_tx,
-    )
-    .await;
+    if was_fenced {
+        drain_and_shutdown_node(
+            node_id,
+            &telemetry,
+            heartbeat_handle,
+            snapshotter,
+            snapshot_worker_handle,
+            &director_addr,
+            grpc_shutdown_tx,
+        )
+        .await;
+    } else {
+        {
+            let mut sim_guard = sim.write().await;
+            sim_guard.is_draining = true;
+        }
+        telemetry.mark_unready();
+        heartbeat_handle.abort();
+
+        let (batches, gateway_addr) = {
+            let sim_guard = sim.read().await;
+            (
+                sim_guard.collect_all_entities_for_drain(),
+                sim_guard.gateway_grpc_addr.clone(),
+            )
+        };
+
+        crate::snapshotter::deregister_node_from_director(node_id, &director_addr).await;
+
+        if !batches.is_empty() {
+            let pool = crate::network::GrpcClientPool::new();
+            dispatch_migration_batches(u32::from(node_id), batches, gateway_addr, &sim, &pool)
+                .await;
+        }
+
+        crate::snapshotter::flush_snapshotter_on_shutdown(snapshotter, snapshot_worker_handle)
+            .await;
+        let _ = grpc_shutdown_tx.send(());
+    }
 
     let _ = tokio::time::timeout(Duration::from_secs(2), grpc_handle).await;
     println!("[Node {node_id}] Clean shutdown complete.");

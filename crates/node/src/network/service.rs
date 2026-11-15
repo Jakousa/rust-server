@@ -215,6 +215,14 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<tonic::Response<MigrateEntityResponse>, tonic::Status> {
         let req = request.into_inner();
         let mut sim = self.sim.write().await;
+        if sim.is_draining {
+            return Ok(tonic::Response::new(MigrateEntityResponse {
+                success: false,
+                error_code: 0,
+                error_message: "Recipient node is draining".to_string(),
+                acknowledged_guid: req.guid,
+            }));
+        }
         match crate::network::migration::ingest_migrated_entity(&mut sim, &req) {
             Ok(()) => {
                 metrics::counter!("mmo_migration_inbound_total", "status" => "success")
@@ -243,6 +251,13 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<tonic::Response<BatchMigrateEntityResponse>, tonic::Status> {
         let req = request.into_inner();
         let mut sim = self.sim.write().await;
+        if sim.is_draining {
+            return Ok(tonic::Response::new(BatchMigrateEntityResponse {
+                success: false,
+                migrated_count: 0,
+                error_message: "Recipient node is draining".to_string(),
+            }));
+        }
 
         // 1. Validation pass: check all entities have valid positions inside recipient bounds
         for entity_req in &req.entities {
@@ -857,5 +872,46 @@ mod tests {
         let result = extract_initiator(&req);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), initiator);
+    }
+
+    #[tokio::test]
+    async fn test_draining_node_rejects_inbound_migrations() {
+        use mmo_core::BoundingBox3D;
+        use mmo_schema::cluster::node_service_server::NodeService;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let mut sim = TickSimulation::new(1, bounds);
+        sim.is_draining = true;
+        let input_tx = sim.input_sender();
+        let ghost_store = sim.ghost_store.clone();
+        let svc = NodeServiceImpl::new(Arc::new(RwLock::new(sim)), input_tx, ghost_store);
+
+        let single_resp = svc
+            .migrate_entity(tonic::Request::new(MigrateEntityRequest {
+                guid: 1001,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!single_resp.success);
+        assert_eq!(single_resp.error_message, "Recipient node is draining");
+
+        let batch_resp = svc
+            .migrate_batch_entities(tonic::Request::new(BatchMigrateEntityRequest {
+                entities: vec![MigrateEntityRequest {
+                    guid: 1001,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!batch_resp.success);
+        assert_eq!(batch_resp.migrated_count, 0);
+        assert_eq!(batch_resp.error_message, "Recipient node is draining");
     }
 }

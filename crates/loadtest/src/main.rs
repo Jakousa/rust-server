@@ -152,6 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("Duration           : {:.2} s", snapshot.duration_secs);
     println!(
+        "Auth Sessions      : {} ({:.1} sessions/s)",
+        snapshot.authenticated_sessions, snapshot.auth_throughput_sps
+    );
+    println!(
         "Packets Sent       : {} ({:.1} pkts/s)",
         snapshot.total_packets_sent, snapshot.send_rate_pps
     );
@@ -159,6 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Packets Received   : {} ({:.1} pkts/s)",
         snapshot.total_packets_received, snapshot.recv_rate_pps
     );
+    println!(
+        "Bytes Received     : {} bytes ({:.2} kbps)",
+        snapshot.total_bytes_received, snapshot.recv_bandwidth_kbps
+    );
+    println!("Entity Deltas Recv : {}", snapshot.entity_deltas_received);
+    println!("Route Handovers    : {}", snapshot.route_handovers_observed);
     println!("Snapback Rejections: {}", snapshot.snapbacks);
     println!("Connection Errors  : {}", snapshot.connection_errors);
     println!("Auth Failures      : {}", snapshot.auth_failures);

@@ -9,12 +9,19 @@
 <body>
   <div id="canvas-container"></div>
 
+  <!-- Non-intrusive Toast Notification Banner -->
+  <div id="hud-toast" class="hud-toast hidden" role="status" aria-live="polite"></div>
+
   <!-- HUD Telemetry & Diagnostics Overlay -->
   <div id="hud-overlay">
     <div class="hud-panel connection-panel">
       <div class="panel-header">
         <span class="status-indicator disconnected" id="status-dot"></span>
-        <span class="panel-title">WebTransport Gateway</span>
+        <span class="panel-title">Edge Gateway</span>
+        <div class="connection-badges">
+          <span id="status-text" class="status-badge disconnected">Disconnected</span>
+          <span id="transport-badge" class="transport-badge offline">Offline</span>
+        </div>
       </div>
       <div class="hud-row">
         <label for="gateway-url">URL:</label>
@@ -62,8 +69,14 @@
     </div>
 
     <div class="hud-panel controls-hint">
-      <div class="hint-title">Controls</div>
-      <div class="hint-text">WASD / Arrows: Move &amp; Turn | Mouse Drag: Orbit View | Wheel: Zoom | Space: Cast | E: Interact/Barter</div>
+      <div class="hint-title">Village &amp; Barter Controls</div>
+      <div class="hint-grid">
+        <div class="hint-item"><span class="hint-keys"><kbd>WASD</kbd> / <kbd>Arrows</kbd></span> Move &amp; Turn</div>
+        <div class="hint-item"><span class="hint-keys"><kbd>Drag</kbd> / <kbd>Wheel</kbd></span> Orbit &amp; Zoom</div>
+        <div class="hint-item"><span class="hint-keys"><kbd>E</kbd></span> Talk / Barter / Trade</div>
+        <div class="hint-item"><span class="hint-keys"><kbd>Space</kbd></span> Action / Cast</div>
+      </div>
+      <div class="hint-subtext">Approach a Villager or Traveler (&le;5m) and press <kbd>E</kbd> to barter or trade.</div>
     </div>
   </div>
 
