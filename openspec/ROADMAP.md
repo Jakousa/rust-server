@@ -8,7 +8,7 @@ Historical specifications, change proposals, and task manifests are permanently 
 
 ## Active Focus: Cloud Deployment & Live Multi-Client Playtesting
 
-Following the completion of the playable Village & Barter Vertical Slice ([`2026-11-07-village-barter-vertical-slice-poc`](changes/archive/2026-11-07-village-barter-vertical-slice-poc/)), automated GitOps Flux v2 delivery ([`2026-11-09-gitops-flux-rollout`](changes/archive/2026-11-09-gitops-flux-rollout/)), Director restart resilience ([`2026-11-13-node-director-registration-resilience`](changes/archive/2026-11-13-node-director-registration-resilience/)), and WebSocket/TLS fallback ingress ([`2026-11-13-websocket-fallback-transport`](changes/archive/2026-11-13-websocket-fallback-transport/)):
+Following the completion of the playable Village & Barter Vertical Slice ([`2026-11-07-village-barter-vertical-slice-poc`](changes/archive/2026-11-07-village-barter-vertical-slice-poc/)), automated GitOps Flux v2 delivery ([`2026-11-09-gitops-flux-rollout`](changes/archive/2026-11-09-gitops-flux-rollout/)), Director restart resilience ([`2026-11-13-node-director-registration-resilience`](changes/archive/2026-11-13-node-director-registration-resilience/)), WebSocket/TLS fallback ingress ([`2026-11-13-websocket-fallback-transport`](changes/archive/2026-11-13-websocket-fallback-transport/)), and node split migration & topology-aware routing ([`2026-11-15-node-split-migration-and-routing`](changes/archive/2026-11-15-node-split-migration-and-routing/)):
 
 | Focus Area | GitHub Issue(s) | Status | Target Crates / Artifacts | Summary |
 | :--- | :---: | :---: | :--- | :--- |
@@ -18,9 +18,9 @@ Following the completion of the playable Village & Barter Vertical Slice ([`2026
 
 ## Upcoming Initiatives
 
-1. **Voxel FPS Arena Prototype**: Second distinct game genre testing the engine substrate's genre-agnostic claim via high-frequency input prediction, destructible voxel terrain ([`crates/plugins/voxel`](../crates/plugins/voxel)), and fast projectile combat.
+1. **Cluster Auto-Scaling & Dynamic Partitioning**: Director-driven live partition merging, graceful node drain/rebalancing, and multi-region simulation node scaling.
 2. **Dedicated Godot Client (Separate Repository)**: Standalone native Godot client repository demonstrating multi-client connectivity to the authoritative cluster.
-3. **Cluster Auto-Scaling & Dynamic Partitioning**: Director-driven live partition boundary migration and load rebalancing across multi-region simulation nodes.
+3. **Demo Polish & Cloud Playtesting Hardening**: Load/soak validation against the live K3s cluster and UX polish for the Village & Barter showcase.
 
 ---
 
