@@ -6,13 +6,19 @@
   <title>OpenSpec MMO - Web Visual Inspector</title>
   <link rel="stylesheet" href="./style.css">
 </head>
-<body>
+<body data-game-mode="village">
   <div id="canvas-container"></div>
 
   <!-- Top-Level Game Mode Switcher -->
   <div id="game-mode-switcher" class="game-mode-switcher" role="navigation" aria-label="Game Mode Selector">
-    <button id="btn-mode-village" class="mode-btn active" data-mode="village" type="button">Game A: Village RPG</button>
-    <button id="btn-mode-asteroid" class="mode-btn" data-mode="asteroid" type="button">Game B: 6DoF Voxel Asteroid Miners</button>
+    <button id="btn-mode-village" class="mode-btn active" data-mode="village" type="button">
+      <span class="mode-indicator mode-indicator-village" aria-hidden="true"></span>
+      <span>Game A: Village RPG</span>
+    </button>
+    <button id="btn-mode-asteroid" class="mode-btn" data-mode="asteroid" type="button">
+      <span class="mode-indicator mode-indicator-asteroid" aria-hidden="true"></span>
+      <span>Game B: 6DoF Voxel Asteroid Miners</span>
+    </button>
   </div>
 
   <!-- Non-intrusive Toast Notification Banner -->
@@ -38,8 +44,8 @@
         <input type="text" id="cert-hash" placeholder="Auto / SHA-256 Hex" />
       </div>
       <div class="hud-buttons">
-        <button id="btn-connect" class="primary-btn">Connect</button>
-        <button id="btn-disconnect" class="danger-btn" disabled>Disconnect</button>
+        <button id="btn-connect" class="primary-btn" type="button">Connect</button>
+        <button id="btn-disconnect" class="danger-btn" type="button" disabled>Disconnect</button>
       </div>
       <div id="connection-error" class="connection-error hidden" role="alert"></div>
     </div>
@@ -186,25 +192,31 @@
         <span id="target-distance" class="stat-val">-- m</span>
       </div>
       <div class="hud-buttons">
-        <button id="btn-interact" class="primary-btn">Interact [E]</button>
+        <button id="btn-interact" class="primary-btn" type="button">Interact [E]</button>
       </div>
     </div>
   </div>
 
   <!-- NPC Barter Modal -->
-  <div id="npc-barter-modal" class="modal-overlay" style="display: none;">
+  <div id="npc-barter-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="npc-name" style="display: none;">
     <div class="modal-window barter-window">
       <div class="modal-header">
-        <div>
-          <h2 id="npc-name">Blacksmith Ilmari</h2>
-          <span id="npc-role" class="npc-role-tag">Village Artisan</span>
+        <div class="npc-header-identity">
+          <span id="npc-avatar" class="npc-avatar role-blacksmith" aria-hidden="true">⚒</span>
+          <div class="npc-title-group">
+            <h2 id="npc-name">Blacksmith Ilmari</h2>
+            <span id="npc-role" class="npc-role-tag">Village Artisan</span>
+          </div>
         </div>
-        <button id="btn-close-barter" class="close-btn">&times;</button>
+        <button id="btn-close-barter" class="close-btn" type="button" aria-label="Close barter dialog">&times;</button>
       </div>
       <div class="npc-dialog-box">
         <p id="npc-greeting">"Fine steel and sturdy tools for the village."</p>
       </div>
-      <div class="barter-recipes-header">Available Trades</div>
+      <div class="barter-recipes-header">
+        <span>Available Trades</span>
+        <span class="modal-key-hint"><kbd>Esc</kbd> to close</span>
+      </div>
       <div id="barter-recipes-list" class="barter-recipes-list">
         <!-- Rendered dynamically -->
       </div>
@@ -212,37 +224,50 @@
   </div>
 
   <!-- Player-to-Player Trade Modal -->
-  <div id="player-trade-modal" class="modal-overlay" style="display: none;">
+  <div id="player-trade-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="trade-modal-title" style="display: none;">
     <div class="modal-window trade-window">
       <div class="modal-header">
-        <div>
-          <h2>Direct Player Trade</h2>
+        <div class="trade-header-identity">
+          <h2 id="trade-modal-title">Direct Player Trade</h2>
           <span class="trade-session-label">Session #<span id="trade-session-id">--</span></span>
         </div>
-        <button id="btn-close-trade" class="close-btn">&times;</button>
+        <button id="btn-close-trade" class="close-btn" type="button" aria-label="Close trade dialog">&times;</button>
       </div>
       <div class="trade-grid">
-        <div class="trade-col">
-          <h3>My Offer</h3>
+        <div id="trade-my-col" class="trade-col">
+          <div class="trade-col-header">
+            <h3>My Offer</h3>
+            <span id="trade-my-lock-badge" class="trade-lock-badge unlocked">Editing</span>
+          </div>
           <div class="trade-gold-input-row">
             <label id="trade-offer-currency-label" for="trade-offer-gold">Offer Gold:</label>
-            <input type="number" id="trade-offer-gold" min="0" value="0" />
+            <div class="trade-currency-input-wrap">
+              <span id="trade-offer-currency-icon" class="currency-icon" aria-hidden="true">🪙</span>
+              <input type="number" id="trade-offer-gold" min="0" value="0" />
+            </div>
           </div>
           <div id="trade-my-items" class="trade-item-list"></div>
         </div>
-        <div class="trade-col">
-          <h3>Partner Offer</h3>
+        <div id="trade-partner-col" class="trade-col">
+          <div class="trade-col-header">
+            <h3>Partner Offer</h3>
+            <span id="trade-partner-lock-badge" class="trade-lock-badge unlocked">Negotiating</span>
+          </div>
           <div class="partner-gold-display">
-            <span id="trade-partner-currency-label">Gold:</span> <span id="trade-partner-gold" class="gold-amount">0</span> 🪙
+            <span id="trade-partner-currency-label">Gold:</span>
+            <span class="partner-currency-pill">
+              <span id="trade-partner-gold" class="gold-amount">0</span>
+              <span id="trade-partner-currency-icon" class="currency-icon" aria-hidden="true">🪙</span>
+            </span>
           </div>
           <div id="trade-partner-items" class="trade-item-list"></div>
         </div>
       </div>
       <div id="trade-status-msg" class="trade-status-msg">Waiting for trade offer...</div>
       <div class="modal-footer">
-        <button id="btn-trade-offer" class="primary-btn">Submit Offer</button>
-        <button id="btn-trade-accept" class="accept-btn">Lock & Accept</button>
-        <button id="btn-trade-cancel" class="danger-btn">Cancel Trade</button>
+        <button id="btn-trade-offer" class="primary-btn" type="button">Submit Offer</button>
+        <button id="btn-trade-accept" class="accept-btn" type="button">Lock &amp; Accept</button>
+        <button id="btn-trade-cancel" class="danger-btn" type="button">Cancel Trade</button>
       </div>
     </div>
   </div>

@@ -78,6 +78,9 @@ export class SpaceFlightControls {
     this.linearDamping = options.linearDamping ?? 2.0;
     this.turnSpeed = options.turnSpeed ?? 2.4;
     this.pitchSpeed = options.pitchSpeed ?? 1.8;
+    this.bankAngle = 0.0;
+    this.maxBankAngle = options.maxBankAngle ?? 0.42;
+    this.bankSmoothRate = options.bankSmoothRate ?? 8.0;
     this.sequence = 1;
 
     this.onMineCallback = null;
@@ -162,8 +165,15 @@ export class SpaceFlightControls {
   update(dt) {
     if (!Number.isFinite(dt) || dt <= 0) return;
 
-    if (this.keys.q || this.keys.arrowLeft) this.yaw += this.turnSpeed * dt;
-    if (this.keys.e || this.keys.arrowRight) this.yaw -= this.turnSpeed * dt;
+    let turnInput = 0.0;
+    if (this.keys.q || this.keys.arrowLeft) {
+      this.yaw += this.turnSpeed * dt;
+      turnInput += 1.0;
+    }
+    if (this.keys.e || this.keys.arrowRight) {
+      this.yaw -= this.turnSpeed * dt;
+      turnInput -= 1.0;
+    }
     if (this.keys.arrowUp) this.pitch += this.pitchSpeed * dt;
     if (this.keys.arrowDown) this.pitch -= this.pitchSpeed * dt;
 
@@ -227,6 +237,15 @@ export class SpaceFlightControls {
     this.position.x += this.velocity.x * dt;
     this.position.y += this.velocity.y * dt;
     this.position.z += this.velocity.z * dt;
+
+    // Smooth visual roll/bank angle during lateral strafing and turning (positive = bank right)
+    const bankInput = Math.max(-1.0, Math.min(1.0, thrustRight - turnInput));
+    const targetBank = bankInput * this.maxBankAngle;
+    const bankAlpha = 1.0 - Math.exp(-this.bankSmoothRate * dt);
+    this.bankAngle += (targetBank - this.bankAngle) * bankAlpha;
+    if (targetBank === 0.0 && Math.abs(this.bankAngle) < 1e-5) {
+      this.bankAngle = 0.0;
+    }
   }
 
   /**
