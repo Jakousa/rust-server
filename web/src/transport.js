@@ -54,6 +54,14 @@ export class WebTransportClient {
     this.onStatusCallback = null;
     this._isConnecting = false;
     this._connectSeq = 0;
+    this._streamInitPromise = null;
+    this._streamWriteChain = Promise.resolve();
+  }
+
+  _resetStreamState() {
+    this.streamWriter = null;
+    this._streamInitPromise = null;
+    this._streamWriteChain = Promise.resolve();
   }
 
   /**
@@ -215,6 +223,7 @@ export class WebTransportClient {
         if (this.connected && this.transportMode === "webtransport") {
           this.connected = false;
           this.transportMode = null;
+          this._resetStreamState();
           if (this.pingInterval) {
             clearInterval(this.pingInterval);
             this.pingInterval = null;
@@ -226,6 +235,7 @@ export class WebTransportClient {
         if (this.connected && this.transportMode === "webtransport") {
           this.connected = false;
           this.transportMode = null;
+          this._resetStreamState();
           if (this.pingInterval) {
             clearInterval(this.pingInterval);
             this.pingInterval = null;
@@ -513,6 +523,7 @@ export class WebTransportClient {
 
   /**
    * Sends reliable bytes via a bidirectional stream (or WebSocket binary frame in fallback mode).
+   * Serializes WebTransport stream initialization and writes across concurrent callers.
    */
   async sendStream(data) {
     if (!this.connected) return;
@@ -527,17 +538,58 @@ export class WebTransportClient {
       return;
     }
     if (!this.transport) return;
-    try {
-      if (!this.streamWriter) {
-        const biStream = await this.transport.createBidirectionalStream();
-        this.streamWriter = biStream.writable.getWriter();
-        this.handleIncomingStream(biStream.readable);
+
+    const seq = this._connectSeq;
+    const activeTransport = this.transport;
+
+    const getOrCreateWriter = async () => {
+      if (this.streamWriter) return this.streamWriter;
+      if (!this._streamInitPromise) {
+        this._streamInitPromise = (async () => {
+          const biStream = await activeTransport.createBidirectionalStream();
+          if (!this.connected || this._connectSeq !== seq || this.transport !== activeTransport) {
+            try {
+              await biStream?.writable?.close?.();
+            } catch (_) {}
+            throw new Error("Transport closed during stream setup");
+          }
+          const writer = biStream.writable.getWriter();
+          this.streamWriter = writer;
+          this.handleIncomingStream(biStream.readable);
+          return writer;
+        })();
       }
-      await this.streamWriter.write(data);
-    } catch (err) {
+      try {
+        return await this._streamInitPromise;
+      } catch (err) {
+        if (this._connectSeq === seq && this.transport === activeTransport) {
+          this._streamInitPromise = null;
+          this.streamWriter = null;
+        }
+        throw err;
+      }
+    };
+
+    const nextWrite = this._streamWriteChain.then(async () => {
+      if (!this.connected || this._connectSeq !== seq || this.transport !== activeTransport) {
+        return;
+      }
+      const writer = await getOrCreateWriter();
+      if (!this.connected || this._connectSeq !== seq || this.transport !== activeTransport) {
+        return;
+      }
+      await writer.write(data);
+    });
+
+    this._streamWriteChain = nextWrite.catch((err) => {
       console.warn("Failed to send stream data:", err);
-      this.streamWriter = null;
-    }
+      if (this._connectSeq === seq && this.transport === activeTransport) {
+        this.streamWriter = null;
+        this._streamInitPromise = null;
+      }
+    });
+
+    return this._streamWriteChain;
   }
 
   /**
@@ -600,7 +652,7 @@ export class WebTransportClient {
       } catch (_) {}
       this.datagramWriter = null;
     }
-    this.streamWriter = null;
+    this._resetStreamState();
     if (this.transport) {
       try {
         await this.transport.close();

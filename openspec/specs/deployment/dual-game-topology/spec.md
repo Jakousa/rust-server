@@ -7,12 +7,12 @@ Defines the modular browser client architecture and Kubernetes deployment topolo
 ## Requirements
 
 ### Requirement: Pluggable Dual-Game Browser Client over Shared WASM Networking Core
-The browser client (`web/`) SHALL decouple the shared transport and state-replication layer (`transport.js`, `protocol.js`, `WasmClientWorld`, `WasmVoxelWorld`) from game-specific rendering, input controls, and HUD cartridges so it can run either the **Village RPG (`village`)** cartridge or the **Voxel Asteroid Miners (`asteroid`)** cartridge based on build/runtime configuration (`VITE_GAME_MODE` or URL query/selector).
+The browser client (`web/`) SHALL decouple shared networking (`transport.js`, `protocol.js`, `WasmClientWorld`, `WasmVoxelWorld`) from game-specific rendering, controls, and HUD cartridges (`village` vs. `asteroid`), gate gameplay packets and chunk requests behind `AUTH_RESPONSE`, serialize WebTransport stream writes, and render deterministic procedural asteroid previews (`isPreview = true`) immediately until replaced by authoritative server chunks (`revision >= 0`).
 
 #### Scenario: Running the browser client in Asteroid Miners mode (`asteroid`)
 - **GIVEN** the browser client launched in `asteroid` mode connected to a gateway routing to `mmo-asteroid-node`
-- **WHEN** the client receives AoI entity snapshots and voxel chunk payloads (`module_id = 0x00A0`)
-- **THEN** the client SHALL render a 3D space scene with greedy-meshed volumetric voxel asteroids (`WasmVoxelWorld`), 6DoF flight and laser mining/combat controls, ship meshes whose emissive metallic/glow intensity scales dynamically with the replicated `state_flags` loot-shininess byte (`bits 16..23`), and an Orbital Station Vault & Trade HUD (`module_id = 0x03`)
+- **WHEN** the client mounts `asteroid` mode and completes `AUTH_RESPONSE` authentication
+- **THEN** the client SHALL render deterministic preview asteroid meshes immediately before sync, defer `Movement`, `Inspect`, and `0x00A0` chunk requests until `AUTH_RESPONSE` succeeds, serialize `sendStream` writes over a single bidirectional stream, replace `isPreview` chunks when authoritative `0x00A0` chunks (`revision >= 0`) arrive, display 3D asteroid cluster beacons and a material-tinted voxel aim highlight reticle, provide 6DoF flight-assist navigation (`Fly to Asteroid`, `Fly to Station`, `Brake`), and present a guided mission HUD alongside the Orbital Station Vault & Trade HUD (`module_id = 0x03`)
 
 #### Scenario: Running the browser client in Village RPG mode (`village`)
 - **GIVEN** the browser client launched in `village` mode connected to a gateway routing to `mmo-village-node`
@@ -26,3 +26,16 @@ The server container image (`Dockerfile`) SHALL compile and bundle both `mmo-vil
 - **GIVEN** the unified `mmo-server` and `mmo-web` container images deployed via the dual-game Kubernetes manifests/overlays
 - **WHEN** both game stacks start in the cluster
 - **THEN** the Village stack's `mmo-node` StatefulSet SHALL execute `mmo-village-node` serving `village` web clients, and the Asteroid stack's `mmo-node` StatefulSet SHALL execute `mmo-asteroid-node` serving `asteroid` web clients, with zero cross-talk between the two virtual worlds
+
+### Requirement: Browser Playtest Workbench & Fast Local Iteration Tooling
+The browser client (`web/`) and workspace scripts (`scripts/`, `docker-compose.yml`) SHALL provide a toggleable in-browser Playtest Workbench (`DevToolsController`) for offline sandbox mining/combat, sector teleports, target dummy spawning, and voxel diagnostics alongside an isolated native local runner (`scripts/dev-local.sh`) without requiring container rebuilds or causing HUD overlap at `1280x800`.
+
+#### Scenario: Iterating offline on `/asteroid` via the Playtest Workbench
+- **GIVEN** a developer opening `/asteroid` without a live backend cluster
+- **WHEN** the developer enables Local Sandbox Mode or uses the Playtest Tools drawer (`#btn-toggle-devtools`) to teleport to an asteroid, mine ore voxels, spawn a high-shininess target dummy, and return to the station dock
+- **THEN** the browser client SHALL preserve local preview asteroids across offline disconnect events, simulate ore harvesting into unbanked cargo, update ship loot-shininess shaders (`state_flags`), resolve dummy laser combat with full-loot transfer, bank loot into the station vault, and keep all visible HUD panels free of viewport overlap at `1280x800`
+
+#### Scenario: Switching to live authenticated session automatically exits sandbox isolation
+- **GIVEN** a developer testing `/asteroid` with Local Sandbox Mode or simulated target dummies active
+- **WHEN** the client completes `AUTH_RESPONSE` authentication with a live gateway
+- **THEN** `DevToolsController` SHALL automatically disable Local Sandbox Mode and remove simulated dummy entities so live authoritative server state is never mixed with synthetic local state

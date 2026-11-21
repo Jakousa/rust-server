@@ -50,8 +50,20 @@ export class UIController {
     this.asteroidShininessText = document.getElementById("asteroid-shininess-text");
     this.asteroidShininessBar = document.getElementById("asteroid-shininess-bar");
     this.asteroidKdStats = document.getElementById("asteroid-kd-stats");
+    this.asteroidNavSummary = document.getElementById("asteroid-nav-summary");
+    this.missionStepApproach = document.getElementById("mission-step-approach");
+    this.missionStepMine = document.getElementById("mission-step-mine");
+    this.missionStepBank = document.getElementById("mission-step-bank");
+    this.asteroidAimTarget = document.getElementById("asteroid-aim-target");
+    this.btnFlyAsteroid = document.getElementById("btn-fly-asteroid");
+    this.btnFlyStation = document.getElementById("btn-fly-station");
+    this.btnBrakeShip = document.getElementById("btn-brake-ship");
     this.btnMineAsteroid = document.getElementById("btn-mine-asteroid");
     this.btnBankLoot = document.getElementById("btn-bank-loot");
+    this.btnToggleDevtools = document.getElementById("btn-toggle-devtools");
+    this.devtoolsDrawer = document.getElementById("devtools-drawer");
+    this.btnCloseDevtools = document.getElementById("btn-close-devtools");
+    this.devtoolsStats = document.getElementById("devtools-stats");
     this.asteroidUnbankedValue = document.getElementById("asteroid-unbanked-value");
     this.asteroidCargoWeight = document.getElementById("asteroid-cargo-weight");
     this.asteroidCargoGrid = document.getElementById("asteroid-cargo-grid");
@@ -128,6 +140,10 @@ export class UIController {
     onFireLaser,
     onBankLoot,
     onTradePilot,
+    onFlyToAsteroid,
+    onFlyToStation,
+    onBrakeShip,
+    onToggleDevTools,
   }) {
     this.btnModeVillage?.addEventListener("click", () => {
       if (onGameModeChange) onGameModeChange("village");
@@ -143,6 +159,26 @@ export class UIController {
 
     this.btnBankLoot?.addEventListener("click", () => {
       if (onBankLoot) onBankLoot();
+    });
+
+    this.btnFlyAsteroid?.addEventListener("click", () => {
+      if (onFlyToAsteroid) onFlyToAsteroid();
+    });
+
+    this.btnFlyStation?.addEventListener("click", () => {
+      if (onFlyToStation) onFlyToStation();
+    });
+
+    this.btnBrakeShip?.addEventListener("click", () => {
+      if (onBrakeShip) onBrakeShip();
+    });
+
+    this.btnToggleDevtools?.addEventListener("click", () => {
+      if (onToggleDevTools) onToggleDevTools();
+    });
+
+    this.btnCloseDevtools?.addEventListener("click", () => {
+      if (onToggleDevTools) onToggleDevTools(false);
     });
 
     this.btnFireLaser?.addEventListener("click", () => {
@@ -309,7 +345,7 @@ export class UIController {
               ["WASD", "Thrust & Strafe"],
               ["Space / Shift", "Ascend / Descend"],
               ["Q/E / Arrows", "Yaw & Pitch"],
-              ["Click / J", "Mine / Fire Laser"],
+              ["Click / J / X", "Mine / Brake"],
             ]
           : [
               ["WASD / Arrows", "Move & Turn"],
@@ -614,12 +650,55 @@ export class UIController {
     }
   }
 
+  /**
+   * Updates the Game B mission checklist, navigation distance readout, and aimed voxel indicator.
+   */
+  updateAsteroidGuidance({
+    distToStation = 0,
+    nearestAsteroidDist = null,
+    aimedHit = null,
+    aimedMaterial = null,
+    cargoValue = 0,
+    bankedCredits = 0,
+  } = {}) {
+    if (this.asteroidNavSummary) {
+      const beltTxt =
+        nearestAsteroidDist != null && Number.isFinite(nearestAsteroidDist)
+          ? `${nearestAsteroidDist.toFixed(1)}m`
+          : "--";
+      this.asteroidNavSummary.textContent = `Belt: ${beltTxt} | Dock: ${Number(distToStation).toFixed(1)}m`;
+    }
+
+    if (this.asteroidAimTarget) {
+      if (aimedHit && aimedMaterial) {
+        const valText = aimedMaterial.unitValue > 0 ? `${aimedMaterial.unitValue} cr` : "Crust";
+        this.asteroidAimTarget.textContent = `Aim: ${aimedMaterial.name} (${valText}) ${aimedHit.distance.toFixed(1)}m [Click/J]`;
+      } else if (nearestAsteroidDist != null && nearestAsteroidDist > 18.0) {
+        this.asteroidAimTarget.textContent = `Fly closer (<=18m) or click Fly Asteroid`;
+      } else {
+        this.asteroidAimTarget.textContent = `Aim or click an asteroid block (<=18m) to mine`;
+      }
+    }
+
+    const approached = nearestAsteroidDist != null && nearestAsteroidDist <= 18.0;
+    const hasCargo = cargoValue > 0;
+    const hasBanked = bankedCredits > 0;
+
+    this._setElementClass(this.missionStepApproach, "done", approached || hasCargo);
+    this._setElementClass(this.missionStepApproach, "active", !approached && !hasCargo);
+    this._setElementClass(this.missionStepMine, "done", hasCargo || hasBanked);
+    this._setElementClass(this.missionStepMine, "active", approached && !hasCargo);
+    this._setElementClass(this.missionStepBank, "done", hasBanked);
+    this._setElementClass(this.missionStepBank, "active", hasCargo);
+  }
+
   showAsteroidTarget(target, inSafeZone = false) {
     if (!this.asteroidTargetPanel || !target) return;
     this.asteroidTargetPanel.style.display = "block";
     const tier = (Number(target.stateFlags || 0) >>> 16) & 0xff;
+    const isNpc = target.type === 2;
     if (this.asteroidTargetName) {
-      this.asteroidTargetName.textContent = `Pilot #${target.id}`;
+      this.asteroidTargetName.textContent = isNpc ? `Rogue Drone #${target.id}` : `Pilot #${target.id}`;
     }
     if (this.asteroidTargetShininess) {
       this.asteroidTargetShininess.textContent = `Tier ${tier}`;
@@ -632,6 +711,10 @@ export class UIController {
     }
     if (this.btnFireLaser) {
       this.btnFireLaser.disabled = Boolean(inSafeZone);
+    }
+    if (this.btnTradePilot) {
+      this.btnTradePilot.disabled = isNpc;
+      this.btnTradePilot.style.display = isNpc ? "none" : "";
     }
   }
 

@@ -19,6 +19,28 @@
       <span class="mode-indicator mode-indicator-asteroid" aria-hidden="true"></span>
       <span>Game B: 6DoF Voxel Asteroid Miners</span>
     </button>
+    <button id="btn-toggle-devtools" class="mode-btn devtools-toggle-btn" type="button" title="Toggle Playtest Workbench [`]">
+      <span aria-hidden="true">&#128736;</span>
+      <span>Playtest</span>
+    </button>
+  </div>
+
+  <!-- Toggleable In-Browser Playtest Workbench Drawer -->
+  <div id="devtools-drawer" class="hud-panel devtools-drawer" style="display: none;" role="region" aria-label="Playtest Workbench">
+    <div class="panel-header">
+      <span class="panel-title">Playtest Workbench [`]</span>
+      <button id="btn-close-devtools" class="close-btn devtools-close-btn" type="button" aria-label="Close playtest tools">&times;</button>
+    </div>
+    <div class="devtools-diagnostics font-mono" id="devtools-stats">Chunks: 0 | Ore: 0 | Mode: Live</div>
+    <div class="devtools-grid">
+      <button id="btn-devtools-sandbox" class="primary-btn devtools-btn" type="button">Sandbox: OFF</button>
+      <button id="btn-reload-chunks" class="primary-btn devtools-btn" type="button">Reload Chunks</button>
+      <button id="btn-teleport-asteroid" class="primary-btn devtools-btn" type="button">TP: Asteroid</button>
+      <button id="btn-teleport-station" class="primary-btn devtools-btn" type="button">TP: Station</button>
+      <button id="btn-teleport-pvp" class="primary-btn devtools-btn" type="button">TP: Patrol Zone</button>
+      <button id="btn-spawn-dummy" class="accept-btn devtools-btn" type="button">Spawn Shiny Dummy</button>
+      <button id="btn-reset-sandbox" class="danger-btn devtools-btn" type="button">Reset Sandbox</button>
+    </div>
   </div>
 
   <!-- Non-intrusive Toast Notification Banner -->
@@ -119,10 +141,22 @@
       </div>
       <div class="asteroid-meta-row">
         <span id="asteroid-kd-stats" class="stat-label font-mono">Kills: 0 | Deaths: 0</span>
+        <span id="asteroid-nav-summary" class="stat-val font-mono">Belt: -- | Dock: 8.0m</span>
+      </div>
+      <div id="asteroid-mission-steps" class="mission-checklist">
+        <div id="mission-step-approach" class="mission-step active">1. Fly near an asteroid (&le;18m)</div>
+        <div id="mission-step-mine" class="mission-step">2. Mine Ore blocks [Click / J]</div>
+        <div id="mission-step-bank" class="mission-step">3. Dock (&le;15m) &amp; Bank Cargo [B]</div>
+      </div>
+      <div id="asteroid-aim-target" class="aim-target-readout font-mono">Tip: Click Fly Asteroid or thrust toward a glowing beacon.</div>
+      <div class="hud-buttons flight-assist-row">
+        <button id="btn-fly-asteroid" class="primary-btn compact-btn" type="button">Fly Asteroid</button>
+        <button id="btn-fly-station" class="primary-btn compact-btn" type="button">Station</button>
+        <button id="btn-brake-ship" class="danger-btn compact-btn" type="button">Brake [X]</button>
       </div>
       <div class="hud-buttons">
         <button id="btn-mine-asteroid" class="primary-btn" type="button">Mine Asteroid [J]</button>
-        <button id="btn-bank-loot" class="accept-btn" type="button">Dock &amp; Bank Loot</button>
+        <button id="btn-bank-loot" class="accept-btn" type="button">Dock &amp; Bank [B]</button>
       </div>
     </div>
 

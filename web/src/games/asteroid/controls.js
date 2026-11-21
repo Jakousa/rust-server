@@ -9,6 +9,8 @@ const KEY_BINDINGS = {
   f: "f",
   c: "c",
   j: "j",
+  x: "x",
+  b: "b",
   arrowup: "arrowUp",
   arrowdown: "arrowDown",
   arrowleft: "arrowLeft",
@@ -54,6 +56,8 @@ export class SpaceFlightControls {
       f: false,
       c: false,
       j: false,
+      x: false,
+      b: false,
       arrowUp: false,
       arrowDown: false,
       arrowLeft: false,
@@ -85,6 +89,8 @@ export class SpaceFlightControls {
 
     this.onMineCallback = null;
     this.onFireLaserCallback = null;
+    this.onBankCallback = null;
+    this.autopilotTarget = null;
     this.enabled = true;
 
     if (typeof window !== "undefined") {
@@ -107,6 +113,45 @@ export class SpaceFlightControls {
   }
 
   /**
+   * Registers a callback invoked when the player presses `B` to dock & bank cargo.
+   */
+  onBank(callback) {
+    this.onBankCallback = callback;
+  }
+
+  /**
+   * Zeroes linear velocity, levels pitch, and cancels any active autopilot target.
+   */
+  brake() {
+    this.velocity = { x: 0.0, y: 0.0, z: 0.0 };
+    this.pitch = 0.0;
+    this.autopilotTarget = null;
+  }
+
+  /**
+   * Orients ship nose toward `targetPos` and optionally engages gentle approach autopilot.
+   */
+  orientToward(targetPos, engageAutopilot = false, stopDistance = 10.0) {
+    if (!targetPos) return;
+    const dx = targetPos.x - this.position.x;
+    const dy = targetPos.y - this.position.y;
+    const dz = targetPos.z - this.position.z;
+    const horiz = Math.hypot(dx, dz);
+    const total = Math.hypot(dx, dy, dz);
+    if (total < 1e-4) return;
+    this.yaw = Math.atan2(dx, dz);
+    this.pitch = Math.max(-1.45, Math.min(1.45, Math.atan2(dy, Math.max(1e-4, horiz))));
+    if (engageAutopilot) {
+      this.autopilotTarget = {
+        x: targetPos.x,
+        y: targetPos.y,
+        z: targetPos.z,
+        stopDistance: Math.max(2.0, Number(stopDistance) || 10.0),
+      };
+    }
+  }
+
+  /**
    * Updates key state from DOM keyboard events, ignoring editable input elements on keydown.
    */
   setKeyState(e, pressed) {
@@ -118,6 +163,14 @@ export class SpaceFlightControls {
     const bound = KEY_BINDINGS[key] || CODE_BINDINGS[e?.code];
     if (bound && Object.prototype.hasOwnProperty.call(this.keys, bound)) {
       this.keys[bound] = pressed;
+      if (
+        pressed &&
+        bound !== "j" &&
+        bound !== "b" &&
+        bound !== "x"
+      ) {
+        this.autopilotTarget = null;
+      }
     }
 
     if (pressed && this.enabled) {
@@ -125,6 +178,10 @@ export class SpaceFlightControls {
         this.onMineCallback();
       } else if (e?.code === "Enter" && !e?.repeat && this.onFireLaserCallback) {
         this.onFireLaserCallback();
+      } else if ((key === "b" || e?.code === "KeyB") && !e?.repeat && this.onBankCallback) {
+        this.onBankCallback();
+      } else if ((key === "x" || e?.code === "KeyX") && !e?.repeat) {
+        this.brake();
       }
     }
   }
@@ -204,25 +261,56 @@ export class SpaceFlightControls {
     if (this.keys.space || this.keys.r) thrustUp += 1.0;
     if (this.keys.shift || this.keys.c || this.keys.f) thrustUp -= 1.0;
 
-    let ax = fx * thrustForward + rx * thrustRight;
-    let ay = fy * thrustForward + thrustUp;
-    let az = fz * thrustForward + rz * thrustRight;
+    let usedAutopilot = false;
+    if (
+      this.autopilotTarget &&
+      thrustForward === 0.0 &&
+      thrustRight === 0.0 &&
+      thrustUp === 0.0
+    ) {
+      const dist = Math.hypot(
+        this.autopilotTarget.x - this.position.x,
+        this.autopilotTarget.y - this.position.y,
+        this.autopilotTarget.z - this.position.z
+      );
+      if (dist <= this.autopilotTarget.stopDistance) {
+        this.brake();
+      } else {
+        usedAutopilot = true;
+        this.orientToward(this.autopilotTarget, false);
+        const cosP = Math.cos(this.pitch);
+        const sinP = Math.sin(this.pitch);
+        const sinY = Math.sin(this.yaw);
+        const cosY = Math.cos(this.yaw);
+        const apScale = Math.min(1.0, (dist - this.autopilotTarget.stopDistance) / 6.0);
+        const targetSpeed = Math.max(2.5, this.maxSpeed * apScale);
+        this.velocity.x = sinY * cosP * targetSpeed;
+        this.velocity.y = sinP * targetSpeed;
+        this.velocity.z = cosY * cosP * targetSpeed;
+      }
+    }
 
-    const aMag = Math.hypot(ax, ay, az);
-    if (aMag > 1e-6) {
-      const scale = this.thrustAcceleration / aMag;
-      this.velocity.x += ax * scale * dt;
-      this.velocity.y += ay * scale * dt;
-      this.velocity.z += az * scale * dt;
-    } else if (this.linearDamping > 0.0) {
-      const damp = Math.max(0.0, 1.0 - this.linearDamping * dt);
-      this.velocity.x *= damp;
-      this.velocity.y *= damp;
-      this.velocity.z *= damp;
-      if (Math.hypot(this.velocity.x, this.velocity.y, this.velocity.z) < 0.01) {
-        this.velocity.x = 0.0;
-        this.velocity.y = 0.0;
-        this.velocity.z = 0.0;
+    if (!usedAutopilot) {
+      let ax = fx * thrustForward + rx * thrustRight;
+      let ay = fy * thrustForward + thrustUp;
+      let az = fz * thrustForward + rz * thrustRight;
+
+      const aMag = Math.hypot(ax, ay, az);
+      if (aMag > 1e-6) {
+        const scale = this.thrustAcceleration / aMag;
+        this.velocity.x += ax * scale * dt;
+        this.velocity.y += ay * scale * dt;
+        this.velocity.z += az * scale * dt;
+      } else if (this.linearDamping > 0.0) {
+        const damp = Math.max(0.0, 1.0 - this.linearDamping * dt);
+        this.velocity.x *= damp;
+        this.velocity.y *= damp;
+        this.velocity.z *= damp;
+        if (Math.hypot(this.velocity.x, this.velocity.y, this.velocity.z) < 0.01) {
+          this.velocity.x = 0.0;
+          this.velocity.y = 0.0;
+          this.velocity.z = 0.0;
+        }
       }
     }
 

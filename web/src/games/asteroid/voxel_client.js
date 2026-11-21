@@ -26,26 +26,102 @@ export const VOXEL_MATERIALS = Object.freeze({
     name: "Silicate Crust",
     color: "#64748b",
     hex: 0x64748b,
+    unitValue: 0,
   }),
   [VOXEL_TITANIUM]: Object.freeze({
     id: VOXEL_TITANIUM,
     name: "Titanium",
     color: "#38bdf8",
     hex: 0x38bdf8,
+    unitValue: 10,
   }),
   [VOXEL_SOLAR_GOLD]: Object.freeze({
     id: VOXEL_SOLAR_GOLD,
     name: "Solar Gold",
     color: "#facc15",
     hex: 0xfacc15,
+    unitValue: 30,
   }),
   [VOXEL_VOID_CRYSTAL]: Object.freeze({
     id: VOXEL_VOID_CRYSTAL,
     name: "Void Crystal",
     color: "#c084fc",
     hex: 0xc084fc,
+    unitValue: 75,
   }),
 });
+
+export const SEEDED_ASTEROID_CHUNKS = Object.freeze([
+  Object.freeze({ x: 0, y: 0, z: -2 }),
+  Object.freeze({ x: 1, y: 0, z: -1 }),
+  Object.freeze({ x: -2, y: 0, z: 0 }),
+  Object.freeze({ x: 0, y: 1, z: -1 }),
+  Object.freeze({ x: 1, y: 0, z: 1 }),
+  Object.freeze({ x: -1, y: -1, z: -2 }),
+  Object.freeze({ x: -1, y: 0, z: -2 }),
+  Object.freeze({ x: 0, y: -1, z: -2 }),
+  Object.freeze({ x: -1, y: 0, z: 1 }),
+  Object.freeze({ x: 1, y: -1, z: -1 }),
+]);
+
+const SEEDED_CHUNK_KEYS = new Set(SEEDED_ASTEROID_CHUNKS.map((c) => `${c.x},${c.y},${c.z}`));
+
+/**
+ * Returns metadata (`id`, `name`, `color`, `hex`, `unitValue`) for a voxel ID.
+ */
+export function getVoxelMaterialInfo(voxelId) {
+  return (
+    VOXEL_MATERIALS[voxelId] || {
+      id: voxelId,
+      name: voxelId === VOXEL_EMPTY ? "Empty Space" : `Voxel #${voxelId}`,
+      color: "#94a3b8",
+      hex: 0x94a3b8,
+      unitValue: 0,
+    }
+  );
+}
+
+/**
+ * Deterministic procedural 16x16x16 asteroid generator mirroring
+ * `crates/gameplay/src/asteroid.rs::generate_asteroid_chunk`.
+ */
+export function generateProceduralAsteroidChunk(cx, cy, cz) {
+  const voxels = new Uint16Array(CHUNK_VOXELS);
+  const seedSalt = Math.abs(cx) * 7 + Math.abs(cy) * 13 + Math.abs(cz) * 19;
+
+  for (let lz = 1; lz < CHUNK_SIZE - 1; lz++) {
+    for (let ly = 1; ly < CHUNK_SIZE - 1; ly++) {
+      for (let lx = 1; lx < CHUNK_SIZE - 1; lx++) {
+        const dx = lx - 7.5;
+        const dy = ly - 7.5;
+        const dz = lz - 7.5;
+        const dist = Math.hypot(dx, dy, dz);
+        const bump = ((lx * 31 + ly * 17 + lz * 13 + seedSalt) % 5) * 0.2;
+
+        let voxel = VOXEL_EMPTY;
+        if (dist <= 1.8) {
+          voxel = VOXEL_VOID_CRYSTAL;
+        } else if (dist <= 3.1) {
+          voxel = VOXEL_SOLAR_GOLD;
+        } else if (dist <= 4.5) {
+          voxel = VOXEL_TITANIUM;
+        } else if (dist <= 5.6 + bump) {
+          const surfaceHash = (lx * 3 + ly * 5 + lz * 7 + seedSalt) % 11;
+          if (surfaceHash === 0) {
+            voxel = VOXEL_SOLAR_GOLD;
+          } else if (surfaceHash <= 2) {
+            voxel = VOXEL_TITANIUM;
+          } else {
+            voxel = VOXEL_CRUST_ROCK;
+          }
+        }
+        voxels[indexFromLocal(lx, ly, lz)] = voxel;
+      }
+    }
+  }
+
+  return voxels;
+}
 
 /**
  * Computes the 32-bit modular action_id for a voxel sub-opcode.
@@ -466,22 +542,79 @@ export class AsteroidVoxelClient {
     this.chunks = new Map();
     this.dirtyMeshes = new Set();
     this.requestedChunks = new Set();
+    this.pendingChunkRequests = new Map();
+    this.requestRetryTtlMs = 2000;
+    this.maxEmptyChunkRetries = 3;
+    this.maxSeededChunkRetries = 10;
   }
 
   clear() {
     this.chunks.clear();
     this.dirtyMeshes.clear();
     this.requestedChunks.clear();
+    this.pendingChunkRequests.clear();
+  }
+
+  /**
+   * Clears in-flight request tracking so chunks (including preview chunks) are
+   * cleanly requested after authentication succeeds.
+   */
+  resetRequestTracking() {
+    this.requestedChunks.clear();
+    this.pendingChunkRequests.clear();
+  }
+
+  /**
+   * Populates deterministic procedural preview asteroids (`isPreview = true`) so the
+   * 3D belt is immediately visible offline or prior to server sync.
+   */
+  seedLocalPreviewChunks(overwriteAuthoritative = false) {
+    let seededCount = 0;
+    for (const c of SEEDED_ASTEROID_CHUNKS) {
+      const existing = this.getChunk(c.x, c.y, c.z);
+      if (!existing || overwriteAuthoritative) {
+        const voxels = generateProceduralAsteroidChunk(c.x, c.y, c.z);
+        this.setChunk(c.x, c.y, c.z, voxels, 0, { isPreview: true });
+        seededCount++;
+      }
+    }
+    return seededCount;
   }
 
   /**
    * Stores decoded chunk voxels at `(cx, cy, cz)` and marks self + adjacent loaded chunks dirty.
    */
-  setChunk(cx, cy, cz, voxels, revision = 0) {
+  setChunk(cx, cy, cz, voxels, revision = 0, options = {}) {
     const key = chunkKey(cx, cy, cz);
     const data = voxels instanceof Uint16Array ? voxels : new Uint16Array(voxels);
-    this.chunks.set(key, { x: cx, y: cy, z: cz, revision, voxels: data });
+    const isPreview = Boolean(options?.isPreview);
+
+    let solidCount = 0;
+    let oreCount = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (v !== VOXEL_EMPTY) {
+        solidCount++;
+        if (v >= VOXEL_TITANIUM) oreCount++;
+      }
+    }
+
+    this.chunks.set(key, {
+      x: cx,
+      y: cy,
+      z: cz,
+      revision,
+      voxels: data,
+      isPreview,
+      solidCount,
+      oreCount,
+    });
     this.dirtyMeshes.add(key);
+
+    if (!isPreview) {
+      this.pendingChunkRequests.delete(key);
+      this.requestedChunks.add(key);
+    }
 
     // Flag loaded cardinal neighbors dirty for seamless cross-chunk boundary culling
     const neighbors = [
@@ -522,6 +655,13 @@ export class AsteroidVoxelClient {
     const prev = entry.voxels[index];
     entry.voxels[index] = newVoxel;
     entry.revision += 1;
+    if (prev === VOXEL_EMPTY && newVoxel !== VOXEL_EMPTY) {
+      entry.solidCount = (entry.solidCount ?? 0) + 1;
+      if (newVoxel >= VOXEL_TITANIUM) entry.oreCount = (entry.oreCount ?? 0) + 1;
+    } else if (prev !== VOXEL_EMPTY && newVoxel === VOXEL_EMPTY) {
+      entry.solidCount = Math.max(0, (entry.solidCount ?? 1) - 1);
+      if (prev >= VOXEL_TITANIUM) entry.oreCount = Math.max(0, (entry.oreCount ?? 1) - 1);
+    }
     this.dirtyMeshes.add(key);
 
     if (lx === 0) this._markDirtyIfLoaded(chunk.x - 1, chunk.y, chunk.z);
@@ -562,7 +702,9 @@ export class AsteroidVoxelClient {
     if (subOpcode === SUB_OPCODE_CHUNK_REQUEST || subOpcode === SUB_OPCODE_CHUNK_DATA) {
       if (bytes.byteLength < 12) return null;
       const decoded = decodeVoxelChunkData(bytes);
-      this.setChunk(decoded.chunk.x, decoded.chunk.y, decoded.chunk.z, decoded.voxels, decoded.revision);
+      this.setChunk(decoded.chunk.x, decoded.chunk.y, decoded.chunk.z, decoded.voxels, decoded.revision, {
+        isPreview: false,
+      });
       return { type: "chunk_data", ...decoded };
     }
 
@@ -572,9 +714,20 @@ export class AsteroidVoxelClient {
       const entry = this.getChunk(batch.chunk.x, batch.chunk.y, batch.chunk.z);
       if (entry) {
         for (const d of batch.deltas) {
-          entry.voxels[indexFromLocal(d.lx, d.ly, d.lz)] = d.newVoxel;
+          const idx = indexFromLocal(d.lx, d.ly, d.lz);
+          const prev = entry.voxels[idx];
+          entry.voxels[idx] = d.newVoxel;
+          if (prev === VOXEL_EMPTY && d.newVoxel !== VOXEL_EMPTY) {
+            entry.solidCount = (entry.solidCount ?? 0) + 1;
+            if (d.newVoxel >= VOXEL_TITANIUM) entry.oreCount = (entry.oreCount ?? 0) + 1;
+          } else if (prev !== VOXEL_EMPTY && d.newVoxel === VOXEL_EMPTY) {
+            entry.solidCount = Math.max(0, (entry.solidCount ?? 1) - 1);
+            if (prev >= VOXEL_TITANIUM) entry.oreCount = Math.max(0, (entry.oreCount ?? 1) - 1);
+          }
         }
         entry.revision = batch.revision;
+        entry.isPreview = false;
+        this.pendingChunkRequests.delete(chunkKey(batch.chunk.x, batch.chunk.y, batch.chunk.z));
         this.dirtyMeshes.add(chunkKey(batch.chunk.x, batch.chunk.y, batch.chunk.z));
       }
       return { type: "delta_batch", ...batch };
@@ -610,9 +763,10 @@ export class AsteroidVoxelClient {
   }
 
   /**
-   * Returns unrequested chunk coordinates around `pos` and sector origin to stream from server.
+   * Returns unrequested (or expired-pending / preview-only) chunk coordinates around `pos`,
+   * prioritizing known seeded asteroid chunks first.
    */
-  collectUnrequestedChunks(pos, radiusX = 2, radiusY = 1, radiusZ = 2) {
+  collectUnrequestedChunks(pos, radiusX = 2, radiusY = 1, radiusZ = 2, nowMs = Date.now()) {
     const center = voxelCoordToChunk(
       Math.floor(pos?.x ?? 0),
       Math.floor(pos?.y ?? 0),
@@ -620,13 +774,32 @@ export class AsteroidVoxelClient {
     ).chunk;
 
     const toRequest = [];
+    const seen = new Set();
     const addCandidate = (cx, cy, cz) => {
       const key = chunkKey(cx, cy, cz);
-      if (!this.requestedChunks.has(key) && !this.chunks.has(key)) {
-        this.requestedChunks.add(key);
-        toRequest.push({ x: cx, y: cy, z: cz });
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      const existing = this.chunks.get(key);
+      if (existing && !existing.isPreview) return;
+
+      const pending = this.pendingChunkRequests.get(key);
+      const isSeeded = SEEDED_CHUNK_KEYS.has(key);
+      const maxAttempts = isSeeded ? this.maxSeededChunkRetries : this.maxEmptyChunkRetries;
+      if (pending) {
+        if (nowMs - pending.sentAt < this.requestRetryTtlMs) return;
+        if (pending.attempts >= maxAttempts) return;
       }
+
+      const nextAttempts = (pending?.attempts ?? 0) + 1;
+      this.pendingChunkRequests.set(key, { sentAt: nowMs, attempts: nextAttempts });
+      this.requestedChunks.add(key);
+      toRequest.push({ x: cx, y: cy, z: cz });
     };
+
+    for (const c of SEEDED_ASTEROID_CHUNKS) {
+      addCandidate(c.x, c.y, c.z);
+    }
 
     for (let dx = -radiusX; dx <= radiusX; dx++) {
       for (let dy = -radiusY; dy <= radiusY; dy++) {
@@ -637,6 +810,63 @@ export class AsteroidVoxelClient {
     }
 
     return toRequest;
+  }
+
+  /**
+   * Summarizes loaded non-empty asteroid clusters sorted by distance to `shipPos`.
+   */
+  getAsteroidClusterSummaries(shipPos = { x: 0, y: 0, z: 0 }) {
+    const sx = shipPos?.x ?? 0;
+    const sy = shipPos?.y ?? 0;
+    const sz = shipPos?.z ?? 0;
+    const clusters = [];
+
+    for (const chunk of this.chunks.values()) {
+      const solidCount = chunk.solidCount ?? 0;
+      if (solidCount === 0) continue;
+      const cx = chunk.x * CHUNK_SIZE + 8.0;
+      const cy = chunk.y * CHUNK_SIZE + 8.0;
+      const cz = chunk.z * CHUNK_SIZE + 8.0;
+      const distance = Math.hypot(cx - sx, cy - sy, cz - sz);
+      clusters.push({
+        key: chunkKey(chunk.x, chunk.y, chunk.z),
+        cx: chunk.x,
+        cy: chunk.y,
+        cz: chunk.z,
+        center: { x: cx, y: cy, z: cz },
+        distance,
+        solidCount,
+        oreCount: chunk.oreCount ?? 0,
+        isPreview: Boolean(chunk.isPreview),
+      });
+    }
+
+    clusters.sort((a, b) => a.distance - b.distance);
+    return clusters;
+  }
+
+  /**
+   * Returns aggregate loaded chunk & voxel statistics for diagnostics.
+   */
+  getLoadedStats() {
+    let authoritativeCount = 0;
+    let previewCount = 0;
+    let totalSolidVoxels = 0;
+    let totalOreVoxels = 0;
+    for (const chunk of this.chunks.values()) {
+      if (chunk.isPreview) previewCount++;
+      else authoritativeCount++;
+      totalSolidVoxels += chunk.solidCount ?? 0;
+      totalOreVoxels += chunk.oreCount ?? 0;
+    }
+    return {
+      chunkCount: this.chunks.size,
+      authoritativeCount,
+      previewCount,
+      totalSolidVoxels,
+      totalOreVoxels,
+      pendingRequests: this.pendingChunkRequests.size,
+    };
   }
 
   /**

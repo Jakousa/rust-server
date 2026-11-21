@@ -3,6 +3,7 @@ import { WebTransportClient } from "./transport.js";
 import { WorldRenderer } from "./renderer.js";
 import { PlayerControls } from "./controls.js";
 import { UIController } from "./ui.js";
+import { DevToolsController } from "./dev_tools.js";
 import {
   AsteroidRenderer,
   HOME_STATION_SAFE_RADIUS,
@@ -14,6 +15,7 @@ import {
   VOXEL_EMPTY,
   voxelCoordToChunk,
   chunkKey,
+  getVoxelMaterialInfo,
 } from "./games/asteroid/voxel_client.js";
 import {
   OPCODES,
@@ -155,6 +157,7 @@ export class ClientWorldBridge {
     this.receivedPackets = 0;
     this.localPlayerGuid = 1;
     this.sessionId = 0;
+    this.isAuthenticated = false;
     this.clientTime = 0.0;
     this.onInteractionResultCallback = null;
     this.onAuthResponseCallback = null;
@@ -178,6 +181,7 @@ export class ClientWorldBridge {
     this.latestServerTick = 0;
     this.latestBaselineTick = 0;
     this.receivedPackets = 0;
+    this.isAuthenticated = false;
   }
 
   onMovementCorrection(callback) {
@@ -243,6 +247,7 @@ export class ClientWorldBridge {
       if (success) {
         this.sessionId = sessionId;
         this.localPlayerGuid = playerGuid;
+        this.isAuthenticated = true;
         console.log(`[Auth] Authenticated as Player Guid ${playerGuid}, Session ${sessionId}`);
         if (this.onAuthResponseCallback) {
           this.onAuthResponseCallback({ sessionId, playerGuid, success, errorCode });
@@ -1097,7 +1102,7 @@ if (typeof window !== "undefined") {
     );
 
     const controlsByMode = { village: null, asteroid: null };
-    let voxelClient = null;
+    const voxelClient = new AsteroidVoxelClient();
     let activeRenderer = null;
     let activeControls = null;
 
@@ -1127,9 +1132,97 @@ if (typeof window !== "undefined") {
     let activeTradeSessionId = 0;
     let latestAsteroidState = null;
     let lastChunkProbeKey = "";
+    let lastChunkProbeTime = 0;
     let hasSyncedInitialPosition = false;
+    const MAX_MINING_RAYCAST_REACH = 18.0;
+    const MAX_MINING_PROXIMITY_REACH = 14.0;
     const raycaster = new THREE.Raycaster();
     const pointerNdc = new THREE.Vector2();
+
+    function applyAsteroidStatePayload(data) {
+      if (!data) return;
+      const prevDeaths = latestAsteroidState?.station_vault?.deaths;
+      const nextDeaths = data.station_vault?.deaths;
+      if (
+        prevDeaths !== undefined &&
+        nextDeaths !== undefined &&
+        nextDeaths > prevDeaths &&
+        activeGameMode === "asteroid" &&
+        activeControls
+      ) {
+        activeControls.setPosition(0.0, 0.0, 8.0);
+        if (activeControls.velocity) {
+          activeControls.velocity = { x: 0.0, y: 0.0, z: 0.0 };
+        }
+        ui.showToast("Ship destroyed! Respawned at Home Orbital Station.", "error", 3200);
+      }
+
+      latestAsteroidState = data;
+      ui.updateAsteroidState(data);
+
+      const localEnt = world.entities.get(world.localPlayerGuid);
+      if (localEnt) {
+        if (data.shininess_tier !== undefined) {
+          const tier = Number(data.shininess_tier) & 0xff;
+          localEnt.stateFlags = ((localEnt.stateFlags || 0) & 0xff00ffff) | (tier << 16);
+        }
+        if (data.hull_hp !== undefined && data.max_hull_hp > 0) {
+          localEnt.hpPct = data.hull_hp / data.max_hull_hp;
+        }
+      }
+
+      if (data.error) {
+        ui.showToast(data.error, "warning", 2800);
+      }
+    }
+
+    const devTools = new DevToolsController({
+      world,
+      voxelClient,
+      onStateUpdate: (state) => applyAsteroidStatePayload(state),
+      onToast: (msg, type, dur) => ui.showToast(msg, type, dur),
+    });
+
+    const btnSandbox = document.getElementById("btn-devtools-sandbox");
+    const btnReloadChunks = document.getElementById("btn-reload-chunks");
+    const btnTpAsteroid = document.getElementById("btn-teleport-asteroid");
+    const btnTpStation = document.getElementById("btn-teleport-station");
+    const btnTpPvp = document.getElementById("btn-teleport-pvp");
+    const btnSpawnDummy = document.getElementById("btn-spawn-dummy");
+    const btnResetSandbox = document.getElementById("btn-reset-sandbox");
+
+    function updateDevToolsUi() {
+      if (ui.devtoolsDrawer) {
+        ui.devtoolsDrawer.style.display = devTools.isOpen ? "block" : "none";
+      }
+      if (ui.btnToggleDevtools) {
+        ui._setElementClass(ui.btnToggleDevtools, "active", devTools.isOpen);
+      }
+      if (btnSandbox) {
+        btnSandbox.textContent = devTools.sandboxEnabled ? "Sandbox: ON" : "Sandbox: OFF";
+        ui._setElementClass(btnSandbox, "accept-btn", devTools.sandboxEnabled);
+        ui._setElementClass(btnSandbox, "primary-btn", !devTools.sandboxEnabled);
+      }
+      if (ui.devtoolsStats) {
+        const pos = activeControls ? activeControls.position : { x: 0, y: 0, z: 8 };
+        const diag = devTools.getDiagnosticsSummary(pos);
+        const modeLabel = devTools.sandboxEnabled
+          ? "Sandbox"
+          : world.isAuthenticated
+          ? "Live Auth"
+          : "Preview";
+        const beltDist =
+          diag.nearestAsteroidDistance != null
+            ? `${diag.nearestAsteroidDistance.toFixed(1)}m`
+            : "--";
+        ui.devtoolsStats.textContent = `Chunks: ${diag.chunkCount} (${diag.authoritativeCount} srv / ${diag.previewCount} prv) | Ore: ${diag.totalOreVoxels} | Belt: ${beltDist} | ${modeLabel}`;
+      }
+    }
+
+    function toggleDevToolsDrawer(forceOpen = null) {
+      devTools.isOpen = forceOpen === null ? !devTools.isOpen : Boolean(forceOpen);
+      updateDevToolsUi();
+    }
 
     function toSafeGuid(val) {
       if (val == null) return null;
@@ -1175,7 +1268,7 @@ if (typeof window !== "undefined") {
     }
 
     function performInspect(target) {
-      if (!transport.connected || !target) return;
+      if (!transport.connected || !world.isAuthenticated || !target || devTools.sandboxEnabled) return;
       if (activeGameMode === "asteroid") {
         sendAsteroidInteraction(1, target.id, {
           target_guid: target.id ? toSafeGuid(target.id) : null,
@@ -1186,22 +1279,34 @@ if (typeof window !== "undefined") {
     }
 
     function requestVisibleAsteroidChunks(force = false) {
-      if (activeGameMode !== "asteroid" || !transport.connected || !voxelClient || !activeControls) {
+      if (
+        activeGameMode !== "asteroid" ||
+        !transport.connected ||
+        !world.isAuthenticated ||
+        !voxelClient ||
+        !activeControls ||
+        devTools.sandboxEnabled
+      ) {
         return;
       }
+      const nowMs = Date.now();
       const { chunk } = voxelCoordToChunk(
         Math.floor(activeControls.position.x),
         Math.floor(activeControls.position.y),
         Math.floor(activeControls.position.z)
       );
       const key = chunkKey(chunk.x, chunk.y, chunk.z);
-      if (!force && key === lastChunkProbeKey) return;
+      if (!force && key === lastChunkProbeKey && nowMs - lastChunkProbeTime < 2000) return;
       lastChunkProbeKey = key;
+      lastChunkProbeTime = nowMs;
 
-      const candidates = [
-        ...voxelClient.collectUnrequestedChunks(activeControls.position, 2, 1, 2),
-        ...voxelClient.collectUnrequestedChunks({ x: 0, y: 0, z: 0 }, 2, 1, 2),
-      ];
+      const candidates = voxelClient.collectUnrequestedChunks(
+        activeControls.position,
+        2,
+        1,
+        2,
+        nowMs
+      );
       for (const c of candidates) {
         const pkt = voxelClient.encodeChunkRequestPacket(world.localPlayerGuid, c.x, c.y, c.z);
         transport.sendStream(pkt);
@@ -1209,20 +1314,29 @@ if (typeof window !== "undefined") {
     }
 
     function fireMiningLaser(explicitTarget = null) {
-      if (activeGameMode !== "asteroid" || !transport.connected || !voxelClient || !activeControls) {
+      if (activeGameMode !== "asteroid" || !voxelClient || !activeControls) {
         return;
+      }
+      if (!devTools.sandboxEnabled && (!transport.connected || !world.isAuthenticated)) {
+        if (!transport.connected && !transport._isConnecting) {
+          devTools.setSandboxEnabled(true, { silent: true });
+          ui.showToast("Offline mode: Local Sandbox Mining enabled!", "info", 2000);
+          updateDevToolsUi();
+        } else {
+          return;
+        }
       }
       const target =
         explicitTarget ||
         voxelClient.raycastFirstSolid(
           activeControls.position,
           activeControls.getForwardVector(),
-          12.0
+          MAX_MINING_RAYCAST_REACH
         ) ||
-        voxelClient.findNearestSolidVoxel(activeControls.position, 6.5, true);
+        voxelClient.findNearestSolidVoxel(activeControls.position, MAX_MINING_PROXIMITY_REACH, true);
 
       if (!target) {
-        ui.showToast("Fly near an asteroid block (<=6.5m) or click a block to mine.", "info", 2000);
+        ui.showToast("Fly near an asteroid block (<=18m) or click a block to mine.", "info", 2000);
         return;
       }
 
@@ -1232,6 +1346,13 @@ if (typeof window !== "undefined") {
         z: target.z + 0.5,
       };
       activeRenderer?.spawnLaserBeam?.(activeControls.position, targetCenter, 0x38bdf8, 220);
+
+      if (devTools.sandboxEnabled) {
+        devTools.mineVoxelLocally(target.x, target.y, target.z, activeControls.position);
+        updateDevToolsUi();
+        return;
+      }
+
       const pkt = voxelClient.encodeModifyRequestPacket(
         world.localPlayerGuid,
         target.x,
@@ -1243,12 +1364,29 @@ if (typeof window !== "undefined") {
     }
 
     function firePvpLaser(explicitTarget = null) {
-      if (activeGameMode !== "asteroid" || !transport.connected || !activeControls) return;
+      if (activeGameMode !== "asteroid" || !activeControls) return;
       const target = explicitTarget || nearestAsteroidTarget;
       if (!target) {
         ui.showToast("No rival ship within 45m laser range.", "warning", 2000);
         return;
       }
+      if (devTools.sandboxEnabled || target.isSandboxDummy) {
+        if (!devTools.sandboxEnabled) {
+          ui.showToast("Sandbox target is inactive while connected to a live node.", "warning", 2000);
+          return;
+        }
+        const res = devTools.fireSandboxLaser(target.id, activeControls.position);
+        if (res.ok) {
+          activeRenderer?.spawnLaserBeam?.(activeControls.position, target, 0xf43f5e, 240);
+          if (res.destroyed) {
+            ui.showToast("Target destroyed! Cargo looted.", "success", 2200);
+          }
+        } else if (res.error) {
+          ui.showToast(res.error, "warning", 2000);
+        }
+        return;
+      }
+      if (!transport.connected || !world.isAuthenticated) return;
       activeRenderer?.spawnLaserBeam?.(activeControls.position, target, 0xf43f5e, 240);
       sendAsteroidInteraction(
         2,
@@ -1256,6 +1394,20 @@ if (typeof window !== "undefined") {
         { target_guid: toSafeGuid(target.id) },
         INTERACTION_TYPES.ATTACK
       );
+    }
+
+    function bankLoot() {
+      if (activeGameMode !== "asteroid" || !activeControls) return;
+      if (devTools.sandboxEnabled) {
+        devTools.bankSandboxCargo(activeControls.position);
+        updateDevToolsUi();
+        return;
+      }
+      if (!transport.connected || !world.isAuthenticated) {
+        ui.showToast("Enable Sandbox in Playtest Tools or connect to bank cargo.", "info", 2200);
+        return;
+      }
+      sendAsteroidInteraction(3, 0, {});
     }
 
     function bindAsteroidCanvasPicking(rendererInstance) {
@@ -1364,10 +1516,15 @@ if (typeof window !== "undefined") {
           flightControls.onFireLaser(() => {
             if (activeGameMode === "asteroid") firePvpLaser();
           });
+          flightControls.onBank(() => {
+            if (activeGameMode === "asteroid") bankLoot();
+          });
           controlsByMode.asteroid = flightControls;
         }
         activeControls = controlsByMode.asteroid;
-        voxelClient ??= new AsteroidVoxelClient();
+        voxelClient.seedLocalPreviewChunks();
+        activeRenderer.syncVoxelChunks(voxelClient);
+        activeRenderer.alignCameraBehindShip(activeControls.yaw, activeControls.pitch);
         bindAsteroidCanvasPicking(activeRenderer);
       } else {
         activeRenderer = new WorldRenderer(container);
@@ -1422,13 +1579,15 @@ if (typeof window !== "undefined") {
         } catch (_) {}
       }
 
-      if (transport.connected && prevMode === activeGameMode) {
+      if (transport.connected && world.isAuthenticated && prevMode === activeGameMode) {
         performInspect({ id: 0 });
         if (activeGameMode === "asteroid") {
           lastChunkProbeKey = "";
+          lastChunkProbeTime = 0;
           requestVisibleAsteroidChunks(true);
         }
       }
+      updateDevToolsUi();
     }
 
     // Mount initial cartridge synchronously before async cert discovery
@@ -1473,40 +1632,7 @@ if (typeof window !== "undefined") {
 
       // 2. Asteroid Mining Plugin (0x0003) JSON state responses
       if (moduleId === ASTEROID_MODULE_ID) {
-        const prevDeaths = latestAsteroidState?.station_vault?.deaths;
-        const nextDeaths = res.data.station_vault?.deaths;
-        if (
-          prevDeaths !== undefined &&
-          nextDeaths !== undefined &&
-          nextDeaths > prevDeaths &&
-          activeGameMode === "asteroid" &&
-          activeControls
-        ) {
-          activeControls.setPosition(0.0, 0.0, 8.0);
-          if (activeControls.velocity) {
-            activeControls.velocity = { x: 0.0, y: 0.0, z: 0.0 };
-          }
-          ui.showToast("Ship destroyed! Respawned at Home Orbital Station.", "error", 3200);
-        }
-
-        latestAsteroidState = res.data;
-        ui.updateAsteroidState(res.data);
-
-        const localEnt = world.entities.get(world.localPlayerGuid);
-        if (localEnt) {
-          if (res.data.shininess_tier !== undefined) {
-            const tier = Number(res.data.shininess_tier) & 0xff;
-            localEnt.stateFlags = ((localEnt.stateFlags || 0) & 0xff00ffff) | (tier << 16);
-          }
-          if (res.data.hull_hp !== undefined && res.data.max_hull_hp > 0) {
-            localEnt.hpPct = res.data.hull_hp / res.data.max_hull_hp;
-          }
-        }
-
-        if (res.data.error) {
-          ui.showToast(res.data.error, "warning", 2800);
-        }
-
+        applyAsteroidStatePayload(res.data);
         syncTradeModal(res.data, "Station pilot trade completed!");
         return;
       }
@@ -1538,8 +1664,12 @@ if (typeof window !== "undefined") {
 
     // Authoritative server movement & initial auth hydration listeners
     world.onAuthResponse(() => {
+      devTools.onLiveAuthSucceeded();
+      updateDevToolsUi();
       hasSyncedInitialPosition = false;
       lastChunkProbeKey = "";
+      lastChunkProbeTime = 0;
+      voxelClient.resetRequestTracking();
       performInspect({ id: 0 });
       if (activeGameMode === "asteroid") {
         requestVisibleAsteroidChunks(true);
@@ -1588,9 +1718,15 @@ if (typeof window !== "undefined") {
       if (status === "disconnected") {
         hasSyncedInitialPosition = false;
         lastChunkProbeKey = "";
+        lastChunkProbeTime = 0;
         world.clear();
         voxelClient?.clear();
         activeRenderer?.clear();
+        if (activeGameMode === "asteroid") {
+          voxelClient.seedLocalPreviewChunks();
+          activeRenderer?.syncVoxelChunks?.(voxelClient);
+        }
+        updateDevToolsUi();
       }
       if (error) {
         console.warn("Transport status notice:", error);
@@ -1615,18 +1751,24 @@ if (typeof window !== "undefined") {
             world.clear();
             voxelClient?.clear();
             activeRenderer?.clear();
+            if (activeGameMode === "asteroid") {
+              voxelClient.seedLocalPreviewChunks();
+              activeRenderer?.syncVoxelChunks?.(voxelClient);
+            }
           }
           nearestTarget = null;
           nearestAsteroidTarget = null;
           latestAsteroidState = null;
           hasSyncedInitialPosition = false;
           lastChunkProbeKey = "";
+          lastChunkProbeTime = 0;
           await autoFetchCertHash(activeGameMode, true);
           ui.btnConnect?.click();
         }
       },
       onConnect: async (url, certHash) => {
         try {
+          world.isAuthenticated = false;
           ui.setConnectionState("connecting", "Connecting", "");
           const gwConfig = resolveGatewayConfig(activeGameMode);
           await transport.connect(url, certHash, {
@@ -1636,13 +1778,6 @@ if (typeof window !== "undefined") {
           const sessionToken = getOrCreateSessionToken(activeGameMode);
           const authPkt = encodeAuthRequest(sessionToken, 1);
           await transport.sendStream(authPkt);
-
-          setTimeout(() => {
-            performInspect({ id: 0 });
-            if (activeGameMode === "asteroid") {
-              requestVisibleAsteroidChunks(true);
-            }
-          }, 200);
         } catch (err) {
           const errorMsg = formatConnectionError(err);
           console.warn("Failed to connect via WebTransport:", errorMsg);
@@ -1654,6 +1789,11 @@ if (typeof window !== "undefined") {
         world.clear();
         voxelClient?.clear();
         activeRenderer?.clear();
+        if (activeGameMode === "asteroid") {
+          voxelClient.seedLocalPreviewChunks();
+          activeRenderer?.syncVoxelChunks?.(voxelClient);
+        }
+        updateDevToolsUi();
       },
       onTogglePartitions: (visible) => activeRenderer?.setPartitionsVisible(visible),
       onToggleAoi: (visible) => activeRenderer?.setAoiVisible(visible),
@@ -1665,10 +1805,42 @@ if (typeof window !== "undefined") {
       },
       onMineAsteroid: () => fireMiningLaser(),
       onFireLaser: () => firePvpLaser(),
-      onBankLoot: () => {
-        if (activeGameMode !== "asteroid" || !transport.connected) return;
-        sendAsteroidInteraction(3, 0, {});
+      onBankLoot: () => bankLoot(),
+      onFlyToAsteroid: () => {
+        if (activeGameMode !== "asteroid" || !activeControls || !voxelClient) return;
+        let clusters = voxelClient.getAsteroidClusterSummaries(activeControls.position);
+        if (clusters.length === 0) {
+          voxelClient.seedLocalPreviewChunks();
+          activeRenderer?.syncVoxelChunks?.(voxelClient);
+          clusters = voxelClient.getAsteroidClusterSummaries(activeControls.position);
+        }
+        const nearest = clusters[0];
+        if (!nearest) return;
+        const dx = activeControls.position.x - nearest.center.x;
+        const dy = activeControls.position.y - nearest.center.y;
+        const dz = activeControls.position.z - nearest.center.z;
+        const dist = Math.hypot(dx, dy, dz) || 1;
+        const approachPos = {
+          x: nearest.center.x + (dx / dist) * 7.5,
+          y: nearest.center.y + (dy / dist) * 7.5,
+          z: nearest.center.z + (dz / dist) * 7.5,
+        };
+        activeControls.orientToward(approachPos, true, 1.5);
+        activeRenderer?.alignCameraBehindShip?.(activeControls.yaw, activeControls.pitch);
+        ui.showToast(`Autopilot engaged toward asteroid (${nearest.distance.toFixed(0)}m)`, "info", 1800);
       },
+      onFlyToStation: () => {
+        if (activeGameMode !== "asteroid" || !activeControls) return;
+        activeControls.orientToward({ x: 0.0, y: 0.0, z: 8.0 }, true, 1.5);
+        activeRenderer?.alignCameraBehindShip?.(activeControls.yaw, activeControls.pitch);
+        ui.showToast("Autopilot engaged toward Home Orbital Station Dock.", "info", 1800);
+      },
+      onBrakeShip: () => {
+        if (activeGameMode !== "asteroid" || !activeControls) return;
+        activeControls.brake();
+        ui.showToast("Ship stabilized (velocity zeroed).", "info", 1200);
+      },
+      onToggleDevTools: (forceOpen) => toggleDevToolsDrawer(forceOpen ?? null),
       onTradePilot: () => {
         if (activeGameMode !== "asteroid" || !transport.connected || !nearestAsteroidTarget) return;
         sendAsteroidInteraction(4, nearestAsteroidTarget.id, {
@@ -1717,8 +1889,119 @@ if (typeof window !== "undefined") {
       },
     });
 
-    // Keyboard shortcut: E to interact with nearest target in Village mode
+    // Playtest Workbench Actions
+    btnSandbox?.addEventListener("click", () => {
+      if (world.isAuthenticated && transport.connected) {
+        ui.showToast("Disconnect before toggling offline Sandbox Mode.", "warning", 2200);
+        return;
+      }
+      const next = devTools.setSandboxEnabled(!devTools.sandboxEnabled);
+      if (next) {
+        applyAsteroidStatePayload(
+          devTools.buildSandboxStateResponse(activeControls?.position ?? { x: 0, y: 0, z: 8 })
+        );
+      }
+      updateDevToolsUi();
+    });
+
+    btnReloadChunks?.addEventListener("click", () => {
+      if (activeGameMode !== "asteroid") return;
+      if (transport.connected && world.isAuthenticated && !devTools.sandboxEnabled) {
+        voxelClient.resetRequestTracking();
+        lastChunkProbeKey = "";
+        lastChunkProbeTime = 0;
+        requestVisibleAsteroidChunks(true);
+        ui.showToast("Re-requesting authoritative asteroid chunks...", "info", 1800);
+      } else {
+        voxelClient.seedLocalPreviewChunks(true);
+        activeRenderer?.syncVoxelChunks?.(voxelClient);
+        ui.showToast("Re-seeded local procedural asteroid belt.", "info", 1800);
+      }
+      updateDevToolsUi();
+    });
+
+    function sandboxTeleport(pos, lookAt = null, msg = "") {
+      if (activeGameMode !== "asteroid") {
+        ui.showToast("Switch to Game B: Asteroid Miners to use space playtest tools.", "info", 2000);
+        return;
+      }
+      if (world.isAuthenticated && transport.connected && !devTools.sandboxEnabled) {
+        ui.showToast("Teleports are disabled during live server sessions.", "warning", 2200);
+        return;
+      }
+      if (!devTools.sandboxEnabled) {
+        devTools.setSandboxEnabled(true, { silent: true });
+      }
+      if (activeControls) {
+        activeControls.brake?.();
+        activeControls.setPosition(pos.x, pos.y, pos.z);
+        if (lookAt && activeControls.orientToward) {
+          activeControls.orientToward(lookAt, false);
+        }
+        activeRenderer?.alignCameraBehindShip?.(activeControls.yaw, activeControls.pitch);
+      }
+      applyAsteroidStatePayload(devTools.buildSandboxStateResponse(pos));
+      if (msg) ui.showToast(msg, "info", 1800);
+      updateDevToolsUi();
+    }
+
+    btnTpAsteroid?.addEventListener("click", () => {
+      sandboxTeleport(
+        { x: 7.5, y: 7.5, z: -15.5 },
+        { x: 7.5, y: 7.5, z: -24.5 },
+        "Teleported to Asteroid Core (0, 0, -2)"
+      );
+    });
+
+    btnTpStation?.addEventListener("click", () => {
+      sandboxTeleport({ x: 0.0, y: 0.0, z: 8.0 }, { x: 0.0, y: 0.0, z: 0.0 }, "Teleported to Station Dock");
+    });
+
+    btnTpPvp?.addEventListener("click", () => {
+      sandboxTeleport({ x: 18.0, y: 0.0, z: -18.0 }, { x: 22.0, y: 0.0, z: -18.0 }, "Teleported to Patrol Zone");
+    });
+
+    btnSpawnDummy?.addEventListener("click", () => {
+      if (activeGameMode !== "asteroid") {
+        ui.showToast("Switch to Game B: Asteroid Miners to spawn space target dummies.", "info", 2000);
+        return;
+      }
+      if (world.isAuthenticated && transport.connected && !devTools.sandboxEnabled) {
+        ui.showToast("Disconnect to spawn offline sandbox dummies.", "warning", 2200);
+        return;
+      }
+      const shipPos = activeControls?.position ?? { x: 18, y: 0, z: -18 };
+      const spawnPos =
+        Math.hypot(shipPos.x, shipPos.y, shipPos.z) <= HOME_STATION_SAFE_RADIUS
+          ? { x: 14.0, y: 0.0, z: -18.0 }
+          : { x: shipPos.x + 8.0, y: shipPos.y, z: shipPos.z - 8.0 };
+      const dummy = devTools.spawnTargetDummy(spawnPos, 200);
+      ui.showToast(`Spawned Shiny Dummy #${dummy.id} (Tier 200)`, "success", 2000);
+      updateDevToolsUi();
+    });
+
+    btnResetSandbox?.addEventListener("click", () => {
+      if (world.isAuthenticated && transport.connected && !devTools.sandboxEnabled) {
+        ui.showToast("Cannot reset sandbox while on live session.", "warning", 2000);
+        return;
+      }
+      devTools.setSandboxEnabled(true, { silent: true });
+      devTools.resetSandbox(activeControls?.position ?? { x: 0, y: 0, z: 8 });
+      activeRenderer?.syncVoxelChunks?.(voxelClient);
+      ui.showToast("Sandbox cargo, vault, and asteroid belt reset.", "info", 1800);
+      updateDevToolsUi();
+    });
+
+    // Keyboard shortcut: backtick (`) toggles Playtest Workbench, E interacts in Village mode
     window.addEventListener("keydown", (e) => {
+      const tag = typeof e?.target?.tagName === "string" ? e.target.tagName.toUpperCase() : "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e?.target?.isContentEditable) {
+        return;
+      }
+      if ((e.key === "`" || e.code === "Backquote") && !e.repeat) {
+        toggleDevToolsDrawer();
+        return;
+      }
       if (activeGameMode !== "village") return;
       if ((e.key === "e" || e.key === "E") && !e.repeat) {
         if (ui.npcBarterModal && ui.npcBarterModal.style.display !== "none") return;
@@ -1812,17 +2095,44 @@ if (typeof window !== "undefined") {
           ui.hideAsteroidTarget();
         }
 
-        if (transport.connected) {
+        if (transport.connected && world.isAuthenticated && !devTools.sandboxEnabled) {
           requestVisibleAsteroidChunks(false);
         }
+
+        const aimedHit =
+          voxelClient.raycastFirstSolid(
+            playerPos,
+            activeControls?.getForwardVector?.() ?? { x: 0, y: 0, z: -1 },
+            MAX_MINING_RAYCAST_REACH
+          ) ||
+          voxelClient.findNearestSolidVoxel(playerPos, MAX_MINING_PROXIMITY_REACH, true);
+        activeRenderer?.setHighlightedVoxel?.(aimedHit);
+
+        const nearestCluster = voxelClient.getAsteroidClusterSummaries(playerPos)[0] || null;
+        ui.updateAsteroidGuidance({
+          distToStation,
+          nearestAsteroidDist: nearestCluster ? nearestCluster.distance : null,
+          aimedHit,
+          aimedMaterial: aimedHit ? getVoxelMaterialInfo(aimedHit.voxelId) : null,
+          cargoValue: Number(latestAsteroidState?.unbanked_cargo_value ?? 0),
+          bankedCredits: Number(latestAsteroidState?.station_vault?.banked_credits ?? 0),
+        });
       }
 
       if (now - lastMoveSendTime >= MOVE_INTERVAL_MS) {
         lastMoveSendTime = now;
-        if (transport.connected && activeControls) {
+        if (
+          transport.connected &&
+          world.isAuthenticated &&
+          !devTools.sandboxEnabled &&
+          activeControls
+        ) {
           const sample = activeControls.sample();
           const moveBuf = encodeMovement(world.localPlayerGuid, sample);
           transport.sendDatagram(moveBuf);
+        }
+        if (devTools.isOpen) {
+          updateDevToolsUi();
         }
       }
 
@@ -1840,11 +2150,12 @@ if (typeof window !== "undefined") {
             pitch: activeControls.pitch,
             stateFlags: localFlags,
           });
+          activeRenderer.updateCamera(activeControls.position, activeControls.yaw);
         } else {
           activeRenderer.syncEntities(renderBuffer, world.localPlayerGuid);
           activeRenderer.updateWorldObjects(world.getWorldObjectsRenderBuffer());
+          activeRenderer.updateCamera(activeControls.position);
         }
-        activeRenderer.updateCamera(activeControls.position);
         activeRenderer.render();
       }
 
