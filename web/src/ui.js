@@ -72,6 +72,7 @@ export class UIController {
     this.btnInteract = document.getElementById("btn-interact");
 
     this.npcBarterModal = document.getElementById("npc-barter-modal");
+    this.npcAvatar = document.getElementById("npc-avatar");
     this.npcName = document.getElementById("npc-name");
     this.npcRole = document.getElementById("npc-role");
     this.npcGreeting = document.getElementById("npc-greeting");
@@ -80,8 +81,14 @@ export class UIController {
 
     this.playerTradeModal = document.getElementById("player-trade-modal");
     this.tradeSessionId = document.getElementById("trade-session-id");
+    this.tradeMyCol = document.getElementById("trade-my-col");
+    this.tradePartnerCol = document.getElementById("trade-partner-col");
+    this.tradeMyLockBadge = document.getElementById("trade-my-lock-badge");
+    this.tradePartnerLockBadge = document.getElementById("trade-partner-lock-badge");
     this.tradeOfferCurrencyLabel = document.getElementById("trade-offer-currency-label");
+    this.tradeOfferCurrencyIcon = document.getElementById("trade-offer-currency-icon");
     this.tradePartnerCurrencyLabel = document.getElementById("trade-partner-currency-label");
+    this.tradePartnerCurrencyIcon = document.getElementById("trade-partner-currency-icon");
     this.tradeOfferGold = document.getElementById("trade-offer-gold");
     this.tradeMyItems = document.getElementById("trade-my-items");
     this.tradePartnerGold = document.getElementById("trade-partner-gold");
@@ -94,9 +101,16 @@ export class UIController {
 
     this._lastInventorySlots = [];
     this._selectedTradeItems = new Map();
+    this._activeTradeSessionId = null;
+    this._onTradeCancelCallback = null;
+    this._onEscapeKey = null;
+    this._onBarterBackdropClick = null;
 
     this.frameCount = 0;
     this.lastFpsUpdate = performance.now();
+
+    this._renderEmptyPlaceholderGrid(this.inventoryGrid);
+    this._renderEmptyPlaceholderGrid(this.asteroidCargoGrid);
   }
 
   initEvents({
@@ -165,9 +179,29 @@ export class UIController {
       if (onInteract) onInteract();
     });
 
+    this._onTradeCancelCallback = onTradeCancel || null;
+
     this.btnCloseBarter?.addEventListener("click", () => {
       this.hideNpcBarter();
     });
+
+    if (
+      this.npcBarterModal &&
+      typeof this.npcBarterModal.addEventListener === "function"
+    ) {
+      if (
+        this._onBarterBackdropClick &&
+        typeof this.npcBarterModal.removeEventListener === "function"
+      ) {
+        this.npcBarterModal.removeEventListener("click", this._onBarterBackdropClick);
+      }
+      this._onBarterBackdropClick = (e) => {
+        if (e && e.target === this.npcBarterModal) {
+          this.hideNpcBarter();
+        }
+      };
+      this.npcBarterModal.addEventListener("click", this._onBarterBackdropClick);
+    }
 
     this.btnCloseTrade?.addEventListener("click", () => {
       this.hidePlayerTrade();
@@ -180,7 +214,8 @@ export class UIController {
     });
 
     this.btnTradeOffer?.addEventListener("click", () => {
-      const gold = Number(this.tradeOfferGold?.value || 0);
+      const rawGold = Number(this.tradeOfferGold?.value || 0);
+      const gold = Number.isFinite(rawGold) && rawGold > 0 ? Math.floor(rawGold) : 0;
       const items = Array.from(this._selectedTradeItems.values());
       if (onTradeOffer) onTradeOffer(gold, items);
     });
@@ -188,6 +223,29 @@ export class UIController {
     this.btnTradeAccept?.addEventListener("click", () => {
       if (onTradeAccept) onTradeAccept();
     });
+
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      if (this._onEscapeKey && typeof window.removeEventListener === "function") {
+        window.removeEventListener("keydown", this._onEscapeKey);
+      }
+      this._onEscapeKey = (e) => {
+        if (!e || e.key !== "Escape") return;
+        let handled = false;
+        if (this._isModalVisible(this.npcBarterModal)) {
+          this.hideNpcBarter();
+          handled = true;
+        }
+        if (this._isModalVisible(this.playerTradeModal)) {
+          this.hidePlayerTrade();
+          if (this._onTradeCancelCallback) this._onTradeCancelCallback();
+          handled = true;
+        }
+        if (handled && typeof e.preventDefault === "function") {
+          e.preventDefault();
+        }
+      };
+      window.addEventListener("keydown", this._onEscapeKey);
+    }
   }
 
   /**
@@ -221,6 +279,13 @@ export class UIController {
     if (this.tradePartnerCurrencyLabel) {
       this.tradePartnerCurrencyLabel.textContent =
         normalized === "asteroid" ? "Credits:" : "Gold:";
+    }
+    const currencyGlyph = normalized === "asteroid" ? "\u25c8" : "\ud83e\ude99";
+    if (this.tradeOfferCurrencyIcon) {
+      this.tradeOfferCurrencyIcon.textContent = currencyGlyph;
+    }
+    if (this.tradePartnerCurrencyIcon) {
+      this.tradePartnerCurrencyIcon.textContent = currencyGlyph;
     }
 
     if (this.controlsHintTitle) {
@@ -305,28 +370,127 @@ export class UIController {
     el.className = classes.join(" ");
   }
 
+  _isModalVisible(modalEl) {
+    return Boolean(modalEl && modalEl.style && modalEl.style.display && modalEl.style.display !== "none");
+  }
+
+  _getItemCategory(item) {
+    const name = String(item?.name || "").toLowerCase();
+    const id = Number(item?.item_id || 0);
+
+    if (
+      name.includes("gold") ||
+      name.includes("coin") ||
+      name.includes("solar") ||
+      name.includes("charter") ||
+      name.includes("seal") ||
+      id === 3001
+    ) {
+      return { key: "gold", className: "cat-gold", badge: "GOLD", label: "Precious" };
+    }
+
+    if (
+      name.includes("void") ||
+      name.includes("crystal") ||
+      name.includes("potion") ||
+      name.includes("elixir") ||
+      name.includes("arcane") ||
+      name.includes("gem")
+    ) {
+      return { key: "arcane", className: "cat-arcane", badge: "ARC", label: "Crystal / Alchemy" };
+    }
+
+    if (
+      name.includes("titanium") ||
+      name.includes("steel") ||
+      name.includes("iron") ||
+      name.includes("pickaxe") ||
+      name.includes("sword") ||
+      name.includes("alloy") ||
+      name.includes("metal")
+    ) {
+      return { key: "metal", className: "cat-cyan", badge: "ORE", label: "Metal / Gear" };
+    }
+
+    if (
+      name.includes("herb") ||
+      name.includes("wood") ||
+      name.includes("timber") ||
+      name.includes("leaf") ||
+      name.includes("flora") ||
+      name.includes("remedy")
+    ) {
+      return { key: "nature", className: "cat-emerald", badge: "HERB", label: "Botanical / Supply" };
+    }
+
+    return { key: "default", className: "cat-default", badge: "ITEM", label: "Cargo / Item" };
+  }
+
+  _getNpcRoleMeta(role, name) {
+    const raw = `${role || ""} ${name || ""}`.toLowerCase();
+    if (raw.includes("blacksmith") || raw.includes("smith") || raw.includes("forge")) {
+      return { className: "role-blacksmith", glyph: "\u2692" };
+    }
+    if (raw.includes("herbal") || raw.includes("alchem") || raw.includes("botan")) {
+      return { className: "role-herbalist", glyph: "\ud83c\udf3f" };
+    }
+    if (raw.includes("elder") || raw.includes("mayor") || raw.includes("council")) {
+      return { className: "role-elder", glyph: "\ud83d\udcdc" };
+    }
+    return { className: "role-merchant", glyph: "\u2696" };
+  }
+
+  _renderEmptyPlaceholderGrid(gridEl, count = 8) {
+    if (!gridEl || typeof document === "undefined" || typeof document.createElement !== "function") {
+      return;
+    }
+    this._clearChildren(gridEl);
+    for (let i = 0; i < count; i++) {
+      const slotEl = document.createElement("div");
+      slotEl.className = "inventory-slot empty placeholder-slot";
+      gridEl.appendChild(slotEl);
+    }
+  }
+
   _renderInventorySlots(gridEl, slots) {
     if (!gridEl || !Array.isArray(slots)) return;
+    if (typeof document === "undefined" || typeof document.createElement !== "function") return;
+    if (slots.length === 0) {
+      this._renderEmptyPlaceholderGrid(gridEl);
+      return;
+    }
     this._clearChildren(gridEl);
     slots.forEach((slot) => {
       const slotEl = document.createElement("div");
-      slotEl.className = `inventory-slot ${slot ? "occupied" : "empty"}`;
       if (slot) {
+        const category = this._getItemCategory(slot);
+        slotEl.className = `inventory-slot occupied ${category.className}`;
+        if (slotEl.dataset) {
+          slotEl.dataset.category = category.key;
+          slotEl.dataset.badge = category.badge;
+        }
+        const qty = slot.quantity || 1;
+        const totalWeight = ((slot.unit_weight || 0) * qty).toFixed(1);
+        const itemName = slot.name || "Item #" + slot.item_id;
+        slotEl.title = `${itemName} (${category.label}) — Qty ${qty}, ${totalWeight} kg`;
+
         const nameSpan = document.createElement("span");
         nameSpan.className = "slot-item-name";
-        nameSpan.textContent = slot.name || "Item #" + slot.item_id;
+        nameSpan.textContent = itemName;
 
         const qtySpan = document.createElement("span");
         qtySpan.className = "slot-item-qty";
-        qtySpan.textContent = `x${slot.quantity || 1}`;
+        qtySpan.textContent = `x${qty}`;
 
         const weightSpan = document.createElement("span");
         weightSpan.className = "slot-item-weight";
-        weightSpan.textContent = `${((slot.unit_weight || 0) * (slot.quantity || 1)).toFixed(1)}kg`;
+        weightSpan.textContent = `${totalWeight}kg`;
 
         slotEl.appendChild(nameSpan);
         slotEl.appendChild(qtySpan);
         slotEl.appendChild(weightSpan);
+      } else {
+        slotEl.className = "inventory-slot empty";
       }
       gridEl.appendChild(slotEl);
     });
@@ -440,7 +604,8 @@ export class UIController {
         } else {
           for (const item of bankedItems) {
             const chip = document.createElement("span");
-            chip.className = "vault-item-chip";
+            const category = this._getItemCategory(item);
+            chip.className = `vault-item-chip ${category.className}`;
             chip.textContent = `${item.quantity}x ${item.name}`;
             this.asteroidVaultItems.appendChild(chip);
           }
@@ -492,73 +657,119 @@ export class UIController {
 
   showNpcBarter(merchant, onBarterClick) {
     if (!this.npcBarterModal) return;
-    if (this.npcName) this.npcName.textContent = merchant.name || "Villager";
-    if (this.npcRole) this.npcRole.textContent = merchant.role || "Merchant";
-    if (this.npcGreeting) this.npcGreeting.textContent = merchant.greeting || "Greetings traveler.";
+    const merchantInfo = merchant || {};
+    const npcName = merchantInfo.name || "Villager";
+    const npcRole = merchantInfo.role || "Merchant";
+    const roleMeta = this._getNpcRoleMeta(npcRole, npcName);
 
-    if (this.barterRecipesList) {
-      if (typeof this.barterRecipesList.replaceChildren === "function") {
-        this.barterRecipesList.replaceChildren();
+    if (this.npcName) this.npcName.textContent = npcName;
+    if (this.npcRole) {
+      this.npcRole.textContent = npcRole;
+      this.npcRole.className = `npc-role-tag ${roleMeta.className}`;
+    }
+    if (this.npcAvatar) {
+      this.npcAvatar.textContent = roleMeta.glyph;
+      this.npcAvatar.className = `npc-avatar ${roleMeta.className}`;
+    }
+    if (this.npcGreeting) this.npcGreeting.textContent = merchantInfo.greeting || "Greetings traveler.";
+
+    if (this.barterRecipesList && typeof document !== "undefined" && typeof document.createElement === "function") {
+      this._clearChildren(this.barterRecipesList);
+      const recipes = Array.isArray(merchantInfo.recipes) ? merchantInfo.recipes : [];
+
+      if (recipes.length === 0) {
+        const emptyEl = document.createElement("div");
+        emptyEl.className = "barter-empty-state";
+        emptyEl.textContent = "No trades available from this merchant right now.";
+        this.barterRecipesList.appendChild(emptyEl);
       } else {
-        this.barterRecipesList.innerHTML = "";
-      }
-      const recipes = merchant.recipes || [];
-      recipes.forEach((r) => {
-        const card = document.createElement("div");
-        card.className = "barter-recipe-card";
-
-        const reqs = [];
-        if (r.required_items) {
-          r.required_items.forEach((it) => reqs.push(`${it.quantity}x ${it.name}`));
-        }
-        if (r.required_currency > 0) {
-          reqs.push(`${r.required_currency} Gold`);
-        }
-
-        const rewards = [];
-        if (r.reward_items) {
-          r.reward_items.forEach((it) => rewards.push(`${it.quantity}x ${it.name}`));
-        }
-        if (r.reward_currency > 0) {
-          rewards.push(`${r.reward_currency} Gold`);
-        }
-
-        const exchangeDiv = document.createElement("div");
-        exchangeDiv.className = "recipe-exchange";
-
-        const reqsSpan = document.createElement("span");
-        reqsSpan.className = "recipe-reqs";
-        reqsSpan.textContent = reqs.join(" + ") || "Free";
-
-        const arrowSpan = document.createElement("span");
-        arrowSpan.className = "barter-arrow";
-        arrowSpan.textContent = "\u2192";
-
-        const rewardsSpan = document.createElement("span");
-        rewardsSpan.className = "recipe-rewards";
-        rewardsSpan.textContent = rewards.join(" + ");
-
-        exchangeDiv.appendChild(reqsSpan);
-        exchangeDiv.appendChild(arrowSpan);
-        exchangeDiv.appendChild(rewardsSpan);
-
-        const btn = document.createElement("button");
-        btn.className = "barter-action-btn";
-        btn.setAttribute("data-recipe-id", String(r.recipe_id));
-        btn.textContent = "Barter";
-
-        btn.addEventListener("click", () => {
-          if (onBarterClick) onBarterClick(r.recipe_id);
+        recipes.forEach((r) => {
+          this.barterRecipesList.appendChild(this._createBarterRecipeCard(r, onBarterClick));
         });
-
-        card.appendChild(exchangeDiv);
-        card.appendChild(btn);
-
-        this.barterRecipesList.appendChild(card);
-      });
+      }
     }
 
     this.npcBarterModal.style.display = "flex";
+  }
+
+  _createBarterRecipeCard(recipe, onBarterClick) {
+    const card = document.createElement("div");
+    card.className = "barter-recipe-card";
+
+    const reqs = [];
+    if (recipe.required_items) {
+      recipe.required_items.forEach((it) => reqs.push(`${it.quantity}x ${it.name}`));
+    }
+    if (recipe.required_currency > 0) {
+      reqs.push(`${recipe.required_currency} Gold`);
+    }
+
+    const rewards = [];
+    if (recipe.reward_items) {
+      recipe.reward_items.forEach((it) => rewards.push(`${it.quantity}x ${it.name}`));
+    }
+    if (recipe.reward_currency > 0) {
+      rewards.push(`${recipe.reward_currency} Gold`);
+    }
+
+    const mainDiv = document.createElement("div");
+    mainDiv.className = "recipe-main";
+
+    if (typeof recipe.title === "string" && recipe.title.trim().length > 0) {
+      const titleDiv = document.createElement("div");
+      titleDiv.className = "recipe-title";
+      titleDiv.textContent = recipe.title.trim();
+      mainDiv.appendChild(titleDiv);
+    }
+
+    const exchangeDiv = document.createElement("div");
+    exchangeDiv.className = "recipe-exchange";
+
+    const giveSide = document.createElement("div");
+    giveSide.className = "recipe-side recipe-give-side";
+    const giveTag = document.createElement("span");
+    giveTag.className = "recipe-pill-label give-label";
+    giveTag.textContent = "Give";
+    const reqsSpan = document.createElement("span");
+    reqsSpan.className = "recipe-reqs";
+    reqsSpan.textContent = reqs.join(" + ") || "Free";
+    giveSide.appendChild(giveTag);
+    giveSide.appendChild(reqsSpan);
+
+    const arrowSpan = document.createElement("span");
+    arrowSpan.className = "barter-arrow";
+    arrowSpan.textContent = "\u2192";
+
+    const receiveSide = document.createElement("div");
+    receiveSide.className = "recipe-side recipe-receive-side";
+    const receiveTag = document.createElement("span");
+    receiveTag.className = "recipe-pill-label receive-label";
+    receiveTag.textContent = "Receive";
+    const rewardsSpan = document.createElement("span");
+    rewardsSpan.className = "recipe-rewards";
+    rewardsSpan.textContent = rewards.join(" + ") || "None";
+    receiveSide.appendChild(receiveTag);
+    receiveSide.appendChild(rewardsSpan);
+
+    exchangeDiv.appendChild(giveSide);
+    exchangeDiv.appendChild(arrowSpan);
+    exchangeDiv.appendChild(receiveSide);
+    mainDiv.appendChild(exchangeDiv);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "barter-action-btn";
+    if (typeof btn.setAttribute === "function") {
+      btn.setAttribute("data-recipe-id", String(recipe.recipe_id));
+    }
+    btn.textContent = "Barter";
+    btn.addEventListener("click", () => {
+      if (onBarterClick) onBarterClick(recipe.recipe_id);
+    });
+
+    card.appendChild(mainDiv);
+    card.appendChild(btn);
+    return card;
   }
 
   hideNpcBarter() {
@@ -567,8 +778,45 @@ export class UIController {
     }
   }
 
+  _updateTradeLockIndicators(myLocked, myAccepted, theirLocked, theirAccepted) {
+    const applyColBadge = (colEl, badgeEl, locked, accepted, defaultText) => {
+      const stateClass = accepted ? "accepted" : locked ? "locked" : "unlocked";
+      const label = accepted ? "Accepted" : locked ? "Locked" : defaultText;
+      if (badgeEl) {
+        badgeEl.textContent = label;
+        badgeEl.className = `trade-lock-badge ${stateClass}`;
+      }
+      if (colEl) {
+        this._setElementClass(colEl, "is-locked", Boolean(locked && !accepted));
+        this._setElementClass(colEl, "is-accepted", Boolean(accepted));
+      }
+    };
+
+    applyColBadge(this.tradeMyCol, this.tradeMyLockBadge, myLocked, myAccepted, "Editing");
+    applyColBadge(
+      this.tradePartnerCol,
+      this.tradePartnerLockBadge,
+      theirLocked,
+      theirAccepted,
+      "Negotiating"
+    );
+  }
+
   showPlayerTrade(tradeSession) {
-    if (!this.playerTradeModal) return;
+    if (!this.playerTradeModal || !tradeSession) return;
+    const wasOpen = this._isModalVisible(this.playerTradeModal);
+    const nextSessionId = tradeSession.session_id ?? null;
+    const isNewSession = nextSessionId !== this._activeTradeSessionId;
+
+    if (isNewSession) {
+      this._selectedTradeItems.clear();
+      this._activeTradeSessionId = nextSessionId;
+    }
+
+    if ((!wasOpen || isNewSession) && this.tradeOfferGold) {
+      this.tradeOfferGold.value = String(tradeSession.my_offer?.currency ?? 0);
+    }
+
     if (this.tradeSessionId) {
       this.tradeSessionId.textContent = tradeSession.session_id || "Active";
     }
@@ -584,13 +832,15 @@ export class UIController {
 
       if (invItems.length > 0) {
         for (const item of invItems) {
+          const category = this._getItemCategory(item);
+          const isSelected = this._selectedTradeItems.has(item.item_id);
           const row = document.createElement("div");
-          row.className = "trade-item-chip";
+          row.className = `trade-item-chip ${category.className}${isSelected ? " selected" : ""}`;
           const label = document.createElement("span");
+          label.className = "trade-item-label";
           label.textContent = `${item.quantity || 1}x ${item.name || "Item #" + item.item_id}`;
           const btn = document.createElement("button");
           btn.type = "button";
-          const isSelected = this._selectedTradeItems.has(item.item_id);
           btn.className = `trade-item-toggle ${isSelected ? "selected" : ""}`;
           btn.textContent = isSelected ? "Offered" : "+ Offer";
           btn.addEventListener("click", () => {
@@ -598,6 +848,7 @@ export class UIController {
               this._selectedTradeItems.delete(item.item_id);
               btn.textContent = "+ Offer";
               this._setElementClass(btn, "selected", false);
+              this._setElementClass(row, "selected", false);
             } else {
               this._selectedTradeItems.set(item.item_id, {
                 item_id: item.item_id,
@@ -607,6 +858,7 @@ export class UIController {
               });
               btn.textContent = "Offered";
               this._setElementClass(btn, "selected", true);
+              this._setElementClass(row, "selected", true);
             }
           });
           row.appendChild(label);
@@ -615,11 +867,17 @@ export class UIController {
         }
       } else if (offeredItems.length > 0) {
         for (const item of offeredItems) {
+          const category = this._getItemCategory(item);
           const row = document.createElement("div");
-          row.className = "trade-item-chip";
+          row.className = `trade-item-chip ${category.className}`;
           row.textContent = `${item.quantity || 1}x ${item.name || "Item #" + item.item_id}`;
           this.tradeMyItems.appendChild(row);
         }
+      } else {
+        const emptyHint = document.createElement("div");
+        emptyHint.className = "trade-empty-hint";
+        emptyHint.textContent = "No items in bag — offer currency above.";
+        this.tradeMyItems.appendChild(emptyHint);
       }
     }
 
@@ -628,13 +886,28 @@ export class UIController {
       const partnerItems = Array.isArray(tradeSession.their_offer?.items)
         ? tradeSession.their_offer.items
         : [];
-      for (const item of partnerItems) {
-        const row = document.createElement("div");
-        row.className = "trade-item-chip";
-        row.textContent = `${item.quantity || 1}x ${item.name || "Item #" + item.item_id}`;
-        this.tradePartnerItems.appendChild(row);
+      if (partnerItems.length > 0) {
+        for (const item of partnerItems) {
+          const category = this._getItemCategory(item);
+          const row = document.createElement("div");
+          row.className = `trade-item-chip ${category.className}`;
+          row.textContent = `${item.quantity || 1}x ${item.name || "Item #" + item.item_id}`;
+          this.tradePartnerItems.appendChild(row);
+        }
+      } else {
+        const emptyHint = document.createElement("div");
+        emptyHint.className = "trade-empty-hint";
+        emptyHint.textContent = "No items offered by partner yet.";
+        this.tradePartnerItems.appendChild(emptyHint);
       }
     }
+
+    this._updateTradeLockIndicators(
+      tradeSession.my_locked,
+      tradeSession.my_accepted,
+      tradeSession.their_locked,
+      tradeSession.their_accepted
+    );
 
     if (this.tradeStatusMsg) {
       let status = tradeSession.status;
@@ -651,13 +924,29 @@ export class UIController {
           status = "Trade active";
         }
       }
+      const statusVariant = tradeSession.completed
+        ? "status-completed"
+        : tradeSession.my_accepted && tradeSession.their_accepted
+        ? "status-accepted"
+        : tradeSession.my_locked || tradeSession.their_locked
+        ? "status-locked"
+        : "status-active";
       this.tradeStatusMsg.textContent = status;
+      this.tradeStatusMsg.className = `trade-status-msg ${statusVariant}`;
     }
     this.playerTradeModal.style.display = "flex";
   }
 
   hidePlayerTrade() {
     this._selectedTradeItems.clear();
+    this._activeTradeSessionId = null;
+    if (this.tradeOfferGold) {
+      this.tradeOfferGold.value = "0";
+    }
+    this._updateTradeLockIndicators(false, false, false, false);
+    if (this.tradeStatusMsg) {
+      this.tradeStatusMsg.className = "trade-status-msg";
+    }
     if (this.playerTradeModal) {
       this.playerTradeModal.style.display = "none";
     }
