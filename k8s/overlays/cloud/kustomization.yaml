@@ -13,10 +13,10 @@ resources:
 images:
   - name: mmo-server:local
     newName: jakousa/mmo-server
-    newTag: latest
+    newTag: sha-f60739b
   - name: jakousa/mmo-web
     newName: jakousa/mmo-web
-    newTag: latest
+    newTag: sha-f60739b
 
 patches:
   - target:
