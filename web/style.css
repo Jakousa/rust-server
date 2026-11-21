@@ -361,10 +361,53 @@ kbd {
   box-shadow: 0 1px 1px rgba(0, 0, 0, 0.35);
 }
 
+/* Top-Level Game Mode Switcher */
+.game-mode-switcher {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: inline-flex;
+  gap: 6px;
+  padding: 5px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.88);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+
+.mode-btn {
+  flex: none;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.mode-btn:hover {
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.55);
+}
+
+.mode-btn.active {
+  background: linear-gradient(135deg, #2563eb, #0ea5e9);
+  color: #f8fafc;
+  border-color: rgba(125, 211, 252, 0.5);
+  box-shadow: 0 0 12px rgba(14, 165, 233, 0.4);
+}
+
 /* Non-intrusive Toast Notification Banner */
 .hud-toast {
   position: fixed;
-  top: 18px;
+  top: 60px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 150;
@@ -723,4 +766,148 @@ kbd {
 .modal-footer {
   display: flex;
   gap: 8px;
+}
+
+/* Game B: Asteroid Miners HUD */
+.asteroid-hud-container {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 15;
+  pointer-events: none;
+}
+
+.asteroid-hud-container .hud-panel {
+  pointer-events: auto;
+  width: 340px;
+  margin-bottom: 0;
+  border-color: rgba(56, 189, 248, 0.32);
+}
+
+.safe-zone-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.safe-zone-badge.safe {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.45);
+}
+
+.safe-zone-badge.danger {
+  background: rgba(244, 63, 94, 0.18);
+  color: #fda4af;
+  border: 1px solid rgba(244, 63, 94, 0.45);
+}
+
+.meter-block {
+  margin-bottom: 10px;
+}
+
+.meter-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.meter-track {
+  width: 100%;
+  height: 8px;
+  background: rgba(30, 41, 59, 0.9);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.2s ease, background 0.2s ease;
+}
+
+.hull-fill {
+  background: linear-gradient(90deg, #10b981, #34d399);
+}
+
+.hull-fill.low {
+  background: linear-gradient(90deg, #ef4444, #f97316);
+}
+
+.shininess-fill {
+  background: linear-gradient(90deg, #38bdf8, #facc15, #c084fc);
+}
+
+.asteroid-meta-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.vault-divider {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.vault-header {
+  margin-bottom: 6px;
+}
+
+.vault-credits {
+  font-size: 13px;
+  font-weight: 700;
+  color: #6ee7b7;
+}
+
+.vault-items-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.vault-item-chip {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #a7f3d0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.trade-item-chip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+}
+
+.trade-item-toggle {
+  flex: none;
+  padding: 2px 6px;
+  font-size: 10px;
+  border-radius: 4px;
+  background: #334155;
+  color: #f8fafc;
+}
+
+.trade-item-toggle.selected {
+  background: #0ea5e9;
 }

@@ -9,6 +9,12 @@
 <body>
   <div id="canvas-container"></div>
 
+  <!-- Top-Level Game Mode Switcher -->
+  <div id="game-mode-switcher" class="game-mode-switcher" role="navigation" aria-label="Game Mode Selector">
+    <button id="btn-mode-village" class="mode-btn active" data-mode="village" type="button">Game A: Village RPG</button>
+    <button id="btn-mode-asteroid" class="mode-btn" data-mode="asteroid" type="button">Game B: 6DoF Voxel Asteroid Miners</button>
+  </div>
+
   <!-- Non-intrusive Toast Notification Banner -->
   <div id="hud-toast" class="hud-toast hidden" role="status" aria-live="polite"></div>
 
@@ -68,15 +74,88 @@
       </div>
     </div>
 
-    <div class="hud-panel controls-hint">
-      <div class="hint-title">Village &amp; Barter Controls</div>
-      <div class="hint-grid">
+    <div id="controls-hint" class="hud-panel controls-hint">
+      <div id="controls-hint-title" class="hint-title">Village &amp; Barter Controls</div>
+      <div id="controls-hint-grid" class="hint-grid">
         <div class="hint-item"><span class="hint-keys"><kbd>WASD</kbd> / <kbd>Arrows</kbd></span> Move &amp; Turn</div>
         <div class="hint-item"><span class="hint-keys"><kbd>Drag</kbd> / <kbd>Wheel</kbd></span> Orbit &amp; Zoom</div>
         <div class="hint-item"><span class="hint-keys"><kbd>E</kbd></span> Talk / Barter / Trade</div>
         <div class="hint-item"><span class="hint-keys"><kbd>Space</kbd></span> Action / Cast</div>
       </div>
-      <div class="hint-subtext">Approach a Villager or Traveler (&le;5m) and press <kbd>E</kbd> to barter or trade.</div>
+      <div id="controls-hint-subtext" class="hint-subtext">Approach a Villager or Traveler (&le;5m) and press <kbd>E</kbd> to barter or trade.</div>
+    </div>
+  </div>
+
+  <!-- Game B: Asteroid Miners HUD -->
+  <div id="asteroid-hud" class="asteroid-hud-container" style="display: none;">
+    <div class="hud-panel ship-status-panel">
+      <div class="panel-header">
+        <span class="panel-title">Ship Status</span>
+        <span id="asteroid-safe-zone-badge" class="safe-zone-badge safe">DOCKED SAFE ZONE</span>
+      </div>
+      <div class="meter-block">
+        <div class="meter-header">
+          <span class="stat-label">Hull Integrity</span>
+          <span id="asteroid-hull-text" class="stat-val font-mono">100 / 100 HP</span>
+        </div>
+        <div class="meter-track">
+          <div id="asteroid-hull-bar" class="meter-fill hull-fill" style="width: 100%;"></div>
+        </div>
+      </div>
+      <div class="meter-block">
+        <div class="meter-header">
+          <span class="stat-label">Loot Shininess Risk</span>
+          <span id="asteroid-shininess-text" class="stat-val font-mono">Tier 0 / 255 (Stealth)</span>
+        </div>
+        <div class="meter-track">
+          <div id="asteroid-shininess-bar" class="meter-fill shininess-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+      <div class="asteroid-meta-row">
+        <span id="asteroid-kd-stats" class="stat-label font-mono">Kills: 0 | Deaths: 0</span>
+      </div>
+      <div class="hud-buttons">
+        <button id="btn-mine-asteroid" class="primary-btn" type="button">Mine Asteroid [J]</button>
+        <button id="btn-bank-loot" class="accept-btn" type="button">Dock &amp; Bank Loot</button>
+      </div>
+    </div>
+
+    <div class="hud-panel cargo-vault-panel">
+      <div class="panel-header">
+        <span class="panel-title">Unbanked Cargo</span>
+        <span class="coin-purse"><span id="asteroid-unbanked-value" class="gold-amount">0</span> cr</span>
+      </div>
+      <div class="inventory-weight-row">
+        <span class="stat-label">Cargo Mass:</span>
+        <span id="asteroid-cargo-weight" class="stat-val font-mono">0.0 / 150.0 kg</span>
+      </div>
+      <div id="asteroid-cargo-grid" class="inventory-grid">
+        <!-- Rendered dynamically -->
+      </div>
+      <div class="vault-divider">
+        <div class="panel-header vault-header">
+          <span class="panel-title">Station Vault (Safe)</span>
+          <span class="vault-credits"><span id="asteroid-vault-credits" class="stat-val font-mono">0</span> cr</span>
+        </div>
+        <div id="asteroid-vault-items" class="vault-items-list">
+          <span class="stat-label">No banked ore stored yet.</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="asteroid-target-panel" class="hud-panel target-panel" style="display: none;">
+      <div class="panel-header">
+        <span id="asteroid-target-name" class="panel-title">Target Ship</span>
+        <span id="asteroid-target-shininess" class="metric-highlight">Tier 0</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-item"><span class="stat-label">Range:</span> <span id="asteroid-target-distance" class="stat-val">-- m</span></div>
+        <div class="stat-item"><span class="stat-label">Hull:</span> <span id="asteroid-target-hull" class="stat-val">100%</span></div>
+      </div>
+      <div class="hud-buttons">
+        <button id="btn-fire-laser" class="danger-btn" type="button">Fire PvP Laser</button>
+        <button id="btn-trade-pilot" class="primary-btn" type="button">Trade Pilot</button>
+      </div>
     </div>
   </div>
 
@@ -146,7 +225,7 @@
         <div class="trade-col">
           <h3>My Offer</h3>
           <div class="trade-gold-input-row">
-            <label for="trade-offer-gold">Offer Gold:</label>
+            <label id="trade-offer-currency-label" for="trade-offer-gold">Offer Gold:</label>
             <input type="number" id="trade-offer-gold" min="0" value="0" />
           </div>
           <div id="trade-my-items" class="trade-item-list"></div>
@@ -154,7 +233,7 @@
         <div class="trade-col">
           <h3>Partner Offer</h3>
           <div class="partner-gold-display">
-            <span>Gold:</span> <span id="trade-partner-gold" class="gold-amount">0</span> 🪙
+            <span id="trade-partner-currency-label">Gold:</span> <span id="trade-partner-gold" class="gold-amount">0</span> 🪙
           </div>
           <div id="trade-partner-items" class="trade-item-list"></div>
         </div>
