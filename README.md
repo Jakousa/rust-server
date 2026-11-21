@@ -85,13 +85,13 @@ rust-server/
 │   ├── director/        # Global cluster orchestrator, node discovery, spatial domain balancing, orphan failover
 │   ├── gateway/         # Edge ingress proxy: HTTP/3 WebTransport, QUIC UDP, WebSocket/WSS fallback, and TCP
 │   ├── storage/         # Dual SQL engine (PostgreSQL & SQLite), 2PC containers, ACID trade/escrow, write-behind DB
-│   ├── gameplay/        # Pluggable modules: Combat, Threat, Inventory, Trade, Barter, Quests, Guilds, NPC AI, WASM scripts
+│   ├── gameplay/        # Pluggable modules & game binaries (mmo-village-node, mmo-asteroid-node, Combat, Inventory, Trade, AI)
 │   ├── plugins/
 │   │   └── voxel/       # Modular volumetric 3D voxel & deformable terrain plugin (16³ palette chunks, RLE, CSG)
 │   ├── loadtest/        # Scale & chaos test bot swarm generator (RandomWalk, HotspotClustering, CombatInteraction)
 │   └── client-wasm/     # Pure Rust WebAssembly leaf crate: zero-copy Float32Array render buffer, delta & voxel decoding
-├── web/                 # Interactive 3D Web Visual Inspector (Vite + Three.js), HUD, Vitest + Playwright E2E suites
-├── k8s/                 # Kubernetes manifests (base, local k3d overlay, cloud overlay, and Flux v2 GitOps system)
+├── web/                 # Interactive 3D Web Client (Vite + Three.js), Village & Asteroid cartridges, Vitest + Playwright E2E
+├── k8s/                 # Kubernetes manifests (base, local, cloud, game-village, game-asteroid, and Flux v2 GitOps)
 ├── docs/                # Cloud PoC deployment, wire protocol SDK, Godot client integration, and architecture audits
 ├── openspec/            # OpenSpec 2.0 capability specifications (openspec/specs/) and archived change history
 └── scripts/             # Cluster lifecycle, chaos failover testing, and deployment automation scripts
@@ -113,15 +113,31 @@ rust-server/
 
 ---
 
-## Playable Village & Barter Showcase
+## Dual-Game Architecture & Playable Showcases
 
-The repository ships an interactive **Village & Barter Vertical Slice** powered by [`mmo-village-node`](crates/gameplay/src/bin/mmo_village_node.rs), `mmo-gateway`, and the Three.js browser client in [`web/`](web/):
+To prove that the core engine crates (`mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-schema`, `mmo-client-wasm`) are genuinely genre-agnostic, the repository builds and deploys **two completely different MMO games** on top of the exact same distributed substrate and shared economy plugins:
 
-- **Auto-Discovery & Transport Fallback**: On load, the Web Visual Inspector resolves the gateway host, fetches `/cert-hash`, and connects over **HTTP/3 WebTransport** (`:4433/udp`), automatically falling back to **WebSocket** (`ws://`/`wss://` on `:8443/tcp`) when UDP is restricted. Live connection state (`Disconnected`, `Connecting...`, `Connected`) and active protocol (`HTTP/3`, `WebSocket`, `Offline`) appear in the **Edge Gateway** HUD header.
-- **Controls & Multi-Tab Playtesting**:
+- **Game A: Medieval Village & Barter RPG** ([`mmo-village-node`](crates/gameplay/src/bin/mmo_village_node.rs)): A grounded 2D/3D village vertical slice with patrolling villager NPCs (*Blacksmith Ilmari*, *Herbalist Aino*, *Elder Väinö*), NPC barter recipes, and atomic two-player trading (`VillagePlugin`, `module_id = 0x02`).
+- **Game B: Competitive 6DoF Voxel Asteroid Miners** ([`mmo-asteroid-node`](crates/gameplay/src/bin/mmo_asteroid_node.rs)): A zero-G 3D space mining & PvP dogfight game featuring `Newtonian6DoF` flight physics, destructible `16×16×16` volumetric voxel asteroids (`VoxelTerrainPlugin`, `module_id = 0x00A0`), real-time ship loot-shininess visuals encoded in `Entity::state_flags` (`bits 16..23`), PvP laser combat with full-loot cargo drops on kill (`CombatPlugin`), and Home Orbital Station vault banking & player trading (`AsteroidMiningPlugin`, `module_id = 0x03`).
+
+### Plugin Composition Matrix
+
+| Layer / Capability | Game A: Medieval Village & Barter RPG (`mmo-village-node`) | Game B: 6DoF Voxel Asteroid Miners (`mmo-asteroid-node`) |
+| :--- | :--- | :--- |
+| **Core Engine & Cluster** | **Shared**: `mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-schema`, `mmo-client-wasm` | **Shared**: `mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-schema`, `mmo-client-wasm` |
+| **Shared Economy Plugins** | **Shared**: `InventoryPlugin`, `TradePlugin` | **Shared**: `InventoryPlugin`, `TradePlugin` |
+| **Kinematics Mode** | `MotionMode::DiscreteGround` (2D XZ movement) | `MotionMode::Newtonian6DoF` (3D XYZ zero-G thrusters) |
+| **Exclusive Plugins** | `VillagePlugin` (`0x02`), `NpcMovementPlugin` | `VoxelTerrainPlugin` (`0x00A0`), `CombatPlugin`, `AsteroidMiningPlugin` (`0x03`) |
+| **Browser Cartridge (`web/`)** | `?game=village` (or `VITE_GAME_MODE=village`, default) — cobblestone plaza, `WASD` ground movement, `E` to barter/trade | `?game=asteroid` (or `VITE_GAME_MODE=asteroid`) — 3D starfield, 6DoF thrusters, voxel mining/PvP lasers, Orbital Station HUD |
+| **Kubernetes Overlay** | [`k8s/overlays/game-village/`](k8s/overlays/game-village/kustomization.yaml) (`mmo-village` namespace) | [`k8s/overlays/game-asteroid/`](k8s/overlays/game-asteroid/kustomization.yaml) (`mmo-asteroid` namespace) |
+
+- **Auto-Discovery & Transport Fallback**: In both games, the browser client resolves the gateway host, fetches `/cert-hash`, and connects over **HTTP/3 WebTransport** (`:4433/udp`), automatically falling back to **WebSocket** (`ws://`/`wss://` on `:8443/tcp`) when UDP is restricted. Live connection state (`Disconnected`, `Connecting...`, `Connected`) and active protocol (`HTTP/3`, `WebSocket`, `Offline`) appear in the **Edge Gateway** HUD header.
+- **Game A Controls (`?game=village`)**:
   - `WASD` / `Arrow` keys: Move and turn (`Space` to trigger action/cast; keyboard movement is automatically ignored while typing into HUD inputs).
   - `Mouse Drag` / `Scroll Wheel`: Orbit pitch/yaw and zoom the 3D camera around your character.
-  - `E` (within `5m`): Open the NPC Barter modal with village artisans (*Blacksmith Ilmari*, *Herbalist Aino*, *Elder Väinö*) or initiate atomic two-player gold/item trading with another browser tab (each tab receives an isolated `sessionStorage` guest identity).
+  - `E` (within `5m`): Open the NPC Barter modal with village artisans or initiate atomic two-player gold/item trading across browser tabs (`sessionStorage` isolates guest identities per tab).
+- **Game B Controls (`?game=asteroid`)**:
+  - 6DoF space flight (`W`/`S` thrust, `A`/`D` strafe, vertical thrusters for Y-axis ascent/descent, aim/click or HUD actions) to carve into Titanium, Solar Gold, and Void Crystal veins inside voxel asteroids (`0x00A0`), fire PvP lasers outside the Home Orbital Station safe ring (`(0, 0, 0)`, radius `15m`), dock to bank cargo into your permanent `StationVaultComponent`, or trade ore with rival pilots via the shared `TradePlugin` modal (`0x03`).
 
 ---
 
@@ -165,13 +181,22 @@ npm --prefix web run test:e2e
 ```
 
 To run the native Rust cluster locally alongside `npm --prefix web run dev` (in separate terminals):
-```bash
-cargo run -p mmo-director
-cargo run -p mmo-gameplay --bin mmo-village-node
-cargo run -p mmo-gateway
-```
 
-### 3. Local Kubernetes Cluster (`k3d`)
+- **Game A (Medieval Village & Barter RPG)** — open [http://localhost:3000/?game=village](http://localhost:3000/?game=village) (default):
+  ```bash
+  cargo run -p mmo-director
+  cargo run --bin mmo-village-node
+  cargo run -p mmo-gateway
+  ```
+
+- **Game B (Competitive 6DoF Voxel Asteroid Miners)** — open [http://localhost:3000/?game=asteroid](http://localhost:3000/?game=asteroid) (or launch Vite with `VITE_GAME_MODE=asteroid npm --prefix web run dev`):
+  ```bash
+  cargo run -p mmo-director
+  cargo run --bin mmo-asteroid-node
+  cargo run -p mmo-gateway
+  ```
+
+### 3. Local Kubernetes Cluster (`k3d`) & Dual-Game Overlays
 Cluster lifecycle, image builds, load testing, and chaos failover are automated via [`scripts/cluster.sh`](scripts/cluster.sh) using [`k8s/k3d.yaml`](k8s/k3d.yaml) and `k8s/overlays/local/`:
 
 ```bash
@@ -192,6 +217,25 @@ Cluster lifecycle, image builds, load testing, and chaos failover are automated 
 ```
 
 Local `k3d` forwards ports `4433/udp` (WebTransport), `8080/tcp+udp` (TCP/QUIC), `9091` (Gateway admin & `/cert-hash`), `50051` (Director), `9090` (Prometheus), and `3000` (Grafana, `admin`/`admin`).
+
+#### Deploying Both Games Side-by-Side (`game-village` & `game-asteroid`)
+The unified `mmo-server` ([`Dockerfile`](Dockerfile)) bundles both `mmo-village-node` and `mmo-asteroid-node` alongside the genre-agnostic `mmo-director` and `mmo-gateway` binaries. Two isolated Kustomize overlays run both games concurrently in separate namespaces (`mmo-village` and `mmo-asteroid`) using identical infrastructure components:
+
+```bash
+# Render & inspect both dual-game Kustomize overlays
+kubectl kustomize k8s/overlays/game-village
+kubectl kustomize k8s/overlays/game-asteroid
+
+# Deploy Game A (mmo-village namespace) and Game B (mmo-asteroid namespace) side-by-side
+kubectl apply -k k8s/overlays/game-village
+kubectl apply -k k8s/overlays/game-asteroid
+
+# Verify both independent game stacks are running
+kubectl get pods,svc,statefulset -n mmo-village
+kubectl get pods,svc,statefulset -n mmo-asteroid
+```
+
+Each overlay configures `mmo-node`'s StatefulSet command (`exec mmo-village-node` vs. `exec mmo-asteroid-node`), scopes `DATABASE_URL` to its namespace-local `postgres` service, and serves `mmo-web` in the matching game mode (`?game=village` vs. `?game=asteroid`). For local port-forwarding when running both overlays on a single node, forward each stack's `mmo-web` service to distinct local ports (e.g., `kubectl port-forward -n mmo-village svc/mmo-web 3001:3000` and `kubectl port-forward -n mmo-asteroid svc/mmo-web 3002:3000`).
 
 ### 4. Cloud PoC Deployment & GitOps
 For public cloud VM sizing, firewall rules (`UDP 4433` WebTransport, `TCP 8443` WebSocket fallback, `TCP 8080` TCP ingress, `TCP 80/443/3000` web + `/cert-hash`), kernel UDP buffer tuning, `k8s/overlays/cloud/`, and Flux v2 GitOps (`k8s/flux-system/`), see:
