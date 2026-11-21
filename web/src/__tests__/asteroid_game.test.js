@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as THREE from "three";
-import { resolveGameMode, ClientWorldBridge, ASTEROID_MODULE_ID } from "../main.js";
+import {
+  resolveGameMode,
+  resolveGatewayConfig,
+  ClientWorldBridge,
+  ASTEROID_MODULE_ID,
+} from "../main.js";
 import { UIController } from "../ui.js";
 import { OPCODES, DELTA_FLAGS, putVarintU64 } from "../protocol.js";
 import { SpaceFlightControls } from "../games/asteroid/controls.js";
@@ -70,8 +75,8 @@ function buildInteractionResultFrame(actionId, payloadBytes, success = true, err
   return frame;
 }
 
-describe("Dual-Game Mode Resolution", () => {
-  it("resolves ?game= query parameter over envMode and defaults to village", () => {
+describe("Dual-Game Mode & Subpath Resolution", () => {
+  it("resolves ?game= query parameter over URL subpath and envMode, defaulting to village", () => {
     expect(resolveGameMode("", "")).toBe("village");
     expect(resolveGameMode("", "asteroid")).toBe("asteroid");
     expect(resolveGameMode("?game=asteroid", "village")).toBe("asteroid");
@@ -80,6 +85,40 @@ describe("Dual-Game Mode Resolution", () => {
     expect(resolveGameMode("game=asteroid", "village")).toBe("asteroid");
     expect(resolveGameMode("?game=invalid", "asteroid")).toBe("asteroid");
     expect(resolveGameMode("?game=invalid", "invalid")).toBe("village");
+
+    // Subpath routing resolution (/village, /asteroid)
+    expect(resolveGameMode("", "", "/asteroid")).toBe("asteroid");
+    expect(resolveGameMode("", "", "/asteroid/")).toBe("asteroid");
+    expect(resolveGameMode("", "", "/asteroids")).toBe("asteroid");
+    expect(resolveGameMode("", "", "/village")).toBe("village");
+    expect(resolveGameMode("", "asteroid", "/village/")).toBe("village");
+    expect(resolveGameMode("?game=village", "asteroid", "/asteroid")).toBe("village");
+    expect(resolveGameMode("?game=asteroid", "village", "/village")).toBe("asteroid");
+    expect(resolveGameMode("", "asteroid", "/unknown")).toBe("asteroid");
+  });
+
+  it("resolves distinct WebTransport, WebSocket subpath, and cert-hash endpoints per game", () => {
+    const loc = { hostname: "rust-server.kousa.dev", host: "rust-server.kousa.dev", protocol: "https:" };
+    expect(resolveGatewayConfig("village", loc)).toEqual({
+      mode: "village",
+      subpath: "/village",
+      wtUrl: "https://rust-server.kousa.dev:4433",
+      wsPathUrl: "wss://rust-server.kousa.dev/village/ws",
+      wsPortUrl: "wss://rust-server.kousa.dev:8443",
+      wsPort: 8443,
+      adminPort: 9091,
+      certHashPaths: ["/village/cert-hash", "/cert-hash"],
+    });
+    expect(resolveGatewayConfig("asteroid", loc)).toEqual({
+      mode: "asteroid",
+      subpath: "/asteroid",
+      wtUrl: "https://rust-server.kousa.dev:4434",
+      wsPathUrl: "wss://rust-server.kousa.dev/asteroid/ws",
+      wsPortUrl: "wss://rust-server.kousa.dev:8444",
+      wsPort: 8444,
+      adminPort: 9092,
+      certHashPaths: ["/asteroid/cert-hash"],
+    });
   });
 });
 

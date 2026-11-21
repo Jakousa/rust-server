@@ -1,0 +1,390 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-asteroid-director
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-director
+    game: asteroid
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mmo-asteroid-director
+  template:
+    metadata:
+      labels:
+        app: mmo-asteroid-director
+        game: asteroid
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: director
+          image: mmo-server:local
+          imagePullPolicy: Always
+          command: ["mmo-director"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:50051"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
+            - name: GATEWAY_GRPC_ADDR
+              value: "http://mmo-asteroid-gateway:50050"
+            - name: NODE_DEAD_TIMEOUT_MS
+              value: "3000"
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-asteroid-director
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-director
+    game: asteroid
+spec:
+  type: ClusterIP
+  selector:
+    app: mmo-asteroid-director
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmo-asteroid-gateway
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-gateway
+    game: asteroid
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: mmo-asteroid-gateway
+  template:
+    metadata:
+      labels:
+        app: mmo-asteroid-gateway
+        game: asteroid
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: mmo-server:local
+          imagePullPolicy: Always
+          command: ["mmo-gateway"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: GATEWAY_ID
+              value: "gw-asteroid-1"
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: WEBTRANSPORT_ADDR
+              value: "0.0.0.0:4434"
+            - name: WEBSOCKET_ADDR
+              value: "0.0.0.0:8443"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
+            - name: GRPC_ADDR
+              value: "0.0.0.0:50050"
+            - name: DIRECTOR_ADDR
+              value: "http://mmo-asteroid-director:50051"
+            - name: DEFAULT_NODE_ADDR
+              value: "mmo-asteroid-node-0.mmo-asteroid-node:50052"
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          ports:
+            - name: webtransport
+              containerPort: 4434
+              protocol: UDP
+            - name: websocket
+              containerPort: 8443
+              protocol: TCP
+            - name: http-tcp
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+            - name: cluster-grpc
+              containerPort: 50050
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "1000m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-asteroid-gateway
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-gateway
+    game: asteroid
+spec:
+  type: ClusterIP
+  selector:
+    app: mmo-asteroid-gateway
+  ports:
+    - name: http-tcp
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: websocket
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
+      protocol: TCP
+    - name: cluster-grpc
+      port: 50050
+      targetPort: 50050
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-asteroid-gateway-external
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-gateway
+    game: asteroid
+spec:
+  type: LoadBalancer
+  selector:
+    app: mmo-asteroid-gateway
+  ports:
+    - name: webtransport
+      port: 4434
+      targetPort: 4434
+      protocol: UDP
+    - name: websocket
+      port: 8444
+      targetPort: 8443
+      protocol: TCP
+    - name: admin
+      port: 9092
+      targetPort: 9091
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmo-asteroid-node
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-node
+    game: asteroid
+spec:
+  serviceName: mmo-asteroid-node
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mmo-asteroid-node
+  template:
+    metadata:
+      labels:
+        app: mmo-asteroid-node
+        game: asteroid
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: node
+          image: mmo-server:local
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /bin/sh
+            - -c
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              export NODE_ID=$((ORDINAL + 1))
+              echo "Starting asteroid simulation node with dynamic NODE_ID=${NODE_ID} (hostname: ${HOSTNAME})"
+              if [ -n "${STARTUP_DELAY_SECS:-}" ] && [ "${STARTUP_DELAY_SECS}" -gt 0 ] 2>/dev/null; then
+                echo "Applying startup delay of ${STARTUP_DELAY_SECS}s..."
+                sleep "${STARTUP_DELAY_SECS}"
+              fi
+              echo "Starting asteroid simulation node (mmo-asteroid-node)..."
+              exec mmo-asteroid-node
+          env:
+            - name: STARTUP_DELAY_SECS
+              value: "4"
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:50052"
+            - name: ADMIN_ADDR
+              value: "0.0.0.0:9091"
+            - name: DIRECTOR_ADDR
+              value: "http://mmo-asteroid-director:50051"
+            - name: GATEWAY_GRPC_ADDR
+              value: "http://mmo-asteroid-gateway:50050"
+            - name: DATABASE_URL
+              value: "postgres://mmo:mmo_secret@postgres.mmo.svc.cluster.local:5432/mmo_db"
+          ports:
+            - name: grpc
+              containerPort: 50052
+              protocol: TCP
+            - name: admin
+              containerPort: 9091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmo-asteroid-node
+  namespace: mmo
+  labels:
+    app: mmo-asteroid-node
+    game: asteroid
+spec:
+  clusterIP: None
+  selector:
+    app: mmo-asteroid-node
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: 50052
+      protocol: TCP
+    - name: admin
+      port: 9091
+      targetPort: 9091
+      protocol: TCP

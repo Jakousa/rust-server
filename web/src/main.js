@@ -39,16 +39,25 @@ export const PVP_LASER_RANGE = 45.0;
 
 /**
  * Resolves the active game cartridge mode (`"village"` or `"asteroid"`).
- * Priority: `?game=asteroid|village` URL query -> `envMode` (`VITE_GAME_MODE`) -> `"village"`.
+ * Priority: `?game=asteroid|village` URL query -> URL subpath (`/asteroid` or `/village`) -> `envMode` (`VITE_GAME_MODE`) -> `"village"`.
  */
-export function resolveGameMode(search = "", envMode = "") {
+export function resolveGameMode(search = "", envMode = "", pathname = "") {
   const normalize = (raw) => {
     if (typeof raw !== "string") return "";
     const val = raw.trim().toLowerCase();
-    if (val === "asteroid" || val === "asteroid-miners" || val === "game-b") {
+    if (
+      val === "asteroid" ||
+      val === "asteroids" ||
+      val === "asteroid-miners" ||
+      val === "game-b"
+    ) {
       return "asteroid";
     }
-    if (val === "village" || val === "game-a") {
+    if (
+      val === "village" ||
+      val === "village-rpg" ||
+      val === "game-a"
+    ) {
       return "village";
     }
     return "";
@@ -65,10 +74,55 @@ export function resolveGameMode(search = "", envMode = "") {
     }
   }
 
+  if (typeof pathname === "string" && pathname.trim().length > 0) {
+    const segments = pathname.split("/").filter(Boolean);
+    for (const seg of segments) {
+      const fromPath = normalize(seg);
+      if (fromPath) return fromPath;
+    }
+  }
+
   const fromEnv = normalize(envMode);
   if (fromEnv) return fromEnv;
 
   return "village";
+}
+
+/**
+ * Resolves per-game WebTransport, WebSocket fallback, and cert-hash discovery endpoints.
+ */
+export function resolveGatewayConfig(gameMode = "village", locationObj = null) {
+  const loc =
+    locationObj ||
+    (typeof window !== "undefined" ? window.location : null);
+  const host = loc?.hostname || "127.0.0.1";
+  const originHost = loc?.host || host;
+  const wsProto = loc?.protocol === "https:" ? "wss:" : "ws:";
+  const mode = gameMode === "asteroid" ? "asteroid" : "village";
+
+  if (mode === "asteroid") {
+    return {
+      mode: "asteroid",
+      subpath: "/asteroid",
+      wtUrl: `https://${host}:4434`,
+      wsPathUrl: `${wsProto}//${originHost}/asteroid/ws`,
+      wsPortUrl: `${wsProto}//${host}:8444`,
+      wsPort: 8444,
+      adminPort: 9092,
+      certHashPaths: ["/asteroid/cert-hash"],
+    };
+  }
+
+  return {
+    mode: "village",
+    subpath: "/village",
+    wtUrl: `https://${host}:4433`,
+    wsPathUrl: `${wsProto}//${originHost}/village/ws`,
+    wsPortUrl: `${wsProto}//${host}:8443`,
+    wsPort: 8443,
+    adminPort: 9091,
+    certHashPaths: ["/village/cert-hash", "/cert-hash"],
+  };
 }
 
 /**
@@ -952,59 +1006,59 @@ export class ClientWorldBridge {
  * Returns or generates a unique session token stored in sessionStorage
  * so concurrent browser tabs authenticate as distinct characters.
  */
-export function getOrCreateSessionToken() {
+export function getOrCreateSessionToken(gameMode = "village") {
   if (typeof window === "undefined" || !window.sessionStorage) {
-    return "guest-poc";
+    return gameMode === "asteroid" ? "guest-poc-asteroid" : "guest-poc";
   }
   const params = new URLSearchParams(window.location.search);
   const tokenParam = params.get("token");
+  let baseToken = tokenParam;
   if (tokenParam) {
     window.sessionStorage.setItem("mmo_token", tokenParam);
-    return tokenParam;
+  } else {
+    baseToken = window.sessionStorage.getItem("mmo_token");
+    if (!baseToken) {
+      const rand = Math.random().toString(36).substring(2, 8);
+      const ts = Date.now().toString(36);
+      baseToken = `guest-${ts}-${rand}`;
+      window.sessionStorage.setItem("mmo_token", baseToken);
+    }
   }
-  let token = window.sessionStorage.getItem("mmo_token");
-  if (!token) {
-    const rand = Math.random().toString(36).substring(2, 8);
-    const ts = Date.now().toString(36);
-    token = `guest-${ts}-${rand}`;
-    window.sessionStorage.setItem("mmo_token", token);
-  }
-  return token;
+  return gameMode === "asteroid" ? `${baseToken}-asteroid` : baseToken;
 }
 
 /**
  * Automatically retrieves the ephemeral SHA-256 certificate digest
- * exposed by TelemetryServer GET /cert-hash.
+ * exposed by TelemetryServer GET /cert-hash for the active game mode.
  */
-export async function autoFetchCertHash() {
+export async function autoFetchCertHash(gameMode = "village", force = false) {
   const certInput = document.getElementById("cert-hash");
-  if (certInput && certInput.value.trim().length > 0) return;
+  if (!force && certInput && certInput.value.trim().length > 0) return;
+  if (force && certInput) {
+    certInput.value = "";
+  }
   try {
-    // 1. First try relative /cert-hash (works over both HTTP and HTTPS via ingress reverse proxy)
-    let res = null;
-    try {
-      res = await fetch("/cert-hash");
-    } catch {
-      // Fallback below
-    }
+    const gwConfig = resolveGatewayConfig(gameMode);
+    const proto = window.location.protocol === "https:" ? "https:" : "http:";
+    const host = window.location.hostname || "127.0.0.1";
+    const candidateUrls = [
+      ...gwConfig.certHashPaths,
+      `${proto}//${host}:${gwConfig.adminPort}/cert-hash`,
+      `http://${host}:${gwConfig.adminPort}/cert-hash`,
+    ];
 
-    if (!res || !res.ok) {
-      // 2. Fall back to port 9091 matching active protocol or HTTP
-      const proto = window.location.protocol === "https:" ? "https:" : "http:";
-      const adminUrl = `${proto}//${window.location.hostname || "127.0.0.1"}:9091/cert-hash`;
+    for (const candidateUrl of candidateUrls) {
       try {
-        res = await fetch(adminUrl);
+        const res = await fetch(candidateUrl);
+        if (!res || !res.ok) continue;
+        const data = await res.json();
+        if (data && typeof data.cert_hash === "string" && data.cert_hash.length > 0) {
+          if (certInput) certInput.value = data.cert_hash;
+          console.log(`[WebTransport] Auto-discovered certificate hash (${gameMode}):`, data.cert_hash);
+          return;
+        }
       } catch {
-        // Fall back to plain http
-        res = await fetch(`http://${window.location.hostname || "127.0.0.1"}:9091/cert-hash`);
-      }
-    }
-
-    if (res && res.ok) {
-      const data = await res.json();
-      if (data && data.cert_hash) {
-        if (certInput) certInput.value = data.cert_hash;
-        console.log("[WebTransport] Auto-discovered certificate hash:", data.cert_hash);
+        // Try next candidate endpoint
       }
     }
   } catch (err) {
@@ -1036,7 +1090,11 @@ if (typeof window !== "undefined") {
       window.__GAME_MODE__ ||
       window.__MMO_GAME_MODE__ ||
       "";
-    let activeGameMode = resolveGameMode(window.location.search, runtimeEnvMode);
+    let activeGameMode = resolveGameMode(
+      window.location.search,
+      runtimeEnvMode,
+      window.location.pathname
+    );
 
     const controlsByMode = { village: null, asteroid: null };
     let voxelClient = null;
@@ -1044,11 +1102,16 @@ if (typeof window !== "undefined") {
     let activeControls = null;
 
     // Dynamic gateway host resolution
-    const host = window.location.hostname || "127.0.0.1";
-    const defaultGatewayUrl = `https://${host}:4433`;
+    const initialGwConfig = resolveGatewayConfig(activeGameMode);
     const urlInput = document.getElementById("gateway-url");
-    if (urlInput && (!urlInput.value || urlInput.value.includes("127.0.0.1"))) {
-      urlInput.value = defaultGatewayUrl;
+    if (
+      urlInput &&
+      (!urlInput.value ||
+        urlInput.value.includes("127.0.0.1") ||
+        urlInput.value.endsWith(":4433") ||
+        urlInput.value.endsWith(":4434"))
+    ) {
+      urlInput.value = initialGwConfig.wtUrl;
     }
 
     // Try to load cert hash from URL parameters if provided (e.g. ?cert=aa:bb:cc...)
@@ -1058,7 +1121,7 @@ if (typeof window !== "undefined") {
       const certInput = document.getElementById("cert-hash");
       if (certInput) certInput.value = certFromUrl;
     } else {
-      await autoFetchCertHash();
+      await autoFetchCertHash(activeGameMode);
     }
 
     let nearestTarget = null;
@@ -1274,6 +1337,7 @@ if (typeof window !== "undefined") {
     }
 
     function mountGameMode(nextMode, updateHistory = true) {
+      const prevMode = activeGameMode;
       const targetMode = nextMode === "asteroid" ? "asteroid" : "village";
 
       if (activeRenderer) {
@@ -1337,16 +1401,30 @@ if (typeof window !== "undefined") {
         activeRenderer.setWireframe(ui.toggleWireframe.checked);
       }
 
+      const gwConfig = resolveGatewayConfig(activeGameMode);
+      if (
+        urlInput &&
+        (!urlInput.value ||
+          urlInput.value.includes("127.0.0.1") ||
+          urlInput.value.endsWith(":4433") ||
+          urlInput.value.endsWith(":4434"))
+      ) {
+        urlInput.value = gwConfig.wtUrl;
+      }
+
       ui.setGameMode(activeGameMode);
       if (updateHistory && typeof window.history?.replaceState === "function") {
         try {
           const nextUrl = new URL(window.location.href);
-          nextUrl.searchParams.set("game", activeGameMode);
+          nextUrl.pathname = gwConfig.subpath;
+          if (nextUrl.searchParams.has("game")) {
+            nextUrl.searchParams.delete("game");
+          }
           window.history.replaceState(null, "", nextUrl.toString());
         } catch (_) {}
       }
 
-      if (transport.connected) {
+      if (transport.connected && prevMode === activeGameMode) {
         performInspect({ id: 0 });
         if (activeGameMode === "asteroid") {
           lastChunkProbeKey = "";
@@ -1527,7 +1605,7 @@ if (typeof window !== "undefined") {
 
     // UI Event Bindings
     ui.initEvents({
-      onGameModeChange: (nextMode) => {
+      onGameModeChange: async (nextMode) => {
         if (nextMode !== activeGameMode) {
           mountGameMode(nextMode, true);
           ui.showToast(
@@ -1537,13 +1615,30 @@ if (typeof window !== "undefined") {
             "info",
             2200
           );
+          if (transport.connected || transport._isConnecting) {
+            await transport.disconnect();
+            world.clear();
+            voxelClient?.clear();
+            activeRenderer?.clear();
+          }
+          nearestTarget = null;
+          nearestAsteroidTarget = null;
+          latestAsteroidState = null;
+          hasSyncedInitialPosition = false;
+          lastChunkProbeKey = "";
+          await autoFetchCertHash(activeGameMode, true);
+          ui.btnConnect?.click();
         }
       },
       onConnect: async (url, certHash) => {
         try {
           ui.setConnectionState("connecting", "Connecting", "");
-          await transport.connect(url, certHash);
-          const sessionToken = getOrCreateSessionToken();
+          const gwConfig = resolveGatewayConfig(activeGameMode);
+          await transport.connect(url, certHash, {
+            wsUrls: [gwConfig.wsPathUrl, gwConfig.wsPortUrl],
+            wsPort: gwConfig.wsPort,
+          });
+          const sessionToken = getOrCreateSessionToken(activeGameMode);
           const authPkt = encodeAuthRequest(sessionToken, 1);
           await transport.sendStream(authPkt);
 

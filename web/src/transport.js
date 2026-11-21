@@ -53,6 +53,7 @@ export class WebTransportClient {
     this.onPacketCallback = null;
     this.onStatusCallback = null;
     this._isConnecting = false;
+    this._connectSeq = 0;
   }
 
   /**
@@ -74,7 +75,7 @@ export class WebTransportClient {
    * WebSocket if WebTransport is unavailable or fails to establish.
    * @param {string} url - Target URL e.g. "https://127.0.0.1:4433" or "ws://127.0.0.1:8443"
    * @param {string} certHashHex - SHA-256 fingerprint in dotted or raw hex format.
-   * @param {{ wsUrl?: string, wsPort?: number, wtTimeoutMs?: number, wsTimeoutMs?: number }} [options]
+   * @param {{ wsUrl?: string, wsUrls?: string[], wsPort?: number, wtTimeoutMs?: number, wsTimeoutMs?: number }} [options]
    */
   async connect(url, certHashHex = "", options = {}) {
     if (this._isConnecting) {
@@ -85,40 +86,72 @@ export class WebTransportClient {
     if (this.transport || this.ws) {
       await this.disconnect();
     }
+    const seq = ++this._connectSeq;
+    this._isConnecting = true;
 
     this.transportMode = null;
     this.notifyStatus("connecting");
 
     try {
       if (url.startsWith("ws://") || url.startsWith("wss://")) {
-        await this._connectWebSocket(url, options);
+        await this._connectWebSocket(url, options, seq);
         return;
       }
 
       try {
-        await this._connectWebTransport(url, certHashHex, options.wtTimeoutMs ?? 4000);
+        await this._connectWebTransport(url, certHashHex, options.wtTimeoutMs ?? 4000, seq);
       } catch (wtErr) {
-        const wsUrl = options.wsUrl || deriveWebSocketUrl(url, options);
-        console.warn(
-          `WebTransport failed (${wtErr?.message || wtErr}), falling back to WebSocket: ${wsUrl}`
+        if (this._connectSeq !== seq) {
+          return;
+        }
+        const rawCandidates = [
+          ...(Array.isArray(options.wsUrls) ? options.wsUrls : []),
+          ...(options.wsUrl ? [options.wsUrl] : []),
+          deriveWebSocketUrl(url, options),
+        ];
+        const wsCandidates = Array.from(
+          new Set(rawCandidates.filter((candidate) => typeof candidate === "string" && candidate.length > 0))
         );
-        await this._connectWebSocket(wsUrl, options);
+        console.warn(
+          `WebTransport failed (${wtErr?.message || wtErr}), falling back to WebSocket: ${wsCandidates.join(", ")}`
+        );
+        let lastWsErr = wtErr;
+        for (const wsUrl of wsCandidates) {
+          if (this._connectSeq !== seq) {
+            return;
+          }
+          try {
+            await this._connectWebSocket(wsUrl, options, seq);
+            return;
+          } catch (wsErr) {
+            if (this._connectSeq !== seq) {
+              return;
+            }
+            lastWsErr = wsErr;
+          }
+        }
+        throw lastWsErr;
       }
     } catch (err) {
+      if (this._connectSeq !== seq) {
+        return;
+      }
       console.error("All transport connection attempts failed:", err);
       this.connected = false;
       this.transportMode = null;
       this.notifyStatus("disconnected", err?.message || String(err));
       throw err;
     } finally {
-      this._isConnecting = false;
+      if (this._connectSeq === seq) {
+        this._isConnecting = false;
+      }
     }
   }
 
   /**
    * Attempts HTTP/3 WebTransport connection with bounded handshake timeout.
    */
-  async _connectWebTransport(url, certHashHex, timeoutMs) {
+  async _connectWebTransport(url, certHashHex, timeoutMs, seq = this._connectSeq) {
     if (typeof WebTransport === "undefined") {
       throw new Error("WebTransport is not supported by this browser.");
     }
@@ -163,6 +196,13 @@ export class WebTransportClient {
       }
     }
 
+    if (this._connectSeq !== seq) {
+      try {
+        transport.close();
+      } catch (_) {}
+      throw new Error("Connection cancelled");
+    }
+
     this.transport = transport;
     this.transportMode = "webtransport";
     this.connected = true;
@@ -203,7 +243,7 @@ export class WebTransportClient {
   /**
    * Connects via WebSocket (WS/WSS over TCP) with binary ArrayBuffer framing.
    */
-  async _connectWebSocket(wsUrl, options = {}) {
+  async _connectWebSocket(wsUrl, options = {}, seq = this._connectSeq) {
     if (typeof WebSocket === "undefined") {
       throw new Error("WebSocket is not supported in this environment.");
     }
@@ -248,6 +288,13 @@ export class WebTransportClient {
         }
       };
     });
+
+    if (this._connectSeq !== seq) {
+      try {
+        ws.close();
+      } catch (_) {}
+      throw new Error("Connection cancelled");
+    }
 
     this.ws = ws;
     this.transportMode = "websocket";
@@ -539,6 +586,8 @@ export class WebTransportClient {
   }
 
   async disconnect() {
+    this._connectSeq++;
+    this._isConnecting = false;
     this.connected = false;
     this.transportMode = null;
     if (this.pingInterval) {
