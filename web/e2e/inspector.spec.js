@@ -14,10 +14,15 @@ const HUD_PANEL_SELECTORS = [
 ];
 
 function isExpectedOfflineGatewayConsoleError(msg) {
-  if (process.env.E2E_BASE_URL) return false;
   const text = msg.text() || "";
   const locUrl = msg.location()?.url || "";
   const combined = `${locUrl} ${text}`;
+  if (process.env.E2E_BASE_URL) {
+    return (
+      /:(4433|4434)\b/.test(combined) &&
+      /ERR_TUNNEL_CONNECTION_FAILED|ERR_QUIC_PROTOCOL_ERROR|WebTransport/i.test(combined)
+    );
+  }
   return (
     /:(4433|4434|8443|8444|9091|9092)\b/.test(combined) ||
     /\/(village|asteroid)\/ws\b/.test(combined) ||
