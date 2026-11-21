@@ -688,4 +688,398 @@ test.describe("OpenSpec MMO Web Inspector E2E", () => {
     expect(pageErrors).toEqual([]);
     expect(rawConsoleErrors).toEqual([]);
   });
+
+  test("streams VXR1 asteroid chunks after auth, renders asteroid belt, mines ore, engages NPC drone, banks loot, and exercises Playtest Workbench on /asteroid", async ({
+    page,
+  }) => {
+    test.skip(
+      !!process.env.E2E_BASE_URL,
+      "Simulated WebSocket gateway harness runs only when E2E_BASE_URL is unset"
+    );
+
+    const { pageErrors, unexpectedConsoleErrors } = attachErrorCollectors(page);
+
+    await page.route("**/asteroid/cert-hash", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          cert_hash:
+            "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+        }),
+      })
+    );
+
+    await page.addInitScript(() => {
+      try {
+        delete window.WebTransport;
+      } catch (_) {
+        window.WebTransport = undefined;
+      }
+
+      const OPCODE_MOVEMENT = 0x0001;
+      const OPCODE_INTERACTION = 0x0003;
+      const OPCODE_INTERACTION_RESULT = 0x0004;
+      const OPCODE_ENTITY_DELTA_BATCH = 0x0009;
+      const OPCODE_AUTH_REQUEST = 0x0011;
+      const OPCODE_AUTH_RESPONSE = 0x0012;
+
+      const VOXEL_MODULE_ID = 0x00a0;
+      const ASTEROID_MODULE_ID = 0x0003;
+
+      const SEEDED_KEYS = new Set([
+        "0,0,-2",
+        "1,0,-1",
+        "-2,0,0",
+        "0,1,-1",
+        "1,0,1",
+        "-1,-1,-2",
+        "-1,0,-2",
+        "0,-1,-2",
+        "-1,0,1",
+        "1,-1,-1",
+      ]);
+
+      window.__mockAsteroidStats = {
+        receivedPreAuthPacket: false,
+        authCompleted: false,
+        chunkRequests: [],
+        modifyRequests: 0,
+        pvpShots: 0,
+        bankCalls: 0,
+      };
+
+      function writeVarint(val, out) {
+        let v = BigInt(val);
+        while (v >= 0x80n) {
+          out.push(Number((v & 0x7fn) | 0x80n));
+          v >>= 7n;
+        }
+        out.push(Number(v & 0x7fn));
+      }
+
+      function makeFrame(opcode, payloadBytes) {
+        const payload = payloadBytes instanceof Uint8Array ? payloadBytes : new Uint8Array(payloadBytes);
+        const frame = new Uint8Array(8 + payload.length);
+        const view = new DataView(frame.buffer);
+        frame[0] = 0x4d;
+        frame[1] = 0x4d;
+        view.setUint16(2, opcode, true);
+        view.setUint32(4, payload.length, true);
+        frame.set(payload, 8);
+        return frame;
+      }
+
+      function makeInteractionResultBytes(actionId, payloadBytes) {
+        const payload = new Uint8Array(13 + payloadBytes.length);
+        const view = new DataView(payload.buffer);
+        view.setUint32(0, actionId >>> 0, true);
+        payload[4] = 1;
+        view.setUint32(5, 0, true);
+        view.setUint32(9, payloadBytes.length, true);
+        payload.set(payloadBytes, 13);
+        return makeFrame(OPCODE_INTERACTION_RESULT, payload);
+      }
+
+      function makeInteractionResultJson(actionId, jsonObj) {
+        return makeInteractionResultBytes(
+          actionId,
+          new TextEncoder().encode(JSON.stringify(jsonObj))
+        );
+      }
+
+      function encodeVxr1ChunkPacket(cx, cy, cz, revision = 0n) {
+        const voxels = new Uint16Array(4096);
+        const seedSalt = Math.abs(cx) * 7 + Math.abs(cy) * 13 + Math.abs(cz) * 19;
+        for (let lz = 1; lz < 15; lz++) {
+          for (let ly = 1; ly < 15; ly++) {
+            for (let lx = 1; lx < 15; lx++) {
+              const dist = Math.hypot(lx - 7.5, ly - 7.5, lz - 7.5);
+              const bump = ((lx * 31 + ly * 17 + lz * 13 + seedSalt) % 5) * 0.2;
+              let v = 0;
+              if (dist <= 1.8) v = 4;
+              else if (dist <= 3.1) v = 3;
+              else if (dist <= 4.5) v = 2;
+              else if (dist <= 5.6 + bump) v = (lx * 3 + ly * 5 + lz * 7 + seedSalt) % 11 === 0 ? 3 : 1;
+              voxels[lx + ly * 16 + lz * 256] = v;
+            }
+          }
+        }
+        const spans = [];
+        let cur = voxels[0];
+        let count = 1;
+        for (let i = 1; i < 4096; i++) {
+          if (voxels[i] === cur) {
+            count++;
+          } else {
+            spans.push([count, cur]);
+            cur = voxels[i];
+            count = 1;
+          }
+        }
+        spans.push([count, cur]);
+
+        const out = new Uint8Array(12 + 16 + spans.length * 4);
+        const view = new DataView(out.buffer);
+        view.setInt32(0, cx, true);
+        view.setInt32(4, cy, true);
+        view.setInt32(8, cz, true);
+        out[12] = 0x56;
+        out[13] = 0x58;
+        out[14] = 0x52;
+        out[15] = 0x31;
+        view.setBigUint64(16, revision, true);
+        view.setUint32(24, spans.length, true);
+        let off = 28;
+        for (const [c, v] of spans) {
+          view.setUint16(off, c, true);
+          view.setUint16(off + 2, v, true);
+          off += 4;
+        }
+        return out;
+      }
+
+      let droneHp = 100;
+      let tickCounter = 1;
+      function makeDroneBatch(hpVal) {
+        const p = [];
+        writeVarint(tickCounter++, p);
+        writeVarint(0, p);
+        p.push(0); // 0 despawns
+        p.push(1); // 1 delta
+        const droneGuid = (2n << 48n) | 1n; // EntityType::Npc
+        writeVarint(droneGuid, p);
+        const mask = 0x0001 | 0x0080 | 0x0100 | 0x0200; // KEYFRAME | HEALTH | MAX_HEALTH | STATE_FLAGS
+        p.push(mask & 0xff, (mask >> 8) & 0xff);
+        const f = new ArrayBuffer(12);
+        const fv = new DataView(f);
+        fv.setFloat32(0, 20.0, true);
+        fv.setFloat32(4, 0.0, true);
+        fv.setFloat32(8, -18.0, true);
+        new Uint8Array(f).forEach((b) => p.push(b));
+        writeVarint(hpVal, p);
+        writeVarint(100, p);
+        writeVarint(10 << 16, p);
+        return makeFrame(OPCODE_ENTITY_DELTA_BATCH, p);
+      }
+
+      const simState = {
+        player_guid: Number((1n << 48n) | 1n),
+        hull_hp: 100,
+        max_hull_hp: 100,
+        shininess_tier: 0,
+        unbanked_cargo_value: 0,
+        current_weight: 0,
+        max_weight: 150,
+        in_safe_zone: true,
+        inventory: { currency: 0, max_weight: 150, slots: [] },
+        station_vault: { banked_credits: 0, banked_items: [], kills: 0, deaths: 0 },
+      };
+
+      class MockWebSocket {
+        constructor(url) {
+          this.url = url;
+          this.binaryType = "arraybuffer";
+          this.readyState = 0;
+          setTimeout(() => {
+            this.readyState = 1;
+            if (this.onopen) this.onopen();
+          }, 10);
+        }
+
+        send(data) {
+          const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+          if (bytes.byteLength < 8 || bytes[0] !== 0x4d || bytes[1] !== 0x4d) return;
+          const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          const opcode = view.getUint16(2, true);
+
+          if (opcode !== OPCODE_AUTH_REQUEST && !window.__mockAsteroidStats.authCompleted) {
+            window.__mockAsteroidStats.receivedPreAuthPacket = true;
+          }
+
+          if (opcode === OPCODE_AUTH_REQUEST) {
+            const authPayload = new Uint8Array(25);
+            const av = new DataView(authPayload.buffer);
+            authPayload[0] = 1;
+            av.setUint32(1, 0, true);
+            av.setBigUint64(5, 77n, true);
+            av.setBigUint64(13, (1n << 48n) | 1n, true);
+            setTimeout(() => {
+              window.__mockAsteroidStats.authCompleted = true;
+              this.onmessage?.({ data: makeFrame(OPCODE_AUTH_RESPONSE, authPayload).buffer });
+              this.onmessage?.({ data: makeDroneBatch(droneHp).buffer });
+            }, 15);
+            return;
+          }
+
+          if (opcode === OPCODE_MOVEMENT) {
+            return;
+          }
+
+          if (opcode === OPCODE_INTERACTION && bytes.byteLength >= 33) {
+            const actionId = view.getUint32(25, true);
+            const moduleId = (actionId >>> 16) & 0xffff;
+            const subOp = actionId & 0xffff;
+            const payloadLen = view.getUint32(29, true);
+            const payload = bytes.subarray(33, 33 + payloadLen);
+
+            if (moduleId === VOXEL_MODULE_ID && subOp === 1 && payload.byteLength >= 12) {
+              const pv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+              const cx = pv.getInt32(0, true);
+              const cy = pv.getInt32(4, true);
+              const cz = pv.getInt32(8, true);
+              const key = `${cx},${cy},${cz}`;
+              window.__mockAsteroidStats.chunkRequests.push(key);
+              if (SEEDED_KEYS.has(key)) {
+                const chunkData = encodeVxr1ChunkPacket(cx, cy, cz, 0n);
+                setTimeout(() => {
+                  this.onmessage?.({ data: makeInteractionResultBytes(actionId, chunkData).buffer });
+                }, 5);
+              }
+              return;
+            }
+
+            if (moduleId === VOXEL_MODULE_ID && subOp === 4 && payload.byteLength >= 26) {
+              window.__mockAsteroidStats.modifyRequests += 1;
+              const pv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+              const vx = pv.getBigInt64(0, true);
+              const vy = pv.getBigInt64(8, true);
+              const vz = pv.getBigInt64(16, true);
+              const newVoxel = pv.getUint16(24, true);
+
+              simState.inventory.slots.push({
+                item_id: 2002,
+                name: "Solar Gold",
+                quantity: 1,
+                unit_weight: 3.0,
+              });
+              simState.current_weight += 3.0;
+              simState.unbanked_cargo_value += 30;
+              simState.shininess_tier = Math.min(255, Math.floor(simState.unbanked_cargo_value / 5));
+
+              const resp = new Uint8Array(27);
+              const rv = new DataView(resp.buffer);
+              resp[0] = 0;
+              rv.setBigInt64(1, vx, true);
+              rv.setBigInt64(9, vy, true);
+              rv.setBigInt64(17, vz, true);
+              rv.setUint16(25, newVoxel, true);
+              setTimeout(() => {
+                this.onmessage?.({ data: makeInteractionResultBytes(actionId, resp).buffer });
+              }, 5);
+              return;
+            }
+
+            if (moduleId === ASTEROID_MODULE_ID) {
+              if (subOp === 1) {
+                setTimeout(() => {
+                  this.onmessage?.({ data: makeInteractionResultJson(actionId, simState).buffer });
+                }, 5);
+              } else if (subOp === 2) {
+                window.__mockAsteroidStats.pvpShots += 1;
+                droneHp = Math.max(0, droneHp - 25);
+                setTimeout(() => {
+                  this.onmessage?.({ data: makeDroneBatch(droneHp).buffer });
+                  this.onmessage?.({ data: makeInteractionResultJson(actionId, simState).buffer });
+                }, 5);
+              } else if (subOp === 3) {
+                window.__mockAsteroidStats.bankCalls += 1;
+                simState.station_vault.banked_credits += simState.unbanked_cargo_value;
+                for (const s of simState.inventory.slots) {
+                  simState.station_vault.banked_items.push({ ...s });
+                }
+                simState.inventory.slots = [];
+                simState.current_weight = 0;
+                simState.unbanked_cargo_value = 0;
+                simState.shininess_tier = 0;
+                setTimeout(() => {
+                  this.onmessage?.({ data: makeInteractionResultJson(actionId, simState).buffer });
+                }, 5);
+              }
+            }
+          }
+        }
+
+        close() {
+          this.readyState = 3;
+        }
+      }
+
+      window.WebSocket = MockWebSocket;
+    });
+
+    await page.goto("/asteroid", { waitUntil: "domcontentloaded" });
+
+    await expect(page.locator("#status-text")).toHaveText("Connected");
+    await expect(page.locator("#transport-badge")).toHaveText("WebSocket");
+    await expect(page.locator("#asteroid-target-panel")).toBeVisible();
+    await expect(page.locator("#asteroid-target-name")).toContainText("Rogue Drone #");
+    await expect(page.locator("#btn-trade-pilot")).toBeHidden();
+
+    // Verify ALL visible panels including #asteroid-target-panel fit cleanly in 1280x800 without overlap
+    await assertNoOverlappingHudPanels(page, "asteroid");
+
+    // Verify NO pre-auth packets leaked and authoritative chunks (revision=0) replaced preview chunks
+    await page.click("#btn-toggle-devtools");
+    await expect(page.locator("#devtools-drawer")).toBeVisible();
+    await expect(page.locator("#devtools-stats")).toContainText("Chunks: 10 (10 srv / 0 prv)");
+    await page.click("#btn-close-devtools");
+    await expect(page.locator("#devtools-drawer")).toBeHidden();
+
+    const mockStats = await page.evaluate(() => window.__mockAsteroidStats);
+    expect(mockStats.receivedPreAuthPacket).toBe(false);
+    expect(mockStats.chunkRequests.length).toBeGreaterThanOrEqual(10);
+
+    // Engage Flight Assist to fly near the closest asteroid (exiting safe zone), then Mine Ore
+    await page.click("#btn-fly-asteroid");
+    await expect(page.locator("#asteroid-safe-zone-badge")).toHaveText("PVP OPEN SPACE", {
+      timeout: 6000,
+    });
+    await page.click("#btn-brake-ship");
+    await page.click("#btn-mine-asteroid");
+
+    await expect(page.locator("#asteroid-unbanked-value")).toHaveText("30");
+    await expect(page.locator("#asteroid-shininess-text")).toContainText("Tier 6");
+
+    // Fire PvP laser at Rogue Drone while outside safe zone
+    await expect(page.locator("#btn-fire-laser")).toBeEnabled();
+    await page.click("#btn-fire-laser");
+    await expect(page.locator("#asteroid-target-hull")).toHaveText("75%");
+
+    // Return to station dock and bank mined ore
+    await page.click("#btn-fly-station");
+    await expect(page.locator("#asteroid-safe-zone-badge")).toHaveText("DOCKED SAFE ZONE", {
+      timeout: 6000,
+    });
+    await page.click("#btn-bank-loot");
+    await expect(page.locator("#asteroid-vault-credits")).toHaveText("30");
+    await expect(page.locator("#asteroid-unbanked-value")).toHaveText("0");
+
+    // Disconnect and exercise Offline Playtest Workbench (Sandbox Teleport + Mine + Dummy + Bank)
+    await page.click("#btn-disconnect");
+    await expect(page.locator("#status-text")).toHaveText("Disconnected");
+
+    await page.click("#btn-toggle-devtools");
+    await expect(page.locator("#devtools-drawer")).toBeVisible();
+    await expect(page.locator("#devtools-stats")).toContainText("Chunks: 10");
+
+    await page.click("#btn-teleport-asteroid");
+    await expect(page.locator("#val-pos")).toContainText("X: 7.5, Y: 7.5, Z: -15.5");
+    for (let i = 0; i < 4; i++) {
+      await page.click("#btn-mine-asteroid");
+    }
+    await expect(page.locator("#asteroid-unbanked-value")).not.toHaveText("0");
+
+    await page.click("#btn-spawn-dummy");
+    await expect(page.locator("#asteroid-target-panel")).toBeVisible();
+
+    await page.click("#btn-teleport-station");
+    await expect(page.locator("#asteroid-safe-zone-badge")).toHaveText("DOCKED SAFE ZONE");
+    await page.click("#btn-bank-loot");
+    await expect(page.locator("#asteroid-vault-credits")).not.toHaveText("0");
+    await page.click("#btn-close-devtools");
+
+    expect(pageErrors).toEqual([]);
+    expect(unexpectedConsoleErrors).toEqual([]);
+  });
 });

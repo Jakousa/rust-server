@@ -6,12 +6,15 @@ import {
   ClientWorldBridge,
   ASTEROID_MODULE_ID,
 } from "../main.js";
+import { WebTransportClient } from "../transport.js";
 import { UIController } from "../ui.js";
+import { DevToolsController } from "../dev_tools.js";
 import { OPCODES, DELTA_FLAGS, putVarintU64 } from "../protocol.js";
 import { SpaceFlightControls } from "../games/asteroid/controls.js";
 import {
   VOXEL_MODULE_ID,
   SUB_OPCODE_CHUNK_REQUEST,
+  SUB_OPCODE_CHUNK_DATA,
   SUB_OPCODE_MODIFY_REQUEST,
   CHUNK_VOXELS,
   VOXEL_EMPTY,
@@ -20,6 +23,8 @@ import {
   VOXEL_SOLAR_GOLD,
   VOXEL_VOID_CRYSTAL,
   VOXEL_MATERIALS,
+  SEEDED_ASTEROID_CHUNKS,
+  getVoxelMaterialInfo,
   indexFromLocal,
   voxelCoordToChunk,
   encodeVoxelChunkRequest,
@@ -792,5 +797,625 @@ describe("EntityState Shininess & DeltaBatch Voxel Updates", () => {
     ctrl.keys.arrowUp = true;
     ctrl.update(5.0);
     expect(ctrl.pitch).toBeCloseTo(1.45, 5);
+  });
+});
+
+describe("WebTransportClient.sendStream Serialization & Recovery", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("serializes concurrent sendStream calls onto a single bidirectional stream in order", async () => {
+    const client = new WebTransportClient();
+    const written = [];
+    const writer = {
+      write: vi.fn(async (data) => {
+        await Promise.resolve();
+        written.push(data);
+      }),
+    };
+
+    client.connected = true;
+    client.transportMode = "webtransport";
+    client.handleIncomingStream = vi.fn();
+    client.transport = {
+      createBidirectionalStream: vi.fn(async () => {
+        await Promise.resolve();
+        return {
+          readable: {},
+          writable: { getWriter: () => writer },
+        };
+      }),
+    };
+
+    const a = new Uint8Array([1, 2]);
+    const b = new Uint8Array([3, 4]);
+    const c = new Uint8Array([5, 6]);
+
+    await Promise.all([client.sendStream(a), client.sendStream(b), client.sendStream(c)]);
+
+    expect(client.transport.createBidirectionalStream).toHaveBeenCalledTimes(1);
+    expect(client.handleIncomingStream).toHaveBeenCalledTimes(1);
+    expect(writer.write).toHaveBeenCalledTimes(3);
+    expect(written).toEqual([a, b, c]);
+  });
+
+  it("resets stream state on transient write rejection and recovers on subsequent sendStream", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = new WebTransportClient();
+    const written = [];
+    let attempt = 0;
+
+    client.connected = true;
+    client.transportMode = "webtransport";
+    client.handleIncomingStream = vi.fn();
+    client.transport = {
+      createBidirectionalStream: vi.fn(async () => {
+        attempt += 1;
+        const streamIdx = attempt;
+        return {
+          readable: {},
+          writable: {
+            getWriter: () => ({
+              write: vi.fn(async (data) => {
+                if (streamIdx === 1) {
+                  throw new Error("Transient QUIC stream reset");
+                }
+                written.push(data);
+              }),
+            }),
+          },
+        };
+      }),
+    };
+
+    await client.sendStream(new Uint8Array([9]));
+    expect(warnSpy).toHaveBeenCalled();
+    expect(client.streamWriter).toBeNull();
+    expect(client._streamInitPromise).toBeNull();
+
+    const d = new Uint8Array([7, 8, 9]);
+    await client.sendStream(d);
+
+    expect(client.transport.createBidirectionalStream).toHaveBeenCalledTimes(2);
+    expect(client.streamWriter).not.toBeNull();
+    expect(written).toEqual([d]);
+  });
+});
+
+describe("ClientWorldBridge.isAuthenticated Lifecycle", () => {
+  function buildAuthResponseFrame(success = true, errorCode = 0, sessionId = 123n, playerGuid = 456n) {
+    const frame = new Uint8Array(33);
+    const view = new DataView(frame.buffer);
+    frame[0] = 0x4d;
+    frame[1] = 0x4d;
+    view.setUint16(2, OPCODES.AUTH_RESPONSE, true);
+    view.setUint32(4, 25, true);
+    frame[8] = success ? 1 : 0;
+    view.setUint32(9, errorCode >>> 0, true);
+    view.setBigUint64(13, BigInt(sessionId), true);
+    view.setBigUint64(21, BigInt(playerGuid), true);
+    return frame;
+  }
+
+  it("starts false, ignores non-auth and failed auth packets, turns true on valid AUTH_RESPONSE, and resets on clear()", () => {
+    const bridge = new ClientWorldBridge();
+    expect(bridge.isAuthenticated).toBe(false);
+
+    // Non-auth packet leaves isAuthenticated false
+    const nonAuthFrame = buildInteractionResultFrame(1, new Uint8Array([1, 2, 3]));
+    bridge.processPacket(nonAuthFrame);
+    expect(bridge.isAuthenticated).toBe(false);
+
+    // Failed AUTH_RESPONSE leaves isAuthenticated false
+    bridge.processPacket(buildAuthResponseFrame(false, 401, 0n, 0n));
+    expect(bridge.isAuthenticated).toBe(false);
+
+    // Valid AUTH_RESPONSE flips isAuthenticated to true and records IDs
+    const authCb = vi.fn();
+    bridge.onAuthResponse(authCb);
+    bridge.processPacket(buildAuthResponseFrame(true, 0, 777n, 888n));
+    expect(bridge.isAuthenticated).toBe(true);
+    expect(bridge.sessionId).toBe(777);
+    expect(bridge.localPlayerGuid).toBe(888);
+    expect(authCb).toHaveBeenCalledWith({
+      sessionId: 777,
+      playerGuid: 888,
+      success: true,
+      errorCode: 0,
+    });
+
+    // clear() resets isAuthenticated back to false
+    bridge.clear();
+    expect(bridge.isAuthenticated).toBe(false);
+  });
+});
+
+describe("AsteroidVoxelClient Preview Seeding, Authoritative Tracking & Bounded Retries", () => {
+  function buildChunkDataPayload(cx, cy, cz, spans, revision = 0n) {
+    const rle = encodeTestVxr1(spans, revision);
+    const payload = new Uint8Array(12 + rle.length);
+    const view = new DataView(payload.buffer);
+    view.setInt32(0, cx, true);
+    view.setInt32(4, cy, true);
+    view.setInt32(8, cz, true);
+    payload.set(rle, 12);
+    return payload;
+  }
+
+  it("seeds all 10 preview chunks, prioritizes seeded chunks, and clears isPreview on revision=0 CHUNK_DATA", () => {
+    const client = new AsteroidVoxelClient();
+    const seededCount = client.seedLocalPreviewChunks();
+    expect(seededCount).toBe(SEEDED_ASTEROID_CHUNKS.length);
+    expect(SEEDED_ASTEROID_CHUNKS).toHaveLength(10);
+    expect(client.chunks.size).toBe(10);
+
+    for (const c of SEEDED_ASTEROID_CHUNKS) {
+      const entry = client.getChunk(c.x, c.y, c.z);
+      expect(entry).not.toBeNull();
+      expect(entry.isPreview).toBe(true);
+      expect(entry.revision).toBe(0);
+    }
+
+    // Even with preview chunks loaded, collectUnrequestedChunks prioritizes SEEDED_ASTEROID_CHUNKS first
+    const reqs = client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 1, 0, 1, 1000);
+    expect(reqs.slice(0, SEEDED_ASTEROID_CHUNKS.length)).toEqual(
+      SEEDED_ASTEROID_CHUNKS.map((c) => ({ x: c.x, y: c.y, z: c.z }))
+    );
+
+    // Authoritative SUB_OPCODE_CHUNK_DATA with revision=0 clears isPreview and stops re-requesting
+    const first = SEEDED_ASTEROID_CHUNKS[0];
+    const authPayload = buildChunkDataPayload(
+      first.x,
+      first.y,
+      first.z,
+      [[4095, VOXEL_EMPTY], [1, VOXEL_TITANIUM]],
+      0n
+    );
+    const res = client.handleInteractionResult(
+      (VOXEL_MODULE_ID << 16) | SUB_OPCODE_CHUNK_DATA,
+      authPayload
+    );
+    expect(res.type).toBe("chunk_data");
+    expect(client.getChunk(first.x, first.y, first.z).isPreview).toBe(false);
+    expect(client.getChunk(first.x, first.y, first.z).revision).toBe(0);
+
+    const nextReqs = client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 1, 0, 1, 10000);
+    expect(nextReqs.some((c) => c.x === first.x && c.y === first.y && c.z === first.z)).toBe(false);
+  });
+
+  it("bounds empty vacuum chunk retries to maxEmptyChunkRetries (3) and resets via resetRequestTracking()", () => {
+    const client = new AsteroidVoxelClient();
+    expect(client.maxEmptyChunkRetries).toBe(3);
+
+    const hasVacuum = (list) => list.some((c) => c.x === 0 && c.y === 0 && c.z === 0);
+
+    // Attempt 1
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 1000))).toBe(true);
+    // Within TTL (2000ms) -> skipped
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 2000))).toBe(false);
+    // Attempt 2
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 3500))).toBe(true);
+    // Attempt 3
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 6000))).toBe(true);
+    // Attempt 4 -> stopped at maxEmptyChunkRetries = 3
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 9000))).toBe(false);
+
+    // Post-auth resetRequestTracking clears pending tracking so chunks can be re-requested
+    client.resetRequestTracking();
+    expect(client.pendingChunkRequests.size).toBe(0);
+    expect(client.requestedChunks.size).toBe(0);
+    expect(hasVacuum(client.collectUnrequestedChunks({ x: 0, y: 0, z: 8 }, 0, 0, 0, 9500))).toBe(true);
+  });
+
+  it("summarizes sorted asteroid clusters and exposes voxel material metadata", () => {
+    const client = new AsteroidVoxelClient();
+
+    const emptyVoxels = new Uint16Array(CHUNK_VOXELS);
+    client.setChunk(0, 0, 0, emptyVoxels, 1);
+
+    const farVoxels = new Uint16Array(CHUNK_VOXELS);
+    farVoxels[indexFromLocal(0, 0, 0)] = VOXEL_CRUST_ROCK;
+    client.setChunk(3, 0, 0, farVoxels, 1, { isPreview: true });
+
+    const nearVoxels = new Uint16Array(CHUNK_VOXELS);
+    nearVoxels[indexFromLocal(1, 1, 1)] = VOXEL_TITANIUM;
+    nearVoxels[indexFromLocal(2, 1, 1)] = VOXEL_VOID_CRYSTAL;
+    client.setChunk(0, 0, -1, nearVoxels, 2, { isPreview: false });
+
+    const clusters = client.getAsteroidClusterSummaries({ x: 0, y: 0, z: 0 });
+    expect(clusters).toHaveLength(2);
+    expect(clusters[0].key).toBe("0,0,-1");
+    expect(clusters[0].solidCount).toBe(2);
+    expect(clusters[0].oreCount).toBe(2);
+    expect(clusters[0].isPreview).toBe(false);
+    expect(clusters[1].key).toBe("3,0,0");
+    expect(clusters[1].isPreview).toBe(true);
+    expect(clusters[0].distance).toBeLessThan(clusters[1].distance);
+
+    expect(getVoxelMaterialInfo(VOXEL_TITANIUM).unitValue).toBe(10);
+    expect(getVoxelMaterialInfo(VOXEL_SOLAR_GOLD).unitValue).toBe(30);
+    expect(getVoxelMaterialInfo(VOXEL_VOID_CRYSTAL).unitValue).toBe(75);
+    expect(getVoxelMaterialInfo(VOXEL_CRUST_ROCK).unitValue).toBe(0);
+    expect(getVoxelMaterialInfo(VOXEL_EMPTY).unitValue).toBe(0);
+  });
+});
+
+describe("SpaceFlightControls Autopilot, Brake (X) & Bank (B)", () => {
+  it("orients toward target with autopilot and stops cleanly inside stopDistance", () => {
+    const controls = new SpaceFlightControls({ x: 0, y: 0, z: 0, yaw: 0, pitch: 0 });
+    const target = { x: 0, y: 0, z: -20 };
+    controls.orientToward(target, true, 5);
+
+    expect(controls.autopilotTarget).toEqual({ x: 0, y: 0, z: -20, stopDistance: 5 });
+    expect(Math.abs(controls.yaw)).toBeCloseTo(Math.PI, 4);
+
+    for (let i = 0; i < 100; i++) {
+      controls.update(0.1);
+    }
+
+    const remainingDist = Math.hypot(
+      target.x - controls.position.x,
+      target.y - controls.position.y,
+      target.z - controls.position.z
+    );
+    expect(remainingDist).toBeLessThanOrEqual(5.0);
+    expect(controls.autopilotTarget).toBeNull();
+    expect(controls.velocity).toEqual({ x: 0, y: 0, z: 0 });
+    expect(controls.pitch).toBe(0);
+  });
+
+  it("handles KeyX / brake() and KeyB onBank callback while ignoring editable targets", () => {
+    const controls = new SpaceFlightControls({ x: 0, y: 0, z: 0, yaw: 0, pitch: 0.4 });
+    const bankSpy = vi.fn();
+    controls.onBank(bankSpy);
+    controls.velocity = { x: 3.0, y: -2.0, z: 4.0 };
+    controls.orientToward({ x: 0, y: 0, z: -30 }, true, 5);
+
+    // Editable targets must ignore KeyX and KeyB
+    controls.setKeyState({ key: "b", code: "KeyB", target: { tagName: "INPUT" } }, true);
+    controls.setKeyState({ key: "x", code: "KeyX", target: { tagName: "INPUT" } }, true);
+    expect(bankSpy).not.toHaveBeenCalled();
+    expect(controls.autopilotTarget).not.toBeNull();
+    expect(controls.velocity.x).toBe(3.0);
+
+    // Non-editable target fires onBank and KeyX brakes
+    controls.setKeyState({ key: "b", code: "KeyB", target: { tagName: "CANVAS" } }, true);
+    expect(bankSpy).toHaveBeenCalledTimes(1);
+
+    controls.setKeyState({ key: "x", code: "KeyX", target: { tagName: "CANVAS" } }, true);
+    expect(controls.velocity).toEqual({ x: 0, y: 0, z: 0 });
+    expect(controls.pitch).toBe(0);
+    expect(controls.autopilotTarget).toBeNull();
+  });
+});
+
+describe("AsteroidRenderer Chunk Beacons, Voxel Reticle & Chase Camera", () => {
+  it("manages chunkBeacons across non-empty, emptied, and cleared chunks", () => {
+    const renderer = new AsteroidRenderer(null);
+    const voxelClient = new AsteroidVoxelClient();
+
+    const oreVoxels = new Uint16Array(CHUNK_VOXELS);
+    oreVoxels[indexFromLocal(2, 3, 4)] = VOXEL_SOLAR_GOLD;
+    voxelClient.setChunk(0, 0, -2, oreVoxels, 1);
+
+    renderer.syncVoxelChunks(voxelClient);
+    expect(renderer.chunkBeacons.has("0,0,-2")).toBe(true);
+    expect(renderer.chunkBeacons.get("0,0,-2").userData.ringMat.color.getHex()).toBe(0xfacc15);
+
+    // Emptying the only voxel removes both chunk mesh and beacon
+    voxelClient.setVoxel(2, 3, -32 + 4, VOXEL_EMPTY);
+    renderer.syncVoxelChunks(voxelClient);
+    expect(renderer.chunkBeacons.has("0,0,-2")).toBe(false);
+    expect(renderer.voxelChunkMeshes.has("0,0,-2")).toBe(false);
+
+    // Non-ore rock chunk uses cyan beacon and is removed by clear()
+    const rockVoxels = new Uint16Array(CHUNK_VOXELS);
+    rockVoxels[indexFromLocal(0, 0, 0)] = VOXEL_CRUST_ROCK;
+    voxelClient.setChunk(1, 0, 0, rockVoxels, 1);
+    renderer.syncVoxelChunks(voxelClient);
+    expect(renderer.chunkBeacons.has("1,0,0")).toBe(true);
+    expect(renderer.chunkBeacons.get("1,0,0").userData.ringMat.color.getHex()).toBe(0x38bdf8);
+
+    renderer.clear();
+    expect(renderer.chunkBeacons.size).toBe(0);
+  });
+
+  it("positions and tints voxelHighlightMesh on hit and hides it on null", () => {
+    const renderer = new AsteroidRenderer(null);
+    expect(renderer.voxelHighlightMesh.visible).toBe(false);
+
+    renderer.setHighlightedVoxel({ x: 3, y: 4, z: -5, voxelId: VOXEL_VOID_CRYSTAL });
+    expect(renderer.voxelHighlightMesh.visible).toBe(true);
+    expect(renderer.voxelHighlightMesh.position.x).toBeCloseTo(3.5, 5);
+    expect(renderer.voxelHighlightMesh.position.y).toBeCloseTo(4.5, 5);
+    expect(renderer.voxelHighlightMesh.position.z).toBeCloseTo(-4.5, 5);
+    expect(renderer.voxelHighlightMesh.material.color.getHex()).toBe(
+      VOXEL_MATERIALS[VOXEL_VOID_CRYSTAL].hex
+    );
+
+    renderer.setHighlightedVoxel(null);
+    expect(renderer.voxelHighlightMesh.visible).toBe(false);
+  });
+
+  it("aligns camera behind ship and tracks yaw changes unless dragging", () => {
+    const renderer = new AsteroidRenderer(null);
+    renderer.alignCameraBehindShip(Math.PI, 0);
+    expect(renderer.orbitYaw).toBeCloseTo(2 * Math.PI, 5);
+    expect(renderer.orbitPitch).toBeCloseTo(0.28, 5);
+
+    // Tracks yaw delta when not dragging
+    renderer.isDragging = false;
+    renderer.updateCamera({ x: 0, y: 0, z: 8 }, Math.PI + 0.5);
+    expect(renderer.orbitYaw).toBeCloseTo(2 * Math.PI + 0.5, 5);
+
+    // Yields orbitYaw when dragging
+    const yawBeforeDrag = renderer.orbitYaw;
+    renderer.isDragging = true;
+    renderer.updateCamera({ x: 0, y: 0, z: 8 }, Math.PI + 1.2);
+    expect(renderer.orbitYaw).toBeCloseTo(yawBeforeDrag, 5);
+  });
+});
+
+describe("UIController NPC Drone Target & Mission Guidance", () => {
+  let elements;
+
+  function createMockEl(id = "", className = "") {
+    const el = {
+      id,
+      className,
+      style: {},
+      children: [],
+      textContent: "",
+      value: "",
+      disabled: false,
+      dataset: {},
+      _listeners: {},
+      replaceChildren(...newChildren) {
+        this.children = [...newChildren];
+      },
+      appendChild(child) {
+        this.children.push(child);
+      },
+      addEventListener(evt, fn) {
+        this._listeners[evt] = fn;
+      },
+    };
+    el.classList = {
+      add(...tokens) {
+        const s = new Set((el.className || "").split(/\s+/).filter(Boolean));
+        tokens.forEach((t) => s.add(t));
+        el.className = Array.from(s).join(" ");
+      },
+      remove(...tokens) {
+        const s = new Set((el.className || "").split(/\s+/).filter(Boolean));
+        tokens.forEach((t) => s.delete(t));
+        el.className = Array.from(s).join(" ");
+      },
+      contains(token) {
+        return (el.className || "").split(/\s+/).filter(Boolean).includes(token);
+      },
+    };
+    return el;
+  }
+
+  beforeEach(() => {
+    elements = new Map();
+    globalThis.document = {
+      title: "",
+      body: { dataset: {} },
+      getElementById(id) {
+        if (!elements.has(id)) {
+          elements.set(id, createMockEl(id));
+        }
+        return elements.get(id);
+      },
+      createElement() {
+        return createMockEl();
+      },
+    };
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("labels NPC Rogue Drone targets and hides/disables #btn-trade-pilot", () => {
+    const ui = new UIController();
+    ui.showAsteroidTarget(
+      { id: 9, type: 2, distance: 20, hpPct: 0.75, stateFlags: 10 << 16 },
+      false
+    );
+
+    expect(document.getElementById("asteroid-target-panel").style.display).toBe("block");
+    expect(document.getElementById("asteroid-target-name").textContent).toBe("Rogue Drone #9");
+    expect(document.getElementById("asteroid-target-shininess").textContent).toBe("Tier 10");
+    expect(document.getElementById("asteroid-target-distance").textContent).toBe("20.0 m");
+    expect(document.getElementById("asteroid-target-hull").textContent).toBe("75%");
+    expect(document.getElementById("btn-fire-laser").disabled).toBe(false);
+    expect(document.getElementById("btn-trade-pilot").disabled).toBe(true);
+    expect(document.getElementById("btn-trade-pilot").style.display).toBe("none");
+
+    // Re-enables trade button for player pilots (type !== 2)
+    ui.showAsteroidTarget({ id: 4, type: 1, distance: 12, hpPct: 1.0, stateFlags: 0 }, false);
+    expect(document.getElementById("asteroid-target-name").textContent).toBe("Pilot #4");
+    expect(document.getElementById("btn-trade-pilot").disabled).toBe(false);
+    expect(document.getElementById("btn-trade-pilot").style.display).toBe("");
+  });
+
+  it("updates #asteroid-nav-summary, #asteroid-aim-target, and mission step done/active classes", () => {
+    const ui = new UIController();
+    const stepApproach = document.getElementById("mission-step-approach");
+    const stepMine = document.getElementById("mission-step-mine");
+    const stepBank = document.getElementById("mission-step-bank");
+
+    // Step 1 active: far from asteroid
+    ui.updateAsteroidGuidance({
+      distToStation: 8.0,
+      nearestAsteroidDist: 30.0,
+      cargoValue: 0,
+      bankedCredits: 0,
+    });
+    expect(document.getElementById("asteroid-nav-summary").textContent).toBe("Belt: 30.0m | Dock: 8.0m");
+    expect(document.getElementById("asteroid-aim-target").textContent).toBe(
+      "Fly closer (<=18m) or click Fly Asteroid"
+    );
+    expect(stepApproach.classList.contains("active")).toBe(true);
+    expect(stepApproach.classList.contains("done")).toBe(false);
+    expect(stepMine.classList.contains("active")).toBe(false);
+
+    // Step 2 active: approached and aiming at Solar Gold
+    ui.updateAsteroidGuidance({
+      distToStation: 22.5,
+      nearestAsteroidDist: 10.0,
+      aimedHit: { distance: 6.5 },
+      aimedMaterial: VOXEL_MATERIALS[VOXEL_SOLAR_GOLD],
+      cargoValue: 0,
+      bankedCredits: 0,
+    });
+    expect(document.getElementById("asteroid-nav-summary").textContent).toBe("Belt: 10.0m | Dock: 22.5m");
+    expect(document.getElementById("asteroid-aim-target").textContent).toBe(
+      "Aim: Solar Gold (30 cr) 6.5m [Click/J]"
+    );
+    expect(stepApproach.classList.contains("done")).toBe(true);
+    expect(stepApproach.classList.contains("active")).toBe(false);
+    expect(stepMine.classList.contains("active")).toBe(true);
+    expect(stepMine.classList.contains("done")).toBe(false);
+
+    // Step 3 active: cargo collected, not yet banked
+    ui.updateAsteroidGuidance({
+      distToStation: 12.0,
+      nearestAsteroidDist: 25.0,
+      cargoValue: 30,
+      bankedCredits: 0,
+    });
+    expect(stepMine.classList.contains("done")).toBe(true);
+    expect(stepMine.classList.contains("active")).toBe(false);
+    expect(stepBank.classList.contains("active")).toBe(true);
+    expect(stepBank.classList.contains("done")).toBe(false);
+
+    // All steps done after banking
+    ui.updateAsteroidGuidance({
+      distToStation: 8.0,
+      nearestAsteroidDist: 25.0,
+      cargoValue: 0,
+      bankedCredits: 30,
+    });
+    expect(stepBank.classList.contains("done")).toBe(true);
+    expect(stepBank.classList.contains("active")).toBe(false);
+  });
+});
+
+describe("DevToolsController Isolated Offline Sandbox", () => {
+  it("mines ore locally, updates unbanked_cargo_value and shininess_tier, and leaves crust rock uncredited", () => {
+    const voxelClient = new AsteroidVoxelClient();
+    const voxels = new Uint16Array(CHUNK_VOXELS);
+    voxels[indexFromLocal(1, 0, 0)] = VOXEL_CRUST_ROCK;
+    voxels[indexFromLocal(2, 0, 0)] = VOXEL_VOID_CRYSTAL;
+    voxelClient.setChunk(0, 0, -1, voxels, 1);
+
+    const onStateUpdate = vi.fn();
+    const devTools = new DevToolsController({ voxelClient, onStateUpdate });
+    devTools.setSandboxEnabled(true, { silent: true });
+
+    // Mining crust rock clears block without crediting cargo or shininess
+    const rockResp = devTools.mineVoxelLocally(1, 0, -16, { x: 0, y: 0, z: -18 });
+    expect(voxelClient.getVoxel(1, 0, -16)).toBe(VOXEL_EMPTY);
+    expect(rockResp.unbanked_cargo_value).toBe(0);
+    expect(rockResp.shininess_tier).toBe(0);
+    expect(rockResp.inventory.slots.every((s) => s === null)).toBe(true);
+
+    // Mining Void Crystal credits 75 cr and raises shininess_tier = floor(75 / 5) = 15
+    const oreResp = devTools.mineVoxelLocally(2, 0, -16, { x: 0, y: 0, z: -18 });
+    expect(voxelClient.getVoxel(2, 0, -16)).toBe(VOXEL_EMPTY);
+    expect(oreResp.unbanked_cargo_value).toBe(75);
+    expect(oreResp.shininess_tier).toBe(15);
+    expect(oreResp.inventory.slots[0]).toMatchObject({
+      item_id: 2003,
+      name: "Void Crystal",
+      quantity: 1,
+    });
+    expect(onStateUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it("enforces safe zone, range, and cooldown in fireSandboxLaser, loots on kill, and banks in 15m safe zone", () => {
+    const world = new ClientWorldBridge();
+    const devTools = new DevToolsController({ world });
+
+    const dummy = devTools.spawnTargetDummy({ x: 0, y: 0, z: -25 }, 200);
+    expect(devTools.sandboxEnabled).toBe(true);
+    expect(world.entities.has(dummy.id)).toBe(true);
+
+    // Safe zone blocks attacker inside 15m
+    const safeAttackerRes = devTools.fireSandboxLaser(dummy.id, { x: 0, y: 0, z: 8 }, 1000);
+    expect(safeAttackerRes.ok).toBe(false);
+    expect(safeAttackerRes.error).toMatch(/safe zone/i);
+
+    // Safe zone protects target dummy inside 15m
+    const safeDummy = devTools.spawnTargetDummy({ x: 0, y: 0, z: 5 }, 50);
+    const safeTargetRes = devTools.fireSandboxLaser(safeDummy.id, { x: 0, y: 0, z: -20 }, 1000);
+    expect(safeTargetRes.ok).toBe(false);
+    expect(safeTargetRes.error).toMatch(/safe zone/i);
+
+    // Range limit (> 45m) blocks fire
+    const outOfRangeRes = devTools.fireSandboxLaser(dummy.id, { x: 0, y: 0, z: 30 }, 1000);
+    expect(outOfRangeRes.ok).toBe(false);
+    expect(outOfRangeRes.error).toMatch(/range/i);
+
+    // In range outside safe zone: 25 dmg per shot, 500ms cooldown, 100 HP dummy dies on 4th hit
+    const attackPos = { x: 0, y: 0, z: -18 };
+    const hit1 = devTools.fireSandboxLaser(dummy.id, attackPos, 1000);
+    expect(hit1).toMatchObject({ ok: true, destroyed: false, remainingHp: 75 });
+
+    const cooldownRes = devTools.fireSandboxLaser(dummy.id, attackPos, 1200);
+    expect(cooldownRes.ok).toBe(false);
+    expect(cooldownRes.error).toMatch(/recharging/i);
+
+    expect(devTools.fireSandboxLaser(dummy.id, attackPos, 1600)).toMatchObject({
+      ok: true,
+      destroyed: false,
+      remainingHp: 50,
+    });
+    expect(devTools.fireSandboxLaser(dummy.id, attackPos, 2200)).toMatchObject({
+      ok: true,
+      destroyed: false,
+      remainingHp: 25,
+    });
+    const killRes = devTools.fireSandboxLaser(dummy.id, attackPos, 2800);
+    expect(killRes.ok).toBe(true);
+    expect(killRes.destroyed).toBe(true);
+    expect(killRes.remainingHp).toBe(0);
+    expect(world.entities.has(dummy.id)).toBe(false);
+    expect(killRes.state.station_vault.kills).toBe(1);
+    // Loot: 2x Solar Gold (60) + 1x Void Crystal (75) = 135 cr
+    expect(killRes.state.unbanked_cargo_value).toBe(135);
+
+    // Banking outside 15m safe zone fails with error and leaves cargo unbanked
+    const outsideBank = devTools.bankSandboxCargo({ x: 0, y: 0, z: -20 });
+    expect(outsideBank.error).toMatch(/15\.0m/);
+    expect(outsideBank.station_vault.banked_credits).toBe(0);
+    expect(outsideBank.unbanked_cargo_value).toBe(135);
+
+    // Banking inside 15m safe zone deposits items & credits into station_vault
+    const insideBank = devTools.bankSandboxCargo({ x: 0, y: 0, z: 8 });
+    expect(insideBank.error).toBeNull();
+    expect(insideBank.unbanked_cargo_value).toBe(0);
+    expect(insideBank.station_vault.banked_credits).toBe(135);
+    expect(insideBank.station_vault.banked_items).toHaveLength(2);
+    expect(insideBank.inventory.slots.every((s) => s === null)).toBe(true);
+  });
+
+  it("clears sandboxEnabled and removes dummy entities on onLiveAuthSucceeded()", () => {
+    const world = new ClientWorldBridge();
+    const devTools = new DevToolsController({ world });
+    const dummy = devTools.spawnTargetDummy({ x: 10, y: 0, z: -20 }, 150);
+
+    expect(devTools.sandboxEnabled).toBe(true);
+    expect(world.entities.has(dummy.id)).toBe(true);
+
+    devTools.onLiveAuthSucceeded();
+    expect(devTools.sandboxEnabled).toBe(false);
+    expect(devTools.dummies.size).toBe(0);
+    expect(world.entities.has(dummy.id)).toBe(false);
   });
 });

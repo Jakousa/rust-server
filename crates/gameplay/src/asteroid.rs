@@ -78,14 +78,30 @@ pub const ITEM_SOLAR_GOLD_ID: u32 = 2002;
 pub const ITEM_VOID_CRYSTAL_ID: u32 = 2003;
 
 /// Chunk coordinates seeded with volumetric 3D asteroids around the Home Orbital Station.
-pub const SEEDED_ASTEROID_CHUNKS: [VoxelChunkCoord; 6] = [
+pub const SEEDED_ASTEROID_CHUNKS: [VoxelChunkCoord; 10] = [
     VoxelChunkCoord::new(0, 0, -2),
     VoxelChunkCoord::new(1, 0, -1),
     VoxelChunkCoord::new(-2, 0, 0),
     VoxelChunkCoord::new(0, 1, -1),
     VoxelChunkCoord::new(1, 0, 1),
     VoxelChunkCoord::new(-1, -1, -2),
+    VoxelChunkCoord::new(-1, 0, -2),
+    VoxelChunkCoord::new(0, -1, -2),
+    VoxelChunkCoord::new(-1, 0, 1),
+    VoxelChunkCoord::new(1, -1, -1),
 ];
+
+/// Anchor positions for autonomous sector patrol drones outside the station safe zone.
+pub const ROGUE_DRONE_SPAWNS: [(f32, f32, f32); 2] = [(22.0, 0.0, -18.0), (-22.0, 2.0, -18.0)];
+
+/// Orbital patrol state attached to autonomous sector patrol drones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DronePatrolState {
+    pub anchor: (f32, f32, f32),
+    pub radius: f32,
+    pub angular_speed: f32,
+    pub angle: f32,
+}
 
 /// Permanent station vault storage & combat statistics attached to player ship entities.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -275,7 +291,15 @@ fn add_or_merge_item_respecting_capacity(inv: &mut InventoryComponent, stack: It
     }
 }
 
-type PendingOctreeRelocations = Arc<Mutex<Vec<(Guid, (f32, f32, f32), (f32, f32, f32))>>>;
+fn restock_drone_cargo(inv: &mut InventoryComponent) {
+    inv.slots.fill(None);
+    inv.currency = 0;
+    let _ = inv.add_item(ItemStack::new(ITEM_TITANIUM_ORE_ID, "Titanium Ore", 2, 2.0));
+    let _ = inv.add_item(ItemStack::new(ITEM_SOLAR_GOLD_ID, "Solar Gold", 1, 3.0));
+}
+
+type OctreeRelocation = (Guid, (f32, f32, f32), (f32, f32, f32));
+type PendingOctreeRelocations = Arc<Mutex<Vec<OctreeRelocation>>>;
 
 /// Handles full-loot transfer from victim to killer, kill/death counters,
 /// hull restoration, station respawn, and shininess recalculation.
@@ -331,14 +355,38 @@ fn handle_ship_destruction(
         }
     }
 
-    // Reset victim cargo, increment death counter, restore hull, and respawn at dock
+    // Reset victim cargo, increment death counter, restore hull, and respawn at dock or patrol anchor
     let Some(victim_ent) = entities.get_mut_by_guid(victim_guid) else {
         return;
     };
 
+    let is_npc = victim_guid.entity_type() == EntityType::Npc;
+    let respawn_pos = if is_npc {
+        if let Some(patrol) = victim_ent.get_component_mut::<DronePatrolState>() {
+            patrol.angle = 0.0;
+            (
+                patrol.anchor.0 + patrol.radius,
+                patrol.anchor.1,
+                patrol.anchor.2,
+            )
+        } else {
+            (
+                ROGUE_DRONE_SPAWNS[0].0 + 4.5,
+                ROGUE_DRONE_SPAWNS[0].1,
+                ROGUE_DRONE_SPAWNS[0].2,
+            )
+        }
+    } else {
+        DEFAULT_SHIP_SPAWN_POS
+    };
+
     if let Some(victim_inv) = victim_ent.get_component_mut::<InventoryComponent>() {
-        victim_inv.slots.fill(None);
-        victim_inv.currency = 0;
+        if is_npc {
+            restock_drone_cargo(victim_inv);
+        } else {
+            victim_inv.slots.fill(None);
+            victim_inv.currency = 0;
+        }
     }
 
     if let Some(vault) = victim_ent.get_component_mut::<StationVaultComponent>() {
@@ -358,7 +406,7 @@ fn handle_ship_destruction(
     sync_entity_health_properties(victim_ent);
 
     let old_pos = victim_ent.position;
-    victim_ent.position = DEFAULT_SHIP_SPAWN_POS;
+    victim_ent.position = respawn_pos;
     victim_ent.velocity = (0.0, 0.0, 0.0);
     update_entity_shininess(victim_ent);
 
@@ -366,10 +414,10 @@ fn handle_ship_destruction(
         if !tree.remove(victim_guid, old_pos) {
             tree.remove_by_guid(victim_guid);
         }
-        tree.insert(victim_guid, DEFAULT_SHIP_SPAWN_POS);
+        tree.insert(victim_guid, respawn_pos);
     } else if let Some(reloc) = pending_relocations {
         if let Ok(mut queue) = reloc.lock() {
-            queue.push((victim_guid, old_pos, DEFAULT_SHIP_SPAWN_POS));
+            queue.push((victim_guid, old_pos, respawn_pos));
         }
     }
 }
@@ -599,6 +647,49 @@ impl TickSystem for AsteroidMiningTickSystem {
                 None,
                 Some(&self.trade_manager),
             );
+        }
+
+        // 4.5. Advance autonomous NPC patrol drones along orbital paths and sync octree
+        let mut drone_moves: Vec<OctreeRelocation> = Vec::new();
+        let octree_bounds = ctx.octree.bounds;
+        for (_key, entity) in ctx.entities.iter_mut() {
+            if entity.guid.entity_type() != EntityType::Npc || entity.is_incapacitated() {
+                continue;
+            }
+            if entity
+                .get_component::<HealthComponent>()
+                .is_some_and(|h| h.is_dead)
+            {
+                continue;
+            }
+            let Some(patrol) = entity.get_component_mut::<DronePatrolState>() else {
+                continue;
+            };
+            patrol.angle = (patrol.angle + patrol.angular_speed * ctx.dt_sec)
+                .rem_euclid(std::f32::consts::TAU);
+            let raw_pos = (
+                patrol.anchor.0 + patrol.radius * patrol.angle.cos(),
+                patrol.anchor.1,
+                patrol.anchor.2 + patrol.radius * patrol.angle.sin(),
+            );
+            let new_pos = if octree_bounds.contains(raw_pos) {
+                raw_pos
+            } else {
+                octree_bounds.clamp_point(raw_pos)
+            };
+            let vx = -patrol.radius * patrol.angular_speed * patrol.angle.sin();
+            let vz = patrol.radius * patrol.angular_speed * patrol.angle.cos();
+            let old_pos = entity.position;
+            entity.position = new_pos;
+            entity.velocity = (vx, 0.0, vz);
+            entity.rotation = vx.atan2(vz);
+            drone_moves.push((entity.guid, old_pos, new_pos));
+        }
+        for (guid, old_pos, new_pos) in drone_moves {
+            if !ctx.octree.remove(guid, old_pos) {
+                ctx.octree.remove_by_guid(guid);
+            }
+            ctx.octree.insert(guid, new_pos);
         }
 
         // 5. Keep AoI-replicated health properties synchronized with HealthComponent (e.g. regen)
@@ -1037,6 +1128,13 @@ impl ModularPacketHandler for AsteroidPacketHandler {
             4 => {
                 let req: PlayerTradeStartRequest = parse_json_payload(payload)?;
                 let target = Guid::from_raw(req.target_guid);
+                if entity_guid.entity_type() != EntityType::Player
+                    || target.entity_type() != EntityType::Player
+                {
+                    return Err(PacketHandlerError::Custom(
+                        "Pilot trade requires a player target".to_string(),
+                    ));
+                }
                 let mut trade_mgr = self.trade_manager.lock().unwrap_or_else(|e| e.into_inner());
                 trade_mgr
                     .start_session(entity_guid, target, entities)
@@ -1255,6 +1353,27 @@ pub fn bootstrap_asteroid_world(sim: &mut TickSimulation) {
     );
     station_obj.state_flags |= world_object_flags::INTERACTIVE;
     sim.insert_world_object(station_obj);
+
+    for (idx, &anchor) in ROGUE_DRONE_SPAWNS.iter().enumerate() {
+        let drone_guid = Guid::new(EntityType::Npc, sim.node_id, (idx + 1) as u32);
+        let start_pos = (anchor.0 + 4.5, anchor.1, anchor.2);
+        sim.spawn_entity(drone_guid, start_pos);
+        if let Some(drone_ent) = sim.entity_store.get_mut_by_guid(drone_guid) {
+            let mut inv = InventoryComponent::new(16, 150.0);
+            restock_drone_cargo(&mut inv);
+            drone_ent.add_component(inv);
+            drone_ent.add_component(HealthComponent::new(100.0, 0.5));
+            drone_ent.add_component(StationVaultComponent::default());
+            drone_ent.add_component(DronePatrolState {
+                anchor,
+                radius: 4.5,
+                angular_speed: if idx == 0 { 0.45 } else { -0.4 },
+                angle: 0.0,
+            });
+            sync_entity_health_properties(drone_ent);
+            update_entity_shininess(drone_ent);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1998,5 +2117,253 @@ mod tests {
         let after_move_state: AsteroidSectorStateResponse =
             serde_json::from_slice(&after_move_bytes).unwrap();
         assert!(after_move_state.active_trade.is_none());
+    }
+
+    #[test]
+    fn test_all_seeded_asteroid_chunks_populated_outside_safe_zone() {
+        assert_eq!(SEEDED_ASTEROID_CHUNKS.len(), 10);
+        let world = seed_asteroid_voxel_world();
+
+        for coord in SEEDED_ASTEROID_CHUNKS {
+            let chunk_arc = world
+                .get_chunk(coord)
+                .unwrap_or_else(|| panic!("seeded chunk {:?} must exist", coord));
+            let chunk = chunk_arc.read().unwrap();
+
+            let mut solid_count = 0usize;
+            let mut ore_count = 0usize;
+            let mut crust_count = 0usize;
+
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let voxel = chunk.get(index_from_local(lx, ly, lz));
+                        if voxel == VOXEL_EMPTY {
+                            continue;
+                        }
+                        solid_count += 1;
+                        if voxel == VOXEL_CRUST_ROCK {
+                            crust_count += 1;
+                        } else if matches!(
+                            voxel,
+                            VOXEL_TITANIUM | VOXEL_SOLAR_GOLD | VOXEL_VOID_CRYSTAL
+                        ) {
+                            ore_count += 1;
+                        }
+
+                        let voxel_pos = coord.voxel_coord(lx, ly, lz).center_world_pos();
+                        let dist_station = distance_3d(voxel_pos, HOME_STATION_POS);
+                        assert!(
+                            dist_station > HOME_STATION_SAFE_RADIUS,
+                            "voxel {:?} in chunk {:?} at {:?} is inside safe radius ({:.2} <= {:.2})",
+                            voxel,
+                            coord,
+                            voxel_pos,
+                            dist_station,
+                            HOME_STATION_SAFE_RADIUS
+                        );
+                        let dist_spawn = distance_3d(voxel_pos, DEFAULT_SHIP_SPAWN_POS);
+                        assert!(
+                            dist_spawn > 2.0,
+                            "voxel {:?} in chunk {:?} at {:?} is too close to DEFAULT_SHIP_SPAWN_POS ({:.2})",
+                            voxel,
+                            coord,
+                            voxel_pos,
+                            dist_spawn
+                        );
+                    }
+                }
+            }
+
+            assert!(solid_count > 0, "chunk {:?} must have solid voxels", coord);
+            assert!(ore_count > 0, "chunk {:?} must have ore voxels", coord);
+            assert!(crust_count > 0, "chunk {:?} must have crust voxels", coord);
+        }
+    }
+
+    #[test]
+    fn test_npc_drone_patrol_octree_sync_and_trade_rejection() {
+        let mut sim = setup_asteroid_sim();
+        let drone1 = Guid::new(EntityType::Npc, sim.node_id, 1);
+        let drone2 = Guid::new(EntityType::Npc, sim.node_id, 2);
+
+        let initial_positions: Vec<(Guid, (f32, f32, f32))> = [drone1, drone2]
+            .into_iter()
+            .map(|guid| {
+                let ent = sim
+                    .entity_store
+                    .get_by_guid(guid)
+                    .expect("patrol drone spawned");
+                assert!(!is_in_safe_zone(ent.position));
+                assert_eq!(extract_shininess_tier(ent.state_flags), 10);
+                assert_eq!(
+                    ent.get_component::<HealthComponent>().unwrap().current_hp,
+                    100.0
+                );
+                assert!(ent.get_component::<DronePatrolState>().is_some());
+                (guid, ent.position)
+            })
+            .collect();
+
+        // Advance simulation ticks so both drones orbit along their paths
+        for _ in 0..10 {
+            sim.step_tick();
+        }
+
+        let octree_entries = sim.octree.query_radius_with_pos(HOME_STATION_POS, 100.0);
+        for (guid, initial_pos) in initial_positions {
+            let ent = sim.entity_store.get_by_guid(guid).unwrap();
+            assert_ne!(
+                ent.position, initial_pos,
+                "drone {:?} must orbit over ticks",
+                guid
+            );
+            assert!(
+                !is_in_safe_zone(ent.position),
+                "drone {:?} must remain outside 15.0m safe zone",
+                guid
+            );
+            let octree_pos = octree_entries
+                .iter()
+                .find(|(g, _)| *g == guid)
+                .map(|(_, pos)| *pos)
+                .expect("drone present in octree");
+            assert_eq!(
+                octree_pos, ent.position,
+                "octree position for {:?} must match entity_store",
+                guid
+            );
+        }
+
+        // Player initiating trade (sub_opcode = 4) against an NPC drone must be rejected
+        let player = Guid::new(EntityType::Player, 1, 701);
+        sim.spawn_entity(
+            player,
+            sim.entity_store.get_by_guid(drone1).unwrap().position,
+        );
+        let trade_req = serde_json::to_vec(&PlayerTradeStartRequest {
+            target_guid: drone1.raw(),
+        })
+        .unwrap();
+        let err = sim
+            .packets
+            .dispatch(
+                ASTEROID_MODULE_ID,
+                4,
+                player,
+                &trade_req,
+                &mut sim.entity_store,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PacketHandlerError::Custom(_)));
+    }
+
+    #[test]
+    fn test_npc_drone_destruction_transfers_loot_and_respawns_outside_safe_zone() {
+        let mut sim = setup_asteroid_sim();
+        let drone_guid = Guid::new(EntityType::Npc, sim.node_id, 1);
+
+        // Advance 2 ticks so drone moves away from angle == 0.0
+        sim.step_tick();
+        sim.step_tick();
+        let moved_pos = sim.entity_store.get_by_guid(drone_guid).unwrap().position;
+        assert_ne!(
+            sim.entity_store
+                .get_by_guid(drone_guid)
+                .unwrap()
+                .get_component::<DronePatrolState>()
+                .unwrap()
+                .angle,
+            0.0
+        );
+
+        let attacker = Guid::new(EntityType::Player, 1, 801);
+        let attacker_pos = (moved_pos.0 + 5.0, moved_pos.1, moved_pos.2);
+        assert!(!is_in_safe_zone(attacker_pos));
+        sim.spawn_entity(attacker, attacker_pos);
+
+        // Destroy the 100 HP drone using 4 authoritative sub_opcode=2 PvP laser dispatches (25 dmg each)
+        let fire_req = serde_json::to_vec(&FirePvpLaserRequest {
+            target_guid: drone_guid.raw(),
+        })
+        .unwrap();
+        let mut last_resp_bytes = Vec::new();
+        for shot in 0..4 {
+            if shot > 0 {
+                std::thread::sleep(Duration::from_millis(PVP_LASER_COOLDOWN_MS + 20));
+            }
+            last_resp_bytes = sim
+                .packets
+                .dispatch(
+                    ASTEROID_MODULE_ID,
+                    2,
+                    attacker,
+                    &fire_req,
+                    &mut sim.entity_store,
+                )
+                .expect("laser shot succeeds")
+                .expect("response present");
+        }
+        let final_resp: AsteroidSectorStateResponse =
+            serde_json::from_slice(&last_resp_bytes).unwrap();
+
+        // Attacker received 2x Titanium Ore + 1x Solar Gold and +1 kill
+        assert_eq!(final_resp.station_vault.as_ref().unwrap().kills, 1);
+        assert_eq!(final_resp.shininess_tier, 10);
+        let a_ent = sim.entity_store.get_by_guid(attacker).unwrap();
+        let a_inv = a_ent.get_component::<InventoryComponent>().unwrap();
+        assert!(a_inv.has_item_stack(&ItemStack::new(
+            ITEM_TITANIUM_ORE_ID,
+            "Titanium Ore",
+            2,
+            2.0
+        )));
+        assert!(a_inv.has_item_stack(&ItemStack::new(ITEM_SOLAR_GOLD_ID, "Solar Gold", 1, 3.0)));
+
+        // Drone respawned at its patrol anchor outside 15.0m with 100 HP, angle 0.0, restocked ore
+        let expected_respawn = (
+            ROGUE_DRONE_SPAWNS[0].0 + 4.5,
+            ROGUE_DRONE_SPAWNS[0].1,
+            ROGUE_DRONE_SPAWNS[0].2,
+        );
+        {
+            let d_ent = sim.entity_store.get_by_guid(drone_guid).unwrap();
+            assert_eq!(d_ent.position, expected_respawn);
+            assert!(!is_in_safe_zone(d_ent.position));
+            assert_eq!(
+                d_ent.get_component::<HealthComponent>().unwrap().current_hp,
+                100.0
+            );
+            assert_eq!(
+                d_ent.get_component::<DronePatrolState>().unwrap().angle,
+                0.0
+            );
+            assert_eq!(extract_shininess_tier(d_ent.state_flags), 10);
+            let d_inv = d_ent.get_component::<InventoryComponent>().unwrap();
+            assert!(d_inv.has_item_stack(&ItemStack::new(
+                ITEM_TITANIUM_ORE_ID,
+                "Titanium Ore",
+                2,
+                2.0
+            )));
+            assert!(d_inv.has_item_stack(&ItemStack::new(
+                ITEM_SOLAR_GOLD_ID,
+                "Solar Gold",
+                1,
+                3.0
+            )));
+        }
+
+        // Next tick flushes pending_octree_relocations cleanly and advances patrol by 1 tick
+        sim.step_tick();
+        let post_tick_pos = sim.entity_store.get_by_guid(drone_guid).unwrap().position;
+        assert!(!is_in_safe_zone(post_tick_pos));
+        let octree_entries = sim.octree.query_radius_with_pos(HOME_STATION_POS, 100.0);
+        let drone_octree_matches: Vec<(Guid, (f32, f32, f32))> = octree_entries
+            .into_iter()
+            .filter(|(g, _)| *g == drone_guid)
+            .collect();
+        assert_eq!(drone_octree_matches.len(), 1);
+        assert_eq!(drone_octree_matches[0].1, post_tick_pos);
     }
 }

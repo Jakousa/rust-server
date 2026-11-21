@@ -680,7 +680,150 @@ kbd {
   pointer-events: auto;
   width: 332px;
   margin-bottom: 0;
+  padding: 9px 12px;
   border-color: rgba(56, 189, 248, 0.3);
+}
+
+.asteroid-hud-container {
+  gap: 8px;
+}
+
+.asteroid-hud-container .panel-header {
+  margin-bottom: 5px;
+  padding-bottom: 4px;
+}
+
+.asteroid-hud-container .meter-block {
+  margin-bottom: 5px;
+}
+
+.asteroid-hud-container .inventory-weight-row {
+  margin-bottom: 5px;
+  padding: 3px 6px;
+}
+
+.asteroid-hud-container .inventory-grid {
+  max-height: 112px;
+  gap: 5px;
+}
+
+.asteroid-hud-container .inventory-slot {
+  height: 50px;
+  padding: 4px 5px;
+}
+
+.asteroid-hud-container .vault-divider {
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+.asteroid-hud-container .vault-items-list {
+  max-height: 38px;
+}
+
+.asteroid-hud-container .hud-buttons {
+  margin-top: 5px;
+  gap: 6px;
+}
+
+.asteroid-hud-container .hud-buttons button {
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.mission-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0;
+  padding: 5px 7px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.62);
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.mission-step {
+  color: var(--text-muted);
+}
+
+.mission-step.active {
+  color: #7dd3fc;
+  font-weight: 600;
+}
+
+.mission-step.done {
+  color: #6ee7b7;
+  text-decoration: line-through;
+  opacity: 0.85;
+}
+
+.aim-target-readout {
+  font-size: 10px;
+  color: #bae6fd;
+  background: rgba(2, 6, 23, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 5px;
+  padding: 3px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compact-btn {
+  padding: 4px 6px !important;
+  font-size: 10.5px !important;
+}
+
+/* DevTools Playtest Workbench Drawer */
+.devtools-toggle-btn {
+  background: rgba(30, 41, 59, 0.68);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  color: #cbd5e1;
+}
+
+.devtools-toggle-btn.active {
+  background: linear-gradient(135deg, #0f766e, #0d9488);
+  border-color: rgba(94, 234, 212, 0.5);
+  color: #f0fdfa;
+}
+
+.devtools-drawer {
+  position: fixed;
+  top: 62px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 32px));
+  z-index: 90;
+  border-color: rgba(45, 212, 191, 0.45);
+}
+
+.devtools-close-btn {
+  width: 24px;
+  height: 24px;
+  font-size: 16px;
+}
+
+.devtools-diagnostics {
+  font-size: 10.5px;
+  color: #99f6e4;
+  background: rgba(2, 6, 23, 0.55);
+  border: 1px solid rgba(45, 212, 191, 0.2);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin-bottom: 8px;
+}
+
+.devtools-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.devtools-btn {
+  padding: 6px 8px;
+  font-size: 11px;
 }
 
 .coin-purse {

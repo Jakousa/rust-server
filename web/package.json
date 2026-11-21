@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:local": "GATEWAY=local vite",
     "dev:village": "VITE_GAME_MODE=village vite",
     "dev:asteroid": "VITE_GAME_MODE=asteroid vite",
     "build": "vite build",

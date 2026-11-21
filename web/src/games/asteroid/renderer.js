@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { disposeHierarchy } from "../../renderer.js";
-import { CHUNK_SIZE, chunkKey } from "./voxel_client.js";
+import { CHUNK_SIZE, chunkKey, getVoxelMaterialInfo } from "./voxel_client.js";
 
 export const HOME_STATION_POS = Object.freeze({ x: 0, y: 0, z: 0 });
 export const HOME_STATION_SAFE_RADIUS = 15.0;
@@ -128,6 +128,7 @@ export class AsteroidRenderer {
     this.container = containerElement;
     this.entities = new Map();
     this.voxelChunkMeshes = new Map();
+    this.chunkBeacons = new Map();
     this.laserBeams = [];
 
     this.scene = new THREE.Scene();
@@ -140,12 +141,27 @@ export class AsteroidRenderer {
       metalness: 0.25,
     });
 
+    // Wireframe voxel aim reticle
+    const hlGeo = new THREE.BoxGeometry(1.06, 1.06, 1.06);
+    const hlEdges = new THREE.EdgesGeometry(hlGeo);
+    hlGeo.dispose();
+    const hlMat = new THREE.LineBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.92,
+    });
+    this.voxelHighlightMesh = new THREE.LineSegments(hlEdges, hlMat);
+    this.voxelHighlightMesh.visible = false;
+    this.voxelHighlightMesh.userData.preserveWireframe = true;
+    this.scene.add(this.voxelHighlightMesh);
+
     // Orbit camera state around the active ship
     this.orbitYaw = 0.0;
     this.orbitPitch = 0.32;
     this.orbitDistance = 20.0;
     this.isDragging = false;
     this.previousPointerPosition = { x: 0, y: 0 };
+    this._lastShipYaw = null;
 
     if (typeof window === "undefined" || !containerElement) {
       return;
@@ -987,7 +1003,85 @@ export class AsteroidRenderer {
   }
 
   /**
-   * Rebuilds any dirty voxel asteroid chunk meshes from `AsteroidVoxelClient`.
+   * Positions and tints the 3D wireframe aim highlight box over a targeted voxel.
+   */
+  setHighlightedVoxel(hit) {
+    if (!this.voxelHighlightMesh) return;
+    if (!hit) {
+      this.voxelHighlightMesh.visible = false;
+      return;
+    }
+    const cx = hit.center?.x ?? hit.x + 0.5;
+    const cy = hit.center?.y ?? hit.y + 0.5;
+    const cz = hit.center?.z ?? hit.z + 0.5;
+    this.voxelHighlightMesh.position.set(cx, cy, cz);
+    if (this.voxelHighlightMesh.material?.color) {
+      const matInfo = getVoxelMaterialInfo(hit.voxelId);
+      this.voxelHighlightMesh.material.color.setHex(matInfo.hex || 0x38bdf8);
+    }
+    this.voxelHighlightMesh.visible = true;
+  }
+
+  _removeChunkBeacon(key) {
+    const existingBeacon = this.chunkBeacons.get(key);
+    if (existingBeacon) {
+      this.scene.remove(existingBeacon);
+      disposeHierarchy(existingBeacon);
+      this.chunkBeacons.delete(key);
+    }
+  }
+
+  _upsertChunkBeacon(key, entry) {
+    const color = (entry.oreCount ?? 0) > 0 ? 0xfacc15 : 0x38bdf8;
+    const opacity = entry.isPreview ? 0.28 : 0.48;
+    let beaconGroup = this.chunkBeacons.get(key);
+    if (!beaconGroup) {
+      beaconGroup = new THREE.Group();
+      beaconGroup.position.set(
+        entry.x * CHUNK_SIZE + 8.0,
+        entry.y * CHUNK_SIZE + 8.0,
+        entry.z * CHUNK_SIZE + 8.0
+      );
+      beaconGroup.userData.preserveWireframe = true;
+
+      const ringGeo = new THREE.TorusGeometry(7.2, 0.08, 6, 40);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity,
+      });
+      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+      ringMesh.rotation.x = Math.PI / 2;
+      ringMesh.userData.preserveWireframe = true;
+      beaconGroup.add(ringMesh);
+
+      const markerGeo = new THREE.OctahedronGeometry(0.42, 0);
+      const markerMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: Math.min(0.9, opacity + 0.3),
+      });
+      const markerMesh = new THREE.Mesh(markerGeo, markerMat);
+      markerMesh.position.set(0, 7.6, 0);
+      markerMesh.userData.preserveWireframe = true;
+      beaconGroup.add(markerMesh);
+
+      beaconGroup.userData.ringMat = ringMat;
+      beaconGroup.userData.markerMat = markerMat;
+      this.chunkBeacons.set(key, beaconGroup);
+      this.scene.add(beaconGroup);
+    } else {
+      beaconGroup.userData.ringMat?.color?.setHex?.(color);
+      beaconGroup.userData.markerMat?.color?.setHex?.(color);
+      if (beaconGroup.userData.ringMat) beaconGroup.userData.ringMat.opacity = opacity;
+      if (beaconGroup.userData.markerMat) {
+        beaconGroup.userData.markerMat.opacity = Math.min(0.9, opacity + 0.3);
+      }
+    }
+  }
+
+  /**
+   * Rebuilds any dirty voxel asteroid chunk meshes and cluster beacons from `AsteroidVoxelClient`.
    */
   syncVoxelChunks(voxelClient) {
     if (!voxelClient || voxelClient.dirtyMeshes.size === 0) return;
@@ -1003,6 +1097,7 @@ export class AsteroidRenderer {
           existingMesh.geometry?.dispose?.();
           this.voxelChunkMeshes.delete(key);
         }
+        this._removeChunkBeacon(key);
         continue;
       }
 
@@ -1015,6 +1110,7 @@ export class AsteroidRenderer {
           existingMesh.geometry?.dispose?.();
           this.voxelChunkMeshes.delete(key);
         }
+        this._removeChunkBeacon(key);
         continue;
       }
 
@@ -1028,6 +1124,7 @@ export class AsteroidRenderer {
         this.voxelChunkMeshes.set(key, mesh);
         this.scene.add(mesh);
       }
+      this._upsertChunkBeacon(key, entry);
     }
   }
 
@@ -1145,14 +1242,41 @@ export class AsteroidRenderer {
   }
 
   /**
-   * Follows the player ship in 3D with interactive spherical orbit camera.
+   * Immediately aligns the orbit camera directly behind the ship's current nose heading.
    */
-  updateCamera(targetPos) {
-    if (!targetPos || !this.camera) return;
+  alignCameraBehindShip(shipYaw, shipPitch = 0.0) {
+    if (!Number.isFinite(shipYaw)) return;
+    this.orbitYaw = shipYaw + Math.PI;
+    this.orbitPitch = Math.max(-1.2, Math.min(1.2, 0.28 - (Number(shipPitch) || 0) * 0.4));
+    this._lastShipYaw = shipYaw;
+  }
+
+  /**
+   * Follows the player ship in 3D with interactive spherical orbit camera.
+   * Gently tracks heading changes when the ship rotates unless the player is dragging.
+   */
+  updateCamera(targetPos, shipYaw = null) {
+    if (!targetPos) return;
 
     if (this.aoiRing) {
       this.aoiRing.position.set(targetPos.x, targetPos.y, targetPos.z);
     }
+
+    if (Number.isFinite(shipYaw)) {
+      if (this._lastShipYaw === null) {
+        this._lastShipYaw = shipYaw;
+      } else if (!this.isDragging) {
+        let deltaYaw = shipYaw - this._lastShipYaw;
+        while (deltaYaw > Math.PI) deltaYaw -= Math.PI * 2;
+        while (deltaYaw < -Math.PI) deltaYaw += Math.PI * 2;
+        if (Math.abs(deltaYaw) > 1e-4) {
+          this.orbitYaw += deltaYaw;
+        }
+      }
+      this._lastShipYaw = shipYaw;
+    }
+
+    if (!this.camera) return;
 
     const cosPitch = Math.cos(this.orbitPitch);
     const sinPitch = Math.sin(this.orbitPitch);
@@ -1229,6 +1353,13 @@ export class AsteroidRenderer {
       }
     }
 
+    // Animate asteroid cluster beacons
+    let beaconIdx = 0;
+    for (const beacon of this.chunkBeacons.values()) {
+      beacon.rotation.y = now * 0.0005 + beaconIdx * 0.7;
+      beaconIdx++;
+    }
+
     // Animate ship loot-beacon rings and engine thruster flames
     let shipIdx = 0;
     for (const group of this.entities.values()) {
@@ -1300,6 +1431,16 @@ export class AsteroidRenderer {
       chunkMesh.geometry?.dispose?.();
     }
     this.voxelChunkMeshes.clear();
+
+    for (const beacon of this.chunkBeacons.values()) {
+      this.scene.remove(beacon);
+      disposeHierarchy(beacon);
+    }
+    this.chunkBeacons.clear();
+
+    if (this.voxelHighlightMesh) {
+      this.voxelHighlightMesh.visible = false;
+    }
 
     for (const beam of this.laserBeams) {
       this.scene.remove(beam.mesh);

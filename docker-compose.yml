@@ -95,6 +95,66 @@ services:
     profiles:
       - loadtest
 
+  asteroid-director:
+    image: jakousa/mmo-server:latest
+    container_name: mmo-asteroid-director
+    command: ["mmo-director"]
+    environment:
+      GATEWAY_GRPC_ADDR: "http://asteroid-gateway:50050"
+      ADMIN_ADDR: "0.0.0.0:9091"
+    networks:
+      - mmo-net
+    restart: unless-stopped
+    profiles:
+      - asteroid
+      - full
+
+  asteroid-node:
+    image: jakousa/mmo-server:latest
+    container_name: mmo-asteroid-node
+    command: ["mmo-asteroid-node"]
+    environment:
+      NODE_ID: "1"
+      LISTEN_ADDR: "0.0.0.0:50052"
+      ADMIN_ADDR: "0.0.0.0:9091"
+      DIRECTOR_ADDR: "http://asteroid-director:50051"
+      GATEWAY_GRPC_ADDR: "http://asteroid-gateway:50050"
+    networks:
+      - mmo-net
+    depends_on:
+      - asteroid-director
+    restart: unless-stopped
+    profiles:
+      - asteroid
+      - full
+
+  asteroid-gateway:
+    image: jakousa/mmo-server:latest
+    container_name: mmo-asteroid-gateway
+    command: ["mmo-gateway"]
+    environment:
+      GATEWAY_ID: "gw-asteroid-1"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      WEBTRANSPORT_ADDR: "0.0.0.0:4434"
+      WEBSOCKET_ADDR: "0.0.0.0:8444"
+      ADMIN_ADDR: "0.0.0.0:9092"
+      GRPC_ADDR: "0.0.0.0:50050"
+      DIRECTOR_ADDR: "http://asteroid-director:50051"
+      DEFAULT_NODE_ADDR: "asteroid-node:50052"
+    networks:
+      - mmo-net
+    ports:
+      - "4434:4434/udp"
+      - "8444:8444"
+      - "9092:9092"
+    depends_on:
+      - asteroid-node
+      - asteroid-director
+    restart: unless-stopped
+    profiles:
+      - asteroid
+      - full
+
   postgres:
     image: postgres:16-alpine
     container_name: mmo-postgres
