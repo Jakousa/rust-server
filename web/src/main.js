@@ -1120,8 +1120,6 @@ if (typeof window !== "undefined") {
     if (certFromUrl) {
       const certInput = document.getElementById("cert-hash");
       if (certInput) certInput.value = certFromUrl;
-    } else {
-      await autoFetchCertHash(activeGameMode);
     }
 
     let nearestTarget = null;
@@ -1433,13 +1431,9 @@ if (typeof window !== "undefined") {
       }
     }
 
-    // Mount initial cartridge
+    // Mount initial cartridge synchronously before async cert discovery
+    let modeSwitchCount = 0;
     mountGameMode(activeGameMode, false);
-
-    // Auto-connect (WebTransport with automatic WebSocket fallback)
-    setTimeout(() => {
-      ui.btnConnect?.click();
-    }, 150);
 
     // Interaction response listener for Village, Voxel (0x00A0), and Asteroid (0x0003) HUD updates
     world.onInteractionResult((res) => {
@@ -1607,6 +1601,7 @@ if (typeof window !== "undefined") {
     ui.initEvents({
       onGameModeChange: async (nextMode) => {
         if (nextMode !== activeGameMode) {
+          modeSwitchCount++;
           mountGameMode(nextMode, true);
           ui.showToast(
             nextMode === "asteroid"
@@ -1862,5 +1857,18 @@ if (typeof window !== "undefined") {
     }
 
     requestAnimationFrame(animate);
+
+    if (!certFromUrl) {
+      const bootMode = activeGameMode;
+      await autoFetchCertHash(bootMode);
+      if (modeSwitchCount > 0) {
+        await autoFetchCertHash(activeGameMode, true);
+      }
+    }
+    setTimeout(() => {
+      if (modeSwitchCount === 0) {
+        ui.btnConnect?.click();
+      }
+    }, 150);
   });
 }
