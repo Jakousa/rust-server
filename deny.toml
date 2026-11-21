@@ -71,6 +71,14 @@ feature-depth = 1
 # output a note when they are encountered.
 ignore = [
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 is transitive via sqlx 0.8.6; sqlite is only used for trusted local/in-memory stores (never untrusted -wal files), and no sqlx 0.8 patch exists." },
+    { id = "RUSTSEC-2026-0566", reason = "mmo-gameplay pins wasmtime with default-features = false (wasi/wasi-http disabled) and only executes trusted server-side scripts." },
+    { id = "RUSTSEC-2026-0567", reason = "mmo-gameplay pins wasmtime with default-features = false (threads disabled) and only executes trusted server-side scripts." },
+    { id = "RUSTSEC-2026-0568", reason = "mmo-gameplay pins wasmtime with default-features = false (gc disabled) and only executes trusted server-side scripts." },
+    { id = "RUSTSEC-2026-0569", reason = "mmo-gameplay pins wasmtime with default-features = false and only executes trusted server-side scripts without untrusted host re-entrancy." },
+    { id = "RUSTSEC-2026-0570", reason = "mmo-gameplay pins wasmtime with default-features = false (gc disabled) and only executes trusted server-side scripts." },
+    { id = "RUSTSEC-2026-0571", reason = "mmo-gameplay pins wasmtime with default-features = false (wasmtime-wasi-http disabled)." },
+    { id = "RUSTSEC-2026-0572", reason = "mmo-gameplay pins wasmtime with default-features = false (component-model-async disabled)." },
+    { id = "RUSTSEC-2026-0573", reason = "mmo-gameplay pins wasmtime with default-features = false (gc disabled) and only executes trusted server-side scripts." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

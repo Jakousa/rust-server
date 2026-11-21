@@ -1,0 +1,52 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mmo-asteroid
+
+resources:
+  - ../../base
+  - web.yaml
+
+configMapGenerator:
+  - name: mmo-web-nginx-config
+    files:
+      - default.conf=nginx-default.conf
+
+patches:
+  - target:
+      version: v1
+      kind: Namespace
+      name: mmo
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: mmo-asteroid
+  - target:
+      kind: StatefulSet
+      name: mmo-node
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: mmo-node
+      spec:
+        template:
+          spec:
+            containers:
+              - name: node
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    ORDINAL=${HOSTNAME##*-}
+                    export NODE_ID=$((ORDINAL + 1))
+                    echo "Starting simulation node with dynamic NODE_ID=${NODE_ID} (hostname: ${HOSTNAME})"
+                    if [ -n "${STARTUP_DELAY_SECS:-}" ] && [ "${STARTUP_DELAY_SECS}" -gt 0 ] 2>/dev/null; then
+                      echo "Applying startup delay of ${STARTUP_DELAY_SECS}s..."
+                      sleep "${STARTUP_DELAY_SECS}"
+                    fi
+                    echo "Starting asteroid simulation node (mmo-asteroid-node)..."
+                    exec mmo-asteroid-node
+                env:
+                  - name: DATABASE_URL
+                    value: "postgres://mmo:mmo_secret@postgres.mmo-asteroid.svc.cluster.local:5432/mmo_db"

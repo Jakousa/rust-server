@@ -6,6 +6,7 @@ resources:
   - prometheus.yaml
   - grafana.yaml
   - web.yaml
+  - asteroid.yaml
   - cluster-issuer.yaml
   - middleware-redirect.yaml
 
@@ -48,3 +49,7 @@ configMapGenerator:
     namespace: mmo
     files:
       - dashboards/mmo-overview.json
+  - name: mmo-web-nginx-config
+    namespace: mmo
+    files:
+      - default.conf=nginx-default.conf

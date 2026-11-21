@@ -143,14 +143,72 @@ To minimize network egress bandwidth:
 | **`mmo-director`** | Cluster topology & health | `ClusterDirector`, `SpatialRegistry`, `HeartbeatTracker`, `OrphanRecoveryCoordinator` |
 | **`mmo-gateway`** | Edge connection ingress | `GatewayServer`, `SessionRouter`, `WebTransportServer`, `WebSocketServer`, `SessionSink`, `SessionDropGuard` |
 | **`mmo-storage`** | Distributed SQL persistence | `StorageEngine`, `PostgresRepository`, `SqliteRepository`, `TransactionCoordinator`, `TradeCoordinator`, `SocialBus` |
-| **`mmo-gameplay`** | Pluggable game rules | `CombatPlugin`, `ThreatPlugin`, `InventoryPlugin`, `TradePlugin`, `BarterPlugin`, `MonsterAiPlugin`, `ScriptEngine` |
-| **`mmo-plugin-voxel`** | Volumetric 3D voxel terrain | `VoxelPlugin`, `VoxelWorld`, `PaletteChunk`, `VoxelPacketHandler`, `VoxelWriteBehindService` |
+| **`mmo-gameplay`** | Pluggable game rules & binaries | `CombatPlugin`, `ThreatPlugin`, `InventoryPlugin`, `TradePlugin`, `VillagePlugin`, `AsteroidMiningPlugin`, `NpcMovementPlugin`, `MonsterAiPlugin`, `WasmScriptPlugin` |
+| **`mmo-plugin-voxel`** | Volumetric 3D voxel terrain | `VoxelTerrainPlugin`, `VoxelWorld`, `PaletteChunk`, `VoxelPacketHandler`, `VoxelWriteBehindService` |
 | **`mmo-client-wasm`** | Zero-duplication browser WASM | `WasmClientWorld`, `InterpolationBuffer`, `ClientEntityReplica`, `decode_voxel_chunk_mesh` |
 | **`mmo-loadtest`** | Scale & chaos load harness | `BotSwarm`, `BotSession`, `MovementProfile`, `MetricsCollector` |
 
 ---
 
-## 6. Storage & Write-Behind Persistence
+## 6. Dual-Game Architecture & Plugin Composition
+
+The platform proves strict engine decoupling by composing two radically different games—**Game A: Medieval Village & Barter RPG** (`mmo-village-node`) and **Game B: Competitive 6DoF Voxel Asteroid Miners** (`mmo-asteroid-node`)—out of the identical `mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`, `mmo-schema`, and `mmo-client-wasm` substrate.
+
+### Plugin Composition Matrix
+
+| Subsystem / Plugin | Ownership | Game A: Medieval Village & Barter RPG (`mmo-village-node`) | Game B: Competitive 6DoF Voxel Asteroid Miners (`mmo-asteroid-node`) |
+| :--- | :--- | :--- | :--- |
+| **`mmo-core`, `mmo-node`, `mmo-director`, `mmo-gateway`, `mmo-storage`** | **Shared Core** | Identical runtime crates & container binaries (`mmo-director`, `mmo-gateway`) | Identical runtime crates & container binaries (`mmo-director`, `mmo-gateway`) |
+| **Kinematic Physics Mode (`crates/node/src/kinematics.rs`)** | **Configured per Node** | `MotionMode::DiscreteGround` (2D XZ surface movement) | `MotionMode::Newtonian6DoF` (3D XYZ zero-G thrusters with damping) |
+| **`InventoryPlugin` (`crates/gameplay/src/inventory.rs`)** | **Shared Plugin** | Coin purse & village item bags (`InventoryComponent`, encumbrance) | Ship cargo hold (`InventoryComponent`, weight & slot limits for ore) |
+| **`TradePlugin` (`crates/gameplay/src/trade.rs`)** | **Shared Plugin** | Atomic two-player village trading via `TradeManager` | Atomic two-player docked pilot ore/credit trading via `TradeManager` |
+| **`VillagePlugin` (`module_id = 0x02`) + `NpcMovementPlugin`** | **Game A Exclusive** | NPC artisans, barter recipes, patrol waypoints, starter kits | Not installed |
+| **`VoxelTerrainPlugin` (`module_id = 0x00A0`)** | **Game B Exclusive** | Not installed | `16×16×16` `PaletteChunk` RLE asteroids (`Crust=1`, `Titanium=2`, `Gold=3`, `Void Crystal=4`), emits `VoxelChangeEvent` |
+| **`CombatPlugin` (`crates/gameplay/src/combat.rs`)** | **Game B Exclusive** | Not installed | Hull integrity (`HealthComponent`), PvP damage & `EntityDiedEvent` |
+| **`AsteroidMiningPlugin` (`module_id = 0x03`)** | **Game B Exclusive** | Not installed | Harvests `VoxelChangeEvent` ore, encodes `state_flags` bits `16..23` shininess, PvP full-loot transfer & Home Station Vault (`StationVaultComponent`) |
+| **Browser Cartridge (`web/src/`)** | **Shared Transport + Game UI** | `village` mode (`?game=village` / default) over `transport.js` & `protocol.js` | `asteroid` mode (`?game=asteroid` / `VITE_GAME_MODE=asteroid`) over `transport.js` & `protocol.js` |
+
+### Cross-Plugin Decoupling & Zero-Protocol-Change Visual Replication
+
+In Game B (`mmo-asteroid-node`), plugins remain completely decoupled from each other and from core crates:
+1. **Event-Mediated Voxel Harvesting**: `VoxelTerrainPlugin` (`mmo-plugin-voxel`) has zero dependency on `InventoryPlugin`. Instead, `VoxelTickSystem` pushes `VoxelChangeEvent` into `TickContext::events`, and `AsteroidMiningTickSystem` consumes those events on the same 20 Hz tick to grant ore `ItemStack`s into `InventoryComponent`.
+2. **Zero-Schema-Change Ship Shininess**: `AsteroidMiningPlugin` encodes each ship's unbanked cargo value tier (`0..=255`) into `Entity::state_flags` bits `16..23`. `AoiManager` already delta-replicates `state_flags` changes at 20 Hz, allowing the browser renderer to scale metallic emissive/aura shaders without changing wire schemas (`mmo-schema`) or WASM bindings (`mmo-client-wasm`).
+3. **Full-Loot PvP & Safe Station Vault**: Outside the Home Orbital Station safe ring (`(0, 0, 0)`, radius `15.0`), PvP laser shots (`module_id = 0x03`, `sub_opcode = 2`) trigger `CombatPlugin` hull damage and full-loot cargo transfer on `EntityDiedEvent`. Pilots docked inside the safe ring can deposit cargo into permanent `StationVaultComponent` storage (`sub_opcode = 3`) or trade safely via the shared `TradePlugin` (`sub_opcode = 4..=7`).
+
+### Side-by-Side Dual-Game Kubernetes Topology
+
+Both games are packaged in the unified `mmo-server` [`Dockerfile`](Dockerfile) (bundling `mmo-director`, `mmo-node`, `mmo-village-node`, `mmo-asteroid-node`, `mmo-gateway`, and `mmo-loadtest`) and deployed into isolated Kubernetes namespaces using Kustomize overlays:
+
+```mermaid
+flowchart LR
+    subgraph NS_V["Namespace: mmo-village (k8s/overlays/game-village)"]
+        V_WEB["mmo-web\n(GAME_MODE=village / ?game=village)"]
+        V_GW["mmo-gateway"]
+        V_DIR["mmo-director"]
+        V_NODE["mmo-node StatefulSet\n(exec mmo-village-node)"]
+        V_PG[("postgres\n(mmo-village)")]
+        V_WEB <--> V_GW
+        V_GW <--> V_NODE
+        V_DIR <--> V_NODE
+        V_NODE --> V_PG
+    end
+
+    subgraph NS_A["Namespace: mmo-asteroid (k8s/overlays/game-asteroid)"]
+        A_WEB["mmo-web\n(GAME_MODE=asteroid / ?game=asteroid)"]
+        A_GW["mmo-gateway"]
+        A_DIR["mmo-director"]
+        A_NODE["mmo-node StatefulSet\n(exec mmo-asteroid-node)"]
+        A_PG[("postgres\n(mmo-asteroid)")]
+        A_WEB <--> A_GW
+        A_GW <--> A_NODE
+        A_DIR <--> A_NODE
+        A_NODE --> A_PG
+    end
+```
+
+---
+
+## 7. Storage & Write-Behind Persistence
 
 The storage tier separates high-frequency simulation state updates from relational database persistence:
 - **Write-Behind Coalesced Snapshotting**: Dirty entity and world-object state changes are coalesced in memory during the tick and flushed asynchronously in batches using parameterized multi-row `INSERT ... ON CONFLICT DO UPDATE` queries.
@@ -159,12 +217,14 @@ The storage tier separates high-frequency simulation state updates from relation
 
 ---
 
-## 7. Deployment Topologies & Operational Guides
+## 8. Deployment Topologies & Operational Guides
 
 | Environment | Entry Point | Topology & Services | Reference |
 | :--- | :--- | :--- | :--- |
 | **Local Single-Command Demo** | `docker compose up -d` | `director`, `node-1` (`mmo-village-node`), `node-2` (`mmo-node`), `gateway`, `web` (`:3000`), optional `storage` & `loadtest` profiles | [`docker-compose.yml`](docker-compose.yml) |
-| **Frontend Dev Server** | `npm --prefix web run dev` | Vite HMR dev server (`:3000`) connecting to local/Compose/k3d `mmo-gateway` | [`web/vite.config.js`](web/vite.config.js) |
+| **Native Local Dual-Game Dev** | `cargo run --bin mmo-asteroid-node` / `mmo-village-node` + `npm --prefix web run dev` | Local `mmo-director`, `mmo-gateway`, chosen game node binary, and Vite HMR (`?game=village` or `?game=asteroid`) | [`README.md`](README.md) |
 | **Local Kubernetes (`k3d`)** | `./scripts/cluster.sh all` | `k8s/k3d.yaml` + `k8s/overlays/local/` (`mmo-director`, `mmo-gateway`, `mmo-node` StatefulSet, `postgres`, Prometheus `:9090`, Grafana `:3000`) | [`scripts/cluster.sh`](scripts/cluster.sh) |
+| **Dual-Game K8s: Village RPG** | `kubectl kustomize k8s/overlays/game-village` / `kubectl apply -k ...` | Namespace `mmo-village`: shared `mmo-director`/`mmo-gateway`/`postgres`, `mmo-node` running `mmo-village-node`, `mmo-web` serving `village` mode | [`k8s/overlays/game-village/`](k8s/overlays/game-village/kustomization.yaml) |
+| **Dual-Game K8s: Asteroid Miners** | `kubectl kustomize k8s/overlays/game-asteroid` / `kubectl apply -k ...` | Namespace `mmo-asteroid`: shared `mmo-director`/`mmo-gateway`/`postgres`, `mmo-node` running `mmo-asteroid-node`, `mmo-web` serving `asteroid` mode | [`k8s/overlays/game-asteroid/`](k8s/overlays/game-asteroid/kustomization.yaml) |
 | **Cloud PoC & Flux GitOps** | `kubectl apply -k k8s/overlays/cloud` | `k8s/overlays/cloud/` + `k8s/flux-system/` with Let's Encrypt HTTPS ingress, `/cert-hash` routing, UDP `:4433`, WSS `:8443` | [`docs/CLOUD_POC_DEPLOYMENT.md`](docs/CLOUD_POC_DEPLOYMENT.md) |
 | **External Client & Godot SDKs** | `0x4D4D` Binary Framing | Custom native/Godot client connectivity, auth handshake, and `EntityDeltaBatch` decoding | [`docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md`](docs/WIRE_PROTOCOL_AND_CLIENT_SDK.md), [`docs/GODOT_CLIENT_INTEGRATION.md`](docs/GODOT_CLIENT_INTEGRATION.md) |

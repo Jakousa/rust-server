@@ -25,6 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/mmo-director \
        /app/target/release/mmo-node \
        /app/target/release/mmo-village-node \
+       /app/target/release/mmo-asteroid-node \
        /app/target/release/mmo-gateway \
        /app/target/release/mmo-loadtest \
        /app/bin/
@@ -43,6 +44,7 @@ WORKDIR /app
 COPY --from=builder /app/bin/mmo-director /usr/local/bin/mmo-director
 COPY --from=builder /app/bin/mmo-node /usr/local/bin/mmo-node
 COPY --from=builder /app/bin/mmo-village-node /usr/local/bin/mmo-village-node
+COPY --from=builder /app/bin/mmo-asteroid-node /usr/local/bin/mmo-asteroid-node
 COPY --from=builder /app/bin/mmo-gateway /usr/local/bin/mmo-gateway
 COPY --from=builder /app/bin/mmo-loadtest /usr/local/bin/mmo-loadtest
 

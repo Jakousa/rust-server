@@ -1,7 +1,20 @@
+import * as THREE from "three";
 import { WebTransportClient } from "./transport.js";
 import { WorldRenderer } from "./renderer.js";
 import { PlayerControls } from "./controls.js";
 import { UIController } from "./ui.js";
+import {
+  AsteroidRenderer,
+  HOME_STATION_SAFE_RADIUS,
+} from "./games/asteroid/renderer.js";
+import { SpaceFlightControls } from "./games/asteroid/controls.js";
+import {
+  AsteroidVoxelClient,
+  VOXEL_MODULE_ID,
+  VOXEL_EMPTY,
+  voxelCoordToChunk,
+  chunkKey,
+} from "./games/asteroid/voxel_client.js";
 import {
   OPCODES,
   INTERACTION_TYPES,
@@ -19,6 +32,98 @@ import {
   readVarintString,
   readPropertyMap,
 } from "./protocol.js";
+
+export const VILLAGE_MODULE_ID = 0x0002;
+export const ASTEROID_MODULE_ID = 0x0003;
+export const PVP_LASER_RANGE = 45.0;
+
+/**
+ * Resolves the active game cartridge mode (`"village"` or `"asteroid"`).
+ * Priority: `?game=asteroid|village` URL query -> URL subpath (`/asteroid` or `/village`) -> `envMode` (`VITE_GAME_MODE`) -> `"village"`.
+ */
+export function resolveGameMode(search = "", envMode = "", pathname = "") {
+  const normalize = (raw) => {
+    if (typeof raw !== "string") return "";
+    const val = raw.trim().toLowerCase();
+    if (
+      val === "asteroid" ||
+      val === "asteroids" ||
+      val === "asteroid-miners" ||
+      val === "game-b"
+    ) {
+      return "asteroid";
+    }
+    if (
+      val === "village" ||
+      val === "village-rpg" ||
+      val === "game-a"
+    ) {
+      return "village";
+    }
+    return "";
+  };
+
+  if (typeof search === "string" && search.trim().length > 0) {
+    try {
+      const qs = search.startsWith("?") ? search : `?${search}`;
+      const params = new URLSearchParams(qs);
+      const fromQuery = normalize(params.get("game") || "");
+      if (fromQuery) return fromQuery;
+    } catch (_) {
+      // Ignore malformed query strings
+    }
+  }
+
+  if (typeof pathname === "string" && pathname.trim().length > 0) {
+    const segments = pathname.split("/").filter(Boolean);
+    for (const seg of segments) {
+      const fromPath = normalize(seg);
+      if (fromPath) return fromPath;
+    }
+  }
+
+  const fromEnv = normalize(envMode);
+  if (fromEnv) return fromEnv;
+
+  return "village";
+}
+
+/**
+ * Resolves per-game WebTransport, WebSocket fallback, and cert-hash discovery endpoints.
+ */
+export function resolveGatewayConfig(gameMode = "village", locationObj = null) {
+  const loc =
+    locationObj ||
+    (typeof window !== "undefined" ? window.location : null);
+  const host = loc?.hostname || "127.0.0.1";
+  const originHost = loc?.host || host;
+  const wsProto = loc?.protocol === "https:" ? "wss:" : "ws:";
+  const mode = gameMode === "asteroid" ? "asteroid" : "village";
+
+  if (mode === "asteroid") {
+    return {
+      mode: "asteroid",
+      subpath: "/asteroid",
+      wtUrl: `https://${host}:4434`,
+      wsPathUrl: `${wsProto}//${originHost}/asteroid/ws`,
+      wsPortUrl: `${wsProto}//${host}:8444`,
+      wsPort: 8444,
+      adminPort: 9092,
+      certHashPaths: ["/asteroid/cert-hash"],
+    };
+  }
+
+  return {
+    mode: "village",
+    subpath: "/village",
+    wtUrl: `https://${host}:4433`,
+    wsPathUrl: `${wsProto}//${originHost}/village/ws`,
+    wsPortUrl: `${wsProto}//${host}:8443`,
+    wsPort: 8443,
+    adminPort: 9091,
+    certHashPaths: ["/village/cert-hash", "/cert-hash"],
+  };
+}
 
 /**
  * Shortest-arc angular interpolation in radians wrapped to [0, 2*PI).
@@ -152,10 +257,11 @@ export class ClientWorldBridge {
       const success = view.getUint8(12) === 1;
       const errorCode = view.getUint32(13, true);
       const payloadLen = view.getUint32(17, true);
+      let payloadBytes = new Uint8Array(0);
       let payloadJson = null;
       let payloadText = "";
       if (view.byteLength >= 21 + payloadLen && payloadLen > 0) {
-        const payloadBytes = new Uint8Array(data.buffer, data.byteOffset + 21, payloadLen);
+        payloadBytes = new Uint8Array(data.buffer, data.byteOffset + 21, payloadLen);
         payloadText = new TextDecoder().decode(payloadBytes);
         try {
           payloadJson = JSON.parse(payloadText);
@@ -169,6 +275,7 @@ export class ClientWorldBridge {
           errorCode,
           text: payloadText,
           data: payloadJson,
+          rawBytes: payloadBytes,
         });
       }
       return;
@@ -185,8 +292,10 @@ export class ClientWorldBridge {
       const vy = view.getFloat32(32, true);
       const vz = view.getFloat32(36, true);
       const yaw = view.getFloat32(40, true);
+      const pitch = view.getFloat32(44, true);
       const health = view.getUint32(48, true);
       const maxHealth = view.getUint32(52, true);
+      const stateFlags = view.getUint32(56, true);
 
       const entityType = Number((rawEntityId >> 48n) & 0xffffn);
       const existing = this.entities.get(entityId);
@@ -205,8 +314,12 @@ export class ClientWorldBridge {
           vz,
           yaw,
           serverYaw: yaw,
+          pitch,
+          health,
+          maxHealth,
           hpPct: maxHealth > 0 ? health / maxHealth : 1.0,
           castPct: 0.0,
+          stateFlags,
           type: entityType,
         });
       } else {
@@ -217,7 +330,11 @@ export class ClientWorldBridge {
         existing.vy = vy;
         existing.vz = vz;
         existing.serverYaw = yaw;
+        existing.pitch = pitch;
+        existing.health = health;
+        existing.maxHealth = maxHealth;
         existing.hpPct = maxHealth > 0 ? health / maxHealth : 1.0;
+        existing.stateFlags = stateFlags;
         existing.type = entityType;
       }
 
@@ -444,6 +561,8 @@ export class ClientWorldBridge {
               maxHealth: maxHealth ?? 100,
               hpPct: (maxHealth && maxHealth > 0) ? (health ?? 100) / maxHealth : 1.0,
               castPct: 0.0,
+              stateFlags: stateFlags ?? 0,
+              actionId: actionId ?? 0,
               type: entityType,
             };
             this.entities.set(entityId, ent);
@@ -887,59 +1006,59 @@ export class ClientWorldBridge {
  * Returns or generates a unique session token stored in sessionStorage
  * so concurrent browser tabs authenticate as distinct characters.
  */
-export function getOrCreateSessionToken() {
+export function getOrCreateSessionToken(gameMode = "village") {
   if (typeof window === "undefined" || !window.sessionStorage) {
-    return "guest-poc";
+    return gameMode === "asteroid" ? "guest-poc-asteroid" : "guest-poc";
   }
   const params = new URLSearchParams(window.location.search);
   const tokenParam = params.get("token");
+  let baseToken = tokenParam;
   if (tokenParam) {
     window.sessionStorage.setItem("mmo_token", tokenParam);
-    return tokenParam;
+  } else {
+    baseToken = window.sessionStorage.getItem("mmo_token");
+    if (!baseToken) {
+      const rand = Math.random().toString(36).substring(2, 8);
+      const ts = Date.now().toString(36);
+      baseToken = `guest-${ts}-${rand}`;
+      window.sessionStorage.setItem("mmo_token", baseToken);
+    }
   }
-  let token = window.sessionStorage.getItem("mmo_token");
-  if (!token) {
-    const rand = Math.random().toString(36).substring(2, 8);
-    const ts = Date.now().toString(36);
-    token = `guest-${ts}-${rand}`;
-    window.sessionStorage.setItem("mmo_token", token);
-  }
-  return token;
+  return gameMode === "asteroid" ? `${baseToken}-asteroid` : baseToken;
 }
 
 /**
  * Automatically retrieves the ephemeral SHA-256 certificate digest
- * exposed by TelemetryServer GET /cert-hash.
+ * exposed by TelemetryServer GET /cert-hash for the active game mode.
  */
-export async function autoFetchCertHash() {
+export async function autoFetchCertHash(gameMode = "village", force = false) {
   const certInput = document.getElementById("cert-hash");
-  if (certInput && certInput.value.trim().length > 0) return;
+  if (!force && certInput && certInput.value.trim().length > 0) return;
+  if (force && certInput) {
+    certInput.value = "";
+  }
   try {
-    // 1. First try relative /cert-hash (works over both HTTP and HTTPS via ingress reverse proxy)
-    let res = null;
-    try {
-      res = await fetch("/cert-hash");
-    } catch {
-      // Fallback below
-    }
+    const gwConfig = resolveGatewayConfig(gameMode);
+    const proto = window.location.protocol === "https:" ? "https:" : "http:";
+    const host = window.location.hostname || "127.0.0.1";
+    const candidateUrls = [
+      ...gwConfig.certHashPaths,
+      `${proto}//${host}:${gwConfig.adminPort}/cert-hash`,
+      `http://${host}:${gwConfig.adminPort}/cert-hash`,
+    ];
 
-    if (!res || !res.ok) {
-      // 2. Fall back to port 9091 matching active protocol or HTTP
-      const proto = window.location.protocol === "https:" ? "https:" : "http:";
-      const adminUrl = `${proto}//${window.location.hostname || "127.0.0.1"}:9091/cert-hash`;
+    for (const candidateUrl of candidateUrls) {
       try {
-        res = await fetch(adminUrl);
+        const res = await fetch(candidateUrl);
+        if (!res || !res.ok) continue;
+        const data = await res.json();
+        if (data && typeof data.cert_hash === "string" && data.cert_hash.length > 0) {
+          if (certInput) certInput.value = data.cert_hash;
+          console.log(`[WebTransport] Auto-discovered certificate hash (${gameMode}):`, data.cert_hash);
+          return;
+        }
       } catch {
-        // Fall back to plain http
-        res = await fetch(`http://${window.location.hostname || "127.0.0.1"}:9091/cert-hash`);
-      }
-    }
-
-    if (res && res.ok) {
-      const data = await res.json();
-      if (data && data.cert_hash) {
-        if (certInput) certInput.value = data.cert_hash;
-        console.log("[WebTransport] Auto-discovered certificate hash:", data.cert_hash);
+        // Try next candidate endpoint
       }
     }
   } catch (err) {
@@ -961,343 +1080,787 @@ export function formatConnectionError(err) {
 // Application Bootstrap
 if (typeof window !== "undefined") {
   window.addEventListener("DOMContentLoaded", async () => {
-  const container = document.getElementById("canvas-container");
-  const renderer = new WorldRenderer(container);
-  const controls = new PlayerControls();
-  const transport = new WebTransportClient();
-  const ui = new UIController();
-  const world = new ClientWorldBridge();
+    const container = document.getElementById("canvas-container");
+    const transport = new WebTransportClient();
+    const ui = new UIController();
+    const world = new ClientWorldBridge();
 
-  // Dynamic gateway host resolution
-  const host = window.location.hostname || "127.0.0.1";
-  const defaultGatewayUrl = `https://${host}:4433`;
-  const urlInput = document.getElementById("gateway-url");
-  if (urlInput && (!urlInput.value || urlInput.value.includes("127.0.0.1"))) {
-    urlInput.value = defaultGatewayUrl;
-  }
+    const runtimeEnvMode =
+      (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_GAME_MODE) ||
+      window.__GAME_MODE__ ||
+      window.__MMO_GAME_MODE__ ||
+      "";
+    let activeGameMode = resolveGameMode(
+      window.location.search,
+      runtimeEnvMode,
+      window.location.pathname
+    );
 
-  // Try to load cert hash from URL parameters if provided (e.g. ?cert=aa:bb:cc...)
-  const params = new URLSearchParams(window.location.search);
-  const certFromUrl = params.get("cert");
-  if (certFromUrl) {
-    const certInput = document.getElementById("cert-hash");
-    if (certInput) certInput.value = certFromUrl;
-  } else {
-    await autoFetchCertHash();
-  }
+    const controlsByMode = { village: null, asteroid: null };
+    let voxelClient = null;
+    let activeRenderer = null;
+    let activeControls = null;
 
-  // Auto-connect (WebTransport with automatic WebSocket fallback)
-  setTimeout(() => {
-    ui.btnConnect?.click();
-  }, 150);
-
-  let nearestTarget = null;
-  let activeTradeSessionId = 0;
-
-  // Interaction response listener for Village HUD updates
-  world.onInteractionResult((res) => {
-    if (!res.data) return;
-
-    // 1. Update player inventory if included (authoritative VillageTradeStateResponse.inventory)
-    const inv = res.data.inventory || res.data.player_inventory;
-    const currentWeight = res.data.current_weight ?? inv?.current_weight;
-    if (inv) {
-      ui.updateInventory(inv, currentWeight);
+    // Dynamic gateway host resolution
+    const initialGwConfig = resolveGatewayConfig(activeGameMode);
+    const urlInput = document.getElementById("gateway-url");
+    if (
+      urlInput &&
+      (!urlInput.value ||
+        urlInput.value.includes("127.0.0.1") ||
+        urlInput.value.endsWith(":4433") ||
+        urlInput.value.endsWith(":4434"))
+    ) {
+      urlInput.value = initialGwConfig.wtUrl;
     }
 
-    // 2. Open NPC Barter modal if merchant data present (authoritative target_merchant)
-    const merchant = res.data.target_merchant || res.data.npc_merchant;
-    if (merchant && nearestTarget) {
-      ui.showNpcBarter(merchant, (recipeId) => {
-        // Send Sub-opcode 2: NpcBarter
-        const actionId = (0x0002 << 16) | 2;
-        const payload = new TextEncoder().encode(
-          JSON.stringify({ target_guid: nearestTarget.id, recipe_id: recipeId })
-        );
-        const pkt = encodeInteraction(
-          world.localPlayerGuid,
-          nearestTarget.id,
-          actionId,
-          payload,
-          INTERACTION_TYPES.TRADE
-        );
+    // Try to load cert hash from URL parameters if provided (e.g. ?cert=aa:bb:cc...)
+    const params = new URLSearchParams(window.location.search);
+    const certFromUrl = params.get("cert");
+    if (certFromUrl) {
+      const certInput = document.getElementById("cert-hash");
+      if (certInput) certInput.value = certFromUrl;
+    } else {
+      await autoFetchCertHash(activeGameMode);
+    }
+
+    let nearestTarget = null;
+    let nearestAsteroidTarget = null;
+    let activeTradeSessionId = 0;
+    let latestAsteroidState = null;
+    let lastChunkProbeKey = "";
+    let hasSyncedInitialPosition = false;
+    const raycaster = new THREE.Raycaster();
+    const pointerNdc = new THREE.Vector2();
+
+    function toSafeGuid(val) {
+      if (val == null) return null;
+      return Number(val);
+    }
+
+    function sendAsteroidInteraction(
+      subOpcode,
+      targetGuid = 0,
+      body = {},
+      interactionType = INTERACTION_TYPES.CUSTOM
+    ) {
+      if (!transport.connected) return;
+      const actionId = ((ASTEROID_MODULE_ID << 16) | (subOpcode & 0xffff)) >>> 0;
+      const payload = new TextEncoder().encode(JSON.stringify(body));
+      const pkt = encodeInteraction(
+        world.localPlayerGuid,
+        targetGuid ?? 0,
+        actionId,
+        payload,
+        interactionType
+      );
+      transport.sendStream(pkt);
+    }
+
+    function sendVillageInteraction(
+      subOpcode,
+      targetGuid = 0,
+      body = {},
+      interactionType = INTERACTION_TYPES.TRADE
+    ) {
+      if (!transport.connected) return;
+      const actionId = ((VILLAGE_MODULE_ID << 16) | (subOpcode & 0xffff)) >>> 0;
+      const payload = new TextEncoder().encode(JSON.stringify(body));
+      const pkt = encodeInteraction(
+        world.localPlayerGuid,
+        targetGuid ?? 0,
+        actionId,
+        payload,
+        interactionType
+      );
+      transport.sendStream(pkt);
+    }
+
+    function performInspect(target) {
+      if (!transport.connected || !target) return;
+      if (activeGameMode === "asteroid") {
+        sendAsteroidInteraction(1, target.id, {
+          target_guid: target.id ? toSafeGuid(target.id) : null,
+        });
+      } else {
+        sendVillageInteraction(1, target.id, { target_guid: toSafeGuid(target.id) });
+      }
+    }
+
+    function requestVisibleAsteroidChunks(force = false) {
+      if (activeGameMode !== "asteroid" || !transport.connected || !voxelClient || !activeControls) {
+        return;
+      }
+      const { chunk } = voxelCoordToChunk(
+        Math.floor(activeControls.position.x),
+        Math.floor(activeControls.position.y),
+        Math.floor(activeControls.position.z)
+      );
+      const key = chunkKey(chunk.x, chunk.y, chunk.z);
+      if (!force && key === lastChunkProbeKey) return;
+      lastChunkProbeKey = key;
+
+      const candidates = [
+        ...voxelClient.collectUnrequestedChunks(activeControls.position, 2, 1, 2),
+        ...voxelClient.collectUnrequestedChunks({ x: 0, y: 0, z: 0 }, 2, 1, 2),
+      ];
+      for (const c of candidates) {
+        const pkt = voxelClient.encodeChunkRequestPacket(world.localPlayerGuid, c.x, c.y, c.z);
         transport.sendStream(pkt);
+      }
+    }
+
+    function fireMiningLaser(explicitTarget = null) {
+      if (activeGameMode !== "asteroid" || !transport.connected || !voxelClient || !activeControls) {
+        return;
+      }
+      const target =
+        explicitTarget ||
+        voxelClient.raycastFirstSolid(
+          activeControls.position,
+          activeControls.getForwardVector(),
+          12.0
+        ) ||
+        voxelClient.findNearestSolidVoxel(activeControls.position, 6.5, true);
+
+      if (!target) {
+        ui.showToast("Fly near an asteroid block (<=6.5m) or click a block to mine.", "info", 2000);
+        return;
+      }
+
+      const targetCenter = target.center || {
+        x: target.x + 0.5,
+        y: target.y + 0.5,
+        z: target.z + 0.5,
+      };
+      activeRenderer?.spawnLaserBeam?.(activeControls.position, targetCenter, 0x38bdf8, 220);
+      const pkt = voxelClient.encodeModifyRequestPacket(
+        world.localPlayerGuid,
+        target.x,
+        target.y,
+        target.z,
+        VOXEL_EMPTY
+      );
+      transport.sendStream(pkt);
+    }
+
+    function firePvpLaser(explicitTarget = null) {
+      if (activeGameMode !== "asteroid" || !transport.connected || !activeControls) return;
+      const target = explicitTarget || nearestAsteroidTarget;
+      if (!target) {
+        ui.showToast("No rival ship within 45m laser range.", "warning", 2000);
+        return;
+      }
+      activeRenderer?.spawnLaserBeam?.(activeControls.position, target, 0xf43f5e, 240);
+      sendAsteroidInteraction(
+        2,
+        target.id,
+        { target_guid: toSafeGuid(target.id) },
+        INTERACTION_TYPES.ATTACK
+      );
+    }
+
+    function bindAsteroidCanvasPicking(rendererInstance) {
+      const canvas = rendererInstance?.renderer?.domElement;
+      if (!canvas) return;
+      let downPos = null;
+
+      canvas.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        if (
+          e.target &&
+          e.target.closest &&
+          e.target.closest("#hud-overlay, #asteroid-hud, .modal-overlay, #game-mode-switcher")
+        ) {
+          return;
+        }
+        downPos = { x: e.clientX, y: e.clientY };
+      });
+
+      canvas.addEventListener("pointerup", (e) => {
+        if (activeGameMode !== "asteroid" || !downPos || e.button !== 0) return;
+        const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+        downPos = null;
+        if (moved >= 6 || !rendererInstance.camera) return;
+
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(pointerNdc, rendererInstance.camera);
+
+        // 1. Check rival ships for PvP laser targeting
+        const shipHits = raycaster.intersectObjects(
+          rendererInstance.getShipMeshes(world.localPlayerGuid),
+          true
+        );
+        if (shipHits.length > 0) {
+          let obj = shipHits[0].object;
+          while (obj && obj.userData?.guid == null) {
+            obj = obj.parent;
+          }
+          if (obj && obj.userData?.guid != null) {
+            const targetGuid = obj.userData.guid;
+            const entKey =
+              targetGuid <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(targetGuid) : targetGuid;
+            const ent = world.entities.get(entKey) ?? world.entities.get(targetGuid);
+            if (ent && activeControls) {
+              const dist = Math.hypot(
+                ent.x - activeControls.position.x,
+                ent.y - activeControls.position.y,
+                ent.z - activeControls.position.z
+              );
+              if (dist <= PVP_LASER_RANGE) {
+                firePvpLaser({ ...ent, distance: dist });
+                return;
+              }
+            }
+          }
+        }
+
+        // 2. Check asteroid voxel chunks for laser mining
+        const voxelHits = raycaster.intersectObjects(rendererInstance.getChunkMeshObjects(), false);
+        if (voxelHits.length > 0 && voxelHits[0].face) {
+          const hit = voxelHits[0];
+          const n = hit.face.normal;
+          const vx = Math.floor(hit.point.x - n.x * 0.1);
+          const vy = Math.floor(hit.point.y - n.y * 0.1);
+          const vz = Math.floor(hit.point.z - n.z * 0.1);
+          fireMiningLaser({
+            x: vx,
+            y: vy,
+            z: vz,
+            center: { x: vx + 0.5, y: vy + 0.5, z: vz + 0.5 },
+          });
+        }
       });
     }
 
-    // 3. Open Player Trade modal if active trade session present (authoritative active_trade)
-    const tradeSession = res.data.active_trade || res.data.trade_session;
-    if (tradeSession) {
-      activeTradeSessionId = tradeSession.session_id || activeTradeSessionId;
-      ui.showPlayerTrade(tradeSession);
+    function mountGameMode(nextMode, updateHistory = true) {
+      const prevMode = activeGameMode;
+      const targetMode = nextMode === "asteroid" ? "asteroid" : "village";
+
+      if (activeRenderer) {
+        activeRenderer.clear?.();
+        if (typeof activeRenderer.dispose === "function") {
+          activeRenderer.dispose();
+        } else {
+          activeRenderer.renderer?.dispose?.();
+          activeRenderer.renderer?.domElement?.remove?.();
+        }
+        activeRenderer = null;
+      }
+
+      if (container && typeof container.replaceChildren === "function") {
+        container.replaceChildren();
+      }
+
+      activeGameMode = targetMode;
+      if (activeGameMode === "asteroid") {
+        activeRenderer = new AsteroidRenderer(container);
+        if (!controlsByMode.asteroid) {
+          const flightControls = new SpaceFlightControls();
+          flightControls.onMine(() => {
+            if (activeGameMode === "asteroid") fireMiningLaser();
+          });
+          flightControls.onFireLaser(() => {
+            if (activeGameMode === "asteroid") firePvpLaser();
+          });
+          controlsByMode.asteroid = flightControls;
+        }
+        activeControls = controlsByMode.asteroid;
+        voxelClient ??= new AsteroidVoxelClient();
+        bindAsteroidCanvasPicking(activeRenderer);
+      } else {
+        activeRenderer = new WorldRenderer(container);
+        if (!controlsByMode.village) {
+          const groundControls = new PlayerControls();
+          groundControls.onCast(() => {
+            if (activeGameMode !== "village" || !transport.connected) return;
+            const pkt = encodeInteraction(
+              world.localPlayerGuid,
+              nearestTarget ? nearestTarget.id : 0,
+              42,
+              new Uint8Array(0),
+              INTERACTION_TYPES.ATTACK
+            );
+            transport.sendStream(pkt);
+          });
+          controlsByMode.village = groundControls;
+        }
+        activeControls = controlsByMode.village;
+      }
+
+      if (ui.togglePartitions) {
+        activeRenderer.setPartitionsVisible(ui.togglePartitions.checked);
+      }
+      if (ui.toggleAoi) {
+        activeRenderer.setAoiVisible(ui.toggleAoi.checked);
+      }
+      if (ui.toggleWireframe) {
+        activeRenderer.setWireframe(ui.toggleWireframe.checked);
+      }
+
+      const gwConfig = resolveGatewayConfig(activeGameMode);
+      if (
+        urlInput &&
+        (!urlInput.value ||
+          urlInput.value.includes("127.0.0.1") ||
+          urlInput.value.endsWith(":4433") ||
+          urlInput.value.endsWith(":4434"))
+      ) {
+        urlInput.value = gwConfig.wtUrl;
+      }
+
+      ui.setGameMode(activeGameMode);
+      if (updateHistory && typeof window.history?.replaceState === "function") {
+        try {
+          const nextUrl = new URL(window.location.href);
+          nextUrl.pathname = gwConfig.subpath;
+          if (nextUrl.searchParams.has("game")) {
+            nextUrl.searchParams.delete("game");
+          }
+          window.history.replaceState(null, "", nextUrl.toString());
+        } catch (_) {}
+      }
+
+      if (transport.connected && prevMode === activeGameMode) {
+        performInspect({ id: 0 });
+        if (activeGameMode === "asteroid") {
+          lastChunkProbeKey = "";
+          requestVisibleAsteroidChunks(true);
+        }
+      }
     }
 
-    // 4. Close trade modal if trade completed
-    if (res.data.trade_completed || (tradeSession && tradeSession.completed)) {
-      ui.hidePlayerTrade();
-    }
-  });
+    // Mount initial cartridge
+    mountGameMode(activeGameMode, false);
 
-  // Network Packet Ingestion
-  transport.onPacket((data) => {
-    world.processPacket(data);
-  });
+    // Auto-connect (WebTransport with automatic WebSocket fallback)
+    setTimeout(() => {
+      ui.btnConnect?.click();
+    }, 150);
 
-  // Authoritative server movement correction listener
-  let hasSyncedInitialPosition = false;
-  world.onAuthResponse(() => {
-    hasSyncedInitialPosition = false;
-  });
-  world.onLocalPlayerKeyframe((state) => {
-    const snapError = Math.hypot(
-      controls.position.x - state.x,
-      controls.position.y - state.y,
-      controls.position.z - state.z
-    );
-    if (!hasSyncedInitialPosition || snapError > 10.0) {
-      controls.setPosition(state.x, state.y, state.z);
-      hasSyncedInitialPosition = true;
-    }
-  });
+    // Interaction response listener for Village, Voxel (0x00A0), and Asteroid (0x0003) HUD updates
+    world.onInteractionResult((res) => {
+      const moduleId = (res.actionId >>> 16) & 0xffff;
 
-  world.onMovementCorrection((corr) => {
-    if (BigInt(corr.entityId) === BigInt(world.localPlayerGuid)) {
-      controls.reconcile(corr.sequence, corr.x, corr.y, corr.z);
-      hasSyncedInitialPosition = true;
-    }
-  });
+      // 1. Voxel Subsystem (0x00A0) binary chunk & modify responses
+      if (moduleId === VOXEL_MODULE_ID) {
+        if (!voxelClient || !res.rawBytes || res.rawBytes.byteLength === 0) return;
+        const handled = voxelClient.handleInteractionResult(res.actionId, res.rawBytes);
+        if (handled?.type === "modify_response") {
+          if (handled.status === 0) {
+            performInspect({ id: 0 });
+          } else if (handled.status === 1) {
+            ui.showToast("Target asteroid block is out of mining reach!", "warning", 2000);
+          } else if (handled.status === 2) {
+            ui.showToast("Mining laser recharging...", "info", 1200);
+          }
+        }
+        return;
+      }
 
-  // Baseline Ack Hook: Send ClientAck upon observing new server tick
-  world.onServerTick(({ sessionId, serverTick }) => {
-    if (transport.connected && sessionId) {
-      const ackPkt = encodeClientAck(sessionId, serverTick, 0);
-      transport.sendDatagram(ackPkt);
-    }
-  });
+      if (!res.data) return;
 
-  transport.onStatus(({ status, error }) => {
-    const statusText =
-      status === "connected"
-        ? "Connected"
-        : status === "connecting"
-        ? "Connecting"
-        : "Disconnected";
-    const errorMsg =
-      status === "disconnected" && error ? formatConnectionError(error) : "";
-    ui.setConnectionState(status, statusText, errorMsg);
-    if (status === "disconnected") {
+      function syncTradeModal(payload, completionToast) {
+        const tradeSession = payload.active_trade || payload.trade_session;
+        if (tradeSession) {
+          activeTradeSessionId = tradeSession.session_id || activeTradeSessionId;
+          ui.showPlayerTrade(tradeSession);
+        }
+        if (payload.trade_completed || (tradeSession && tradeSession.completed)) {
+          ui.hidePlayerTrade();
+          if (completionToast) {
+            ui.showToast(completionToast, "success", 2800);
+          }
+        }
+      }
+
+      // 2. Asteroid Mining Plugin (0x0003) JSON state responses
+      if (moduleId === ASTEROID_MODULE_ID) {
+        const prevDeaths = latestAsteroidState?.station_vault?.deaths;
+        const nextDeaths = res.data.station_vault?.deaths;
+        if (
+          prevDeaths !== undefined &&
+          nextDeaths !== undefined &&
+          nextDeaths > prevDeaths &&
+          activeGameMode === "asteroid" &&
+          activeControls
+        ) {
+          activeControls.setPosition(0.0, 0.0, 8.0);
+          if (activeControls.velocity) {
+            activeControls.velocity = { x: 0.0, y: 0.0, z: 0.0 };
+          }
+          ui.showToast("Ship destroyed! Respawned at Home Orbital Station.", "error", 3200);
+        }
+
+        latestAsteroidState = res.data;
+        ui.updateAsteroidState(res.data);
+
+        const localEnt = world.entities.get(world.localPlayerGuid);
+        if (localEnt) {
+          if (res.data.shininess_tier !== undefined) {
+            const tier = Number(res.data.shininess_tier) & 0xff;
+            localEnt.stateFlags = ((localEnt.stateFlags || 0) & 0xff00ffff) | (tier << 16);
+          }
+          if (res.data.hull_hp !== undefined && res.data.max_hull_hp > 0) {
+            localEnt.hpPct = res.data.hull_hp / res.data.max_hull_hp;
+          }
+        }
+
+        if (res.data.error) {
+          ui.showToast(res.data.error, "warning", 2800);
+        }
+
+        syncTradeModal(res.data, "Station pilot trade completed!");
+        return;
+      }
+
+      // 3. Village RPG (0x0002) state responses
+      const inv = res.data.inventory || res.data.player_inventory;
+      const currentWeight = res.data.current_weight ?? inv?.current_weight;
+      if (inv) {
+        ui.updateInventory(inv, currentWeight);
+      }
+
+      const merchant = res.data.target_merchant || res.data.npc_merchant;
+      if (merchant && nearestTarget) {
+        ui.showNpcBarter(merchant, (recipeId) => {
+          sendVillageInteraction(2, nearestTarget.id, {
+            target_guid: toSafeGuid(nearestTarget.id),
+            recipe_id: recipeId,
+          });
+        });
+      }
+
+      syncTradeModal(res.data, "");
+    });
+
+    // Network Packet Ingestion
+    transport.onPacket((data) => {
+      world.processPacket(data);
+    });
+
+    // Authoritative server movement & initial auth hydration listeners
+    world.onAuthResponse(() => {
       hasSyncedInitialPosition = false;
-      world.clear();
-      renderer.clear();
-    }
-    if (error) {
-      console.warn("Transport status notice:", error);
-    }
-  });
-
-  function performInspect(target) {
-    if (!transport.connected || !target) return;
-    // Sub-opcode 1: Inspect
-    const actionId = (0x0002 << 16) | 1;
-    const payload = new TextEncoder().encode(JSON.stringify({ target_guid: target.id }));
-    const pkt = encodeInteraction(
-      world.localPlayerGuid,
-      target.id,
-      actionId,
-      payload,
-      INTERACTION_TYPES.TRADE
-    );
-    transport.sendStream(pkt);
-  }
-
-  // UI Event Bindings
-  ui.initEvents({
-    onConnect: async (url, certHash) => {
-      try {
-        ui.setConnectionState("connecting", "Connecting", "");
-        await transport.connect(url, certHash);
-        // Send AuthRequest handshake upon connection with isolated session token
-        const sessionToken = getOrCreateSessionToken();
-        const authPkt = encodeAuthRequest(sessionToken, 1);
-        await transport.sendStream(authPkt);
-
-        // Initial inventory inspection query
-        setTimeout(() => {
-          performInspect({ id: 0 });
-        }, 200);
-      } catch (err) {
-        const errorMsg = formatConnectionError(err);
-        console.warn("Failed to connect via WebTransport:", errorMsg);
-        ui.setConnectionState("disconnected", "Disconnected", errorMsg);
+      lastChunkProbeKey = "";
+      performInspect({ id: 0 });
+      if (activeGameMode === "asteroid") {
+        requestVisibleAsteroidChunks(true);
       }
-    },
-    onDisconnect: async () => {
-      await transport.disconnect();
-      world.clear();
-      renderer.clear();
-    },
-    onTogglePartitions: (visible) => renderer.setPartitionsVisible(visible),
-    onToggleAoi: (visible) => renderer.setAoiVisible(visible),
-    onToggleWireframe: (wireframe) => renderer.setWireframe(wireframe),
-    onInteract: () => {
-      if (nearestTarget) {
-        performInspect(nearestTarget);
+    });
+
+    world.onLocalPlayerKeyframe((state) => {
+      if (!activeControls) return;
+      const snapError = Math.hypot(
+        activeControls.position.x - state.x,
+        activeControls.position.y - state.y,
+        activeControls.position.z - state.z
+      );
+      if (!hasSyncedInitialPosition || snapError > 10.0) {
+        activeControls.setPosition(state.x, state.y, state.z);
+        hasSyncedInitialPosition = true;
       }
-    },
-    onTradeOffer: (gold, items) => {
-      if (!transport.connected) return;
-      const actionId = (0x0002 << 16) | 4; // Sub-opcode 4: Offer
-      const payload = new TextEncoder().encode(
-        JSON.stringify({ session_id: activeTradeSessionId, currency: gold, items })
-      );
-      const pkt = encodeInteraction(
-        world.localPlayerGuid,
-        nearestTarget ? nearestTarget.id : 0,
-        actionId,
-        payload,
-        INTERACTION_TYPES.TRADE
-      );
-      transport.sendStream(pkt);
-    },
-    onTradeAccept: () => {
-      if (!transport.connected) return;
-      const actionId = (0x0002 << 16) | 5; // Sub-opcode 5: Accept
-      const payload = new TextEncoder().encode(
-        JSON.stringify({ session_id: activeTradeSessionId })
-      );
-      const pkt = encodeInteraction(
-        world.localPlayerGuid,
-        nearestTarget ? nearestTarget.id : 0,
-        actionId,
-        payload,
-        INTERACTION_TYPES.TRADE
-      );
-      transport.sendStream(pkt);
-    },
-    onTradeCancel: () => {
-      if (!transport.connected) return;
-      const actionId = (0x0002 << 16) | 6; // Sub-opcode 6: Cancel
-      const payload = new TextEncoder().encode(
-        JSON.stringify({ session_id: activeTradeSessionId })
-      );
-      const pkt = encodeInteraction(
-        world.localPlayerGuid,
-        nearestTarget ? nearestTarget.id : 0,
-        actionId,
-        payload,
-        INTERACTION_TYPES.TRADE
-      );
-      transport.sendStream(pkt);
-    },
-  });
+    });
 
-  // Action Cast Hook
-  controls.onCast(() => {
-    if (!transport.connected) return;
-    const pkt = encodeInteraction(
-      world.localPlayerGuid,
-      nearestTarget ? nearestTarget.id : 0,
-      42,
-      new Uint8Array(0),
-      INTERACTION_TYPES.ATTACK
-    );
-    transport.sendStream(pkt);
-  });
-
-  // Keyboard shortcut: E to interact with nearest target
-  window.addEventListener("keydown", (e) => {
-    if ((e.key === "e" || e.key === "E") && !e.repeat) {
-      // If modal is open, ignore
-      if (ui.npcBarterModal && ui.npcBarterModal.style.display !== "none") return;
-      if (ui.playerTradeModal && ui.playerTradeModal.style.display !== "none") return;
-
-      if (nearestTarget) {
-        performInspect(nearestTarget);
+    world.onMovementCorrection((corr) => {
+      if (!activeControls) return;
+      if (BigInt(corr.entityId) === BigInt(world.localPlayerGuid)) {
+        activeControls.reconcile(corr.sequence, corr.x, corr.y, corr.z, corr.vx, corr.vy, corr.vz);
+        hasSyncedInitialPosition = true;
       }
+    });
+
+    // Baseline Ack Hook: Send ClientAck upon observing new server tick
+    world.onServerTick(({ sessionId, serverTick }) => {
+      if (transport.connected && sessionId) {
+        const ackPkt = encodeClientAck(sessionId, serverTick, 0);
+        transport.sendDatagram(ackPkt);
+      }
+    });
+
+    transport.onStatus(({ status, error, transportMode }) => {
+      const statusText =
+        status === "connected"
+          ? "Connected"
+          : status === "connecting"
+          ? "Connecting"
+          : "Disconnected";
+      const errorMsg =
+        status === "disconnected" && error ? formatConnectionError(error) : "";
+      ui.setConnectionState(status, statusText, errorMsg, transportMode || "");
+      if (status === "disconnected") {
+        hasSyncedInitialPosition = false;
+        lastChunkProbeKey = "";
+        world.clear();
+        voxelClient?.clear();
+        activeRenderer?.clear();
+      }
+      if (error) {
+        console.warn("Transport status notice:", error);
+      }
+    });
+
+    // UI Event Bindings
+    ui.initEvents({
+      onGameModeChange: async (nextMode) => {
+        if (nextMode !== activeGameMode) {
+          mountGameMode(nextMode, true);
+          ui.showToast(
+            nextMode === "asteroid"
+              ? "Switched to Game B: 6DoF Voxel Asteroid Miners"
+              : "Switched to Game A: Village RPG",
+            "info",
+            2200
+          );
+          if (transport.connected || transport._isConnecting) {
+            await transport.disconnect();
+            world.clear();
+            voxelClient?.clear();
+            activeRenderer?.clear();
+          }
+          nearestTarget = null;
+          nearestAsteroidTarget = null;
+          latestAsteroidState = null;
+          hasSyncedInitialPosition = false;
+          lastChunkProbeKey = "";
+          await autoFetchCertHash(activeGameMode, true);
+          ui.btnConnect?.click();
+        }
+      },
+      onConnect: async (url, certHash) => {
+        try {
+          ui.setConnectionState("connecting", "Connecting", "");
+          const gwConfig = resolveGatewayConfig(activeGameMode);
+          await transport.connect(url, certHash, {
+            wsUrls: [gwConfig.wsPathUrl, gwConfig.wsPortUrl],
+            wsPort: gwConfig.wsPort,
+          });
+          const sessionToken = getOrCreateSessionToken(activeGameMode);
+          const authPkt = encodeAuthRequest(sessionToken, 1);
+          await transport.sendStream(authPkt);
+
+          setTimeout(() => {
+            performInspect({ id: 0 });
+            if (activeGameMode === "asteroid") {
+              requestVisibleAsteroidChunks(true);
+            }
+          }, 200);
+        } catch (err) {
+          const errorMsg = formatConnectionError(err);
+          console.warn("Failed to connect via WebTransport:", errorMsg);
+          ui.setConnectionState("disconnected", "Disconnected", errorMsg);
+        }
+      },
+      onDisconnect: async () => {
+        await transport.disconnect();
+        world.clear();
+        voxelClient?.clear();
+        activeRenderer?.clear();
+      },
+      onTogglePartitions: (visible) => activeRenderer?.setPartitionsVisible(visible),
+      onToggleAoi: (visible) => activeRenderer?.setAoiVisible(visible),
+      onToggleWireframe: (wireframe) => activeRenderer?.setWireframe(wireframe),
+      onInteract: () => {
+        if (activeGameMode === "village" && nearestTarget) {
+          performInspect(nearestTarget);
+        }
+      },
+      onMineAsteroid: () => fireMiningLaser(),
+      onFireLaser: () => firePvpLaser(),
+      onBankLoot: () => {
+        if (activeGameMode !== "asteroid" || !transport.connected) return;
+        sendAsteroidInteraction(3, 0, {});
+      },
+      onTradePilot: () => {
+        if (activeGameMode !== "asteroid" || !transport.connected || !nearestAsteroidTarget) return;
+        sendAsteroidInteraction(4, nearestAsteroidTarget.id, {
+          target_guid: toSafeGuid(nearestAsteroidTarget.id),
+        });
+      },
+      onTradeOffer: (gold, items) => {
+        if (!transport.connected) return;
+        if (activeGameMode === "asteroid") {
+          sendAsteroidInteraction(5, nearestAsteroidTarget ? nearestAsteroidTarget.id : 0, {
+            session_id: activeTradeSessionId,
+            currency: gold,
+            items,
+          });
+        } else {
+          sendVillageInteraction(4, nearestTarget ? nearestTarget.id : 0, {
+            session_id: activeTradeSessionId,
+            currency: gold,
+            items,
+          });
+        }
+      },
+      onTradeAccept: () => {
+        if (!transport.connected) return;
+        if (activeGameMode === "asteroid") {
+          sendAsteroidInteraction(6, nearestAsteroidTarget ? nearestAsteroidTarget.id : 0, {
+            session_id: activeTradeSessionId,
+          });
+        } else {
+          sendVillageInteraction(5, nearestTarget ? nearestTarget.id : 0, {
+            session_id: activeTradeSessionId,
+          });
+        }
+      },
+      onTradeCancel: () => {
+        if (!transport.connected) return;
+        if (activeGameMode === "asteroid") {
+          sendAsteroidInteraction(7, nearestAsteroidTarget ? nearestAsteroidTarget.id : 0, {
+            session_id: activeTradeSessionId,
+          });
+        } else {
+          sendVillageInteraction(6, nearestTarget ? nearestTarget.id : 0, {
+            session_id: activeTradeSessionId,
+          });
+        }
+      },
+    });
+
+    // Keyboard shortcut: E to interact with nearest target in Village mode
+    window.addEventListener("keydown", (e) => {
+      if (activeGameMode !== "village") return;
+      if ((e.key === "e" || e.key === "E") && !e.repeat) {
+        if (ui.npcBarterModal && ui.npcBarterModal.style.display !== "none") return;
+        if (ui.playerTradeModal && ui.playerTradeModal.style.display !== "none") return;
+
+        if (nearestTarget) {
+          performInspect(nearestTarget);
+        }
+      }
+    });
+
+    // Fixed 20 Hz movement update interval (50ms)
+    let lastMoveSendTime = 0;
+    const MOVE_INTERVAL_MS = 50;
+    const MAX_INTERACT_DISTANCE = 5.0;
+
+    let lastFrameTime = performance.now();
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
+      lastFrameTime = now;
+
+      if (activeControls) {
+        activeControls.update(dt);
+      }
+      world.update(dt);
+
+      const playerPos = activeControls ? activeControls.position : { x: 0, y: 0, z: 0 };
+
+      if (activeGameMode === "village") {
+        let closest = null;
+        let minDistance = Infinity;
+
+        for (const ent of world.entities.values()) {
+          if (BigInt(ent.id) === BigInt(world.localPlayerGuid)) continue;
+          const dx = ent.x - playerPos.x;
+          const dy = ent.y - playerPos.y;
+          const dz = ent.z - playerPos.z;
+          const dist = Math.hypot(dx, dy, dz);
+          if (dist < minDistance && dist <= MAX_INTERACT_DISTANCE) {
+            minDistance = dist;
+            closest = { ...ent, distance: dist };
+          }
+        }
+
+        nearestTarget = closest;
+        if (nearestTarget) {
+          let targetName = `Entity #${nearestTarget.id}`;
+          let targetType = "Creature";
+          if (nearestTarget.type === 2) {
+            targetType = "Villager NPC";
+            targetName =
+              BigInt(nearestTarget.id) % 3n === 1n
+                ? "Blacksmith Ilmari"
+                : BigInt(nearestTarget.id) % 3n === 2n
+                ? "Herbalist Aino"
+                : "Elder Väinö";
+          } else if (nearestTarget.type === 1) {
+            targetType = "Player";
+            targetName = `Traveler #${nearestTarget.id}`;
+          }
+          ui.showTarget(targetName, targetType, nearestTarget.distance);
+        } else {
+          ui.hideTarget();
+        }
+      } else {
+        const distToStation = Math.hypot(playerPos.x, playerPos.y, playerPos.z);
+        const inSafeZone = distToStation <= HOME_STATION_SAFE_RADIUS;
+        ui.setSafeZoneStatus(inSafeZone);
+
+        let closestShip = null;
+        let minShipDist = Infinity;
+        for (const ent of world.entities.values()) {
+          if (BigInt(ent.id) === BigInt(world.localPlayerGuid)) continue;
+          const dx = ent.x - playerPos.x;
+          const dy = ent.y - playerPos.y;
+          const dz = ent.z - playerPos.z;
+          const dist = Math.hypot(dx, dy, dz);
+          if (dist < minShipDist && dist <= PVP_LASER_RANGE) {
+            minShipDist = dist;
+            closestShip = { ...ent, distance: dist };
+          }
+        }
+
+        nearestAsteroidTarget = closestShip;
+        if (nearestAsteroidTarget) {
+          ui.showAsteroidTarget(nearestAsteroidTarget, inSafeZone);
+        } else {
+          ui.hideAsteroidTarget();
+        }
+
+        if (transport.connected) {
+          requestVisibleAsteroidChunks(false);
+        }
+      }
+
+      if (now - lastMoveSendTime >= MOVE_INTERVAL_MS) {
+        lastMoveSendTime = now;
+        if (transport.connected && activeControls) {
+          const sample = activeControls.sample();
+          const moveBuf = encodeMovement(world.localPlayerGuid, sample);
+          transport.sendDatagram(moveBuf);
+        }
+      }
+
+      if (activeRenderer && activeControls) {
+        const renderBuffer = world.getRenderBuffer(activeControls.position, activeControls.yaw);
+        if (activeGameMode === "asteroid") {
+          activeRenderer.syncVoxelChunks(voxelClient);
+          const localEnt = world.entities.get(world.localPlayerGuid);
+          const localFlags =
+            localEnt?.stateFlags ??
+            (latestAsteroidState?.shininess_tier != null
+              ? (Number(latestAsteroidState.shininess_tier) & 0xff) << 16
+              : 0);
+          activeRenderer.syncEntities(renderBuffer, world.localPlayerGuid, world.entities, {
+            pitch: activeControls.pitch,
+            stateFlags: localFlags,
+          });
+        } else {
+          activeRenderer.syncEntities(renderBuffer, world.localPlayerGuid);
+          activeRenderer.updateWorldObjects(world.getWorldObjectsRenderBuffer());
+        }
+        activeRenderer.updateCamera(activeControls.position);
+        activeRenderer.render();
+      }
+
+      ui.updateTelemetry(
+        world.getTelemetry(),
+        transport.pingMs,
+        transport.bandwidthBps,
+        playerPos
+      );
     }
-  });
 
-  // Fixed 20 Hz movement update interval (50ms)
-  let lastMoveSendTime = 0;
-  const MOVE_INTERVAL_MS = 50;
-  const MAX_INTERACT_DISTANCE = 5.0;
-
-  let lastFrameTime = performance.now();
-
-  function animate(now) {
     requestAnimationFrame(animate);
-
-    const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
-    lastFrameTime = now;
-
-    // 1. Advance controls and world interpolation
-    controls.update(dt);
-    world.update(dt);
-
-    // 2. Discover nearest target entity within interact distance
-    let closest = null;
-    let minDistance = Infinity;
-    const playerPos = controls.position;
-
-    for (const ent of world.entities.values()) {
-      if (BigInt(ent.id) === BigInt(world.localPlayerGuid)) continue;
-      const dx = ent.x - playerPos.x;
-      const dy = ent.y - playerPos.y;
-      const dz = ent.z - playerPos.z;
-      const dist = Math.hypot(dx, dy, dz);
-      if (dist < minDistance && dist <= MAX_INTERACT_DISTANCE) {
-        minDistance = dist;
-        closest = { ...ent, distance: dist };
-      }
-    }
-
-    nearestTarget = closest;
-    if (nearestTarget) {
-      let targetName = `Entity #${nearestTarget.id}`;
-      let targetType = "Creature";
-      if (nearestTarget.type === 2) {
-        targetType = "Villager NPC";
-        targetName =
-          BigInt(nearestTarget.id) % 3n === 1n
-            ? "Blacksmith Ilmari"
-            : BigInt(nearestTarget.id) % 3n === 2n
-            ? "Herbalist Aino"
-            : "Elder Väinö";
-      } else if (nearestTarget.type === 1) {
-        targetType = "Player";
-        targetName = `Traveler #${nearestTarget.id}`;
-      }
-      ui.showTarget(targetName, targetType, nearestTarget.distance);
-    } else {
-      ui.hideTarget();
-    }
-
-    // 3. Transmit 20 Hz movement updates over WebTransport datagrams
-    if (now - lastMoveSendTime >= MOVE_INTERVAL_MS) {
-      lastMoveSendTime = now;
-      if (transport.connected) {
-        const sample = controls.sample();
-        const moveBuf = encodeMovement(world.localPlayerGuid, sample);
-        transport.sendDatagram(moveBuf);
-      }
-    }
-
-    // 4. Render synchronized 3D scene
-    const renderBuffer = world.getRenderBuffer(controls.position, controls.yaw);
-    renderer.syncEntities(renderBuffer, world.localPlayerGuid);
-    renderer.updateWorldObjects(world.getWorldObjectsRenderBuffer());
-    renderer.updateCamera(controls.position);
-    renderer.render();
-
-    // 5. Update HUD Telemetry
-    ui.updateTelemetry(
-      world.getTelemetry(),
-      transport.pingMs,
-      transport.bandwidthBps,
-      controls.position
-    );
-  }
-
-  requestAnimationFrame(animate);
-});
+  });
 }

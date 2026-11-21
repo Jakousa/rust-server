@@ -103,4 +103,20 @@ test.describe("OpenSpec MMO Web Inspector E2E", () => {
     const certHash = await page.inputValue("#cert-hash");
     expect(certHash).toMatch(/^[0-9a-f]{2}(:[0-9a-f]{2}){31}$/i);
   });
+
+  test("boots Village RPG on /village and Asteroid Miners on /asteroid subpaths", async ({
+    page,
+  }) => {
+    await page.goto("/asteroid", { waitUntil: "domcontentloaded" });
+    await expect(page.locator("#asteroid-hud")).toBeVisible();
+    await expect(page.locator("#village-hud")).toBeHidden();
+    await expect(page.locator("#btn-mode-asteroid")).toHaveClass(/active/);
+    expect(await page.inputValue("#gateway-url")).toMatch(/:4434$/);
+
+    await page.goto("/village", { waitUntil: "domcontentloaded" });
+    await expect(page.locator("#village-hud")).toBeVisible();
+    await expect(page.locator("#asteroid-hud")).toBeHidden();
+    await expect(page.locator("#btn-mode-village")).toHaveClass(/active/);
+    expect(await page.inputValue("#gateway-url")).toMatch(/:4433$/);
+  });
 });
