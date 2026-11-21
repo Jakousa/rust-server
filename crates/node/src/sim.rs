@@ -15,7 +15,7 @@ use mmo_core::{
 };
 
 use crate::aoi::{AoiBroadcastJob, AoiManager, ObserverConfig, ObserverState};
-use crate::kinematics::{EntityKinematicState, KinematicValidator};
+use crate::kinematics::{EntityKinematicState, KinematicValidator, MotionMode};
 use crate::network::{GhostBroadcaster, GhostStore, NodeServiceImpl};
 
 /// Authoritative simulation node driving world ticks, spatial partitioning,
@@ -62,6 +62,7 @@ pub struct TickSimulation {
     pub combat_resolver: Arc<dyn mmo_core::combat::CombatResolver>,
     pub default_spawn_position: (f32, f32, f32),
     pub default_collider_half_extents: (f32, f32, f32),
+    pub default_motion_mode: MotionMode,
     pub owned_bounds: Vec<BoundingBox3D>,
     pub peer_partitions: Vec<(BoundingBox3D, u32, String)>,
     pub pending_migrations: Vec<Guid>,
@@ -228,6 +229,7 @@ impl TickSimulation {
             combat_resolver: Arc::new(crate::combat_pipeline::DefaultCombatResolver),
             default_spawn_position: (0.0, 0.0, 0.0),
             default_collider_half_extents: (0.4, 0.9, 0.4),
+            default_motion_mode: MotionMode::DiscreteGround,
             owned_bounds: vec![bounds],
             peer_partitions: Vec::new(),
             pending_migrations: Vec::new(),
@@ -503,6 +505,17 @@ impl TickSimulation {
     /// Updates the default unobstructed spawn position for new player sessions.
     pub fn set_default_spawn_position(&mut self, position: (f32, f32, f32)) {
         self.default_spawn_position = position;
+    }
+
+    /// Configures the default kinematic motion mode for newly tracked entities.
+    pub fn with_default_motion_mode(mut self, mode: MotionMode) -> Self {
+        self.default_motion_mode = mode;
+        self
+    }
+
+    /// Updates the default kinematic motion mode for newly tracked entities.
+    pub fn set_default_motion_mode(&mut self, mode: MotionMode) {
+        self.default_motion_mode = mode;
     }
 
     /// Returns `true` if `pos` is finite, inside world bounds, and free of static obstacle collisions
@@ -1244,6 +1257,7 @@ impl TickSimulation {
 
         let mut k_state = EntityKinematicState::new(self.current_time).with_position(pos);
         k_state.initialized = true;
+        k_state.motion_mode = self.default_motion_mode;
         self.kinematic_states.insert(guid, k_state);
 
         let aoi_config = crate::aoi::ObserverConfig {
@@ -1826,10 +1840,12 @@ impl TickSimulation {
     /// Calculates server-authoritative delta time with jitter tolerance based on sequence delta.
     pub fn compute_server_dt_with_seq(&mut self, guid: Guid, seq_delta: u32) -> f32 {
         let now = self.current_time;
-        let state = self
-            .kinematic_states
-            .entry(guid)
-            .or_insert_with(|| EntityKinematicState::new(now));
+        let default_motion_mode = self.default_motion_mode;
+        let state = self.kinematic_states.entry(guid).or_insert_with(|| {
+            let mut s = EntityKinematicState::new(now);
+            s.motion_mode = default_motion_mode;
+            s
+        });
 
         if !state.initialized {
             state.initialized = true;
@@ -1887,11 +1903,13 @@ impl TickSimulation {
         // 3. Compute server-authoritative delta time and verify replenishing time credit
         let now = self.current_time;
         let dt_nominal = (Self::TICK_DT_SEC * (seq_delta.max(1) as f32)).min(0.2);
+        let default_motion_mode = self.default_motion_mode;
         {
-            let state = self
-                .kinematic_states
-                .entry(guid)
-                .or_insert_with(|| EntityKinematicState::new(now));
+            let state = self.kinematic_states.entry(guid).or_insert_with(|| {
+                let mut s = EntityKinematicState::new(now);
+                s.motion_mode = default_motion_mode;
+                s
+            });
 
             if !state.initialized {
                 state.initialized = true;
@@ -3827,5 +3845,43 @@ mod tests {
         assert!(guids.contains(&passenger));
         assert!(!guids.contains(&static_obj));
         assert!(!guids.contains(&tombstoned));
+    }
+
+    #[test]
+    fn test_default_motion_mode_propagation() {
+        let bounds = BoundingBox3D::new((-100.0, -100.0, -100.0), (100.0, 100.0, 100.0));
+        let default_sim = TickSimulation::new(1, bounds);
+        assert_eq!(default_sim.default_motion_mode, MotionMode::DiscreteGround);
+
+        let mode_6dof = MotionMode::Newtonian6DoF {
+            max_acceleration: 250.0,
+            linear_damping: 0.2,
+        };
+        let mut sim = TickSimulation::new(1, bounds).with_default_motion_mode(mode_6dof);
+        assert_eq!(sim.default_motion_mode, mode_6dof);
+
+        // 1. hydrate_player_session propagates default_motion_mode
+        let p1 = Guid::new(EntityType::Player, 1, 1);
+        sim.hydrate_player_session(p1, 1001, 1, None, 80.0);
+        assert_eq!(sim.kinematic_states[&p1].motion_mode, mode_6dof);
+
+        // 2. compute_server_dt_with_seq propagates default_motion_mode
+        let p2 = Guid::new(EntityType::Player, 1, 2);
+        sim.spawn_entity(p2, (0.0, 0.0, 0.0));
+        sim.compute_server_dt_with_seq(p2, 1);
+        assert_eq!(sim.kinematic_states[&p2].motion_mode, mode_6dof);
+
+        // 3. process_client_move_with_seq propagates updated set_default_motion_mode
+        let custom_mode = MotionMode::Newtonian6DoF {
+            max_acceleration: 120.0,
+            linear_damping: 0.1,
+        };
+        sim.set_default_motion_mode(custom_mode);
+        let p3 = Guid::new(EntityType::Player, 1, 3);
+        sim.spawn_entity(p3, (0.0, 0.0, 0.0));
+        // (0.1, 0.1, 0.1) in 0.05s => speed ~3.46 m/s, accel ~69.3 m/s^2 <= 120 * 1.1
+        let res = sim.process_client_move_with_seq(p3, (0.1, 0.1, 0.1), 1);
+        assert!(res.is_ok());
+        assert_eq!(sim.kinematic_states[&p3].motion_mode, custom_mode);
     }
 }

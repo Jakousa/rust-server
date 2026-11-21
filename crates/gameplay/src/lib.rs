@@ -7,6 +7,7 @@
 
 pub mod ability;
 pub mod ai_brain;
+pub mod asteroid;
 pub mod combat;
 pub mod guild;
 pub mod inventory;
@@ -28,6 +29,18 @@ pub use ability::{
     AbilityTickSystem, CooldownTracker,
 };
 pub use ai_brain::{FsmBrainComponent, FsmBrainSystem, FsmState, MonsterAiPlugin};
+pub use asteroid::{
+    bootstrap_asteroid_world, build_asteroid_state_response, compute_cargo_value,
+    compute_shininess_tier, encode_shininess_state_flags, extract_shininess_tier, is_in_safe_zone,
+    ore_item_for_voxel, ore_unit_value, seed_asteroid_voxel_world, update_entity_shininess,
+    AsteroidMiningPlugin, AsteroidMiningTickSystem, AsteroidPacketHandler,
+    AsteroidSectorStateResponse, FirePvpLaserRequest, PilotStarterKitHook, StationVaultComponent,
+    TargetShipInfo, ASTEROID_MODULE_ID, DEFAULT_SHIP_SPAWN_POS, HOME_STATION_POS,
+    HOME_STATION_SAFE_RADIUS, ITEM_SOLAR_GOLD_ID, ITEM_TITANIUM_ORE_ID, ITEM_VOID_CRYSTAL_ID,
+    PVP_LASER_COOLDOWN_MS, PVP_LASER_DAMAGE, PVP_LASER_RANGE, SEEDED_ASTEROID_CHUNKS,
+    STATION_PREFAB_ID, VOXEL_CRUST_ROCK, VOXEL_EMPTY, VOXEL_SOLAR_GOLD, VOXEL_TITANIUM,
+    VOXEL_VOID_CRYSTAL,
+};
 pub use combat::{
     process_damage_events, CombatPlugin, DamageEvent, EntityDiedEvent, HealthComponent,
     HealthRegenSystem, StatsComponent,
